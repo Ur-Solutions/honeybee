@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { CELL_BROKER_DENIAL_PREFIX, CELL_SPAWN_ALTERNATIVE } from "../src/cellBroker.js";
+import { hashCellBrokerCapability } from "../src/cellBrokerCapability.js";
 import type { BrokerSpawnArgs } from "../src/daemon/broker.js";
 import { startHsrControlServer } from "../src/daemon/hsrControl.js";
 import { capturePersistableProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
@@ -15,6 +17,19 @@ import { listSeals } from "../src/seal.js";
 import type { BeeViewV1 } from "../src/view/types.js";
 
 const execFileAsync = promisify(execFile);
+
+function brokerTokenFor(name: string): string {
+  return createHash("sha256").update(`cell-broker-cli-test:${name}`).digest("base64url");
+}
+
+function cellEnv(name: string, overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+  return {
+    HIVE_CELL: "1",
+    HIVE_BEE_NAME: name,
+    HIVE_CELL_BROKER_TOKEN: brokerTokenFor(name),
+    ...overrides,
+  };
+}
 
 async function seedSession(store: string, name: string, id = name, liveRunner = true): Promise<void> {
   const sessions = join(store, "sessions");
@@ -30,7 +45,8 @@ async function seedSession(store: string, name: string, id = name, liveRunner = 
     substrate: "hsr",
     createdAt: now,
     updatedAt: now,
-    status: "dead",
+    status: "running",
+    cellBrokerCapabilityHash: hashCellBrokerCapability(name, 0, brokerTokenFor(name)),
   }, null, 2)}\n`, { mode: 0o600 });
   if (liveRunner) {
     const hostFingerprint = await capturePersistableProcessBirthFingerprint(process.pid);
@@ -99,7 +115,7 @@ test("Cell CLI brokers buz send/inbox, self state, and self seal over the daemon
     const artifactPath = join(store, "seal-input.json");
     await writeFile(artifactPath, JSON.stringify({ status: "done", summary: "brokered from Cell", type: "implementation" }));
     const server = await startHsrControlServer();
-    const env = { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" };
+    const env = cellEnv("cell-caller");
     try {
       const sent = await hive(store, env, "buz", "send", "cell-recipient", "--sender", "cell-caller", "--tier", "queue", "-p", "hello from Cell");
       assert.match(sent.stdout, /^buz\.send\tcell-recipient\t/m);
@@ -130,7 +146,7 @@ test("Cell CLI surfaces broker ACL denials with the Cell pointer", async () => {
     const artifactPath = join(store, "seal-input.json");
     await writeFile(artifactPath, JSON.stringify({ status: "done", summary: "must be denied" }));
     const server = await startHsrControlServer();
-    const env = { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" };
+    const env = cellEnv("cell-caller");
     try {
       const failures = await Promise.all([
         hiveFailure(store, env, "buz", "send", "cell-caller", "--sender", "cell-other", "--tier", "queue", "-p", "forged"),
@@ -154,7 +170,7 @@ test("Cell CLI refuses politely when neither HIVE_BEE_NAME nor HIVE_BEE is prese
   await withStore(async (store) => {
     const stderr = await hiveFailure(
       store,
-      { HIVE_CELL: "1", HIVE_BEE_NAME: undefined, HIVE_BEE: undefined },
+      { HIVE_CELL: "1", HIVE_BEE_NAME: undefined, HIVE_BEE: undefined, HIVE_CELL_BROKER_TOKEN: undefined },
       "state", "ls", "--json",
     );
     assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -163,12 +179,48 @@ test("Cell CLI refuses politely when neither HIVE_BEE_NAME nor HIVE_BEE is prese
   });
 });
 
+test("Cell CLI requires the runtime-only broker capability before contacting the daemon", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller");
+    const server = await startHsrControlServer();
+    try {
+      const stderr = await hiveFailure(
+        store,
+        cellEnv("cell-caller", { HIVE_CELL_BROKER_TOKEN: undefined }),
+        "state", "explain", "cell-caller", "--json",
+      );
+      assert.match(stderr, /HIVE_CELL_BROKER_TOKEN is missing or malformed/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("a Cell cannot impersonate another live bee by overriding HIVE_BEE_NAME", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-caller");
+    await seedSession(store, "cell-other");
+    const server = await startHsrControlServer();
+    try {
+      const stderr = await hiveFailure(
+        store,
+        cellEnv("cell-caller", { HIVE_BEE_NAME: "cell-other" }),
+        "state", "explain", "cell-other", "--json",
+      );
+      assert.match(stderr, /broker capability for cell-other is missing, stale, or invalid/);
+      assert.doesNotMatch(stderr, new RegExp(brokerTokenFor("cell-caller")));
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 test("Cell CLI derives identity from the runner-stamped HIVE_BEE when HIVE_BEE_NAME is absent", async () => {
   await withStore(async (store) => {
     await seedSession(store, "cell-caller");
     await seedSession(store, "cell-other");
     const server = await startHsrControlServer();
-    const env = { HIVE_CELL: "1", HIVE_BEE_NAME: undefined, HIVE_BEE: "cell-caller" };
+    const env = cellEnv("cell-caller", { HIVE_BEE_NAME: undefined, HIVE_BEE: "cell-caller" });
     try {
       // A self-inbox read succeeding proves the daemon accepted HIVE_BEE as
       // the caller identity; a cross-bee read is denied AS that identity.
@@ -190,7 +242,7 @@ test("Cell CLI denies a dead caller claim with the standard Cell pointer", async
     try {
       const stderr = await hiveFailure(
         store,
-        { HIVE_CELL: "1", HIVE_BEE_NAME: "dead-cell" },
+        cellEnv("dead-cell"),
         "state", "explain", "dead-cell", "--json",
       );
       assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -213,9 +265,9 @@ test("Cell CLI old-daemon fallback refuses instead of touching Hive state direct
       },
     });
     try {
-      const stderr = await hiveFailure(store, { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" }, "state", "explain", "cell-caller", "--json");
+      const stderr = await hiveFailure(store, cellEnv("cell-caller"), "state", "explain", "cell-caller", "--json");
       assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-      assert.match(stderr, /does not advertise broker:1/);
+      assert.match(stderr, /does not advertise broker:3/);
       assert.doesNotMatch(stderr, /EPERM|at .*\.ts:\d+/);
     } finally {
       await oldDaemon.close();
@@ -249,7 +301,7 @@ test("Cell CLI broker:spawn denies by default, then routes a granted filesystem 
         },
       },
     });
-    const env = { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" };
+    const env = cellEnv("cell-caller");
     try {
       const denied = await hiveFailure(store, env,
         "spawn", "codex", "do the work", "--cwd", cwd, "--name", "child-name");
@@ -297,11 +349,11 @@ test("Cell CLI broker:spawn refuses politely when the daemon has only broker:1",
     try {
       const stderr = await hiveFailure(
         store,
-        { HIVE_CELL: "1", HIVE_BEE_NAME: "cell-caller" },
+        cellEnv("cell-caller"),
         "spawn", "codex", "--cwd", store,
       );
       assert.match(stderr, new RegExp(CELL_BROKER_DENIAL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-      assert.match(stderr, /does not advertise broker:2/);
+      assert.match(stderr, /does not advertise broker:3/);
       assert.match(stderr, new RegExp(CELL_SPAWN_ALTERNATIVE));
       assert.doesNotMatch(stderr, /EPERM|at .*\.ts:\d+/);
     } finally {

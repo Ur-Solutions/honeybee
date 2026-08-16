@@ -12,7 +12,6 @@ import {
   probeCellSandbox,
   resolveCellSandboxExtraWriteRoots,
   shutdownCellSandbox,
-  withoutAmbientProviderState,
   wrapCellSandboxCommand,
   wrapCellSandboxCommandForState,
 } from "../src/hsr/cellSandbox.js";
@@ -79,6 +78,7 @@ test("Cell policy permits only the Cell, provider state, and per-run scratch out
     assert.ok(built.state.allowWrite.includes(await realpath(provider)));
     assert.ok(built.state.allowWrite.includes(await realpath(join(runDir, "cell-sandbox"))));
     assert.ok(!built.state.allowWrite.includes(join(root, "home")));
+    assert.equal(built.env.HOME, join(built.state.scratchRoot, "home"));
     assert.equal(built.env.TMPDIR, join(built.state.scratchRoot, "tmp"));
     assert.equal(
       built.env.npm_config_store_dir,
@@ -121,6 +121,14 @@ test("Cell policy explicitly allows hive buz mailboxes, next-tool locks, and the
     assert.equal(await realpath(nextToolLocks), nextToolLocks);
     assert.equal(await readFile(join(store, "ledger.jsonl"), "utf8"), "");
     assert.equal(built.env.HIVE_LEDGER_MAX_BYTES, "0", "in-cell ledger rotation is pinned off");
+    assert.ok(
+      built.state.allowWrite.includes(join(built.state.scratchRoot, "home", ".codex")),
+      "an accountless provider default is isolated below the per-run HOME",
+    );
+    assert.ok(
+      !built.state.allowWrite.includes(join(root, "home", ".codex")),
+      "the daemon user's provider default is never reopened",
+    );
     assert.ok(!built.state.allowWrite.includes(canonicalStore), "the store root itself stays read-only");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -339,22 +347,6 @@ test("macOS wrapper allows system trust evaluation, denies the login keychain, a
 test("commandString preserves arbitrary argv as data", () => {
   assert.equal(commandString("/tmp/a b", ["", "a'b", "$(touch nope)"]),
     "'/tmp/a b' '' 'a'\\''b' '$(touch nope)'");
-});
-
-test("protocol Cells discard ambient provider homes but keep the explicitly resolved account home", () => {
-  const inherited = {
-    PATH: "/usr/bin",
-    CODEX_HOME: "/ambient/codex",
-    CLAUDE_CONFIG_DIR: "/ambient/claude",
-    XDG_DATA_HOME: "/ambient/xdg",
-  };
-  assert.deepEqual(withoutAmbientProviderState("codex", inherited, {}), { PATH: "/usr/bin", XDG_DATA_HOME: "/ambient/xdg" });
-  assert.deepEqual(withoutAmbientProviderState("codex", inherited, { CODEX_HOME: "/account/codex" }), {
-    PATH: "/usr/bin",
-    CODEX_HOME: "/ambient/codex",
-    XDG_DATA_HOME: "/ambient/xdg",
-  });
-  assert.deepEqual(withoutAmbientProviderState("opencode", inherited, {}), { PATH: "/usr/bin" });
 });
 
 test("the native macOS/Linux sandbox commits inside its Cell, blocks a canonical sibling, and serves locally", {

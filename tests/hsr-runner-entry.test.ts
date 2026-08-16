@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -8,17 +8,30 @@ import test from "node:test";
 import {
   HSR_HOST_POLL_INTERVAL_MS,
   dedicatedHsrEntryCandidate,
+  hsrCellPayloadFields,
   hsrEntryArgv,
   inheritableExecArgvForHsr,
   isRunnerHostBundleEntry,
   resolveHsrEntry,
   waitForHsrHost,
+  waitForHsrReadiness,
 } from "../src/hsr/runnerHost.js";
+import type { HsrMeta } from "../src/hsr/runDir.js";
 import { ensureRunnerHostBundle } from "../src/hsr/buildRunnerHostBundle.js";
+import { localGithubSessionCredentialLeaseId } from "../src/execution/localCredentials.js";
 import {
+  EXECUTION_CELL_AMBIENT_ENV_KEYS,
   applyCellEnvironmentStamp,
   applyCellGithubCredential,
+  assertExecutionCellProxyEnvironment,
   cellSpaceKeyForCwd,
+  executionCellProviderEnvironment,
+  hsrHarnessEnvironment,
+  hsrHostEnvironment,
+  hostGithubCredentialResolverEnvironment,
+  hostGithubSessionToken,
+  sanitizeExecutionCellPayload,
+  type HsrRunPayload,
 } from "../src/hsr/runner-entry.js";
 
 const execFileAsync = promisify(execFile);
@@ -60,32 +73,61 @@ test("Cell spawns are stamped HIVE_CELL=1 + HIVE_CELL_SPACE; non-Cell spawns are
   assert.equal("HIVE_CELL_SPACE" in plain, false);
 });
 
-test("Cell spawns borrow the host gh session token; explicit tokens and opt-out win", async () => {
-  const cell = (): Parameters<typeof applyCellGithubCredential>[1] => ({ filesystemWriteScope: "cwd" });
+test("execution Cell relaunch fields preserve the exact Run and credential lease", () => {
+  const runId = "run-relaunch-gh-1";
+  const credentialLeaseId = localGithubSessionCredentialLeaseId(runId);
+  assert.deepEqual(hsrCellPayloadFields({
+    executionRunId: runId,
+    executionRuntimeCredentialLeaseIds: [credentialLeaseId],
+    sandboxWriteRoots: ["/cell-wrapper"],
+  }), {
+    filesystemWriteScope: "cwd",
+    executionRunId: runId,
+    runtimeCredentialLeaseIds: [credentialLeaseId],
+    extraWriteRoots: ["/cell-wrapper"],
+  });
+  assert.deepEqual(hsrCellPayloadFields({}), {});
+});
+
+test("Cell gh injection requires the exact signed Run-bound runtime credential lease", async () => {
+  const runId = "run-cell-gh-1";
+  const cell = (): Parameters<typeof applyCellGithubCredential>[1] => ({
+    filesystemWriteScope: "cwd",
+    executionRunId: runId,
+    runtimeCredentialLeaseIds: [localGithubSessionCredentialLeaseId(runId)],
+  });
 
   const stamped: Record<string, string> = {};
-  await applyCellGithubCredential(stamped, cell(), async () => "gho_host_session_token\n");
+  let authorizedResolverCalls = 0;
+  await applyCellGithubCredential(stamped, cell(), async () => {
+    authorizedResolverCalls += 1;
+    return "gho_host_session_token\n";
+  });
   assert.equal(stamped.GH_TOKEN, "gho_host_session_token");
+  assert.equal(authorizedResolverCalls, 1, "the exact signed lease resolves host gh once");
 
-  // Non-Cell spawns are never stamped — the operator env already governs.
+  // Non-Cell spawns are never stamped — ordinary HSR remains unchanged.
   const plain: Record<string, string> = {};
   await applyCellGithubCredential(plain, {}, async () => "gho_host_session_token");
   assert.equal("GH_TOKEN" in plain, false);
 
-  // An explicit spawn-env credential always wins over the borrowed session.
-  const explicit: Record<string, string> = { GITHUB_TOKEN: "ghs_explicit" };
-  await applyCellGithubCredential(explicit, cell(), async () => "gho_host_session_token");
-  assert.equal("GH_TOKEN" in explicit, false);
-
-  // HIVE_CELL_GH=0 on the host opts the machine out entirely.
-  process.env.HIVE_CELL_GH = "0";
-  try {
-    const opted: Record<string, string> = {};
-    await applyCellGithubCredential(opted, cell(), async () => "gho_host_session_token");
-    assert.equal("GH_TOKEN" in opted, false);
-  } finally {
-    delete process.env.HIVE_CELL_GH;
+  let unauthorizedResolverCalls = 0;
+  for (const denied of [
+    { filesystemWriteScope: "cwd" as const, executionRunId: runId },
+    {
+      filesystemWriteScope: "cwd" as const,
+      executionRunId: runId,
+      runtimeCredentialLeaseIds: [localGithubSessionCredentialLeaseId("run-other")],
+    },
+  ]) {
+    const env: Record<string, string> = {};
+    await applyCellGithubCredential(env, denied, async () => {
+      unauthorizedResolverCalls += 1;
+      return "gho_must_not_cross";
+    });
+    assert.equal("GH_TOKEN" in env, false);
   }
+  assert.equal(unauthorizedResolverCalls, 0, "an absent/mismatched lease never touches the host gh session");
 
   // Not-a-token shapes (gh error prose, empties) and resolver failures are
   // soft: the Cell simply stays unauthenticated.
@@ -98,6 +140,186 @@ test("Cell spawns borrow the host gh session token; explicit tokens and opt-out 
   const failing: Record<string, string> = {};
   await applyCellGithubCredential(failing, cell(), async () => { throw new Error("gh missing"); });
   assert.equal("GH_TOKEN" in failing, false);
+});
+
+test("the real gh resolver keeps host discovery roots while the harness receives none", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-gh-resolver-"));
+  const executable = join(dir, "gh");
+  await writeFile(executable, `#!/bin/sh\n[ "$HOME" = "/host/home" ] || exit 41\n[ "$GH_CONFIG_DIR" = "/host/gh" ] || exit 42\n[ "$XDG_CONFIG_HOME" = "/host/xdg" ] || exit 43\nprintf 'gho_from_host_config\\n'\n`);
+  await chmod(executable, 0o700);
+  try {
+    const inherited = {
+      PATH: dir,
+      HOME: "/host/home",
+      GH_CONFIG_DIR: "/host/gh",
+      XDG_CONFIG_HOME: "/host/xdg",
+      GH_TOKEN: "ambient-must-not-enter-resolver",
+      AWS_SECRET_ACCESS_KEY: "ambient-must-not-enter-resolver",
+    };
+    assert.deepEqual(hostGithubCredentialResolverEnvironment(inherited), {
+      PATH: dir,
+      HOME: "/host/home",
+      GH_CONFIG_DIR: "/host/gh",
+      XDG_CONFIG_HOME: "/host/xdg",
+    });
+    assert.equal((await hostGithubSessionToken(inherited)).trim(), "gho_from_host_config");
+
+    const harness = hsrHarnessEnvironment(envPayload(), {
+      ...inherited,
+      HIVE_STORE_ROOT: "/canonical/hive",
+    });
+    for (const key of ["HOME", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY"]) {
+      assert.equal(key in harness, false, `${key} is resolver-only`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function envPayload(overrides: Partial<HsrRunPayload> = {}): HsrRunPayload {
+  return {
+    bee: "env-cell",
+    kind: "claude",
+    cwd: "/cell",
+    filesystemWriteScope: "cwd",
+    executionRunId: "run-env-1",
+    cellBrokerCapability: "a".repeat(43),
+    spec: { command: "claude", args: [], env: {} },
+    ...overrides,
+  };
+}
+
+test("execution Cell host environment is an exact allowlist; ordinary HSR remains byte-compatible", () => {
+  const inherited = {
+    PATH: "/reviewed/bin",
+    HOME: "/host/home",
+    GH_CONFIG_DIR: "/host/gh",
+    XDG_CONFIG_HOME: "/host/xdg",
+    LANG: "en_US.UTF-8",
+    HTTPS_PROXY: "http://node-proxy.example:8080",
+    HIVE_STORE_ROOT: "/canonical/hive",
+    AWS_SECRET_ACCESS_KEY: "aws-secret",
+    GH_TOKEN: "ambient-gh",
+    GITHUB_TOKEN: "ambient-github",
+    SSH_AUTH_SOCK: "/tmp/agent.sock",
+    NODE_OPTIONS: "--require=/tmp/ambient-hook.cjs",
+    CLAUDE_CONFIG_DIR: "/ambient/claude",
+    RANDOM_GATEWAY_SECRET: "gateway-secret",
+  };
+  const host = hsrHostEnvironment(envPayload(), inherited);
+  assert.deepEqual(host, {
+    PATH: "/reviewed/bin",
+    HOME: "/host/home",
+    GH_CONFIG_DIR: "/host/gh",
+    XDG_CONFIG_HOME: "/host/xdg",
+    LANG: "en_US.UTF-8",
+    HTTPS_PROXY: "http://node-proxy.example:8080",
+    HIVE_STORE_ROOT: "/canonical/hive",
+  });
+  assert.ok(EXECUTION_CELL_AMBIENT_ENV_KEYS.includes("HTTPS_PROXY"));
+  for (const forbidden of [
+    "AWS_SECRET_ACCESS_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "SSH_AUTH_SOCK",
+    "NODE_OPTIONS",
+    "CLAUDE_CONFIG_DIR",
+    "RANDOM_GATEWAY_SECRET",
+  ]) assert.equal(forbidden in host, false, forbidden);
+
+  const ordinary = envPayload({ filesystemWriteScope: undefined });
+  assert.deepEqual(hsrHostEnvironment(ordinary, inherited), inherited);
+});
+
+test("execution Cells refuse credential-bearing proxy URLs while preserving public node routing", () => {
+  for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+    const inherited = { PATH: "/usr/bin", [key]: "http://proxy-user:proxy-secret@node-proxy.example:8080" };
+    assert.throws(
+      () => assertExecutionCellProxyEnvironment(inherited),
+      new RegExp(`credential-bearing ${key}`),
+    );
+    assert.throws(
+      () => hsrHostEnvironment(envPayload(), inherited),
+      new RegExp(`credential-bearing ${key}`),
+    );
+    const ordinary = envPayload({ filesystemWriteScope: undefined });
+    assert.deepEqual(
+      hsrHostEnvironment(ordinary, inherited),
+      inherited,
+      "ordinary HSR environment inheritance remains byte-compatible",
+    );
+    assert.throws(
+      () => assertExecutionCellProxyEnvironment({ PATH: "/usr/bin", [key]: "proxy-user:proxy-secret@node-proxy.example:8080" }),
+      new RegExp(`credential-bearing ${key}`),
+      "scheme-less proxy userinfo must not parse as a credential-free custom URL scheme",
+    );
+  }
+
+  const publicProxy = { PATH: "/usr/bin", HTTPS_PROXY: "http://node-proxy.example:8080", NO_PROXY: "localhost" };
+  assert.doesNotThrow(() => assertExecutionCellProxyEnvironment(publicProxy));
+  assert.deepEqual(hsrHarnessEnvironment(envPayload(), publicProxy), publicProxy);
+});
+
+test("execution Cell payload accepts only the signed account's exact provider identity env", () => {
+  const specEnv = {
+    CLAUDE_CONFIG_DIR: "/accounts/claude-1",
+    CODEX_HOME: "/accounts/codex-ambient",
+    ANTHROPIC_API_KEY: "gateway-api-key",
+    RANDOM_GATEWAY_SECRET: "gateway-secret",
+  };
+  const accountCell = envPayload({ accountId: "acct-claude-1", spec: { command: "claude", args: [], env: specEnv } });
+  assert.deepEqual(executionCellProviderEnvironment(accountCell), {
+    CLAUDE_CONFIG_DIR: "/accounts/claude-1",
+  });
+  const sanitized = sanitizeExecutionCellPayload(accountCell);
+  assert.deepEqual(sanitized.spec.env, { CLAUDE_CONFIG_DIR: "/accounts/claude-1" });
+  assert.equal(JSON.stringify(sanitized).includes("gateway-api-key"), false);
+  assert.equal(JSON.stringify(sanitized).includes("gateway-secret"), false);
+
+  const accountless = envPayload({ spec: { command: "claude", args: [], env: specEnv } });
+  assert.deepEqual(executionCellProviderEnvironment(accountless), {});
+  assert.deepEqual(sanitizeExecutionCellPayload(accountless).spec.env, {});
+
+  const ordinary = envPayload({ filesystemWriteScope: undefined, spec: { command: "claude", args: [], env: specEnv } });
+  assert.equal(sanitizeExecutionCellPayload(ordinary), ordinary, "ordinary HSR payload is not rewritten");
+});
+
+test("execution harness sees the broker socket but not the canonical store or ambient credentials", () => {
+  const cell = envPayload({
+    accountId: "acct-claude-1",
+    spec: {
+      command: "claude",
+      args: [],
+      env: { CLAUDE_CONFIG_DIR: "/accounts/claude-1", GH_TOKEN: "unleased-explicit-gh" },
+    },
+  });
+  const env = hsrHarnessEnvironment(cell, {
+    PATH: "/reviewed/bin",
+    HIVE_STORE_ROOT: "/canonical/hive",
+    AWS_ACCESS_KEY_ID: "ambient-aws",
+  });
+  assert.deepEqual(env, {
+    PATH: "/reviewed/bin",
+    CLAUDE_CONFIG_DIR: "/accounts/claude-1",
+    HIVE_CELL_BROKER_SOCKET: "/canonical/hive/daemon/hsr-control.sock",
+    HIVE_CELL_BROKER_TOKEN: "a".repeat(43),
+  });
+  assert.equal("HIVE_STORE_ROOT" in env, false);
+  assert.equal("GH_TOKEN" in env, false, "GH_TOKEN exists only after the signed lease resolver runs");
+});
+
+test("ordinary HSR never inherits a Cell broker capability from its parent", () => {
+  const ordinary = envPayload({
+    filesystemWriteScope: undefined,
+    executionRunId: undefined,
+    cellBrokerCapability: undefined,
+  });
+  const env = hsrHarnessEnvironment(ordinary, {
+    PATH: "/bin",
+    HIVE_CELL_BROKER_SOCKET: "/forged/broker.sock",
+    HIVE_CELL_BROKER_TOKEN: "z".repeat(43),
+  });
+  assert.deepEqual(env, { PATH: "/bin" });
 });
 
 test("resolveHsrEntry derives source and built entries from the runnerHost module", async () => {
@@ -252,6 +474,39 @@ test("waitForHsrHost caps its final sleep at the unchanged timeout deadline", as
   assert.equal(now, 25);
   assert.equal(probes, 3);
   assert.deepEqual(delays, [10, 10, 5]);
+});
+
+test("waitForHsrReadiness does not confuse a birth-admitted queued host with a controllable runtime", async () => {
+  let now = 0;
+  let reads = 0;
+  const base: HsrMeta = {
+    bee: "bee",
+    harness: "codex",
+    tier: "server",
+    hostPid: 42,
+    hostFingerprint: { pgid: 42, startedAt: "Fri Aug 15 00:00:00 2026" },
+    childAdmission: "admitted",
+    childPid: 43,
+    childPgid: 43,
+    childFingerprint: { pgid: 43, startedAt: "Fri Aug 15 00:00:01 2026" },
+    startedAt: "2026-08-15T00:00:00.000Z",
+    controlSocket: "/tmp/bee.sock",
+    status: "queued",
+  };
+  const ready = await waitForHsrReadiness("bee", 100, {
+    now: () => now,
+    readMeta: async () => {
+      reads += 1;
+      return reads < 3
+        ? base
+        : { ...base, status: "running", runningAt: "2026-08-15T00:00:02.000Z" };
+    },
+    sleep: async (ms) => { now += ms; },
+  });
+
+  assert.equal(ready, true);
+  assert.equal(reads, 3);
+  assert.equal(now, 20);
 });
 
 test("the dedicated source entry and __hsr-run fallback both remain executable under tsx", async () => {

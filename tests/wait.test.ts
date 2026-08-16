@@ -9,7 +9,7 @@ import { enqueuePendingHsrTurn, readPendingHsrTurns } from "../src/hsr/pendingTu
 import { capturePersistableProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import type { SealRecord } from "../src/seal.js";
 import { sessionLivenessFailure } from "../src/sessionLiveness.js";
-import { deleteSession, saveSession, type SessionRecord } from "../src/store.js";
+import { deleteSession, saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
 import { WAIT_EXIT_CODES, WaitError, waitForIdle, waitForSeal } from "../src/wait.js";
 
 const execFileAsync = promisify(execFile);
@@ -58,6 +58,44 @@ test("waitForIdle throws when the session dies mid-wait", async () => {
           assert.ok(error instanceof WaitError);
           assert.equal(error.exitCode, WAIT_EXIT_CODES.terminal);
           assert.match(error.message, /terminal state crashed.*tmux session is not running/);
+          return true;
+        },
+      );
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("waitForIdle preserves canonical-active stop doubt", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-wait-stop-doubt-"));
+  try {
+    await withStoreRoot(dir, async () => {
+      const saved = record(dir);
+      await saveSession(saved);
+      await transitionSession(saved.name, {
+        type: "turn.started",
+        eventId: "wait-stop-doubt-start",
+        at: saved.updatedAt,
+        cause: "first-turn",
+        evidence: { kind: "hook", hookId: "wait-stop-doubt-start", observedAt: saved.updatedAt, hook: "turn-start" },
+      });
+      await updateSession(saved.name, { status: "kill_failed", lastError: "exact stop unconfirmed" });
+
+      await assert.rejects(
+        waitForIdle({
+          record: saved,
+          idleMs: 100,
+          timeoutMs: 5_000,
+          pollMs: 50,
+          output: "pane",
+          rows: 0,
+          json: false,
+          substrate: { capture: async () => "", hasSession: async () => false },
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof WaitError);
+          assert.match(error.message, /terminal state kill_failed/);
           return true;
         },
       );

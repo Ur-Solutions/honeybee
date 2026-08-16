@@ -31,6 +31,7 @@ const sid = process.env.${STUB_SESSION_ENV} || "${STUB_DEFAULT_SESSION_ID}";
 function emit(o) { process.stdout.write(JSON.stringify(o) + "\\n"); }
 emit({ t: "init", sessionId: sid });
 let pendingRequestId = null;
+let requestSequence = 0;
 rl.on("line", (raw) => {
   const line = String(raw).trim();
   if (!line) return;
@@ -57,8 +58,8 @@ rl.on("line", (raw) => {
     return;
   }
   if (text.includes("ask")) {
-    pendingRequestId = "r1";
-    emit({ t: "needs", requestId: "r1", question: "proceed?" });
+    pendingRequestId = "r" + (++requestSequence);
+    emit({ t: "needs", requestId: pendingRequestId, question: text.includes("different") ? "different prompt?" : "proceed?" });
     return;
   }
   // A turn mentioning "slowtool" runs a slow tool: assistant text now, a tool

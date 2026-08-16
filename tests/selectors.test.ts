@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createColony } from "../src/colony.js";
 import { formatSelector, isSelectorMulti, parseSelector, resolveSelector, resolveSelectorFromState } from "../src/selectors.js";
-import type { SessionRecord } from "../src/store.js";
+import { saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-selectors-"));
@@ -156,6 +156,45 @@ test("resolveSelector accepts an existing colony with no member bees", async () 
 test("resolveSelector rejects colonies that do not exist in the store", async () => {
   await withTempStore(async () => {
     await assert.rejects(resolveSelector("colony:missing"), /Unknown colony: colony:missing/);
+  });
+});
+
+test("resolveSelector default targets obey canonical lifecycle over stale status scalars", async () => {
+  await withTempStore(async () => {
+    const active = bee("canonical-active-stale-done");
+    await saveSession(active);
+    await transitionSession(active.name, {
+      type: "turn.started",
+      eventId: "selector-active",
+      at: active.updatedAt,
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "selector-active", observedAt: active.updatedAt, hook: "turn-start" },
+    });
+    await updateSession(active.name, { status: "done" });
+
+    const archived = bee("canonical-archived-stale-running");
+    await saveSession(archived);
+    await transitionSession(archived.name, {
+      type: "bee.archived",
+      eventId: "selector-archived",
+      at: archived.updatedAt,
+      cause: "retire",
+      evidence: { kind: "operator", actionId: "selector-archived", observedAt: archived.updatedAt, action: "retire" },
+      probe: {
+        kind: "probe",
+        probeId: "selector-archived",
+        observerId: "selector-test",
+        observedAt: archived.updatedAt,
+        outcome: "dead",
+        target: { substrate: "local-tmux", tmuxTarget: archived.tmuxTarget },
+      },
+    });
+    await updateSession(archived.name, { status: "running" });
+
+    const resolved = await resolveSelector(active.name);
+    assert.equal(resolved.kind, "bee");
+    if (resolved.kind === "bee") assert.equal(resolved.record.name, active.name);
+    await assert.rejects(resolveSelector(archived.name), /Unknown bee selector/);
   });
 });
 

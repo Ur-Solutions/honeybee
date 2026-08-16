@@ -32,6 +32,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       return;
     }
     write({ id: message.id, result: { thread: { id: "thread-stub", turns: [] } } });
+    if (process.env.CODEX_APP_SERVER_STUB_ASK === "1") {
+      setTimeout(() => write({
+        jsonrpc: "2.0",
+        id: "approval-stub",
+        method: "item/permissions/requestApproval",
+        params: { threadId: "thread-stub", turnId: "turn-stub", itemId: "item-stub", reason: "approve test", permissions: {} },
+      }), 20);
+    }
     return;
   }
   if (message.method === "turn/start" && message.id !== undefined) {

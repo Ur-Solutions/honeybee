@@ -198,11 +198,13 @@ export type BeeDisplayState =
   | "offline";
 
 /**
- * Product interaction contract. Consumers should use this three-state field
+ * Product interaction contract. Consumers should use this field
  * for primary UX and keep displayState/runtime details for diagnostics only.
- * Every non-archived bee accepts messages, including a cold idle runtime.
+ * `blocked` is an active lifecycle whose explicit stop is still unconfirmed;
+ * it may be observed or cleaned up but must not accept new work. Every other
+ * non-archived bee accepts messages, including a cold idle runtime.
  */
-export type BeeInteractionState = "working" | "idle" | "archived";
+export type BeeInteractionState = "working" | "idle" | "blocked" | "archived";
 
 export type ObservationSourceFreshness = {
   source: "hsr-events" | "pane-capture" | "hive-state-option"

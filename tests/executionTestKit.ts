@@ -7,6 +7,7 @@ import { canonicalDigest } from "../src/comb/canonical.js";
 import type { JsonValue } from "../src/comb/types.js";
 import type { JsonObject } from "../src/execution/contract.js";
 import { nativeIsolationManifest } from "../src/execution/describe.js";
+import { localGithubSessionCredentialLeaseId } from "../src/execution/localCredentials.js";
 import {
   installLocalAuthorityHostBinding,
   loadNodeIdentity,
@@ -110,7 +111,12 @@ export function buildRunStartEnvelope(ctx: TestAuthority, overrides: EnvelopeOve
   const harness: JsonValue = {
     driverId: "claude",
     model: "claude-sonnet-5",
-    config: { brief: overrides.brief ?? "Fix the failing parser unit test and run the suite." },
+    // Mirrors Apiary's ordinary native Cell envelope: the catalog's selected
+    // reasoning value and the operator brief are both signed harness config.
+    config: {
+      brief: overrides.brief ?? "Fix the failing parser unit test and run the suite.",
+      reasoning: "high",
+    },
   };
   const capabilities: JsonValue = [{ capability: "harness/claude" }, { capability: "materializer/git-worktree" }];
   const mutationAuthority: JsonValue = [{ kind: "working-copy-write" }];
@@ -139,7 +145,10 @@ export function buildRunStartEnvelope(ctx: TestAuthority, overrides: EnvelopeOve
     requiredCapabilities: structuredClone(capabilities),
     trustZone: "local-default",
     mutationAuthority: structuredClone(mutationAuthority),
-    budget: { maxDurationSeconds: 3600 },
+    // local-core-v1 currently has no token/cost/deadline enforcement seam.
+    // Apiary's default is likewise empty; non-empty signed budgets fail
+    // run.start before reservation instead of being silently ignored.
+    budget: {},
     evidenceContract: structuredClone(evidenceContract),
   };
   overrides.mutateIntent?.(intent);
@@ -159,7 +168,7 @@ export function buildRunStartEnvelope(ctx: TestAuthority, overrides: EnvelopeOve
     networkPolicy: { mode: "inherit-node" },
     mutationAuthority: structuredClone(mutationAuthority),
     materializationCredentialLeaseIds: [],
-    runtimeCredentialLeaseIds: [],
+    runtimeCredentialLeaseIds: [localGithubSessionCredentialLeaseId(runId)],
     evidenceContract: structuredClone(evidenceContract),
     issuedAt: ISSUED_AT,
     notBefore: NOT_BEFORE,
@@ -219,6 +228,7 @@ export function countingLauncher(behavior: {
 } = {}): CountingLauncher {
   const calls: Array<{ runId: string; beeName: string }> = [];
   const launcher: RunLauncher = async ({ runId, beeName }) => {
+    const runnerFingerprint = { pgid: process.pid, startedAt: `test-runtime-birth:${runId}` };
     calls.push({ runId, beeName });
     if (behavior.delayMs) await new Promise((resolve) => setTimeout(resolve, behavior.delayMs));
     if (behavior.failWith) throw behavior.failWith;
@@ -231,6 +241,8 @@ export function countingLauncher(behavior: {
         command: "claude",
         tmuxTarget: beeName,
         substrate: "hsr",
+        runnerPid: process.pid,
+        runnerFingerprint,
         createdAt: now,
         updatedAt: now,
         status: "running",
@@ -242,7 +254,7 @@ export function countingLauncher(behavior: {
       sessionRef: `BEE.${beeName}`,
       environment: testEnvironmentFacts(runId),
       runtime: {
-        identity: { kind: "hsr", beeName, hostPid: process.pid },
+        identity: { kind: "hsr", beeName, hostPid: process.pid, hostFingerprint: runnerFingerprint },
         stop: behavior.cleanup ?? (async () => ({ stopped: true, detail: "fake exact runtime stop confirmed" })),
       },
     };
@@ -261,6 +273,9 @@ export type ServiceOptions = {
   afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
   appendLaunchEvents?: ExecutionServiceOptions["appendLaunchEvents"];
   retireSession?: ExecutionServiceOptions["retireSession"];
+  stopAndRetireSession?: ExecutionServiceOptions["stopAndRetireSession"];
+  /** Exercise the production lifecycle-fenced strict substrate protocol. */
+  useProductionStopProtocol?: boolean;
   launchGraceMs?: number;
 };
 
@@ -281,15 +296,41 @@ function testLaunchOwner(): RunLaunchOwner {
 export function makeService(opts: ServiceOptions = {}): ExecutionService {
   const control = opts.control ?? fakeControl().control;
   const owner = opts.launchOwner ?? testLaunchOwner();
+  const retireSession = opts.retireSession ?? (async () => ({
+    retired: true,
+    detail: "test SessionRecord archived after exact fake stop",
+  }));
+  const testStopAndRetireSession: NonNullable<ExecutionServiceOptions["stopAndRetireSession"]> = async (
+    reservation,
+  ) => {
+    const cleanup = await control.stop(reservation.beeName);
+    if (!cleanup.stopped) {
+      return {
+        settled: false,
+        detail: cleanup.detail,
+        cleanup,
+        stopDoubtPersisted: true,
+      };
+    }
+    const retirement = await retireSession(reservation);
+    return retirement.retired
+      ? { settled: true, detail: retirement.detail, cleanup }
+      : {
+          settled: false,
+          detail: retirement.detail,
+          cleanup,
+          stopDoubtPersisted: true,
+        };
+  };
   return createExecutionService({
     launcher: opts.launcher ?? countingLauncher().launcher,
     sessions: opts.sessions ?? storeSessionEvidenceSource(),
     control,
     stopKnownExecution: control.stop,
-    retireSession: opts.retireSession ?? (async () => ({
-      retired: true,
-      detail: "test SessionRecord archived after exact fake stop",
-    })),
+    retireSession,
+    ...(!opts.useProductionStopProtocol
+      ? { stopAndRetireSession: opts.stopAndRetireSession ?? testStopAndRetireSession }
+      : {}),
     harnessProbe: async (kind) => (kind === "claude" ? { status: "ready" } : { status: "absent" }),
     ...(opts.now ? { now: opts.now } : {}),
     launchOwner: owner,

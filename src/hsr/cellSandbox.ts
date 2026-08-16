@@ -58,8 +58,6 @@ const PROVIDER_HOME_ENV: Readonly<Record<string, string>> = {
   opencode: "OPENCODE_CONFIG_DIR",
 };
 
-const ALL_PROVIDER_HOME_ENV = [...new Set(Object.values(PROVIDER_HOME_ENV))];
-
 // Darwin's Security.framework delegates certificate verification to trustd.
 // These exact services are the missing IPC seam for system-trust HTTPS; the
 // Sandbox Runtime baseline already allows com.apple.SecurityServer.
@@ -77,25 +75,6 @@ const MACOS_SYSTEM_TRUST_READ_PATHS = [
 
 let activeState: CellSandboxState | undefined;
 let previousClaudeCodeTmpdir: string | undefined;
-
-/**
- * A protocol launch may inherit the shell that happened to start Honeybee.
- * Provider homes are identity-bearing state, so only the values deliberately
- * resolved onto this spawn's AgentSpec may cross into the Cell. With no
- * explicit value, the provider uses its ordinary home-relative default.
- */
-export function withoutAmbientProviderState(
-  kind: string,
-  inherited: Record<string, string>,
-  explicit: Record<string, string>,
-): Record<string, string> {
-  const next = { ...inherited };
-  for (const key of ALL_PROVIDER_HOME_ENV) {
-    if (!Object.hasOwn(explicit, key)) delete next[key];
-  }
-  if (kind === "opencode" && !Object.hasOwn(explicit, "XDG_DATA_HOME")) delete next.XDG_DATA_HOME;
-  return next;
-}
 
 function executableOnPath(name: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   const candidates = name.includes("/")
@@ -230,8 +209,13 @@ function providerWriteRoots(kind: string, env: Record<string, string>, cwd: stri
     roots.add(ensurePrivateDirectory(opencodeData));
   }
   if (roots.size === 0) {
+    // Execution Cells replace HOME with a per-run private directory. Provider
+    // defaults must follow that isolated HOME rather than reopening the daemon
+    // user's ~/.claude, ~/.codex, etc. `homedir()` is only a compatibility
+    // fallback for callers that predate the execution environment boundary.
+    const defaultHome = env.HOME ?? homedir();
     for (const relative of DEFAULT_PROVIDER_HOMES[kind] ?? []) {
-      const candidate = join(homedir(), relative);
+      const candidate = join(defaultHome, relative);
       assertNarrowProviderRoot(candidate, cwd);
       roots.add(ensurePrivateDirectory(candidate));
     }
@@ -331,8 +315,13 @@ export function resolveCellSandboxExtraWriteRoots(
 function scratchEnvironment(scratchRoot: string): Record<string, string> {
   const temp = ensurePrivateDirectory(join(scratchRoot, "tmp"));
   const cache = ensurePrivateDirectory(join(scratchRoot, "cache"));
+  const home = ensurePrivateDirectory(join(scratchRoot, "home"));
   const pnpmStore = ensurePrivateDirectory(join(cache, "pnpm-store"));
   return {
+    // Prevent provider CLIs and ordinary developer tools from discovering
+    // ~/.ssh, ~/.gitconfig, cloud config, keyrings, or default harness homes.
+    // Account-bound provider state remains explicit in its dedicated env key.
+    HOME: home,
     TMPDIR: temp,
     TMP: temp,
     TEMP: temp,

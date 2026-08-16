@@ -55,6 +55,7 @@ import {
   type RunReservation,
 } from "./runStore.js";
 import type { SignatureVerifier } from "./signing.js";
+import type { ExecutionRuntimeSettlement } from "./runtimeSettlement.js";
 import {
   readWorkingCopy,
   releaseWorkingCopy,
@@ -88,6 +89,11 @@ export type RunOperationsDeps = {
   sessions: SessionEvidenceReader;
   /** Archive only the exact SessionRecord owned by this Run after stop proof. */
   retireSession: (reservation: RunReservation) => Promise<ExecutionSessionRetirementResult>;
+  /** Pre-signal canonical fence, exact clean stop, and generation archive. */
+  stopAndRetireSession?: (
+    reservation: RunReservation,
+    context: string,
+  ) => Promise<ExecutionRuntimeSettlement>;
   /** Injectable only to place deterministic tests at the post-ownership read barrier. */
   collectGitDiffMetadata?: typeof collectGitDiffMetadata;
   /** Bounded durable continuation lease; production defaults to 15 seconds. */
@@ -127,6 +133,12 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
 
 export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   const { protocolVersion, schemaDigest, now } = deps;
+  const stopAndRetireSession = deps.stopAndRetireSession ?? (async () => ({
+    settled: false as const,
+    detail: "no pre-signal canonical execution stop protocol is configured",
+    cleanup: { stopped: false, detail: "stop was not dispatched" },
+    stopDoubtPersisted: false,
+  }));
   const collectWorkingCopyDiff = deps.collectGitDiffMetadata ?? collectGitDiffMetadata;
   const appendEvents = deps.operationPersistence?.appendRunEvents ?? appendRunEvents;
   const persistOperationResult = deps.operationPersistence?.setOperationResult ?? setOperationResult;
@@ -680,6 +692,9 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       const { validated, reservation, state } = await prepare(request, "run-command-body", "run.command");
       const command = asObject(validated.body.command) ?? {};
       const kind = String(command.kind ?? "");
+      const unsupportedAnswerCause = kind === "answer"
+        ? `driver ${driverIdOf(reservation)} does not deliver run.command answer on this node (expected runner-host epoch is absent from v1)`
+        : undefined;
       const { record, created } = await admitOperation({
         runId: validated.runId,
         method: "run.command",
@@ -700,14 +715,14 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             throw executionError("CAPABILITY_MISMATCH", `driver ${driverIdOf(reservation)} does not support checkpoint on this node`);
           }
           if (kind === "answer") {
-            // needs_input.opened is not bridged into the protocol event
-            // stream, so an open input request is unobservable from protocol
-            // data: answer is not deliverable here (node.describe does not
-            // advertise it). The legacy session/UI answer path is unaffected;
-            // the dispatch machinery below stays for when the bridge lands.
+            // The v1 command carries only inputRequestId, not the runner-host
+            // epoch that authored the intent. A provider restart can reuse r1,
+            // so consulting current pending state would rebind stale authority.
+            // Refuse inside admission before any operation receipt or provider
+            // effect. Aggregate HSR/API answers carry exact source + host.
             throw executionError(
               "CAPABILITY_MISMATCH",
-              `driver ${driverIdOf(reservation)} does not deliver answer on this node yet (needs_input.opened is not bridged)`,
+              unsupportedAnswerCause!,
             );
           }
           assertLeaseNotExpired(reservation, now());
@@ -743,6 +758,27 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         },
       });
       let current = record;
+      if (unsupportedAnswerCause && current.commandState === "accepted") {
+        // Mixed-version/crash compatibility: an older binary may have durably
+        // admitted an answer then died before dispatch. admitOperation guards
+        // run only for a NEW record, so fence that accepted residue here before
+        // dispatchCommand can claim it. A concurrent old binary that already
+        // crossed to dispatching is not rewritten as definite failure.
+        current = await persistOperationResult(
+          validated.runId,
+          validated.effectKey,
+          { commandState: "failed", cause: unsupportedAnswerCause },
+          { commandState: "failed", cause: unsupportedAnswerCause, operationAttempt: undefined },
+          (candidate) => candidate.commandState === "accepted",
+        );
+      }
+      if (
+        unsupportedAnswerCause
+        && current.commandState === "failed"
+        && current.cause === unsupportedAnswerCause
+      ) {
+        throw executionError("CAPABILITY_MISMATCH", unsupportedAnswerCause);
+      }
       if (created || current.commandState === "accepted") {
         // New effect, or an admitted effect whose dispatch never began
         // (crash between admission and `dispatching`): safe to continue.
@@ -834,9 +870,12 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             let stopDetail = "no durable session evidence proves the activated runtime is down";
             if (await sessionIsOurs(reservation)) {
               try {
-                const stop = await deps.control.stop(reservation.beeName);
+                const stop = await stopAndRetireSession(
+                  reservation,
+                  "run.cancel is stopping its exact execution runtime",
+                );
                 stopDetail = stop.detail;
-                stopConfirmed = stop.stopped;
+                stopConfirmed = stop.settled;
               } catch (error) {
                 stopDetail = error instanceof Error ? error.message : String(error);
               }
@@ -1369,10 +1408,15 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 ? "run terminal; no owned harness remains"
                 : "no live harness";
             let stopConfirmed = true;
+            let sessionArchived = false;
             if (ours && !stopAlreadyProven) {
-              const stop = await deps.control.stop(reservation.beeName);
+              const stop = await stopAndRetireSession(
+                reservation,
+                "run.release is stopping its exact execution runtime",
+              );
               detail = stop.detail;
-              stopConfirmed = stop.stopped;
+              stopConfirmed = stop.settled;
+              sessionArchived = stop.settled;
             }
             if (!stopConfirmed) {
               // A terminal computation result says nothing about whether the
@@ -1400,14 +1444,18 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             // there. Archive this exact execution generation before the
             // harness-stop step can settle, otherwise a clean release remains
             // indistinguishable from deleting beneath a live agent.
-            let retirement: ExecutionSessionRetirementResult;
-            try {
-              retirement = await deps.retireSession(reservation);
-            } catch (error) {
-              retirement = {
-                retired: false,
-                detail: error instanceof Error ? error.message : String(error),
-              };
+            let retirement: ExecutionSessionRetirementResult = sessionArchived
+              ? { retired: true, detail: "exact stop protocol archived the SessionRecord" }
+              : { retired: false, detail: "SessionRecord archive has not been attempted" };
+            if (!sessionArchived) {
+              try {
+                retirement = await deps.retireSession(reservation);
+              } catch (error) {
+                retirement = {
+                  retired: false,
+                  detail: error instanceof Error ? error.message : String(error),
+                };
+              }
             }
             if (!retirement.retired) {
               reservation = await mutateReservation(runId, (record) =>

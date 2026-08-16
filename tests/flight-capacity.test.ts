@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { atomicWriteFile, storeRoot } from "../src/fsx.js";
+import { persistHsrEventIntegrityFailure } from "../src/hsr/eventIntegrity.js";
 import {
   createFlightCapacityProvider,
   readLease,
@@ -19,7 +21,9 @@ import {
   type FlightRecord,
   type SlotRecord,
 } from "../src/flight/types.js";
-import type { SessionRecord } from "../src/store.js";
+import { safeName, saveSession, type SessionRecord } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
+import { SpawnAfterForkError } from "../src/spawnRuntime.js";
 
 const T0 = Date.parse("2026-07-28T10:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -124,6 +128,24 @@ function harness(): Harness {
   return h;
 }
 
+async function rewindLeaseToAcquiring(
+  flightId: string,
+  idempotencyKey: string,
+  slotId: string,
+): Promise<void> {
+  const lease = (await readLease(flightId, idempotencyKey))!;
+  const claimed = (await listSlots(flightId)).find((slot) => slot.slotId === slotId)!;
+  const preConfirm = { ...claimed, state: "provisioning" as const };
+  delete preConfirm.beeName;
+  delete preConfirm.beeId;
+  await saveSlot(preConfirm);
+  await atomicWriteFile(
+    join(storeRoot(), "flights", flightId, "leases", `${safeName(idempotencyKey)}.json`),
+    `${JSON.stringify({ ...lease, status: "acquiring", beeName: undefined }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+}
+
 test("acquire: leases a drained lane, spawns with the comb's brief/taskId, persists lease + claim durably", async () => {
   await withTempStore(async () => {
     await saveFlight(flight());
@@ -208,7 +230,7 @@ test("acquire: unavailable on inactive flight, no matching lane, mixKey filter, 
   });
 });
 
-test("crash recovery: an 'acquiring' lease adopts the already-spawned bee instead of double-spawning", async () => {
+test("crash recovery adopts a canonical-active stale-done bee instead of double-spawning", async () => {
   await withTempStore(async () => {
     await saveFlight(flight());
     await saveSlot(laneSlot("s1"));
@@ -221,7 +243,9 @@ test("crash recovery: an 'acquiring' lease adopts the already-spawned bee instea
     const first = await provider.acquire(request());
     assert.equal(first.kind, "acquired");
     const beeName = (first as { beeName: string }).beeName;
-    // Register the spawned bee as a live session (what adoption checks).
+    // Register the spawned bee as canonically active with a stale terminal
+    // scalar. Crash adoption must follow the bounded cursor or it will execute
+    // a duplicate deterministic spawn and orphan the first worker.
     h.sessions.set(beeName, {
       name: beeName,
       agent: "claude",
@@ -230,23 +254,11 @@ test("crash recovery: an 'acquiring' lease adopts the already-spawned bee instea
       tmuxTarget: beeName,
       createdAt: iso(T0),
       updatedAt: iso(T0),
-      status: "running",
+      status: "done",
       id: "CL.test",
+      stateMachine: lifecycleCursor(beeName, "active", iso(T0)),
     });
-    const lease = (await readLease("FL.cap01", "run-1:implement:1:0"))!;
-    const { saveSlot: storeSaveSlot } = await import("../src/flight/store.js");
-    const claimed = (await listSlots("FL.cap01")).find((s) => s.slotId === "s1")!;
-    const preConfirm = { ...claimed, state: "provisioning" as const };
-    delete preConfirm.beeName;
-    delete preConfirm.beeId;
-    await storeSaveSlot(preConfirm);
-    const { atomicWriteFile, storeRoot } = await import("../src/fsx.js");
-    const { safeName } = await import("../src/store.js");
-    await atomicWriteFile(
-      join(storeRoot(), "flights", "FL.cap01", "leases", `${safeName("run-1:implement:1:0")}.json`),
-      `${JSON.stringify({ ...lease, status: "acquiring", beeName: undefined }, null, 2)}\n`,
-      { mode: 0o600 },
-    );
+    await rewindLeaseToAcquiring("FL.cap01", "run-1:implement:1:0", "s1");
 
     const recovered = await provider.acquire(request());
     assert.equal(recovered.kind, "acquired");
@@ -255,6 +267,39 @@ test("crash recovery: an 'acquiring' lease adopts the already-spawned bee instea
     const s1 = (await listSlots("FL.cap01")).find((s) => s.slotId === "s1")!;
     assert.equal(s1.state, "booting");
     assert.equal(s1.beeName, beeName);
+  });
+});
+
+test("crash recovery refuses to adopt an active kill-failed orphan", async () => {
+  await withTempStore(async () => {
+    await saveFlight(flight());
+    await saveSlot(laneSlot("s1"));
+    const h = harness();
+    const provider = createFlightCapacityProvider(h.deps);
+    const first = await provider.acquire(request());
+    assert.equal(first.kind, "acquired");
+    const beeName = (first as { beeName: string }).beeName;
+    h.sessions.set(beeName, {
+      name: beeName,
+      agent: "claude",
+      cwd: "/tmp",
+      command: "claude",
+      tmuxTarget: beeName,
+      createdAt: iso(T0),
+      updatedAt: iso(T0),
+      status: "kill_failed",
+      id: "CL.stop-doubt",
+      stateMachine: lifecycleCursor(beeName, "active", iso(T0)),
+    });
+    await rewindLeaseToAcquiring("FL.cap01", "run-1:implement:1:0", "s1");
+    // Production's duplicate-name fence refuses the replacement while the
+    // kill-failed record still owns the name. Model that refusal here: the
+    // capacity layer must not convert stop doubt into a successful adoption.
+    h.failSpawn = true;
+
+    const recovered = await provider.acquire(request());
+    assert.equal(recovered.kind, "unavailable");
+    assert.equal(h.spawns.length, 1, "stop doubt must never be reported as an adopted or replacement worker");
   });
 });
 
@@ -276,6 +321,42 @@ test("spawn failure: lane restored unbound, unavailable returned, re-acquire suc
     h.failSpawn = false;
     const retried = await provider.acquire(request());
     assert.equal(retried.kind, "acquired");
+  });
+});
+
+test("capacity acquire retains an indeterminate launch and never executes it twice", async () => {
+  await withTempStore(async () => {
+    await saveFlight(flight());
+    await saveSlot(laneSlot("s1"));
+    const h = harness();
+    let calls = 0;
+    h.deps.spawnSlot = async (f, slot) => {
+      calls += 1;
+      throw new SpawnAfterForkError(
+        "runtime-publish",
+        {
+          identity: {
+            kind: "hsr",
+            beeName: slotBeeName(f.id, slot.slotId, slot.generation, slot.attempt),
+            hostPid: 9101,
+          },
+          stop: async () => ({ stopped: false, detail: "still live" }),
+        },
+        { stopped: false, detail: "host absence unconfirmed" },
+        new Error("publication failed"),
+      );
+    };
+    const provider = createFlightCapacityProvider(h.deps);
+
+    assert.equal((await provider.acquire(request())).kind, "unavailable");
+    assert.equal((await provider.acquire(request())).kind, "unavailable");
+
+    const held = (await listSlots("FL.cap01")).find((slot) => slot.slotId === "s1")!;
+    assert.equal(calls, 1);
+    assert.equal(held.state, "provisioning");
+    assert.equal(held.launchOwnership?.status, "indeterminate");
+    assert.ok(h.ledger.some((event) => event.type === "flight.lease.spawn_indeterminate"));
+    assert.equal(h.ledger.some((event) => event.type === "flight.lease.spawn_failed"), false);
   });
 });
 
@@ -313,5 +394,107 @@ test("release: recycles the bound lane, retires the bee, is idempotent, and tole
     await provider.release(second.leaseId, "cancelled");
     const after = (await listSlots("FL.cap01")).find((s) => s.slotId === "s1")!;
     assert.equal(after.taskId, "queue-task-x", "a lane the sweeper re-bound is left alone");
+  });
+});
+
+test("release retains the lane and lease when predecessor retirement is unconfirmed", async () => {
+  await withTempStore(async () => {
+    await saveFlight(flight());
+    await saveSlot(laneSlot("s1"));
+    const h = harness();
+    let failRetire = false;
+    h.deps.retireBee = async () => {
+      if (failRetire) throw new Error("exact process-group stop unconfirmed");
+    };
+    const provider = createFlightCapacityProvider(h.deps);
+    const acquired = (await provider.acquire(request())) as { leaseId: string; beeName: string };
+    const spawnCount = h.spawns.length;
+    failRetire = true;
+
+    await assert.rejects(() => provider.release(acquired.leaseId, "done"), /stop unconfirmed/);
+    const held = (await listSlots("FL.cap01")).find((slot) => slot.slotId === "s1")!;
+    const lease = await readLease("FL.cap01", "run-1:implement:1:0");
+    assert.equal(held.state, "booting");
+    assert.equal(held.beeName, acquired.beeName);
+    assert.equal(held.launchOwnership?.status, "indeterminate");
+    assert.equal(lease?.status, "acquired");
+    assert.match(lease?.lastError ?? "", /stop unconfirmed/);
+
+    const replay = await provider.acquire(request());
+    assert.equal(replay.kind, "acquired");
+    assert.equal(h.spawns.length, spawnCount, "an unresolved release never opens replacement capacity");
+  });
+});
+
+test("production release cleanup refuses archived and recordless event-history heads", async () => {
+  for (const shape of ["archived", "recordless"] as const) {
+    await withTempStore(async () => {
+      await saveFlight(flight());
+      await saveSlot(laneSlot("s1"));
+      const h = harness();
+      const {
+        retireBee: _retireBee,
+        loadSession: _loadSession,
+        ...productionDeps
+      } = h.deps;
+      const provider = createFlightCapacityProvider(productionDeps);
+      const acquired = (await provider.acquire(request())) as { leaseId: string; beeName: string };
+      if (shape === "archived") {
+        await saveSession({
+          name: acquired.beeName,
+          agent: "stub",
+          requestedAgent: "stub",
+          cwd: "/tmp",
+          command: "stub",
+          tmuxTarget: acquired.beeName,
+          substrate: "hsr",
+          runtimeGeneration: 1,
+          createdAt: iso(T0),
+          updatedAt: iso(T0),
+          status: "done",
+        });
+      }
+      await persistHsrEventIntegrityFailure({
+        bee: acquired.beeName,
+        host: {
+          hostPid: shape === "archived" ? 2_147_200_001 : 2_147_200_002,
+          startedAt: `2026-08-15T23:3${shape === "archived" ? "0" : "1"}:00.000Z`,
+          hostFingerprint: {
+            pgid: shape === "archived" ? 2_147_200_001 : 2_147_200_002,
+            startedAt: `capacity-${shape}-integrity-host`,
+          },
+        },
+        deliveryIds: [],
+        reason: `${shape} capacity source still owns unknown provider effects`,
+      });
+
+      await assert.rejects(
+        provider.release(acquired.leaseId, "done"),
+        /unresolved HSR event history/,
+      );
+      const held = (await listSlots("FL.cap01")).find((slot) => slot.slotId === "s1")!;
+      const lease = await readLease("FL.cap01", "run-1:implement:1:0");
+      assert.equal(held.beeName, acquired.beeName, `${shape} authority keeps the lane bound`);
+      assert.equal(held.launchOwnership?.status, "indeterminate");
+      assert.equal(lease?.status, "acquired");
+    });
+  }
+});
+
+test("release refuses to recycle a live lease when exact cleanup is unavailable", async () => {
+  await withTempStore(async () => {
+    await saveFlight(flight());
+    await saveSlot(laneSlot("s1"));
+    const h = harness();
+    const provider = createFlightCapacityProvider(h.deps);
+    const acquired = (await provider.acquire(request())) as { leaseId: string; beeName: string };
+    const providerWithoutCleanup = createFlightCapacityProvider({ ...h.deps, retireBee: undefined });
+
+    await assert.rejects(() => providerWithoutCleanup.release(acquired.leaseId, "done"), /cleanup is unavailable/);
+    const held = (await listSlots("FL.cap01")).find((slot) => slot.slotId === "s1")!;
+    const lease = await readLease("FL.cap01", "run-1:implement:1:0");
+    assert.equal(held.beeName, acquired.beeName);
+    assert.equal(held.launchOwnership?.status, "indeterminate");
+    assert.equal(lease?.status, "acquired");
   });
 });

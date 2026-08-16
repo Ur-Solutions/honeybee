@@ -64,7 +64,7 @@ function makeNode(overrides: Partial<NodeRecord> = {}): NodeRecord {
     kind: "remote-hsr",
     endpoint: "me@remote-host",
     capabilities: ["*"],
-    runnerHostVersion: "0.0.1+deadbeef1234",
+    runnerHostVersion: runnerHostVersionCore(),
     status: "unknown",
     createdAt: "2026-07-03T00:00:00.000Z",
     updatedAt: "2026-07-03T00:00:00.000Z",
@@ -184,7 +184,7 @@ test("nodeHealth: a remote-hsr node pointed at a dead socket is offline with a r
       assert.ok((health.reason ?? "").length > 0, "offline carries a reason");
       assert.equal(typeof health.latencyMs, "number");
       // Unreachable falls back to the recorded runner-host version.
-      assert.equal(health.runnerHostVersion, "0.0.1+deadbeef1234");
+      assert.equal(health.runnerHostVersion, node.runnerHostVersion);
       assert.equal(health.liveBees, undefined);
     } finally {
       await sub.close();

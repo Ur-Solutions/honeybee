@@ -192,8 +192,9 @@ async function refreshWaitSession(record: SessionRecord, deps: WaitSessionDeps =
 
 function recordedWaitTerminalState(record: SessionRecord): string | null {
   if (isArchivedSessionLifecycle(record)) return "done";
-  if (record.status === "dead") return "killed";
   if (record.status === "kill_failed") return "kill_failed";
+  if (record.stateMachine !== undefined) return null;
+  if (record.status === "dead") return "killed";
   switch (record.lastObservedState) {
     case "crashed":
     case "error":

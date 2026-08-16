@@ -34,11 +34,41 @@ import {
   listHsrBees,
   type HsrProcessSignalDependencies,
 } from "./observe.js";
-import { readHsrMeta, readHsrMetaStrict, writeHsrMeta, type HsrMeta } from "./runDir.js";
+import {
+  HsrSourceEventLogBusyError,
+  hsrMetaProvesProviderNeverStarted,
+  isHsrEventHistoryQuarantined,
+  readHsrMeta,
+  readHsrMetaStrict,
+  sealHsrEventStreamClosure,
+  verifyHsrEventStreamClosure,
+  writeHsrMeta,
+  type HsrMeta,
+} from "./runDir.js";
 import { readProcessBirthFingerprint, sameProcessBirthFingerprint } from "./processIdentity.js";
 import { connectRpcClient } from "./rpc.js";
-import { clearPendingHsrTurns, enqueuePendingHsrTurn, withHsrTurnDeliveryLock } from "./pendingTurns.js";
+import {
+  cancelPendingHsrTurnIfQueued,
+  enqueuePendingHsrTurn,
+  HsrDeliveryAmbiguousError,
+  HsrDeliveryDiscardedError,
+  HsrDeliveryIdentityConflictError,
+  HsrDeliveryInFlightError,
+  markPendingHsrTurnAmbiguous,
+  readPendingHsrTurn,
+  readPendingHsrTurns,
+  settlePendingHsrTurnsForIntentionalStop,
+  withHsrTurnDeliveryLock,
+} from "./pendingTurns.js";
 import { stopSpawnedHsrHost } from "./runnerHost.js";
+import {
+  HsrSourceEventIntegrityError,
+  assertHsrSourceEventLogIntegrity,
+  hsrEventIntegrityReceiptOwnsHost,
+  readHsrEventIntegrityReceipt,
+  recordHsrEventIntegrityStop,
+  type HsrEventIntegrityReceipt,
+} from "./eventIntegrity.js";
 
 /** A queued or running host is live while its detached host pid is alive. */
 async function hasSession(bee: string, deps: HsrProcessSignalDependencies = {}): Promise<boolean> {
@@ -56,33 +86,187 @@ async function capture(bee: string, lines?: number): Promise<string> {
 /** Deliver a user turn over the bee's control socket. Throws if no live host. */
 async function sendText(bee: string, text: string, _paneId?: string, options?: SendTextOptions): Promise<void> {
   await withHsrTurnDeliveryLock(bee, async () => {
+    const callerDeliveryId = options?.deliveryId;
+    const mode = options?.mode === "next-tool" ? "next-tool" as const : "turn" as const;
+    const durableTurns = await readPendingHsrTurns(bee);
+    const exact = callerDeliveryId
+      ? durableTurns.find((candidate) => candidate.id === callerDeliveryId)
+      : undefined;
+    if (exact && (exact.text !== text || exact.mode !== mode)) {
+      throw new HsrDeliveryIdentityConflictError(
+        callerDeliveryId!,
+        `HSR delivery id ${callerDeliveryId} is already bound to different content or delivery mode`,
+      );
+    }
+    if (exact?.phase === "completed") return;
+    if (exact?.phase === "ambiguous") {
+      throw new HsrDeliveryAmbiguousError(
+        exact.id,
+        exact.error ?? `HSR delivery ${exact.id} is durably ambiguous`,
+      );
+    }
+    if (exact?.phase === "discarded") {
+      throw new HsrDeliveryDiscardedError(exact.id, `HSR delivery ${exact.id} was explicitly discarded`);
+    }
+    // A completed same-id replay is a receipt lookup, not new work. Every
+    // other fresh delivery is ordered behind a prior durable ambiguity so a
+    // caller cannot bypass an uncertain provider acceptance with a new id.
+    const olderAmbiguity = durableTurns.find((candidate) =>
+      candidate.phase === "ambiguous" && candidate.id !== callerDeliveryId);
+    if (olderAmbiguity) {
+      throw new HsrDeliveryAmbiguousError(
+        olderAmbiguity.id,
+        olderAmbiguity.error ?? `HSR delivery ${olderAmbiguity.id} is durably ambiguous; refusing later work`,
+      );
+    }
+    const abandonedDispatch = durableTurns.find((candidate) =>
+      candidate.phase === "dispatching" && candidate.id !== callerDeliveryId);
+    if (abandonedDispatch) {
+      const detail = `HSR delivery ${abandonedDispatch.id} was left at caller dispatch without a settled RPC outcome; refusing later work`;
+      if (abandonedDispatch.host?.hostFingerprint) {
+        await markPendingHsrTurnAmbiguous(bee, abandonedDispatch.id, abandonedDispatch.host, detail);
+      }
+      throw new HsrDeliveryAmbiguousError(abandonedDispatch.id, detail);
+    }
     const meta = await readHsrMeta(bee);
+    if (meta) {
+      await assertHsrSourceEventLogIntegrity({
+        bee,
+        meta,
+        operation: "HSR delivery",
+      });
+    }
     const live = !!meta && (meta.mirrorOfNode ? meta.status === "running" : await inspectHsrHostProcess(meta) === "match");
     if (meta?.status === "queued" && live) {
       // A queued/booting host has no live turn — the pending turn drains once
       // its harness and control socket are ready, so delivery mode is moot.
-      await enqueuePendingHsrTurn(bee, text);
+      const queued = await enqueuePendingHsrTurn(bee, text, {
+        ...(options?.deliveryId ? { deliveryId: options.deliveryId } : {}),
+        mode,
+      });
+      if (options?.completionRequired) {
+        throw new HsrDeliveryInFlightError(
+          queued.id,
+          `HSR delivery ${queued.id} is durably queued until the host completes it`,
+        );
+      }
       return;
     }
     if (!meta || meta.status !== "running" || !live) {
       throw new Error(`HSR bee ${bee} has no live runner host to steer`);
     }
-    const client = await connectRpcClient(meta.controlSocket);
+    if (!meta.hostFingerprint) {
+      throw new Error(`HSR bee ${bee} has no birth-qualified host identity for delivery`);
+    }
+    const turn = await enqueuePendingHsrTurn(bee, text, {
+      ...(options?.deliveryId ? { deliveryId: options.deliveryId } : {}),
+      mode,
+    });
+    const host = {
+      hostPid: meta.hostPid,
+      startedAt: meta.startedAt,
+      hostFingerprint: meta.hostFingerprint,
+    };
+    const exactOnCurrentHost = !!exact?.host &&
+      exact.host.hostPid === host.hostPid &&
+      exact.host.startedAt === host.startedAt &&
+      sameProcessBirthFingerprint(exact.host.hostFingerprint, host.hostFingerprint);
+    if (exactOnCurrentHost && (exact.phase === "accepted" || exact.phase === "started")) {
+      if (options?.completionRequired) {
+        throw new HsrDeliveryInFlightError(
+          turn.id,
+          `HSR delivery ${turn.id} is ${exact.phase} on this host`,
+        );
+      }
+      return;
+    }
+    if (exactOnCurrentHost && exact.phase === "dispatching") {
+      throw new HsrDeliveryInFlightError(
+        turn.id,
+        `HSR delivery ${turn.id} is already dispatching on this host`,
+      );
+    }
+    let client: Awaited<ReturnType<typeof connectRpcClient>> | undefined;
     try {
-      if (options?.mode === "next-tool") {
-        // Steering joins an already-open provider turn and has no independent
-        // turn_end boundary to ack against, so it keeps its existing native
-        // queue semantics rather than masquerading as a recoverable new turn.
-        await client.call("send", { text, mode: "next-tool" });
-      } else {
-        // Persist BEFORE stdin/RPC acceptance. The host acks this file only on
-        // a completed non-auth turn; a login-required failure leaves the exact
-        // operator text available for restart+replay.
-        const turn = await enqueuePendingHsrTurn(bee, text);
-        await client.call("send", { text, deliveryId: turn.filename });
+      try {
+        client = await connectRpcClient(meta.controlSocket);
+        // `queued` is the caller's durable offer. The host alone atomically
+        // claims queued -> dispatching after it has received this request and
+        // immediately before session.send. A coordinator crash before the
+        // host claim can therefore retry this exact id without manual repair.
+        await client.call("send", {
+          text,
+          deliveryId: turn.id,
+          ...(mode === "next-tool" ? { mode: "next-tool" } : {}),
+        });
+      } catch (error) {
+        // The host may have durably advanced the delivery before its RPC reply
+        // was lost. Same-host accepted/started is not re-sent, but Buz keeps
+        // its queue item until completed so a later host crash remains visible.
+        let current;
+        try {
+          const cancellation = await cancelPendingHsrTurnIfQueued(bee, turn.id);
+          if (cancellation.cancelled) throw error;
+          current = cancellation.turn;
+        } catch (readError) {
+          if (readError === error) throw error;
+          throw new HsrDeliveryAmbiguousError(
+            turn.id,
+            `HSR delivery ${turn.id} crossed RPC dispatch and its durable outcome is unreadable`,
+            { cause: new AggregateError([error, readError], "RPC failure and unreadable HSR delivery journal") },
+          );
+        }
+        if (current?.phase === "completed") return;
+        if (current?.phase === "accepted" || current?.phase === "started") {
+          if (options?.completionRequired) {
+            throw new HsrDeliveryInFlightError(turn.id, `HSR delivery ${turn.id} is ${current.phase} on this host`);
+          }
+          return;
+        }
+        if (current?.phase === "ambiguous") {
+          throw new HsrDeliveryAmbiguousError(turn.id, current.error ?? `HSR delivery ${turn.id} is ambiguous`, { cause: error });
+        }
+        if (current?.phase === "auth_failed") {
+          throw new HsrDeliveryInFlightError(
+            turn.id,
+            `HSR delivery ${turn.id} is awaiting exact auth recovery`,
+          );
+        }
+        if (
+          current?.phase === "dispatching" &&
+          (error as { code?: unknown } | null)?.code === -32000 &&
+          /already dispatching on this host/.test(error instanceof Error ? error.message : String(error))
+        ) {
+          throw new HsrDeliveryInFlightError(
+            turn.id,
+            `HSR delivery ${turn.id} is already dispatching on this host`,
+          );
+        }
+        const detail = `HSR delivery ${turn.id} lost its RPC outcome after durable dispatch: ${error instanceof Error ? error.message : String(error)}`;
+        try {
+          await markPendingHsrTurnAmbiguous(bee, turn.id, host, detail);
+        } catch (persistError) {
+          throw new HsrDeliveryAmbiguousError(
+            turn.id,
+            `${detail}; ambiguity marker persistence also failed`,
+            { cause: new AggregateError([error, persistError], "RPC failure and ambiguity persistence failure") },
+          );
+        }
+        throw new HsrDeliveryAmbiguousError(turn.id, detail, { cause: error });
+      }
+      if (options?.completionRequired) {
+        const current = await readPendingHsrTurn(bee, turn.id);
+        if (current?.phase === "completed") return;
+        if (current?.phase === "ambiguous") {
+          throw new HsrDeliveryAmbiguousError(turn.id, current.error ?? `HSR delivery ${turn.id} is ambiguous`);
+        }
+        throw new HsrDeliveryInFlightError(
+          turn.id,
+          `HSR delivery ${turn.id} is ${current?.phase ?? "dispatching"}; queue remains durable until completion`,
+        );
       }
     } finally {
-      client.close();
+      client?.close();
     }
   });
 }
@@ -185,6 +369,105 @@ async function publishProvenStop(bee: string, initial: HsrMeta, current: HsrMeta
   await writeHsrMeta(bee, { ...current, status: "exited", endedAt: new Date().toISOString() }).catch(() => undefined);
 }
 
+type StoppedSourceHistory =
+  | { kind: "clean" }
+  | { kind: "acknowledged" }
+  | { kind: "integrity"; receipt: HsrEventIntegrityReceipt };
+
+/**
+ * Classify the event stream only after exact host + descendant absence is
+ * proven. A dead process is not proof that every provider byte/effect reached
+ * events.jsonl: SIGKILL can land before the append begins. Clean replacement
+ * therefore requires either a host-authored closure that still verifies, an
+ * exact terminal exit we can seal now, or durable proof that the adapter never
+ * started. Every other outcome becomes purge-surviving manual authority.
+ */
+async function settleStoppedSourceHistory(
+  bee: string,
+  initial: HsrMeta,
+  current: HsrMeta,
+): Promise<StoppedSourceHistory> {
+  // A local remote mirror is a derived projection, never the provider event
+  // source. Its generation/cursor protocol owns integrity and teardown; do not
+  // manufacture a local source-loss receipt from the hostPid=0 sentinel.
+  if (current.mirrorOfNode) return { kind: "clean" };
+  const host = {
+    hostPid: initial.hostPid,
+    startedAt: initial.startedAt,
+    ...(initial.hostFingerprint ? { hostFingerprint: initial.hostFingerprint } : {}),
+  };
+  const existing = await readHsrEventIntegrityReceipt(bee);
+  if (existing?.phase === "unresolved") {
+    if (!hsrEventIntegrityReceiptOwnsHost(existing, host)) {
+      throw new Error(`event-integrity authority belongs to a different ${bee} incarnation`);
+    }
+    return { kind: "integrity", receipt: existing };
+  }
+  if (
+    existing?.phase === "acknowledged"
+    && existing.stopState === "confirmed"
+    && hsrEventIntegrityReceiptOwnsHost(existing, host)
+    && await isHsrEventHistoryQuarantined(bee, existing.integrityId)
+  ) return { kind: "acknowledged" };
+
+  // A host-authored append-failure marker is direct missing-event evidence.
+  // A later exit can be perfectly contiguous because the lost event never
+  // acquired a sequence; it must never launder this marker into clean proof.
+  if (!current.eventIntegrityFailure) {
+    if (hsrMetaProvesProviderNeverStarted(current)) return { kind: "clean" };
+    if (current.eventStreamClosure) {
+      try {
+        if (await verifyHsrEventStreamClosure(bee, current, 250)) return { kind: "clean" };
+      } catch (error) {
+        if (error instanceof HsrSourceEventLogBusyError) throw error;
+        // Invalid closure/history falls through to the durable integrity fence.
+      }
+    }
+
+    try {
+      const closure = await sealHsrEventStreamClosure(bee, current, 250);
+      const latest = await readHsrMetaStrict(bee);
+      if (!sameHostIncarnation(initial, latest)) {
+        throw new Error(`HSR source authority changed while sealing ${bee}'s clean exit`);
+      }
+      await writeHsrMeta(bee, {
+        ...latest!,
+        status: "exited",
+        exitCode: latest!.exitCode ?? null,
+        endedAt: latest!.endedAt ?? closure.closedAt,
+        eventStreamClosure: closure,
+      });
+      const healed = await readHsrMetaStrict(bee);
+      if (!sameHostIncarnation(initial, healed) || !healed?.eventStreamClosure) {
+        throw new Error(`HSR clean-exit proof for ${bee} was not durably published`);
+      }
+      return { kind: "clean" };
+    } catch (cause) {
+      if (cause instanceof HsrSourceEventLogBusyError) throw cause;
+    }
+  }
+
+  try {
+    await assertHsrSourceEventLogIntegrity({
+      bee,
+      meta: {
+        ...current,
+        eventIntegrityFailure: current.eventIntegrityFailure
+          ?? "runner host stopped without a durable clean event-stream closure",
+      },
+      operation: "HSR stopped-source history settlement",
+    });
+    throw new Error(`HSR stopped-source integrity guard unexpectedly admitted ${bee}`);
+  } catch (error) {
+    if (!(error instanceof HsrSourceEventIntegrityError)) throw error;
+  }
+  const receipt = await readHsrEventIntegrityReceipt(bee);
+  if (!receipt || receipt.phase !== "unresolved" || !hsrEventIntegrityReceiptOwnsHost(receipt, host)) {
+    throw new Error(`HSR stopped-source integrity receipt for ${bee} was not durably published`);
+  }
+  return { kind: "integrity", receipt };
+}
+
 /**
  * Best-effort stop: ask the host to stop cleanly over the control socket and
  * give it a brief grace to finalize (the host's stop tears down the harness
@@ -267,20 +550,42 @@ export async function stopHsrIncarnation(
 
   const finalMeta = await readHsrMetaStrict(bee);
   if (sameHostIncarnation(initial, finalMeta)) ownedMeta = finalMeta!;
-  let childStopped = stopped ? await confirmChildGroupStopped(ownedMeta, deps) : false;
-  // A host that died BEFORE child admission completed ("pending"/legacy, no
-  // child pid ever recorded) leaves nothing to verify — and, being dead, can
-  // never publish a locator either. With the host incarnation itself proven
-  // stopped above, refusing forever only wedges kill/revive on exactly the
-  // Cells that crashed during boot; treat the never-recorded child group as
-  // moot. A RECORDED child with unverifiable identity still fails closed.
-  if (stopped && !childStopped && ownedMeta.childPid === undefined && ownedMeta.childPgid === undefined) {
-    childStopped = true;
-  }
+  const childStopped = stopped ? await confirmChildGroupStopped(ownedMeta, deps) : false;
   const confirmed = stopped && childStopped;
   if (confirmed) {
-    await clearPendingHsrTurns(bee).catch(() => undefined);
-    await publishProvenStop(bee, initial, finalMeta);
+    let sourceHistory: StoppedSourceHistory;
+    try {
+      sourceHistory = await settleStoppedSourceHistory(bee, initial, ownedMeta);
+    } catch (error) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: `HSR runtime stopped but source-history settlement is unconfirmed for ${bee}: ${error instanceof Error ? error.message : String(error)}`,
+        exitCode: 1,
+      };
+    }
+    if (sourceHistory.kind === "integrity") {
+      await recordHsrEventIntegrityStop(
+        bee,
+        sourceHistory.receipt.integrityId,
+        sourceHistory.receipt.host,
+        "confirmed",
+        "local controller exact host and child-group stop proof",
+      );
+    }
+    try {
+      await settlePendingHsrTurnsForIntentionalStop(bee);
+    } catch (error) {
+      return {
+        ok: false,
+        stdout: "",
+        stderr: `HSR runtime stopped but durable delivery ownership could not be settled for ${bee}: ${error instanceof Error ? error.message : String(error)}`,
+        exitCode: 1,
+      };
+    }
+    if (sourceHistory.kind === "clean" || sourceHistory.kind === "acknowledged") {
+      await publishProvenStop(bee, initial, await readHsrMetaStrict(bee));
+    }
     return { ok: true, stdout: "", stderr: "", exitCode: 0 };
   }
   return {

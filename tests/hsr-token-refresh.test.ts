@@ -13,6 +13,7 @@
  */
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { test } from "node:test";
 
@@ -28,6 +29,7 @@ import type { NodeRecord } from "../src/node.js";
 import type { AccountRecord } from "../src/accounts.js";
 import type { SessionRecord } from "../src/store.js";
 import type { RunnerEvent } from "../src/hsr/types.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -161,10 +163,10 @@ function harness(opts: {
       return minted;
     },
     substrateForNode: () => fakeSub,
-    updateSession: async (name, patch) => {
-      updates.push({ name, patch });
-      return null;
-    },
+    withAdmission: async (candidate, effect) => effect(candidate, async (patch) => {
+      updates.push({ name: candidate.name, patch });
+      return { ...candidate, ...patch };
+    }),
     appendLedger: async (event) => {
       ledger.push(event);
     },
@@ -230,6 +232,27 @@ test("refresher: reactive fires on a fresh auth_expired and does not re-fire for
   assert.equal(third.find((o) => o.ok)?.trigger, "reactive");
 });
 
+test("refresher: failed-stop doubt blocks proactive and reactive credential mutation", async () => {
+  const nowMs = 1_000_000_000_000;
+  const bee = record({
+    name: "stop-doubt",
+    status: "kill_failed",
+    remoteTokenExpiresAt: Math.floor(nowMs / 1000) + 10 * 60,
+    stateMachine: lifecycleCursor("stop-doubt", "active", new Date(nowMs).toISOString()),
+  });
+  const h = harness({});
+  const outcomes = await h.refresher(
+    [bee],
+    new Map([[bee.name, authExpiredObs(555)]]),
+    nowMs,
+  );
+
+  assert.deepEqual(outcomes, []);
+  assert.deepEqual(h.mintCalls, []);
+  assert.deepEqual(h.refreshCalls, []);
+  assert.deepEqual(h.updates, []);
+});
+
 test("refresher: a non-ephemeral node is skipped (no mint)", async () => {
   const nowMs = 1_000_000_000_000;
   const soon = Math.floor(nowMs / 1000) + 10 * 60;
@@ -284,13 +307,18 @@ test("refreshCreds RPC: restarts with resume, shreds the OLD credential, records
     try {
       const spawnRes = (await controller.methods.spawn!({
         bee,
+        launchId: randomUUID(),
+        consumerId: "token-refresh-test",
         kind: "stub",
         home,
         sessionId: "thread-x",
         creds: { files: [{ homeRelPath: "cred-old.json", contentB64: Buffer.from(OLD).toString("base64"), mode: 0o600 }] },
         spec: { command: process.execPath, args: [], env: {} },
-      }, CTX)) as { ok?: boolean };
+      }, CTX)) as { ok?: boolean; launchId?: string; incarnation?: string };
       assert.equal(spawnRes.ok, true);
+      assert.ok(spawnRes.launchId);
+      assert.ok(spawnRes.incarnation);
+      const authority = { launchId: spawnRes.launchId, incarnation: spawnRes.incarnation };
 
       // The bee comes up, learns its thread id, and the OLD credential is on disk.
       await waitFor(() => fileExists(oldPath), "old credential written");
@@ -301,6 +329,7 @@ test("refreshCreds RPC: restarts with resume, shreds the OLD credential, records
       // Refresh: deliver a fresh credential (different filename) and restart+resume.
       const refreshRes = (await controller.methods.refreshCreds!({
         bee,
+        ...authority,
         creds: { files: [{ homeRelPath: "cred-new.json", contentB64: Buffer.from(NEW).toString("base64"), mode: 0o600 }] },
       }, CTX)) as { ok?: boolean; sessionId?: string; error?: string };
       assert.equal(refreshRes.ok, true, `refresh failed: ${refreshRes.error ?? ""}`);
@@ -320,7 +349,7 @@ test("refreshCreds RPC: restarts with resume, shreds the OLD credential, records
       }, "runner restarted and running");
 
       // kill shreds the current (new) credential.
-      await controller.methods.kill!({ bee }, CTX);
+      await controller.methods.kill!({ bee, ...authority }, CTX);
       await waitFor(async () => !(await fileExists(newPath)), "new credential GONE after kill");
     } finally {
       await controller.close();

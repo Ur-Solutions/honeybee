@@ -150,6 +150,10 @@ export type SlotRecord = {
    * mid-replacement can never double-spawn an attempt.
    */
   idempotencyKey?: string;
+  /** Launch may exist, but exact cleanup/publication was not proved. */
+  launchOwnership?:
+    | { status: "dispatching"; at: string }
+    | { status: "indeterminate"; at: string; error: string };
   /** Set when the deterministic stall nudge has been sent for this attempt. */
   nudgedAt?: string;
   history: SlotHistoryEntry[];

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,9 +8,11 @@ import { test } from "node:test";
 import {
   __testOnlyOwnedProcessGroups,
   attachSessionPlumbing,
+  createSessionPlumbing,
   parseProcessRows,
   spawnSessionChild,
 } from "../src/hsr/sessionBase.js";
+import { ensureHsrRunDir, hsrEventsPath } from "../src/hsr/runDir.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/hsr-detached-grandchild.mjs", import.meta.url));
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,6 +58,41 @@ test("parseProcessRows accepts a topology + birth census and rejects malformed r
   assert.deepEqual(parseProcessRows(" 12  1  12 Tue Jul 22 12:01:02 2026\ninvalid\n"), [
     { pid: 12, ppid: 1, pgid: 12, startedAt: "Tue Jul 22 12:01:02 2026" },
   ]);
+});
+
+test("event append rejection awaits durable authority publication before the iterator can fail", async () => {
+  const previous = process.env.HIVE_STORE_ROOT;
+  const store = await mkdtemp(join(tmpdir(), "hive-hsr-event-boundary-"));
+  process.env.HIVE_STORE_ROOT = store;
+  const bee = "session-base-persistence-boundary";
+  try {
+    await ensureHsrRunDir(bee);
+    await mkdir(hsrEventsPath(bee));
+    let release!: () => void;
+    const authorityRelease = new Promise<void>((resolve) => { release = resolve; });
+    let authorityStarted!: () => void;
+    const authorityStart = new Promise<void>((resolve) => { authorityStarted = resolve; });
+    const core = createSessionPlumbing(bee, undefined, async (event, error) => {
+      assert.equal(event.type, "needs_input");
+      assert.ok(error instanceof Error);
+      authorityStarted();
+      await authorityRelease;
+    });
+    const iterator = core.events[Symbol.asyncIterator]();
+    const next = iterator.next();
+    let rejected = false;
+    void next.catch(() => { rejected = true; });
+    core.ingestEvent({ type: "needs_input", ts: 1, kind: "question", question: "persist?" });
+    await authorityStart;
+    await sleep(25);
+    assert.equal(rejected, false, "the event stream remains nonterminal until authority publication completes");
+    release();
+    await assert.rejects(next);
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(store, { recursive: true, force: true });
+  }
 });
 
 test("stop reaps a setsid grandchild without touching an untracked sibling group", async () => {

@@ -3,7 +3,7 @@ import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
 import { deriveState, isTerminalState, liveTargetKey, parseBeeState, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
-import { isArchivedSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
+import { isActiveSessionLifecycle, isArchivedSessionLifecycle, isRunnableSessionRecord, type ProbeEvidence } from "../stateMachine.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AuthRecoveryOutcome } from "./authRecovery.js";
 import type { RotationResumeOutcome } from "./rotationResume.js";
@@ -1013,7 +1013,10 @@ export async function tick(
   // can no longer affect state.
   const remoteHsrNodes = new Set(nodes.filter((node) => node.kind === "remote-hsr").map((node) => node.name));
   const hsrBeeNames = records
-    .filter((record) => record.status === "running" && record.lastObservedState !== "done" && record.lastObservedState !== "sealed" && !seals.has(record.name) && (
+    .filter((record) => isActiveSessionLifecycle(record) && (
+      record.stateMachine !== undefined ||
+      (record.lastObservedState !== "done" && record.lastObservedState !== "sealed")
+    ) && !seals.has(record.name) && (
       record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
     ))
     .map((record) => record.name);
@@ -1047,6 +1050,10 @@ export async function tick(
   for (const [bee, observation] of hsrObs) {
     const record = recordsByName.get(bee);
     if (!record) continue;
+    if (observation.unavailable) {
+      hsrUnavailable.add(bee);
+      continue;
+    }
     const trustSource = trustedHsrObservationSource(record, observation, remoteHsrNodes);
     if (!trustSource) continue;
     if (observation.live) hsrLive.add(bee);
@@ -1089,7 +1096,7 @@ export async function tick(
   let runtimeDeaths: RuntimeDeathDecision[] = [];
   if (deps.reconcileRuntimeDeaths) {
     const coarseDeaths = records.filter((record) =>
-      record.substrate === "hsr" && record.status === "running" &&
+      record.substrate === "hsr" && isRunnableSessionRecord(record) &&
       !hsrUnavailable.has(record.name) && hsrObs.get(record.name)?.live !== true);
     if (coarseDeaths.length > 0) {
       // Fail closed even if the exact-probe batch times out. Missing proof

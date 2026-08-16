@@ -1,9 +1,12 @@
 import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
+import type { SessionRecord } from "../store.js";
 import type { Substrate } from "./types.js";
 
 export type StrictRuntimeStopOptions = {
   launcherPgid?: number;
   launcherFingerprint?: ProcessBirthFingerprint;
+  remoteLaunchId?: string;
+  remoteIncarnation?: string;
   pollAttempts?: number;
   pollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -13,6 +16,14 @@ export type StrictRuntimeStopOptions = {
 export type StrictRuntimeStopResult = {
   alreadyGone: boolean;
   attempts: number;
+};
+
+export type ReplacementRuntimeStopOptions = Omit<
+  StrictRuntimeStopOptions,
+  "launcherPgid" | "launcherFingerprint"
+> & {
+  /** Persist unresolved explicit-stop ownership before this helper throws. */
+  onStopUnconfirmed?: (message: string) => Promise<void>;
 };
 
 function errorMessage(error: unknown): string {
@@ -48,7 +59,7 @@ export async function stopRuntimeStrict(
   // ssh-tmux always owns a detached remote process group. A legacy/malformed
   // record without its birth evidence cannot use pane absence as process-death
   // proof, so still enter kill() and let the substrate fail closed.
-  const needsRemoteGroupProof = substrate.kind === "ssh-tmux";
+  const needsRemoteGroupProof = substrate.kind === "ssh-tmux" || substrate.kind === "remote-hsr";
   // HSR liveness tracks the host, not its detached child. A false observation
   // therefore still requires the substrate's strict incarnation cleanup.
   const needsLocalHsrCleanup = substrate.kind === "hsr";
@@ -61,11 +72,14 @@ export async function stopRuntimeStrict(
       result = await substrate.kill(target, {
         launcherPgid: options.launcherPgid,
         launcherFingerprint: options.launcherFingerprint,
+        remoteLaunchId: options.remoteLaunchId,
+        remoteIncarnation: options.remoteIncarnation,
       });
     } catch (error) {
       throw new Error(`${context}: kill failed: ${errorMessage(error)}`);
     }
     if (!result.ok) throw new Error(`${context}: exact cleanup unconfirmed: ${killError(result)}`);
+    if (result.incarnationStopped) return { alreadyGone: !initiallyAlive, attempts };
   }
 
   for (let i = 0; i < pollAttempts; i += 1) {
@@ -79,4 +93,44 @@ export async function stopRuntimeStrict(
     if (i < pollAttempts - 1 && pollIntervalMs > 0) await sleep(pollIntervalMs);
   }
   throw new Error(`${context}: ${target} is still alive after exact cleanup`);
+}
+
+/**
+ * Resolve ownership before replacing an existing runtime incarnation.
+ *
+ * `kill_failed` means an explicit stop was attempted but exact teardown could
+ * not be proved. A missing local tmux target is therefore insufficient: the
+ * detached launcher group may still be alive, and a replacement would create
+ * duplicate ownership. Modern local records must carry both the group id and
+ * its birth fingerprint so strict cleanup can prove the exact incarnation.
+ */
+export async function stopRuntimeForReplacement(
+  record: SessionRecord,
+  substrate: Substrate,
+  target: string,
+  options: ReplacementRuntimeStopOptions = {},
+): Promise<StrictRuntimeStopResult> {
+  const context = options.context ?? `Could not stop ${record.name} before replacement`;
+  if (
+    record.status === "kill_failed"
+    && substrate.kind === "local-tmux"
+    && (record.launcherPgid === undefined || record.launcherFingerprint === undefined)
+  ) {
+    throw new Error(`${context}: unresolved stop state and no exact launcher identity`);
+  }
+  const { onStopUnconfirmed, ...strictOptions } = options;
+  try {
+    return await stopRuntimeStrict(substrate, target, {
+      ...strictOptions,
+      context,
+      launcherPgid: record.launcherPgid,
+      launcherFingerprint: record.launcherFingerprint,
+      remoteLaunchId: record.remoteLaunchId,
+      remoteIncarnation: record.remoteIncarnation,
+    });
+  } catch (error) {
+    const message = errorMessage(error);
+    await onStopUnconfirmed?.(message);
+    throw error;
+  }
 }

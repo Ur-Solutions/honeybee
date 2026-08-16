@@ -9,13 +9,14 @@ import {
 } from "../accounts.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { bootMsForAgent } from "../drivers.js";
+import { deliverSessionText } from "../delivery.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
 import { transactionalRetire } from "../kill.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
-import { appendLedger, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, type SessionRecord } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
 import { openInNewTerminal, runInCurrentTerminal } from "../terminal.js";
 import { formatShellCommand } from "../tmux.js";
@@ -87,13 +88,22 @@ export async function waitForPromptReady(record: SessionRecord, parsed: Parsed):
  * newer than waitForIdle's transcript cutoff.
  * Returns the stamp timestamp (cmdRun's waitForIdle needs it).
  */
-export async function deliverPromptToBee(record: SessionRecord, prompt: string): Promise<string> {
-  const now = new Date().toISOString();
-  await deliverPromptText(record, prompt);
-  await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
-  await writeHiveState(record, "working");
-  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
-  return now;
+export type RunPromptDeliveryOptions = {
+  /** @internal deterministic seams for post-acceptance mirror fault tests. */
+  deliver?: NonNullable<Parameters<typeof deliverSessionText>[2]>["deliver"];
+  writeState?: typeof writeHiveState;
+  appendLedger?: typeof appendLedger;
+};
+
+export async function deliverPromptToBee(
+  record: SessionRecord,
+  prompt: string,
+  options: RunPromptDeliveryOptions = {},
+): Promise<string> {
+  const delivered = await deliverSessionText(record, prompt, { deliver: options.deliver ?? deliverPromptText });
+  await (options.writeState ?? writeHiveState)(delivered.record, "working").catch(() => undefined);
+  await (options.appendLedger ?? appendLedger)({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length }).catch(() => undefined);
+  return delivered.deliveredAt;
 }
 
 

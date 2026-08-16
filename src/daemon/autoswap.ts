@@ -12,7 +12,8 @@
 import { accountHasCredentials, listAccounts, type AccountRecord } from "../accounts.js";
 import { canonicalAgentKind } from "../agents.js";
 import { swapAccount } from "../swap.js";
-import type { SessionRecord } from "../store.js";
+import { loadSession, type SessionRecord } from "../store.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
 import { isRecentlyExhausted, usageSummary, type UsageSummary } from "../usage.js";
 import type { UsageTickOutcome } from "./usageSampler.js";
 
@@ -31,6 +32,7 @@ export type AutoswapDeps = {
   accountHasCredentials?: typeof accountHasCredentials;
   usageSummary?: (accountId: string, now: number) => Promise<UsageSummary>;
   swapAccount?: typeof swapAccount;
+  loadRecord?: typeof loadSession;
   now?: () => number;
 };
 
@@ -73,12 +75,47 @@ export async function dispatchAutoswaps(
   const hasCredentials = deps.accountHasCredentials ?? accountHasCredentials;
   const summarize = deps.usageSummary ?? ((accountId: string, now: number) => usageSummary(accountId, now));
   const swap = deps.swapAccount ?? swapAccount;
+  const loadRecord = deps.loadRecord ?? loadSession;
   const now = (deps.now ?? Date.now)();
 
   const outcomes: AutoswapOutcome[] = [];
   for (const trigger of triggers) {
-    const record = byName.get(trigger.bee);
+    const snapshot = byName.get(trigger.bee);
+    if (!snapshot || snapshot.autoswap !== true || !snapshot.accountId) continue;
+    if (snapshot.accountId !== trigger.account) {
+      outcomes.push({
+        bee: snapshot.name,
+        from: snapshot.accountId,
+        ok: false,
+        skipped: "exhaustion trigger account is no longer current",
+      });
+      continue;
+    }
+
+    // Usage is sampled from an earlier tick snapshot. Re-read before account
+    // selection, then revalidate again inside swapAccount's lifecycle lock: an
+    // explicit stop that lands in either window must never be interpreted as
+    // permission for an automatic replacement runtime.
+    const record = await loadRecord(snapshot.name);
     if (!record || record.autoswap !== true || !record.accountId) continue;
+    if (record.accountId !== trigger.account) {
+      outcomes.push({
+        bee: record.name,
+        from: record.accountId,
+        ok: false,
+        skipped: "exhaustion trigger account is no longer current",
+      });
+      continue;
+    }
+    if (!isRunnableSessionRecord(record)) {
+      outcomes.push({
+        bee: record.name,
+        from: record.accountId,
+        ok: false,
+        skipped: "bee is not runnable (stop state unresolved)",
+      });
+      continue;
+    }
 
     const outcome: AutoswapOutcome = { bee: record.name, from: record.accountId, ok: false };
     try {
@@ -110,7 +147,10 @@ export async function dispatchAutoswaps(
         outcomes.push(outcome);
         continue;
       }
-      await swap(record, target);
+      await swap(record, target, {
+        authorization: "automatic",
+        automaticTriggerAccountId: trigger.account,
+      });
       outcome.to = target.id;
       outcome.ok = true;
     } catch (error) {

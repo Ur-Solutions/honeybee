@@ -11,6 +11,7 @@ import { authRequestId, needsInputRequestId, stopFailedRequestId } from "../src/
 import { openRequest, readBeeRequests, requestsRoot, resolveRequest, type OpenRequestInput } from "../src/requests/store.js";
 import { safeName, type SessionRecord } from "../src/store.js";
 import type { BeeState } from "../src/state.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const NOW = Date.parse("2026-07-28T12:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -129,6 +130,31 @@ test("steady state: re-seeing the same pending is a no-op — no duplicate outco
     const second = await reconcile(input({ records: [record], hsrObservations: obs }));
     assert.deepEqual(second, [], "no outcome on the steady-state tick");
     assert.equal(await readFile(path, "utf8"), before, "file bytes untouched");
+  });
+});
+
+test("stop-failed requests preserve stop doubt while canonical archive still wins", async () => {
+  await withTempStore(async () => {
+    const reconcile = createRequestReconciler();
+    const activeStopDoubt = bee("active-stop-doubt", {
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("active-stop-doubt", "active", iso(NOW - 30_000)),
+    });
+    const activeStaleDone = bee("active-stale-done", {
+      status: "done",
+      stateMachine: lifecycleCursor("active-stale-done", "active", iso(NOW - 30_000)),
+    });
+    const archived = bee("archived-stale-stop", {
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("archived-stale-stop", "archived", iso(NOW - 30_000)),
+    });
+    const outcomes = await reconcile(input({ records: [activeStopDoubt, activeStaleDone, archived] }));
+    assert.deepEqual(outcomes.map((outcome) => `${outcome.action}:${outcome.id}`), [
+      `open:${stopFailedRequestId(activeStopDoubt.name, 0)}`,
+    ]);
+    assert.equal((await readBeeRequests(activeStopDoubt.name))[0]?.kind, "manual-action");
+    assert.deepEqual(await readBeeRequests(activeStaleDone.name), []);
+    assert.deepEqual(await readBeeRequests(archived.name), []);
   });
 });
 

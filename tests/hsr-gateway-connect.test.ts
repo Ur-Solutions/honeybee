@@ -26,13 +26,21 @@ import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { connectToGateway, gatewayUrlWithCell } from "../src/hsr/gatewayConnect.js";
+import {
+  connectToGateway,
+  gatewayEventConsumerId,
+  gatewayUrlWithCell,
+  type GatewayConnectOptions,
+} from "../src/hsr/gatewayConnect.js";
 import { buildController, versionString } from "../src/hsr/remoteHost.js";
+import { REMOTE_HSR_SAFETY_PROTOCOL } from "../src/hsr/remoteLaunchReceipt.js";
 import {
   ackHsrEvents,
   appendHsrEvent,
   compactHsrEvents,
   ensureHsrRunDir,
+  hsrRoot,
+  markHsrConsumerSubscribedStrict,
   readHsrSeqState,
   writeHsrMeta,
   type HsrMeta,
@@ -319,6 +327,7 @@ type CellCtx = {
 async function withConnectedCell(
   prepare: (ctx: CellCtx) => Promise<void>,
   fn: (ctx: CellCtx & { handle: ReturnType<typeof connectToGateway> }) => Promise<void>,
+  connectOverrides: Partial<GatewayConnectOptions> = {},
 ): Promise<void> {
   await withTempStore(async () => {
     const gateway = await startFakeGateway();
@@ -335,10 +344,15 @@ async function withConnectedCell(
         backoffInitialMs: 10,
         backoffMaxMs: 50,
         presencePollMs: 25,
+        ...connectOverrides,
       });
       await fn({ gateway, controller, handle });
     } finally {
       await handle?.close();
+      // Gateway fixtures synthesize live metas without launch receipts or real
+      // processes. Remove only this temp store's fixture tree before controller
+      // close; production close must (and does) refuse such unowned run state.
+      await rm(hsrRoot(), { recursive: true, force: true });
       await controller.close();
       await gateway.close();
     }
@@ -412,6 +426,115 @@ test("subscribe replays exactly seq > afterSeq from the durable log, then stream
   );
 });
 
+test("subscribe drains a long retained suffix through bounded exact pages", async () => {
+  const bee = "gw-paged-replay";
+  await withConnectedCell(
+    async () => {
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, liveMeta(bee));
+      await appendTexts(bee, 300);
+    },
+    async ({ gateway }) => {
+      const conn = await gateway.nextConnection();
+      await conn.take(isHello, "hello");
+      assert.deepEqual((await conn.request("subscribe", { bee, afterSeq: 0 })).result, { ok: true });
+      const replay = await takeHsrEvents(conn, 300);
+      assert.deepEqual(
+        replay.map((row) => row.event.seq),
+        Array.from({ length: 300 }, (_, index) => index + 1),
+      );
+      const consumerId = gatewayEventConsumerId(gateway.url, "cell-1");
+      assert.deepEqual((await readHsrSeqState(bee))?.consumers, { [consumerId]: {} });
+    },
+  );
+});
+
+test("a permanently backpressured gateway is closed before replay can buffer another page", async () => {
+  const bee = "gw-paged-backpressure";
+  const descriptor = Object.getOwnPropertyDescriptor(WebSocket.prototype, "bufferedAmount");
+  assert.ok(descriptor?.get && descriptor.configurable, "test requires the configurable undici bufferedAmount getter");
+  Object.defineProperty(WebSocket.prototype, "bufferedAmount", {
+    configurable: true,
+    enumerable: descriptor.enumerable,
+    get: () => 2,
+  });
+  try {
+    await withConnectedCell(
+      async () => {
+        await ensureHsrRunDir(bee);
+        await writeHsrMeta(bee, liveMeta(bee));
+        await appendTexts(bee, 300);
+      },
+      async ({ gateway }) => {
+        const first = await gateway.nextConnection();
+        await first.take(isHello, "hello");
+        assert.deepEqual((await first.request("subscribe", { bee, afterSeq: 0 })).result, { ok: true });
+
+        const replacement = await gateway.nextConnection();
+        await replacement.take(isHello, "reconnect after replay backpressure");
+        assert.equal(
+          first.received.filter(isHsrEvent).length,
+          1,
+          "the first high-water event is the bounded maximum before the socket closes",
+        );
+        assert.equal(
+          (await readHsrSeqState(bee))?.consumers?.[gatewayEventConsumerId(gateway.url, "cell-1")]?.ackedSeq,
+          undefined,
+          "transport buffering never advances the durable gateway ack",
+        );
+      },
+      {
+        replayHighWaterBytes: 1,
+        replayDrainStepMs: 1,
+        replayDrainMaxMs: 10,
+      },
+    );
+  } finally {
+    Object.defineProperty(WebSocket.prototype, "bufferedAmount", descriptor);
+  }
+});
+
+test("a backpressured live tail closes before enqueueing events beyond the durable gateway ack", async () => {
+  const bee = "gw-live-backpressure";
+  const descriptor = Object.getOwnPropertyDescriptor(WebSocket.prototype, "bufferedAmount");
+  assert.ok(descriptor?.get && descriptor.configurable, "test requires the configurable undici bufferedAmount getter");
+  Object.defineProperty(WebSocket.prototype, "bufferedAmount", {
+    configurable: true,
+    enumerable: descriptor.enumerable,
+    get: () => 2,
+  });
+  try {
+    await withConnectedCell(
+      async () => {
+        await ensureHsrRunDir(bee);
+        await writeHsrMeta(bee, liveMeta(bee));
+      },
+      async ({ gateway }) => {
+        const first = await gateway.nextConnection();
+        await first.take(isHello, "hello");
+        assert.deepEqual((await first.request("subscribe", { bee, afterSeq: 0 })).result, { ok: true });
+
+        await appendTexts(bee, 1);
+        const replacement = await gateway.nextConnection();
+        await replacement.take(isHello, "reconnect after live-tail backpressure");
+        assert.equal(
+          first.received.filter(isHsrEvent).length,
+          0,
+          "a socket already above high-water receives no additional live frame",
+        );
+        assert.equal(
+          (await readHsrSeqState(bee))?.consumers?.[gatewayEventConsumerId(gateway.url, "cell-1")]?.ackedSeq,
+          undefined,
+          "the unsent durable event remains eligible for exact replay",
+        );
+      },
+      { replayHighWaterBytes: 1 },
+    );
+  } finally {
+    Object.defineProperty(WebSocket.prototype, "bufferedAmount", descriptor);
+  }
+});
+
 test("subscribe races the live appends without dupes or holes (buffer-merge handoff)", async () => {
   const bee = "gw-race";
   await withConnectedCell(
@@ -437,11 +560,13 @@ test("subscribe races the live appends without dupes or holes (buffer-merge hand
 test("a stale cursor gets the explicit gap and resumes from the oldest retained seq", async () => {
   const bee = "gw-gap";
   await withConnectedCell(
-    async () => {
+    async ({ gateway }) => {
       await ensureHsrRunDir(bee);
       await writeHsrMeta(bee, liveMeta(bee));
+      const consumerId = gatewayEventConsumerId(gateway.url, "cell-1");
+      await markHsrConsumerSubscribedStrict(bee, consumerId);
       await appendTexts(bee, 10); // seq 1..10
-      await ackHsrEvents(bee, 6);
+      await ackHsrEvents(bee, 6, consumerId);
       await compactHsrEvents(bee, { keepLines: 2, targetBytes: 10_000 }); // folds 1..6, retains 7..10
     },
     async ({ gateway }) => {
@@ -465,9 +590,15 @@ test("ackEvents advances the durable on-disk watermark through the relay", async
     async ({ gateway }) => {
       const conn = await gateway.nextConnection();
       await conn.take(isHello, "hello");
+      assert.deepEqual((await conn.request("subscribe", { bee, afterSeq: 0 })).result, { ok: true });
+      await takeHsrEvents(conn, 4);
       const response = await conn.request("ackEvents", { bee, upToSeq: 3 });
       assert.deepEqual(response.result, { ok: true, ackedSeq: 3 });
-      assert.deepEqual(await readHsrSeqState(bee), { lastSeq: 4, ackedSeq: 3 }, "the watermark must be durable");
+      const consumerId = gatewayEventConsumerId(gateway.url, "cell-1");
+      assert.deepEqual(await readHsrSeqState(bee), {
+        lastSeq: 4,
+        consumers: { [consumerId]: { ackedSeq: 3 } },
+      }, "the stable gateway watermark must be durable");
       // Never-regress + clamp semantics ride through the same relay.
       const stale = await conn.request("ackEvents", { bee, upToSeq: 1 });
       assert.deepEqual(stale.result, { ok: true, ackedSeq: 3 });
@@ -499,7 +630,11 @@ test("a server-side drop re-dials with backoff, re-hellos, and a fresh subscribe
       const second = await gateway.nextConnection();
       const hello = await second.take(isHello, "re-hello");
       const params = hello.params as { bees: Array<{ bee: string; lastSeq?: number }> };
-      assert.deepEqual(params.bees.map((row) => [row.bee, row.lastSeq]), [[bee, 5]], "re-hello advertises the durable high-water");
+      const helloRow = params.bees.find((row) => row.bee === bee);
+      assert.ok(
+        helloRow?.lastSeq === 4 || helloRow?.lastSeq === 5,
+        "re-hello advertises the durable high-water at its point-in-time snapshot",
+      );
 
       // The gateway resumes from ITS durable cursor — nothing was lost or duped.
       const response = await second.request("subscribe", { bee, afterSeq: 3 });
@@ -526,14 +661,20 @@ test("controller relays dispatch into the serve-mode methods map with rpc error 
       const conn = await gateway.nextConnection();
       await conn.take(isHello, "hello");
 
+      assert.deepEqual((await conn.request("subscribe", { bee, afterSeq: 0 })).result, { ok: true });
+
       const ping = await conn.request("ping");
-      assert.deepEqual(ping.result, { ok: true, version: versionString() });
+      assert.deepEqual(ping.result, { ok: true, version: versionString(), safetyProtocol: REMOTE_HSR_SAFETY_PROTOCOL });
 
       const liveness = await conn.request("liveness");
       assert.deepEqual(liveness.result, { [bee]: true });
 
-      const list = (await conn.request("list")).result as Array<{ bee: string; status: string }>;
-      assert.deepEqual(list.map((row) => [row.bee, row.status]), [[bee, "running"]]);
+      const list = (await conn.request("list")).result as Array<{ bee: string; status: string; integrityFailure?: true }>;
+      assert.deepEqual(
+        list.map((row) => [row.bee, row.status, row.integrityFailure]),
+        [[bee, "event_integrity", true]],
+        "synthetic live metadata without durable launch/host authority must remain fail-closed",
+      );
 
       // A guarded controller failure is a RESULT (the serve-mode contract)…
       const badSend = await conn.request("send", { bee: "nobody", text: "hi" });
@@ -634,7 +775,7 @@ test("a stale socket's late completion is dropped, never sent to the socket that
       );
       // B's own id-1 request (ids restart per socket) is answered correctly.
       const ping = await b.request("ping"); // id 1 on socket B
-      assert.deepEqual(ping.result, { ok: true, version: versionString() });
+      assert.deepEqual(ping.result, { ok: true, version: versionString(), safetyProtocol: REMOTE_HSR_SAFETY_PROTOCOL });
     },
   );
 });

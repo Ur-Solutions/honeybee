@@ -16,6 +16,11 @@ function record(agent: string): SessionRecord {
   };
 }
 
+const TEST_ADMISSION = async <T>(
+  snapshot: SessionRecord,
+  effect: (current: SessionRecord) => Promise<T>,
+): Promise<T> => effect(snapshot);
+
 test("agent readiness rejects trust and MCP blocker panes", () => {
   const trustPane = "Do you trust the contents of this directory?\nEnter to confirm";
   const mcpPane = "MCP server found in this project";
@@ -130,7 +135,7 @@ test("waitForAgentReady reports an unclearable trust prompt as reason=trust", as
   };
 
   await assert.rejects(
-    waitForAgentReady(record("claude"), { timeoutMs: 100, trustGraceMs: 0, substrate }),
+    waitForAgentReady(record("claude"), { timeoutMs: 100, trustGraceMs: 0, substrate, admitMutation: TEST_ADMISSION }),
     (error: unknown) => error instanceof AgentReadinessError && error.reason === "trust" && /hive attach/.test(error.message),
   );
   assert.ok(enters >= 1, "should have tried to confirm the trust prompt");
@@ -153,7 +158,7 @@ test("waitForAgentReady accepts the bypass-permissions dialog with the '2' key, 
     },
   };
 
-  await waitForAgentReady(record("claude"), { timeoutMs: 2000, trustGraceMs: 0, substrate });
+  await waitForAgentReady(record("claude"), { timeoutMs: 2000, trustGraceMs: 0, substrate, admitMutation: TEST_ADMISSION });
   assert.deepEqual(keys, ["2"], "should confirm via the '2' key exactly once");
   assert.equal(enters, 0, "must never press Enter on the bypass dialog (Enter = 'No, exit')");
 });
@@ -170,7 +175,7 @@ test("waitForAgentReady honors --no-accept-trust on the bypass dialog", async ()
   };
 
   await assert.rejects(
-    waitForAgentReady(record("claude"), { timeoutMs: 100, acceptTrust: false, substrate }),
+    waitForAgentReady(record("claude"), { timeoutMs: 100, acceptTrust: false, substrate, admitMutation: TEST_ADMISSION }),
     (error: unknown) => error instanceof AgentReadinessError && error.reason === "trust",
   );
   assert.deepEqual(keys, [], "must not send any accept key when acceptance is opted out");
@@ -184,7 +189,7 @@ test("waitForAgentReady still reports timeout when no trust prompt is visible", 
   };
 
   await assert.rejects(
-    waitForAgentReady(record("claude"), { timeoutMs: 50, substrate }),
+    waitForAgentReady(record("claude"), { timeoutMs: 50, substrate, admitMutation: TEST_ADMISSION }),
     (error: unknown) => error instanceof AgentReadinessError && error.reason === "timeout",
   );
 });
@@ -206,7 +211,7 @@ test("waitForAgentReady confirms the resume-mode chooser with Enter (recommended
     sendKey: async () => {},
   };
 
-  await waitForAgentReady(record("claude"), { timeoutMs: 3000, trustGraceMs: 0, substrate });
+  await waitForAgentReady(record("claude"), { timeoutMs: 3000, trustGraceMs: 0, substrate, admitMutation: TEST_ADMISSION });
   assert.equal(enters, 1, "should confirm the pre-selected recommended option once");
 });
 
@@ -230,7 +235,7 @@ test("waitForAgentReady declines the fullscreen-renderer tour with Down+Enter", 
     },
   };
 
-  await waitForAgentReady(record("claude"), { timeoutMs: 3000, trustGraceMs: 0, substrate });
+  await waitForAgentReady(record("claude"), { timeoutMs: 3000, trustGraceMs: 0, substrate, admitMutation: TEST_ADMISSION });
   assert.deepEqual(keys, ["Down"], "should move the selector to 'Not now'");
   assert.ok(enters >= 1, "should confirm the declined tour");
 });

@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { hsrActivityFromEvents, hsrObservations, isAuthNeededMessage, structuredStateFromEvents } from "../src/hsr/observe.js";
+import { currentHsrEventEpoch, hsrActivityFromEvents, hsrObservations, isAuthNeededMessage, structuredStateFromEvents } from "../src/hsr/observe.js";
 import { ensureHsrRunDir, hsrRingPath, hsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { deriveState, type BeeState, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -432,6 +432,44 @@ test("an auth error AFTER an auth_resume marker still wins (the login didn't tak
       { type: "turn_end", ts: 7 },
     ]),
     "auth-needed",
+  );
+});
+
+test("a successor host epoch bounds predecessor auth failure without masking the successor", () => {
+  const hostA = {
+    hostPid: 101,
+    startedAt: "2026-08-15T20:00:00.000Z",
+    hostFingerprint: { pgid: 101, startedAt: "host-a" },
+  };
+  const hostB = {
+    hostPid: 202,
+    startedAt: "2026-08-15T20:01:00.000Z",
+    hostFingerprint: { pgid: 202, startedAt: "host-b" },
+  };
+  const predecessorFailure: RunnerEvent[] = [
+    { type: "host_epoch", ts: 1, host: hostA },
+    { type: "turn_start", ts: 2, host: hostA },
+    { type: "error", ts: 3, message: "Not logged in · Please run /login", host: hostA },
+    { type: "turn_end", ts: 4, host: hostA },
+    { type: "host_epoch", ts: 5, host: hostB },
+  ];
+  const successorEpoch = currentHsrEventEpoch(predecessorFailure, hostB).events;
+  assert.notEqual(
+    structuredStateFromEvents(successorEpoch),
+    "auth-needed",
+    "B's pre-adapter epoch excludes A's stale authentication failure",
+  );
+
+  const successorFailure: RunnerEvent[] = [
+    ...predecessorFailure,
+    { type: "turn_start", ts: 6, host: hostB },
+    { type: "error", ts: 7, message: "Not logged in · Please run /login", host: hostB },
+    { type: "turn_end", ts: 8, host: hostB },
+  ];
+  assert.equal(
+    structuredStateFromEvents(currentHsrEventEpoch(successorFailure, hostB).events),
+    "auth-needed",
+    "a real B authentication failure after the epoch remains authoritative",
   );
 });
 

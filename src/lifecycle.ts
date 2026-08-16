@@ -145,6 +145,19 @@ class LockedSessionLifecycleTransaction implements SessionLifecycleTransaction {
 }
 
 /**
+ * Construct a generation-CAS transaction when the caller already owns this
+ * Bee's lifecycle lock. Fresh-name launch admission holds that lock across
+ * publication and rollback, so re-entering `withSessionLifecycleTransaction`
+ * would deadlock. Keep this seam explicit: callers must prove/own the lock for
+ * the whole lifetime of the returned transaction.
+ */
+export function sessionLifecycleTransactionForHeldLock(
+  record: SessionRecord,
+): SessionLifecycleTransaction {
+  return new LockedSessionLifecycleTransaction(record);
+}
+
+/**
  * Serialize one lifecycle operation and reject a stale caller before it can
  * touch a runtime. Metadata-only record writes may proceed independently, but
  * every runtime replacement/terminal operation must use this transaction.

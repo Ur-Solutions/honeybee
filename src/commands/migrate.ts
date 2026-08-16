@@ -2,16 +2,17 @@
 // interactive tmux pane and a pane-less HSR runner (resume), and revive dead bees.
 // Extracted from cli.ts (HIVE-15).
 import { accountEmail, activateAccountIntoHome, captureAccountFromHome, findAccount, homeClaudeEmail, listAccounts, type AccountRecord } from "../accounts.js";
+import { mintCellBrokerCapability } from "../cellBrokerCapability.js";
 import { planClaudeRecoveryCredentials } from "../accounts/credentialHealth.js";
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand, shellQuoteIfNeeded, splitShellWords, type AgentSpec, stampBeeIdentityEnv } from "../agents.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
 import { writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
-import { hsrObservations, readEventTail, type HsrObservation } from "../hsr/observe.js";
+import { hsrObservations, readCurrentHsrEventTail } from "../hsr/observe.js";
 import { readPendingHsrTurns } from "../hsr/pendingTurns.js";
 import { connectRpcClient } from "../hsr/rpc.js";
-import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "../hsr/runDir.js";
+import { ensureHsrRunDir, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "../hsr/runDir.js";
 import { hsrSubstrate, stopHsrIncarnationByPid, stopKnownHsrExecution } from "../hsr/substrate.js";
 import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "../lifecycle.js";
 import { LOCAL_NODE_NAME } from "../node.js";
@@ -21,22 +22,38 @@ import { authPromptLossRequestId } from "../requests/keys.js";
 import { closeRequestsForNewIncarnation, openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadLatestSeal, nextRuntimeIncarnationPatch } from "../seal.js";
 import { appendLedger, listSessions, storeRoot, transitionSession, type SessionRecord } from "../store.js";
-import { isArchivedSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, isRunnableSessionRecord, type ProbeEvidence } from "../stateMachine.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
-import { stopRuntimeStrict } from "../substrates/stop.js";
+import { stopRuntimeForReplacement } from "../substrates/stop.js";
 import type { NewSessionResult, Substrate } from "../substrates/types.js";
 import { resumeArgs, sniffYolo } from "../swap.js";
 import { formatShellCommand, hasSession } from "../tmux.js";
 import { identityRecipeForAgent, modelArgsForAgent } from "../drivers.js";
 import { deliverPromptText, resolveSession, safeTmuxTarget, sleep, stringFlag } from "../cli/shared.js";
 import { loginSeatLiveDigest } from "./account.js";
-import { hsrCellPayloadFields, spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "../hsr/runnerHost.js";
-import { appendFile, readFile, rm, stat } from "node:fs/promises";
+import { hsrCellPayloadFields, spawnHsrHost, waitForHsrHost, waitForHsrReadiness, type HsrRunPayload } from "../hsr/runnerHost.js";
+import { readFile, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { RunnerEvent } from "../hsr/types.js";
 import { lastAuthNeededEvent } from "../view/requests.js";
 import { atomicWriteFile } from "../fsx.js";
 import { finalizeManualRuntimeRevive } from "../recovery/manual.js";
+import { randomUUID } from "node:crypto";
+import { mintEphemeralCredential } from "../hsr/remoteCreds.js";
+import {
+  RemoteSpawnNotAdmittedError,
+  RemoteSpawnIndeterminateError,
+  type RemoteHsrSubstrate,
+  type RemoteSpawnResult,
+} from "../substrates/remote-hsr.js";
+import { cleanupLaunchedRemoteHsrIncarnation } from "../launchPublication.js";
+import {
+  beginBeeReplacementOperation,
+  continueBeeReplacementLaunchAdmission,
+  readBeeNameLaunchReservation,
+  withBeeReplacementLaunchAdmission,
+  type BeeNameLaunchReservation,
+} from "../nameAdmission.js";
 
 // Harnesses whose interactive↔headless resume genuinely carries history — the
 // only ones promote/demote accept. claude is EXCLUDED: its interactive-TUI and
@@ -264,8 +281,16 @@ export async function quiesceHsrBee(record: SessionRecord, now: boolean, verb = 
   }
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    const obs = await hsrObservations().catch(() => new Map<string, HsrObservation>());
-    const state = obs.get(record.name)?.state;
+    const observation = (await hsrObservations({
+      bees: [record.name],
+      includeEvents: true,
+    })).get(record.name);
+    if (observation?.unavailable) {
+      throw new Error(
+        `hive ${verb}: cannot prove ${record.name} is quiescent (${observation.unavailable.kind}: ${observation.unavailable.detail}); retry after HSR event observation recovers or use --now to interrupt`,
+      );
+    }
+    const state = observation?.state;
     if (state !== "active") return;
     await sleep(500);
   }
@@ -283,6 +308,19 @@ export async function stopHsrRunner(record: SessionRecord): Promise<void> {
   // before every fallback signal; never act on a recyclable numeric PID.
   const result = await stopKnownHsrExecution(record.name);
   if (!result.ok) throw new Error(result.stderr || `HSR stop unconfirmed for ${record.name}`);
+}
+
+async function persistReplacementStopDoubt(
+  lifecycle: SessionLifecycleTransaction,
+  operation: string,
+  cause: unknown,
+): Promise<void> {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  await lifecycle.commit({
+    status: "kill_failed",
+    lastError: `${operation}: ${message}`,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 
@@ -406,6 +444,8 @@ export async function reviveHsrRunner(
     replayLaunch?: boolean;
     activateCredentials?: boolean;
     deferRequestClosure?: boolean;
+    replacementOperation?: string;
+    replacementReservation?: BeeNameLaunchReservation;
     afterLaunch?: (launch: { kind: "hsr"; hostPid: number }) => Promise<void>;
     spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
     waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
@@ -425,6 +465,8 @@ async function reviveHsrRunnerInTransaction(
     replayLaunch?: boolean;
     activateCredentials?: boolean;
     deferRequestClosure?: boolean;
+    replacementOperation?: string;
+    replacementReservation?: BeeNameLaunchReservation;
     afterLaunch?: (launch: { kind: "hsr"; hostPid: number }) => Promise<void>;
     spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
     waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
@@ -432,6 +474,12 @@ async function reviveHsrRunnerInTransaction(
   } = {},
 ): Promise<SessionRecord> {
   const record = await lifecycle.refresh();
+  if (record.deliveryStopDoubt) {
+    throw new Error(
+      `hive revive: ${record.name} has unresolved delivery ownership ${record.deliveryStopDoubt.deliveryId}; `
+      + `run hive buz reconcile ${record.name} ${record.deliveryStopDoubt.deliveryId} --delivered|--discard first`,
+    );
+  }
   const explicitArchivedRevive = hasArchivedLifecycle(record);
   const adapter = adapterFor(tool);
   const fresh = opts.fresh === true;
@@ -442,74 +490,120 @@ async function reviveHsrRunnerInTransaction(
     activateCredentials: opts.activateCredentials,
   });
   const incarnation = await nextRuntimeIncarnationPatch(record);
-  await lifecycle.refresh();
-  const hostPid = await (opts.spawnHsrHost ?? spawnHsrHost)({
-    bee: record.name,
-    comb: record.combId ?? record.name,
-    ...(record.parentId ? { parent: record.parentId } : {}),
-    kind: tool,
-    cwd: record.cwd,
-    ...(providerSessionId ? { sessionId: providerSessionId } : {}),
-    ...(fresh ? {} : { resume: true }),
-    authKind: "subscription",
-    ...(record.accountId ? { accountId: record.accountId } : {}),
-    ...(record.model ? { model: record.model } : {}),
-    // An execution Cell keeps its OS write boundary and --sandbox-write
-    // grants across revive; dropping them here would relaunch the same bee
-    // uncontained (or, for Layout v2, without its wrapper box/).
-    ...hsrCellPayloadFields(record),
-    spec: { command: spec.command, args: spec.args, env: spec.env },
-  });
-  const admittedMeta = await readHsrMetaStrict(record.name);
-  const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
-  if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
-    await confirmLaunchedHsrStopped(record.name, hostPid, new Error("HSR revive returned without complete process birth admission"), opts.stopHsrIncarnation);
-  }
-  let restored: SessionRecord;
-  try {
-    const controlReady = await (opts.waitForHsrHost ?? waitForHsrHost)(record.name, 5000);
-    if (!controlReady) {
-      console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
-    }
-    await opts.afterLaunch?.({ kind: "hsr", hostPid });
-    const runnerTier = adapter?.tier();
-    // The lifecycle CAS merges into the latest record so daemon metadata
-    // writes survive, while deletion/replacement can never fabricate a
-    // fallback row.
-    const renderedCommand = shellCommand(spec);
-    const revivedAt = new Date().toISOString();
-    restored = await lifecycle.commit({
-      ...incarnation,
-      ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
-      substrate: "hsr",
-      runnerPid: hostPid,
-      runnerFingerprint: runnerFingerprint!,
-      ...(runnerTier ? { runnerTier } : {}),
-      ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
-      // Clear both halves of the provider-thread anchor. Keeping the old path
-      // lets transcript discovery re-adopt the abandoned session id moments
-      // after a successful --fresh launch.
-      ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
-      ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
-      updatedAt: revivedAt,
-      // An explicit archived revive remains archived until the proof-carrying
-      // bee.revived event below atomically flips both lifecycle spellings.
-      ...(explicitArchivedRevive ? {} : { status: "running" as const }),
-    });
-    if (explicitArchivedRevive) {
-      restored = await persistExplicitRevive(
-        restored,
-        revivedAt,
-        { substrate: "hsr", ...(record.node ? { node: record.node } : {}), runnerPid: hostPid },
-        controlReady
-          ? "HSR birth admission and control probe both verified the revived runtime"
-          : "HSR birth admission verified the revived host; control readiness will reconcile asynchronously",
+  const brokerCapability = record.executionRunId
+    ? mintCellBrokerCapability(record.name, incarnation.runtimeGeneration as number)
+    : undefined;
+  const launchAndPublish = async (reservation: BeeNameLaunchReservation) => {
+      await reservation.markLaunchDispatch();
+      const hostPid = await (opts.spawnHsrHost ?? spawnHsrHost)({
+        bee: record.name,
+        comb: record.combId ?? record.name,
+        ...(record.parentId ? { parent: record.parentId } : {}),
+        kind: tool,
+        cwd: record.cwd,
+        ...(providerSessionId ? { sessionId: providerSessionId } : {}),
+        ...(fresh ? {} : { resume: true }),
+        authKind: "subscription",
+        ...(record.accountId ? { accountId: record.accountId } : {}),
+        ...(record.model ? { model: record.model } : {}),
+        // An execution Cell keeps its OS write boundary + grants across revive.
+        ...hsrCellPayloadFields(record),
+        ...(brokerCapability ? { cellBrokerCapability: brokerCapability.token } : {}),
+        spec: { command: spec.command, args: spec.args, env: spec.env },
+      });
+      let runnerFingerprint: SessionRecord["runnerFingerprint"];
+      const ownership = () => ({
+        ...incarnation,
+        substrate: "hsr" as const,
+        runnerPid: hostPid,
+        ...(runnerFingerprint ? { runnerFingerprint } : {}),
+        agentPaneId: undefined,
+        launcherPgid: undefined,
+        launcherFingerprint: undefined,
+        ...(brokerCapability ? { cellBrokerCapabilityHash: brokerCapability.hash } : {}),
+      });
+      const persistLaunchedStopDoubt = (detail: string) =>
+        retainReplacementLaunchStopDoubt(
+          reservation,
+          lifecycle,
+          ownership(),
+          "HSR revive launch cleanup unconfirmed",
+          detail,
+        );
+      let published: SessionRecord;
+      try {
+        // Record the returned host before reading run-dir metadata: a crash or
+        // metadata fault must never erase the only exact pid locator.
+        await reservation.recordHsrLaunch({ hostPid, childAdmission: "pending" });
+        const admittedMeta = await readHsrMetaStrict(record.name);
+        runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+        if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+          throw new Error("HSR revive returned without complete process birth admission");
+        }
+        await reservation.recordHsrLaunch({
+          hostPid,
+          hostFingerprint: runnerFingerprint,
+          childAdmission: admittedMeta.childAdmission,
+        });
+
+        // `hasSession` becomes true as soon as the detached host publishes
+        // queued birth evidence. Wait for runningAt proof by default.
+        const controlReady = await (opts.waitForHsrHost ?? waitForHsrReadiness)(record.name, 5000);
+        if (!controlReady) {
+          console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+        }
+        await opts.afterLaunch?.({ kind: "hsr", hostPid });
+        const runnerTier = adapter?.tier();
+        const renderedCommand = shellCommand(spec);
+        const revivedAt = new Date().toISOString();
+        published = await lifecycle.commit({
+          ...incarnation,
+          ...(opts.replayLaunch ? { lastReviveCommand: renderedCommand } : { command: renderedCommand }),
+          substrate: "hsr",
+          runnerPid: hostPid,
+          runnerFingerprint: runnerFingerprint!,
+          ...(runnerTier ? { runnerTier } : {}),
+          ...(opts.sessionOverride ? { providerSessionId: opts.sessionOverride } : {}),
+          ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
+          ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
+          updatedAt: revivedAt,
+          ...(explicitArchivedRevive ? {} : { status: "running" as const }),
+          lastError: undefined,
+        });
+        if (explicitArchivedRevive) {
+          published = await persistExplicitRevive(
+            published,
+            revivedAt,
+            { substrate: "hsr", ...(record.node ? { node: record.node } : {}), runnerPid: hostPid },
+            controlReady
+              ? "HSR birth admission and control probe both verified the revived runtime"
+              : "HSR birth admission verified the revived host; control readiness will reconcile asynchronously",
+          );
+        }
+      } catch (error) {
+        await confirmLaunchedHsrStopped(
+          record.name,
+          hostPid,
+          error,
+          opts.stopHsrIncarnation,
+          persistLaunchedStopDoubt,
+        );
+        await reservation.clearAfterConfirmedStop();
+        throw error;
+      }
+      // Once the canonical generation carries this exact admitted birth, a
+      // journal-write fault is reconciled on replay; do not tear down a runtime
+      // the SessionRecord already owns.
+      await reservation.promotePublished(published);
+      return published;
+    };
+  const restored = opts.replacementReservation
+    ? await continueBeeReplacementLaunchAdmission(opts.replacementReservation, launchAndPublish)
+    : await withBeeReplacementLaunchAdmission(
+        lifecycle,
+        opts.replacementOperation ?? "revive-hsr",
+        launchAndPublish,
       );
-    }
-  } catch (error) {
-    await confirmLaunchedHsrStopped(record.name, hostPid, error, opts.stopHsrIncarnation);
-    throw error;
-  }
   await writeSpawnOptions(restored);
   if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
   return restored;
@@ -520,11 +614,14 @@ async function confirmLaunchedHsrStopped(
   hostPid: number,
   cause: unknown,
   stop: typeof stopHsrIncarnationByPid = stopHsrIncarnationByPid,
+  onStopUnconfirmed?: (detail: string) => Promise<void>,
 ): Promise<void> {
   const stopped = await stop(bee, hostPid);
   if (stopped.ok) return;
   const original = cause instanceof Error ? cause.message : String(cause);
-  throw new Error(`${original}; exact launched HSR incarnation cleanup failed: ${stopped.stderr || stopped.stdout}`);
+  const detail = stopped.stderr || stopped.stdout || `exit ${stopped.exitCode}`;
+  await onStopUnconfirmed?.(detail);
+  throw new Error(`${original}; exact launched HSR incarnation cleanup failed: ${detail}`);
 }
 
 async function confirmLaunchedTmuxStopped(
@@ -532,10 +629,13 @@ async function confirmLaunchedTmuxStopped(
   target: string,
   launch: NewSessionResult,
   cause: unknown,
+  onStopUnconfirmed?: (detail: string) => Promise<void>,
 ): Promise<void> {
   if (!substrate.killIncarnation) {
     const original = cause instanceof Error ? cause.message : String(cause);
-    throw new Error(`${original}; substrate ${substrate.kind} cannot tear down exact launched incarnation ${launch.paneId}`);
+    const detail = `substrate ${substrate.kind} cannot tear down exact launched incarnation ${launch.paneId}`;
+    await onStopUnconfirmed?.(detail);
+    throw new Error(`${original}; ${detail}`);
   }
   const result = await substrate.killIncarnation(target, launch).catch((error) => ({
     ok: false,
@@ -545,7 +645,47 @@ async function confirmLaunchedTmuxStopped(
   }));
   if (result.ok) return;
   const original = cause instanceof Error ? cause.message : String(cause);
-  throw new Error(`${original}; exact launched tmux incarnation cleanup failed: ${result.stderr || result.stdout || launch.paneId}`);
+  const detail = result.stderr || result.stdout || launch.paneId;
+  await onStopUnconfirmed?.(detail);
+  throw new Error(`${original}; exact launched tmux incarnation cleanup failed: ${detail}`);
+}
+
+/**
+ * Publication/rollback can fail after a replacement process exists. If exact
+ * teardown is not proved, repoint the durable record at that NEW incarnation
+ * before releasing the lifecycle lock; retaining the old locator would make a
+ * later cleanup signal the wrong process while the escaped replacement stays
+ * runnable.
+ */
+async function persistLaunchedReplacementStopDoubt(
+  lifecycle: SessionLifecycleTransaction,
+  ownership: Partial<SessionRecord>,
+  operation: string,
+  detail: string,
+): Promise<void> {
+  await lifecycle.commit({
+    ...ownership,
+    status: "kill_failed",
+    lastError: `${operation}: ${detail}`,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+async function retainReplacementLaunchStopDoubt(
+  reservation: BeeNameLaunchReservation,
+  lifecycle: SessionLifecycleTransaction,
+  ownership: Partial<SessionRecord>,
+  operation: string,
+  detail: string,
+): Promise<void> {
+  // The already-durable launched locator remains a fence even if upgrading its
+  // phase fails. Persist the canonical kill_failed locator independently so a
+  // later exact teardown has two mutually checking sources of ownership.
+  await reservation.retainStopDoubt(detail).catch(() => undefined);
+  // A concurrent generation change may make the canonical CAS fail. The
+  // generation-bound journal is still the authoritative fence; never mask the
+  // original exact-cleanup failure or overwrite the newer canonical row.
+  await persistLaunchedReplacementStopDoubt(lifecycle, ownership, operation, detail).catch(() => undefined);
 }
 
 /**
@@ -562,9 +702,9 @@ async function closeSupersededRequests(record: SessionRecord, incarnation: Parti
 
 /**
  * Resolve every open auth request for the bee by "auth-resume" — the CLI-side
- * locked write that makes `hive auth-resume` daemon-down functional. Called
- * right after the auth_resume marker lands in the events tail; the daemon's
- * reconciler performs the same resolution when it observes the bounded tail.
+ * locked write that makes `hive auth-resume` daemon-down functional. The new
+ * host's durable `host_epoch` is the event-history boundary; this direct
+ * request-store resolution preserves the more specific operator outcome.
  */
 export async function resolveAuthRequestsAfterResume(bee: string): Promise<void> {
   const openAuth = (await readBeeRequests(bee)).filter((request) => request.status === "open" && request.kind === "auth");
@@ -657,7 +797,7 @@ export async function collectAuthRecoveryPrompts(
 ): Promise<AuthPromptRecovery> {
   const staged = await readStagedAuthReplay(record.name);
   if (staged) return staged;
-  const effectiveEvents = events.length > 0 ? events : await readEventTail(record.name);
+  const effectiveEvents = events.length > 0 ? events : await readCurrentHsrEventTail(record.name);
   const authEvent = lastAuthNeededEvent(effectiveEvents);
   const journaled = await readPendingHsrTurns(record.name);
   if (journaled.length > 0) {
@@ -678,9 +818,11 @@ export async function collectAuthRecoveryPrompts(
 export type AuthResumeSource = "human-login" | "valid-disk-credentials" | "valid-vault-credentials" | "auto";
 
 /**
- * Mechanical stop → same-session revive → auth boundary → exact prompt replay.
- * The boundary lands BEFORE replay: if the new child rejects the credentials,
- * its later auth error wins and the daemon sees needs-auth again.
+ * Mechanical stop → same-session revive → exact prompt replay. The successor
+ * host durably appends `host_epoch` before starting its adapter, so predecessor
+ * auth failures are bounded before the new child can emit anything. Do not add
+ * a coordinator-side post-start marker: it would race the detached event writer
+ * and could incorrectly outrank a genuine successor boot auth failure.
  */
 export async function recoverAuthNeededBee(
   record: SessionRecord,
@@ -707,6 +849,32 @@ async function recoverAuthNeededBeeInTransaction(
   },
 ): Promise<{ record: SessionRecord; replayedPrompts: number; promptSource: AuthPromptRecovery["source"] }> {
   const record = await lifecycle.refresh();
+  if (isArchivedSessionLifecycle(record)) {
+    throw new Error(`hive auth-resume: ${record.name} is archived`);
+  }
+  if (!isRunnableSessionRecord(record)) {
+    let replayingOwnAutomaticStop = false;
+    if (record.status === "kill_failed" && options.source === "auto") {
+      const reservation = await readBeeNameLaunchReservation(record.name);
+      const source = reservation?.replacementOf;
+      replayingOwnAutomaticStop = reservation?.phase === "stopping"
+        && reservation.operation === "auth-resume"
+        && source?.createdAt === record.createdAt
+        && source.runtimeGeneration === (record.runtimeGeneration ?? 0)
+        && (source.id === undefined || source.id === record.id)
+        && (source.uuid === undefined || source.uuid === record.uuid);
+    }
+    // A daemon tick is only authorized to resume the runnable auth-needed
+    // generation it observed.  The sole non-runnable exception is replay of
+    // that exact generation's own pre-dispatch auth-resume journal.  An
+    // unrelated kill/retire may have won after the tick snapshot; rejecting
+    // it here keeps credential staging, activation, stop, and launch at zero.
+    if (record.status !== "kill_failed" || (options.source === "auto" && !replayingOwnAutomaticStop)) {
+      throw new Error(
+        `hive auth-resume: ${record.name} is archived or has unresolved stop ownership`,
+      );
+    }
+  }
   if (!record.homePath) throw new Error(`hive auth-resume: ${record.name} has no dedicated home`);
   const promptRecovery = await collectAuthRecoveryPrompts(record, options.events);
   // The ordinary HSR stop intentionally clears pending turns. Stage an
@@ -720,7 +888,11 @@ async function recoverAuthNeededBeeInTransaction(
   if (activateCredentials) {
     await activateAccountIntoHome(account, record.homePath, { onWarn: (message) => console.error(note(message)) });
   }
-  await stopRuntimeForAuthResume(record);
+  const replacement = await beginBeeReplacementOperation(lifecycle, "auth-resume");
+  await stopRuntimeForAuthResume(record, substrateFor(record), (message) =>
+    replacement.noteFailure(`hive auth-resume stop unconfirmed: ${message}`)
+      .catch(() => undefined)
+      .then(() => persistReplacementStopDoubt(lifecycle, "hive auth-resume stop unconfirmed", message)));
   // Credential selection already chose and, when needed, activated the best
   // persisted chain. Skip revive's generic second activation so the decision
   // cannot be changed between the stop and the new child boot.
@@ -728,19 +900,10 @@ async function recoverAuthNeededBeeInTransaction(
     fresh: false,
     skipCredentialActivation: true,
     deferRequestClosure: true,
+    replacementOperation: "auth-resume",
+    replacementReservation: replacement,
+    predecessorStopConfirmed: true,
   });
-  const marker = {
-    type: "auth_resume" as const,
-    ts: Date.now(),
-    source: options.source,
-    ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
-    replayedPrompts: promptRecovery.prompts.length,
-  };
-  if (record.substrate === "hsr") {
-    await appendFile(hsrEventsPath(record.name), `${JSON.stringify(marker)}\n`);
-  } else {
-    await appendFile(hsrEventsPath(record.name), `${JSON.stringify(marker)}\n`).catch(() => undefined);
-  }
   await resolveAuthRequestsAfterResume(record.name).catch(() => undefined);
   // Auth is a successful recovery fact, not merely a superseded request. Close
   // it as auth-resume first; then supersede any unrelated old-generation opens.
@@ -820,6 +983,8 @@ export async function reviveTmuxPane(
   opts: {
     fresh?: boolean;
     substrate?: Substrate;
+    replacementOperation?: string;
+    replacementReservation?: BeeNameLaunchReservation;
     afterLaunch?: (launch: { kind: "tmux"; result: NewSessionResult }) => Promise<void>;
   } = {},
 ): Promise<void> {
@@ -833,6 +998,8 @@ async function reviveTmuxPaneInTransaction(
   opts: {
     fresh?: boolean;
     substrate?: Substrate;
+    replacementOperation?: string;
+    replacementReservation?: BeeNameLaunchReservation;
     afterLaunch?: (launch: { kind: "tmux"; result: NewSessionResult }) => Promise<void>;
   } = {},
 ): Promise<SessionRecord> {
@@ -842,53 +1009,83 @@ async function reviveTmuxPaneInTransaction(
   const incarnation = await nextRuntimeIncarnationPatch(record);
   const tmuxTarget = safeTmuxTarget(record.name);
   const substrate = opts.substrate ?? localSubstrate();
-  await lifecycle.refresh();
-  const launch = await substrate.newSession(tmuxTarget, record.cwd, {
-    command: spec.command,
-    args: spec.args,
-    env: spec.env,
-    tmuxOptions: spec.tmuxOptions,
-  });
-  // The lifecycle CAS preserves concurrent metadata writes; explicit
-  // undefined deletes the HSR fields.
-  let restored: SessionRecord;
-  try {
-    await opts.afterLaunch?.({ kind: "tmux", result: launch });
-    const revivedAt = new Date().toISOString();
-    restored = await lifecycle.commit({
-      ...incarnation,
-      command: shellCommand(spec),
-      tmuxTarget,
-      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
-      combId: tmuxTarget,
-      updatedAt: revivedAt,
-      ...(explicitArchivedRevive ? {} : { status: "running" as const }),
-      substrate: undefined,
-      runnerPid: undefined,
-      runnerFingerprint: undefined,
-      runnerTier: undefined,
-      // A fresh relaunch abandons the old provider session. Its transcript path
-      // is an equally strong anchor, so retaining it would re-adopt the old id.
-      ...(opts.fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
-    });
-    if (explicitArchivedRevive) {
-      restored = await persistExplicitRevive(
-        restored,
-        revivedAt,
-        {
-          substrate: "local-tmux",
+  const launchAndPublish = async (reservation: BeeNameLaunchReservation) => {
+      await reservation.markLaunchDispatch();
+      const launch = await substrate.newSession(tmuxTarget, record.cwd, {
+        command: spec.command,
+        args: spec.args,
+        env: spec.env,
+        tmuxOptions: spec.tmuxOptions,
+      });
+      const ownership = {
+        ...incarnation,
+        substrate: undefined,
+        runnerPid: undefined,
+        runnerFingerprint: undefined,
+        runnerTier: undefined,
+        tmuxTarget,
+        ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+        ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+        ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
+      };
+      let published: SessionRecord;
+      try {
+        await reservation.recordTmuxLaunch({
+          substrate: substrate.kind === "ssh-tmux" ? "ssh-tmux" : "local-tmux",
+          target: tmuxTarget,
+          ...(substrate.kind === "ssh-tmux" ? { node: substrate.node } : {}),
+          launch,
+        });
+        await opts.afterLaunch?.({ kind: "tmux", result: launch });
+        const revivedAt = new Date().toISOString();
+        published = await lifecycle.commit({
+          ...ownership,
+          command: shellCommand(spec),
+          combId: tmuxTarget,
+          updatedAt: revivedAt,
+          ...(explicitArchivedRevive ? {} : { status: "running" as const }),
+          lastError: undefined,
+          ...(opts.fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
+        });
+        if (explicitArchivedRevive) {
+          published = await persistExplicitRevive(
+            published,
+            revivedAt,
+            {
+              substrate: "local-tmux",
+              tmuxTarget,
+              ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+            },
+            "tmux new-session admission verified the revived runtime",
+          );
+        }
+      } catch (error) {
+        await confirmLaunchedTmuxStopped(
+          substrate,
           tmuxTarget,
-          ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-        },
-        "tmux new-session admission verified the revived runtime",
+          launch,
+          error,
+          (detail) => retainReplacementLaunchStopDoubt(
+            reservation,
+            lifecycle,
+            ownership,
+            "tmux revive launch cleanup unconfirmed",
+            detail,
+          ),
+        );
+        await reservation.clearAfterConfirmedStop();
+        throw error;
+      }
+      await reservation.promotePublished(published);
+      return published;
+    };
+  const restored = opts.replacementReservation
+    ? await continueBeeReplacementLaunchAdmission(opts.replacementReservation, launchAndPublish)
+    : await withBeeReplacementLaunchAdmission(
+        lifecycle,
+        opts.replacementOperation ?? "revive-tmux",
+        launchAndPublish,
       );
-    }
-  } catch (error) {
-    await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, error);
-    throw error;
-  }
   await writeSpawnOptions(restored);
   await closeSupersededRequests(record, incarnation);
   return restored;
@@ -910,6 +1107,9 @@ export async function cmdPromote(parsed: Parsed): Promise<void> {
 
 async function promoteInTransaction(lifecycle: SessionLifecycleTransaction, parsed: Parsed): Promise<void> {
   let record = await lifecycle.refresh();
+  if (isArchivedSessionLifecycle(record)) {
+    throw new Error(`hive promote: ${record.name} is archived; revive it explicitly before migration`);
+  }
   if (record.substrate !== "hsr") {
     throw new Error(`hive promote: ${record.name} is already on tmux (not an HSR bee)`);
   }
@@ -929,69 +1129,110 @@ async function promoteInTransaction(lifecycle: SessionLifecycleTransaction, pars
   const tool = assertResumable(record, "promote");
   const now = truthy(flag(parsed, "now"));
 
-  // 1. Quiesce the running turn (wait for turn end, or interrupt with --now).
-  await quiesceHsrBee(record, now);
-
-  // 2. Stop the HSR runner host — but keep the record.
-  await stopHsrRunner(record);
-
-  // 3. Build the interactive resume spec: claude `--resume <id>`, codex
-  //    `resume <id>`.
+  // Resolve every launch precondition before fencing/stopping the predecessor.
   const spec = await buildResumeSpec(record, tool, resumeArgs(tool, record.providerSessionId));
   const incarnation = await nextRuntimeIncarnationPatch(record);
-
-  // 4. Launch the interactive tmux session (resuming the same provider session).
   const tmuxTarget = safeTmuxTarget(record.name);
   const substrate = localSubstrate();
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`hive promote: a tmux session already exists: ${tmuxTarget}`);
-  await lifecycle.refresh();
-  const launch = await substrate.newSession(tmuxTarget, record.cwd, {
-    command: spec.command,
-    args: spec.args,
-    env: spec.env,
-    tmuxOptions: spec.tmuxOptions,
-  });
-
-  // 4b. Verify the interactive agent actually stayed up. If it rejected the
-  //     resume and exited immediately (the tmux window collapsed), we would
-  //     otherwise flip the record and report success on a DEAD bee whose runner
-  //     is already gone. Instead: tear down the dead remnant and re-fork the
-  //     HSR runner so the bee is restored exactly where it was.
-  if (!(await tmuxSessionSurvives(substrate, tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
-    await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, new Error("promote resume exited"));
-    await reviveHsrRunnerInTransaction(lifecycle, tool);
-    throw new Error(
-      `hive promote: ${record.name} exited immediately after the ${record.agent} resume — its provider session is not interactively resumable; left running on HSR`,
-    );
+  const command = shellCommand(spec);
+  // A passive wait has no runtime side effect, so do it before creating the
+  // durable stop fence. `--now` sends an interrupt and therefore must be fenced
+  // first just like the subsequent teardown.
+  let replacement: BeeNameLaunchReservation;
+  if (now) {
+    replacement = await beginBeeReplacementOperation(lifecycle, "promote");
+    try {
+      await quiesceHsrBee(record, true);
+    } catch (error) {
+      await replacement.noteFailure(`hive promote quiesce failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+      throw error;
+    }
+  } else {
+    await quiesceHsrBee(record, false);
+    replacement = await beginBeeReplacementOperation(lifecycle, "promote");
   }
 
-  // 5. Flip the record to local-tmux: delete substrate/runnerPid/runnerTier
-  //    (explicit undefined = delete), set the pane fields; KEEP
-  //    uuid/providerSessionId/id/lineage/account. Field-merge under the lock
-  //    with a generation CAS so daemon metadata writes survive and a deleted
-  //    or replaced record cannot be resurrected.
-  const command = shellCommand(spec);
-  let promoted: SessionRecord;
+  // 2. Stop the HSR runner host — but keep the record.
   try {
-    promoted = await lifecycle.commit({
+    await stopHsrRunner(record);
+  } catch (error) {
+    await replacement.noteFailure(`hive promote stop unconfirmed: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+    await persistReplacementStopDoubt(lifecycle, "hive promote stop unconfirmed", error);
+    throw error;
+  }
+
+  // 3. Launch the interactive tmux session using the same durable attempt that
+  // fenced work before predecessor teardown.
+  const promoted = await continueBeeReplacementLaunchAdmission(replacement, async (reservation) => {
+    await reservation.markLaunchDispatch();
+    const launch = await substrate.newSession(tmuxTarget, record.cwd, {
+      command: spec.command,
+      args: spec.args,
+      env: spec.env,
+      tmuxOptions: spec.tmuxOptions,
+    });
+    const ownership = {
       ...incarnation,
-      command,
-      tmuxTarget,
-      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
-      combId: tmuxTarget,
-      updatedAt: new Date().toISOString(),
-      status: "running",
       substrate: undefined,
       runnerPid: undefined,
       runnerFingerprint: undefined,
       runnerTier: undefined,
-    });
-  } catch (error) {
-    await confirmLaunchedTmuxStopped(substrate, tmuxTarget, launch, error);
-    throw error;
-  }
+      tmuxTarget,
+      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
+    };
+    const cleanup = async (cause: unknown): Promise<void> => {
+      await confirmLaunchedTmuxStopped(
+        substrate,
+        tmuxTarget,
+        launch,
+        cause,
+        (detail) => retainReplacementLaunchStopDoubt(
+          reservation,
+          lifecycle,
+          ownership,
+          "promote launch cleanup unconfirmed",
+          detail,
+        ),
+      );
+      await reservation.clearAfterConfirmedStop();
+    };
+    try {
+      await reservation.recordTmuxLaunch({ substrate: "local-tmux", target: tmuxTarget, launch });
+    } catch (error) {
+      await cleanup(error);
+      throw error;
+    }
+
+    // A rejected interactive resume is cleaned exactly before the separately
+    // journaled HSR rollback launch begins.
+    if (!(await tmuxSessionSurvives(substrate, tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
+      await cleanup(new Error("promote resume exited"));
+      await reviveHsrRunnerInTransaction(lifecycle, tool, { replacementOperation: "promote-rollback" });
+      throw new Error(
+        `hive promote: ${record.name} exited immediately after the ${record.agent} resume — its provider session is not interactively resumable; left running on HSR`,
+      );
+    }
+
+    let published: SessionRecord;
+    try {
+      published = await lifecycle.commit({
+        ...ownership,
+        command,
+        combId: tmuxTarget,
+        updatedAt: new Date().toISOString(),
+        status: "running",
+        lastError: undefined,
+      });
+    } catch (error) {
+      await cleanup(error);
+      throw error;
+    }
+    await reservation.promotePublished(published);
+    return published;
+  });
   await writeSpawnOptions(promoted);
   await closeSupersededRequests(record, incarnation);
   await appendLedger({ type: "session.promote", session: record.name, from: "hsr", to: "local-tmux", providerSessionId: record.providerSessionId });
@@ -1019,14 +1260,28 @@ export async function cmdDemote(parsed: Parsed): Promise<void> {
 
 async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parsed: Parsed): Promise<void> {
   const record = await lifecycle.refresh();
+  if (isArchivedSessionLifecycle(record)) {
+    throw new Error(`hive demote: ${record.name} is archived; revive it explicitly before migration`);
+  }
   if (record.substrate === "hsr") {
     throw new Error(`hive demote: ${record.name} is already on HSR (not a tmux bee)`);
+  }
+  if (record.node && record.node !== LOCAL_NODE_NAME) {
+    throw new Error(`hive demote: ${record.name} is on remote node ${record.node}; demote only supports local tmux bees`);
   }
   const tool = assertResumable(record, "demote");
   const adapter = adapterFor(tool);
   if (!adapter) throw new Error(`hive demote: no HSR adapter for ${record.agent}`);
   const now = truthy(flag(parsed, "now"));
   const tmuxSubstrate = localSubstrate();
+  const spec = await buildResumeSpec(record, tool, []);
+  const incarnation = await nextRuntimeIncarnationPatch(record);
+  const brokerCapability = record.executionRunId
+    ? mintCellBrokerCapability(record.name, incarnation.runtimeGeneration as number)
+    : undefined;
+  const runnerTier = adapter.tier();
+  const command = shellCommand(spec);
+  const replacement = await beginBeeReplacementOperation(lifecycle, "demote");
 
   // 1. Quiesce. A tmux bee's mid-turn state is heuristic, so absent --now we
   //    proceed best-effort; --now sends Ctrl-C to the agent pane first.
@@ -1038,83 +1293,107 @@ async function demoteInTransaction(lifecycle: SessionLifecycleTransaction, parse
   }
 
   // 2. Kill the tmux session/pane — but keep the record.
-  await stopRuntimeStrict(tmuxSubstrate, record.tmuxTarget, {
-    launcherPgid: record.launcherPgid,
-    launcherFingerprint: record.launcherFingerprint,
+  await stopRuntimeForReplacement(record, tmuxSubstrate, record.tmuxTarget, {
     context: `hive demote: could not stop ${record.name}`,
+    onStopUnconfirmed: async (message) => {
+      await replacement.noteFailure(`hive demote stop unconfirmed: ${message}`).catch(() => undefined);
+      await persistReplacementStopDoubt(lifecycle, "hive demote stop unconfirmed", message);
+    },
   });
 
-  // 3. Build the headless spec (the adapter appends the resume + stream flags)
-  //    and fork the runner host with resume:true against the same session id.
-  const spec = await buildResumeSpec(record, tool, []);
-  const incarnation = await nextRuntimeIncarnationPatch(record);
-  const runnerTier = adapter.tier();
-  await lifecycle.refresh();
-  const hostPid = await spawnHsrHost({
-    bee: record.name,
-    comb: record.combId ?? record.name,
-    ...(record.parentId ? { parent: record.parentId } : {}),
-    kind: tool,
-    cwd: record.cwd,
-    sessionId: record.providerSessionId,
-    resume: true,
-    authKind: "subscription",
-    ...(record.accountId ? { accountId: record.accountId } : {}),
-    ...(record.model ? { model: record.model } : {}),
-    ...hsrCellPayloadFields(record),
-    spec: { command: spec.command, args: spec.args, env: spec.env },
-  });
-  const admittedMeta = await readHsrMetaStrict(record.name);
-  const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
-  if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
-    await confirmLaunchedHsrStopped(record.name, hostPid, new Error("HSR demote returned without complete process birth admission"));
-  }
-
-  // 4. Wait briefly for the host to report live (as spawnBee's HSR path does).
-  if (!(await waitForHsrHost(record.name, 5000))) {
-    console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
-  }
-
-  // 4b. Verify the headless child actually stayed up. If the resume was rejected
-  //     (e.g. claude cannot headlessly resume an interactive TUI session — the
-  //     stores are disjoint) the child exits immediately; flipping now would
-  //     report a dead bee whose tmux pane is already gone. Roll back: stop the
-  //     dead runner and re-launch the interactive pane where the bee started.
-  if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
-    await confirmLaunchedHsrStopped(record.name, hostPid, new Error("demote resume exited"));
-    await reviveTmuxPaneInTransaction(lifecycle, tool);
-    throw new Error(
-      `hive demote: ${record.name} exited immediately after the ${record.agent} headless resume — its provider session is not headlessly resumable; left running on tmux`,
-    );
-  }
-
-  // 5. Flip the record to HSR: set substrate/runnerPid/runnerTier, make
-  //    tmuxTarget the logical id, delete the pane fields (explicit undefined
-  //    = delete); keep the rest. Commit with a generation CAS so daemon
-  //    metadata writes survive and a deleted/replaced row is never revived.
-  const command = shellCommand(spec);
-  let demoted: SessionRecord;
-  try {
-    demoted = await lifecycle.commit({
+  // 3. Fork the runner host with the already-fenced attempt.
+  const demoted = await continueBeeReplacementLaunchAdmission(replacement, async (reservation) => {
+    await reservation.markLaunchDispatch();
+    const hostPid = await spawnHsrHost({
+      bee: record.name,
+      comb: record.combId ?? record.name,
+      ...(record.parentId ? { parent: record.parentId } : {}),
+      kind: tool,
+      cwd: record.cwd,
+      sessionId: record.providerSessionId,
+      resume: true,
+      authKind: "subscription",
+      ...(record.accountId ? { accountId: record.accountId } : {}),
+      ...(record.model ? { model: record.model } : {}),
+      ...hsrCellPayloadFields(record),
+      ...(brokerCapability ? { cellBrokerCapability: brokerCapability.token } : {}),
+      spec: { command: spec.command, args: spec.args, env: spec.env },
+    });
+    let runnerFingerprint: SessionRecord["runnerFingerprint"];
+    const ownership = () => ({
       ...incarnation,
       command,
-      substrate: "hsr",
+      substrate: "hsr" as const,
       runnerPid: hostPid,
-      runnerFingerprint: runnerFingerprint!,
+      ...(runnerFingerprint ? { runnerFingerprint } : {}),
       ...(runnerTier ? { runnerTier } : {}),
       ...(spec.homePath && !record.homePath ? { homePath: spec.homePath } : {}),
       tmuxTarget: record.name,
       combId: record.name,
-      updatedAt: new Date().toISOString(),
-      status: "running",
       agentPaneId: undefined,
       launcherPgid: undefined,
       launcherFingerprint: undefined,
+      ...(brokerCapability ? { cellBrokerCapabilityHash: brokerCapability.hash } : {}),
     });
-  } catch (error) {
-    await confirmLaunchedHsrStopped(record.name, hostPid, error);
-    throw error;
-  }
+    const cleanup = async (cause: unknown): Promise<void> => {
+      await confirmLaunchedHsrStopped(
+        record.name,
+        hostPid,
+        cause,
+        stopHsrIncarnationByPid,
+        (detail) => retainReplacementLaunchStopDoubt(
+          reservation,
+          lifecycle,
+          ownership(),
+          "demote launch cleanup unconfirmed",
+          detail,
+        ),
+      );
+      await reservation.clearAfterConfirmedStop();
+    };
+    try {
+      await reservation.recordHsrLaunch({ hostPid, childAdmission: "pending" });
+      const admittedMeta = await readHsrMetaStrict(record.name);
+      runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+      if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+        throw new Error("HSR demote returned without complete process birth admission");
+      }
+      await reservation.recordHsrLaunch({
+        hostPid,
+        hostFingerprint: runnerFingerprint,
+        childAdmission: admittedMeta.childAdmission,
+      });
+    } catch (error) {
+      await cleanup(error);
+      throw error;
+    }
+
+    if (!(await waitForHsrReadiness(record.name, 5000))) {
+      console.error(note(`hsr host for ${record.name} did not report live within 5s; the daemon will reconcile`));
+    }
+    if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
+      await cleanup(new Error("demote resume exited"));
+      await reviveTmuxPaneInTransaction(lifecycle, tool, { replacementOperation: "demote-rollback" });
+      throw new Error(
+        `hive demote: ${record.name} exited immediately after the ${record.agent} headless resume — its provider session is not headlessly resumable; left running on tmux`,
+      );
+    }
+
+    let published: SessionRecord;
+    try {
+      published = await lifecycle.commit({
+        ...ownership(),
+        updatedAt: new Date().toISOString(),
+        status: "running",
+        lastError: undefined,
+      });
+    } catch (error) {
+      await cleanup(error);
+      throw error;
+    }
+    await reservation.promotePublished(published);
+    return published;
+  });
   await writeSpawnOptions(demoted);
   await closeSupersededRequests(record, incarnation);
   await appendLedger({ type: "session.demote", session: record.name, from: "local-tmux", to: "hsr", providerSessionId: record.providerSessionId });
@@ -1152,7 +1431,8 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
     const records = await listSessions();
     // Retired (done) bees are settled on purpose — bulk revive must never
     // resurrect them. Reviving a retired bee stays possible one at a time.
-    const local = records.filter((r) => (!r.node || r.node === LOCAL_NODE_NAME) && r.status !== "done");
+    const local = records.filter((record) =>
+      (!record.node || record.node === LOCAL_NODE_NAME) && !isArchivedSessionLifecycle(record));
     let revived = 0;
     let alive = 0;
     const skipped: string[] = [];
@@ -1169,7 +1449,7 @@ export async function cmdRevive(parsed: Parsed): Promise<void> {
         // failed (tmux server crash, external kill, harness exit). A bee with a
         // seal finished its work before exiting — deriveState reports it
         // "done" (sealed), not "crashed" — so --crashed must not resurrect it.
-        if (bulkCrashed && record.status !== "running") {
+        if (bulkCrashed && !isRunnableSessionRecord(record)) {
           continue;
         }
         if (bulkCrashed && (await loadLatestSeal(record.name))) {
@@ -1318,14 +1598,14 @@ async function readLoginMarkerDigest(markerPath: string): Promise<string | null>
 export async function stopRuntimeForAuthResume(
   record: SessionRecord,
   substrate: Substrate = substrateFor(record),
+  onStopUnconfirmed?: (message: string) => Promise<void>,
 ): Promise<void> {
   const target = record.substrate === "hsr" ? record.name : record.tmuxTarget;
-  await stopRuntimeStrict(substrate, target, {
-    launcherPgid: record.launcherPgid,
-    launcherFingerprint: record.launcherFingerprint,
+  await stopRuntimeForReplacement(record, substrate, target, {
     pollAttempts: 50,
     pollIntervalMs: 100,
     context: `hive auth-resume: could not stop ${record.name}`,
+    ...(onStopUnconfirmed ? { onStopUnconfirmed } : {}),
   });
 }
 
@@ -1359,6 +1639,12 @@ async function diagnoseSubstrateCrash(): Promise<string | undefined> {
  */
 async function waitReadyOrDead(record: SessionRecord, timeoutMs: number): Promise<void> {
   const substrate = substrateFor(record);
+  if (substrate.kind === "remote-hsr") {
+    // The CLI rejects remote set-model before entering the transaction. Keep
+    // the invariant here too so no internal/stale caller can stop a remote HSR
+    // and then fall through to the tmux-only newSession verb.
+    throw new Error(`hive set-model: ${record.name} is on remote node ${record.node}; set-model only supports local bees`);
+  }
   let settled = false;
   const watcher = (async (): Promise<never> => {
     const deadline = Date.now() + timeoutMs;
@@ -1433,11 +1719,15 @@ export async function reviveRecord(
     sessionOverride?: string;
     skipCredentialActivation?: boolean;
     deferRequestClosure?: boolean;
+    replacementOperation?: string;
+    replacementReservation?: BeeNameLaunchReservation;
+    predecessorStopConfirmed?: boolean;
     substrate?: Substrate;
     afterLaunch?: (
       launch:
         | { kind: "tmux"; result: NewSessionResult }
-        | { kind: "hsr"; hostPid: number },
+        | { kind: "hsr"; hostPid: number }
+        | { kind: "remote-hsr"; result: RemoteSpawnResult },
     ) => Promise<void>;
     spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
     waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
@@ -1454,11 +1744,15 @@ export async function reviveRecordInTransaction(
     sessionOverride?: string;
     skipCredentialActivation?: boolean;
     deferRequestClosure?: boolean;
+    replacementOperation?: string;
+    replacementReservation?: BeeNameLaunchReservation;
+    predecessorStopConfirmed?: boolean;
     substrate?: Substrate;
     afterLaunch?: (
       launch:
         | { kind: "tmux"; result: NewSessionResult }
-        | { kind: "hsr"; hostPid: number },
+        | { kind: "hsr"; hostPid: number }
+        | { kind: "remote-hsr"; result: RemoteSpawnResult },
     ) => Promise<void>;
     spawnHsrHost?: (payload: HsrRunPayload) => Promise<number>;
     waitForHsrHost?: (bee: string, timeoutMs: number) => Promise<boolean>;
@@ -1466,6 +1760,12 @@ export async function reviveRecordInTransaction(
   },
 ): Promise<SessionRecord> {
   const record = await lifecycle.refresh();
+  if (record.deliveryStopDoubt) {
+    throw new Error(
+      `hive revive: ${record.name} has unresolved delivery ownership ${record.deliveryStopDoubt.deliveryId}; `
+      + `run hive buz reconcile ${record.name} ${record.deliveryStopDoubt.deliveryId} --delivered|--discard first`,
+    );
+  }
   const explicitArchivedRevive = hasArchivedLifecycle(record);
   const tool = canonicalAgentKind(record.agent).toLowerCase();
   const fresh = opts.fresh;
@@ -1480,19 +1780,33 @@ export async function reviveRecordInTransaction(
     );
   }
   if (record.substrate === "hsr") {
-    if (await hsrSubstrate().hasSession(record.name)) {
+    if (await hsrSubstrate().hasSession(record.name) && record.status !== "kill_failed") {
       throw new Error(`hive revive: ${record.name} is already running (${record.name})`);
     }
+    const replacement = opts.replacementReservation
+      ?? await beginBeeReplacementOperation(lifecycle, opts.replacementOperation ?? "revive");
     // A dead host is not proof that its detached harness group is gone. Reuse
     // the strict incarnation teardown before replacing meta.json; otherwise a
     // revive could erase the only locator for a crashed host's live child.
-    await stopHsrRunner(record);
+    if (!opts.predecessorStopConfirmed) {
+      try {
+        await stopHsrRunner(record);
+      } catch (error) {
+        await replacement.noteFailure(
+          `hive revive stop unconfirmed: ${error instanceof Error ? error.message : String(error)}`,
+        ).catch(() => undefined);
+        await persistReplacementStopDoubt(lifecycle, "hive revive stop unconfirmed", error);
+        throw error;
+      }
+    }
     const updated = await reviveHsrRunnerInTransaction(lifecycle, tool, {
       fresh,
       sessionOverride,
       replayLaunch: true,
       activateCredentials: opts.skipCredentialActivation !== true,
       deferRequestClosure: opts.deferRequestClosure,
+      replacementOperation: opts.replacementOperation ?? "revive",
+      replacementReservation: replacement,
       afterLaunch: opts.afterLaunch,
       spawnHsrHost: opts.spawnHsrHost,
       waitForHsrHost: opts.waitForHsrHost,
@@ -1507,7 +1821,8 @@ export async function reviveRecordInTransaction(
     return updated;
   }
   const substrate = opts.substrate ?? substrateFor(record);
-  if (await substrate.hasSession(record.tmuxTarget)) {
+  const targetLive = await substrate.hasSession(record.tmuxTarget);
+  if (targetLive && record.status !== "kill_failed") {
     throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
   }
 
@@ -1561,62 +1876,245 @@ export async function reviveRecordInTransaction(
     }
   }
 
-  await lifecycle.refresh();
-  const incarnation = await nextRuntimeIncarnationPatch(record);
-  const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
-    command: spec.command,
-    args: spec.args,
-    env: spec.env,
-    tmuxOptions: spec.tmuxOptions,
-  });
+  const replacement = opts.replacementReservation
+    ?? await beginBeeReplacementOperation(lifecycle, opts.replacementOperation ?? "revive");
 
-  let updated: SessionRecord;
-  try {
-    await opts.afterLaunch?.({ kind: "tmux", result: launch });
-    const revivedAt = new Date().toISOString();
-    updated = await lifecycle.commit({
-      ...incarnation,
-      ...(explicitArchivedRevive ? {} : { status: "running" as const }),
-      lastReviveCommand: shellCommand(spec),
-      combId: record.combId ?? record.tmuxTarget,
-      ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-      ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
-      ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
-      ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
-      // Self-heal a drifted accountId: the home's true owner is authoritative,
-      // so a record that pointed at the wrong account is corrected on revive.
-      ...(ownerId && ownerId !== record.accountId ? { accountId: ownerId } : {}),
-      // A fresh revive abandons the old provider session: keeping its id would
-      // make the NEXT revive resume a session that no longer matches this bee
-      // (or never existed), dying with "No conversation found". Explicit
-      // undefined deletes the fields. The old transcript path must go too or
-      // discovery will immediately restore the abandoned provider id.
-      ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
-      updatedAt: revivedAt,
+  if (!opts.predecessorStopConfirmed) {
+    // Explicit revive grants permission for future work only after the prior
+    // runtime's ownership is positively resolved. A missing tmux target is
+    // insufficient: an escaped launcher group is exactly why kill_failed was
+    // persisted. Remote authority enforces the equivalent token proof.
+    await stopRuntimeForReplacement(record, substrate, record.tmuxTarget, {
+      context: `hive revive: could not resolve prior stop for ${record.name}`,
+      onStopUnconfirmed: async (message) => {
+        await replacement.noteFailure(`hive revive stop unconfirmed: ${message}`).catch(() => undefined);
+        await persistReplacementStopDoubt(lifecycle, "hive revive stop unconfirmed", message);
+      },
     });
-    if (explicitArchivedRevive) {
-      updated = await persistExplicitRevive(
-        updated,
-        revivedAt,
-        {
-          substrate: "local-tmux",
-          tmuxTarget: record.tmuxTarget,
-          ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
-        },
-        "tmux new-session admission verified the revived runtime",
-      );
-    }
-  } catch (error) {
-    await confirmLaunchedTmuxStopped(substrate, record.tmuxTarget, launch, error);
-    throw error;
   }
+
+  const incarnation = await nextRuntimeIncarnationPatch(record);
+  if (substrate.kind === "remote-hsr") {
+    const remote = substrate as RemoteHsrSubstrate;
+    const remoteLaunchId = randomUUID();
+    const account = record.accountId ? await findAccount(record.accountId, tool) : undefined;
+    const ephemeral = account ? await mintEphemeralCredential(account, tool) : undefined;
+    const delivered = ephemeral
+      ? {
+          ...(ephemeral.files.length > 0 ? { files: ephemeral.files } : {}),
+          ...(ephemeral.env ? { env: ephemeral.env } : {}),
+        }
+      : undefined;
+    const updated = await continueBeeReplacementLaunchAdmission(
+      replacement,
+      async (reservation) => {
+        await reservation.markRemoteLaunchDispatch({
+          node: record.node!,
+          remoteLaunchId,
+        });
+        let spawnResult: RemoteSpawnResult | undefined;
+        const persistRemoteStopDoubt = async (
+          locator: { launchId: string; incarnation?: string },
+          detail: string,
+        ): Promise<void> => {
+          await reservation.retainRemoteStopDoubt({
+            node: record.node!,
+            remoteLaunchId: locator.launchId,
+            ...(locator.incarnation ? { remoteIncarnation: locator.incarnation } : {}),
+          }, detail).catch(() => undefined);
+          await lifecycle.commit({
+            ...incarnation,
+            node: record.node,
+            remoteLaunchId: locator.launchId,
+            ...(locator.incarnation ? { remoteIncarnation: locator.incarnation } : {}),
+            cwd: spawnResult?.cwd ?? record.cwd,
+            status: "kill_failed",
+            lastError: `remote HSR revive launch cleanup unconfirmed: ${detail}`,
+            updatedAt: new Date().toISOString(),
+          }).catch(() => undefined);
+        };
+        const cleanup = async (cause: unknown, locator: { launchId: string; incarnation?: string }): Promise<never> => {
+          const proof = await cleanupLaunchedRemoteHsrIncarnation(remote, record.name, locator);
+          if (proof.stopped) {
+            await reservation.clearAfterConfirmedStop();
+          } else {
+            await persistRemoteStopDoubt(locator, proof.detail);
+          }
+          const original = cause instanceof Error ? cause.message : String(cause);
+          throw new Error(
+            `${original}; exact remote replacement cleanup ${proof.stopped ? "confirmed" : `unconfirmed: ${proof.detail}`}`,
+            { cause },
+          );
+        };
+        try {
+          spawnResult = await remote.spawnRemote({
+            bee: record.name,
+            launchId: remoteLaunchId,
+            ...(record.remoteLaunchId ? { previousLaunchId: record.remoteLaunchId } : {}),
+            kind: spec.kind,
+            cwd: record.cwd,
+            comb: record.combId ?? record.name,
+            ...(record.parentId ? { parent: record.parentId } : {}),
+            ...(providerSessionId ? { sessionId: providerSessionId } : {}),
+            ...(fresh ? {} : { resume: true }),
+            authKind: "subscription",
+            ...(record.model ? { model: record.model } : {}),
+            ...(delivered ? { creds: delivered } : {}),
+            spec: { command: spec.command, args: spec.args, env: spec.env },
+          });
+          await reservation.recordRemoteLaunch({
+            node: record.node!,
+            remoteLaunchId,
+            remoteIncarnation: spawnResult.incarnation,
+          });
+          await opts.afterLaunch?.({ kind: "remote-hsr", result: spawnResult });
+        } catch (error) {
+          if (error instanceof RemoteSpawnNotAdmittedError) {
+            await reservation.clearAfterConfirmedStop();
+            throw error;
+          }
+          const incarnationToken = spawnResult?.incarnation
+            ?? (error instanceof RemoteSpawnIndeterminateError ? error.incarnation : undefined);
+          return cleanup(error, {
+            launchId: remoteLaunchId,
+            ...(incarnationToken ? { incarnation: incarnationToken } : {}),
+          });
+        }
+
+        let published: SessionRecord;
+        try {
+          const revivedAt = new Date().toISOString();
+          published = await lifecycle.commit({
+            ...incarnation,
+            ...(explicitArchivedRevive ? {} : { status: "running" as const }),
+            lastError: undefined,
+            lastReviveCommand: shellCommand(spec),
+            cwd: spawnResult.cwd,
+            node: record.node,
+            remoteLaunchId: spawnResult.launchId,
+            remoteIncarnation: spawnResult.incarnation,
+            ...(spawnResult.tier ? { runnerTier: spawnResult.tier } : {}),
+            ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
+            ...(ephemeral?.expiresAt ? { remoteTokenExpiresAt: ephemeral.expiresAt } : {}),
+            ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
+            updatedAt: revivedAt,
+          });
+          if (explicitArchivedRevive) {
+            published = await persistExplicitRevive(
+              published,
+              revivedAt,
+              {
+                substrate: "remote-hsr",
+                node: record.node,
+                remoteLaunchId: spawnResult.launchId,
+                remoteIncarnation: spawnResult.incarnation,
+              },
+              "remote authority admitted the revived launch generation",
+            );
+          }
+        } catch (error) {
+          return cleanup(error, {
+            launchId: spawnResult.launchId,
+            incarnation: spawnResult.incarnation,
+          });
+        }
+        await reservation.promoteExternallyPublished(published);
+        return published;
+      },
+    );
+    await writeSpawnOptions(updated);
+    if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
+    await appendLedger({
+      type: "bee.revive",
+      session: record.name,
+      providerSessionId: providerSessionId ?? null,
+      fresh,
+      node: record.node,
+      remoteLaunchId: updated.remoteLaunchId,
+    });
+    return updated;
+  }
+  const updated = await continueBeeReplacementLaunchAdmission(
+    replacement,
+    async (reservation) => {
+      await reservation.markLaunchDispatch();
+      const launch = await substrate.newSession(record.tmuxTarget, record.cwd, {
+        command: spec.command,
+        args: spec.args,
+        env: spec.env,
+        tmuxOptions: spec.tmuxOptions,
+      });
+      const ownership = {
+        ...incarnation,
+        substrate: undefined,
+        runnerPid: undefined,
+        runnerFingerprint: undefined,
+        runnerTier: undefined,
+        ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+        ...(launch.launcherPgid ? { launcherPgid: launch.launcherPgid } : {}),
+        ...(launch.launcherFingerprint ? { launcherFingerprint: launch.launcherFingerprint } : {}),
+      };
+      let published: SessionRecord;
+      try {
+        await reservation.recordTmuxLaunch({
+          substrate: substrate.kind === "ssh-tmux" ? "ssh-tmux" : "local-tmux",
+          target: record.tmuxTarget,
+          ...(substrate.kind === "ssh-tmux" ? { node: substrate.node } : {}),
+          launch,
+        });
+        await opts.afterLaunch?.({ kind: "tmux", result: launch });
+        const revivedAt = new Date().toISOString();
+        published = await lifecycle.commit({
+          ...ownership,
+          ...(explicitArchivedRevive ? {} : { status: "running" as const }),
+          lastError: undefined,
+          lastReviveCommand: shellCommand(spec),
+          combId: record.combId ?? record.tmuxTarget,
+          ...(sessionOverride ? { providerSessionId: sessionOverride } : {}),
+          ...(ownerId && ownerId !== record.accountId ? { accountId: ownerId } : {}),
+          ...(fresh ? { providerSessionId: undefined, transcriptPath: undefined } : {}),
+          updatedAt: revivedAt,
+        });
+        if (explicitArchivedRevive) {
+          published = await persistExplicitRevive(
+            published,
+            revivedAt,
+            {
+              substrate: "local-tmux",
+              tmuxTarget: record.tmuxTarget,
+              ...(launch.paneId ? { agentPaneId: launch.paneId } : {}),
+            },
+            "tmux new-session admission verified the revived runtime",
+          );
+        }
+      } catch (error) {
+        await confirmLaunchedTmuxStopped(
+          substrate,
+          record.tmuxTarget,
+          launch,
+          error,
+          (detail) => retainReplacementLaunchStopDoubt(
+            reservation,
+            lifecycle,
+            ownership,
+            "tmux revive launch cleanup unconfirmed",
+            detail,
+          ),
+        );
+        await reservation.clearAfterConfirmedStop();
+        throw error;
+      }
+      await reservation.promotePublished(published);
+      return published;
+    },
+  );
   await writeSpawnOptions(updated);
   if (!opts.deferRequestClosure) await closeSupersededRequests(record, incarnation);
   await appendLedger({
     type: "bee.revive",
     session: record.name,
     providerSessionId: providerSessionId ?? null,
-    agentPaneId: launch.paneId,
+    agentPaneId: updated.agentPaneId,
     fresh,
   });
   return updated;
@@ -1641,11 +2139,12 @@ async function claudeAccountOwningHome(homePath: string): Promise<AccountRecord 
 export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { skipReadyWait?: boolean } = {}): Promise<SessionRecord> {
   const substrate = substrateFor(record);
   const alreadyLive = await substrate.hasSession(record.tmuxTarget);
+  const headlessRuntime = record.substrate === "hsr" || substrate.kind === "remote-hsr";
   // A prior manual revive may have launched and committed the replacement,
   // then died before resolving the recovery request/resetting the budget.
   // Treat that exact bounded state as a finalization retry, not "already
   // running"; all ordinary live revives retain the existing rejection.
-  const finalizeExistingRecovery = alreadyLive && record.substrate === "hsr" &&
+  const finalizeExistingRecovery = alreadyLive && headlessRuntime &&
     (record.stateMachine?.runtime === "lost" || record.stateMachine?.runtime === "recovering");
   if (alreadyLive && !finalizeExistingRecovery) {
     throw new Error(`hive revive: ${record.name} is already running (${record.tmuxTarget})`);
@@ -1663,7 +2162,7 @@ export async function reviveOne(record: SessionRecord, parsed: Parsed, opts: { s
     );
   }
 
-  const preserveRecoveryRequest = record.substrate === "hsr" &&
+  const preserveRecoveryRequest = headlessRuntime &&
     (record.stateMachine?.runtime === "lost" || record.stateMachine?.runtime === "recovering");
   const launched = finalizeExistingRecovery
     ? record
@@ -1785,6 +2284,11 @@ async function setModelInTransaction(
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`hive set-model: could not observe ${record.tmuxTarget} before changing runtime: ${detail}`);
   }
+  if (isArchivedSessionLifecycle(record) && alive) {
+    throw new Error(
+      `hive set-model: ${record.name} is archived but still has a live runtime; resolve cleanup before changing it`,
+    );
+  }
   if (alive && !fresh && !record.providerSessionId) {
     throw new Error(
       `hive set-model: ${record.name} has no recorded provider session id to resume; retry with --fresh to relaunch on a new provider session`,
@@ -1800,7 +2304,7 @@ async function setModelInTransaction(
     updatedAt: new Date().toISOString(),
   };
 
-  if (!alive) {
+  if (!alive && record.status !== "kill_failed") {
     const updated = await lifecycle.commit(applyFields);
     await appendLedger({
       type: "bee.set_model",
@@ -1815,24 +2319,43 @@ async function setModelInTransaction(
     return;
   }
 
-  // Stop the runtime BEFORE persisting the new selection — a failed quiesce/
-  // kill must leave the record describing what is actually still running.
+  // One attempt fences work before the first interrupt/stop and is reused by
+  // the successor publication. Passive HSR quiescence happens before the fence
+  // because it has no runtime side effect and may time out harmlessly.
+  let replacement: BeeNameLaunchReservation;
   if (record.substrate === "hsr") {
-    await quiesceHsrBee(record, now, "set-model");
-    await stopHsrRunner(record);
+    if (alive && !now) {
+      await quiesceHsrBee(record, false, "set-model");
+      replacement = await beginBeeReplacementOperation(lifecycle, "set-model");
+    } else {
+      replacement = await beginBeeReplacementOperation(lifecycle, "set-model");
+      if (alive) await quiesceHsrBee(record, true, "set-model");
+    }
+    try {
+      await stopHsrRunner(record);
+    } catch (error) {
+      await replacement.noteFailure(
+        `hive set-model stop unconfirmed: ${error instanceof Error ? error.message : String(error)}`,
+      ).catch(() => undefined);
+      await persistReplacementStopDoubt(lifecycle, "hive set-model stop unconfirmed", error);
+      throw error;
+    }
   } else {
+    replacement = await beginBeeReplacementOperation(lifecycle, "set-model");
     // tmux: a pane's mid-turn state is heuristic (mirrors demote) — interrupt
     // with --now, then kill the session outright like swap-account does.
     if (now) {
       await localSubstrate().sendKey(record.tmuxTarget, "C-c", record.agentPaneId).catch(() => undefined);
       await sleep(300);
     }
-    await stopRuntimeStrict(substrate, record.tmuxTarget, {
-      launcherPgid: record.launcherPgid,
-      launcherFingerprint: record.launcherFingerprint,
+    await stopRuntimeForReplacement(record, substrate, record.tmuxTarget, {
       pollAttempts: 16,
       pollIntervalMs: 250,
       context: `hive set-model: could not stop ${record.tmuxTarget} before relaunch`,
+      onStopUnconfirmed: async (message) => {
+        await replacement.noteFailure(`hive set-model stop unconfirmed: ${message}`).catch(() => undefined);
+        await persistReplacementStopDoubt(lifecycle, "hive set-model stop unconfirmed", message);
+      },
     });
   }
 
@@ -1840,29 +2363,75 @@ async function setModelInTransaction(
 
   // Restore the previous selection and relaunch it — the recovery mirror of
   // promote/demote's rollback, so a bad model name never leaves a dead bee.
-  const rollback = async (): Promise<void> => {
+  const rollback = async (rollbackReservation: BeeNameLaunchReservation): Promise<void> => {
     const restoredFields: Partial<SessionRecord> = {
       model: previous.model,
       modelExtraArgs: previous.modelExtraArgs,
       updatedAt: new Date().toISOString(),
     };
     await lifecycle.commit(restoredFields);
-    if (record.substrate === "hsr") await reviveHsrRunnerInTransaction(lifecycle, tool, { fresh });
-    else await reviveTmuxPaneInTransaction(lifecycle, tool, { fresh });
+    if (record.substrate === "hsr") {
+      await reviveHsrRunnerInTransaction(lifecycle, tool, {
+        fresh,
+        replacementOperation: "set-model-rollback",
+        replacementReservation: rollbackReservation,
+      });
+    } else {
+      await reviveTmuxPaneInTransaction(lifecycle, tool, {
+        fresh,
+        replacementOperation: "set-model-rollback",
+        replacementReservation: rollbackReservation,
+      });
+    }
+  };
+
+  const cleanupFailedReplacement = async (replacement: SessionRecord): Promise<void> => {
+    if (replacement.substrate === "hsr") {
+      try {
+        await stopHsrRunner(replacement);
+      } catch (error) {
+        await persistReplacementStopDoubt(lifecycle, "hive set-model failed replacement stop unconfirmed", error);
+        throw error;
+      }
+      return;
+    }
+    await stopRuntimeForReplacement(replacement, substrate, replacement.tmuxTarget, {
+      context: `hive set-model: could not stop failed replacement ${replacement.name}`,
+      onStopUnconfirmed: (message) =>
+        persistReplacementStopDoubt(lifecycle, "hive set-model failed replacement stop unconfirmed", message),
+    });
+  };
+
+  const restoreAfterRejectedReplacement = async (replacement: SessionRecord): Promise<void> => {
+    // Pane/meta disappearance is not process-group death. Stop the exact
+    // just-published incarnation before launching the previous model; otherwise
+    // a provider that escaped its pane/control host can execute beside rollback.
+    const rollbackReservation = await beginBeeReplacementOperation(lifecycle, "set-model-rollback");
+    await cleanupFailedReplacement(replacement);
+    await rollback(rollbackReservation);
   };
 
   if (record.substrate === "hsr") {
-    await reviveHsrRunnerInTransaction(lifecycle, tool, { fresh });
+    const launchedReplacement = await reviveHsrRunnerInTransaction(lifecycle, tool, {
+      fresh,
+      replacementOperation: "set-model",
+      replacementReservation: replacement,
+    });
     if (!(await hsrChildSurvives(record.name, RESUME_LIVENESS_SETTLE_MS))) {
-      await rollback().catch(() => undefined);
+      await restoreAfterRejectedReplacement(launchedReplacement);
       throw new Error(
         `hive set-model: ${record.agent} exited immediately on model ${model ?? "(default)"} — bad model name or rejected resume; previous model restored`,
       );
     }
   } else {
-    await reviveTmuxPaneInTransaction(lifecycle, tool, { fresh, substrate });
+    const launchedReplacement = await reviveTmuxPaneInTransaction(lifecycle, tool, {
+      fresh,
+      substrate,
+      replacementOperation: "set-model",
+      replacementReservation: replacement,
+    });
     if (!(await tmuxSessionSurvives(substrate, record.tmuxTarget, RESUME_LIVENESS_SETTLE_MS))) {
-      await rollback().catch(() => undefined);
+      await restoreAfterRejectedReplacement(launchedReplacement);
       throw new Error(
         `hive set-model: ${record.agent} exited immediately on model ${model ?? "(default)"} — bad model name or rejected resume; previous model restored`,
       );

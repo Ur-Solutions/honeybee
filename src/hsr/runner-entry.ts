@@ -10,11 +10,16 @@ import { lstat, open, realpath, rmdir, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import {
+  CELL_BROKER_CAPABILITY_ENV,
+  isCellBrokerCapabilityToken,
+} from "../cellBrokerCapability.js";
+import { driverIdentityEnvKeysForAgent } from "../driverIdentityEnv.js";
+import { hasExactLocalGithubSessionCredentialLease } from "../execution/localCredentials.js";
 import { loadAdapterFor } from "./adapter-loader.js";
 import {
   initializeCellSandbox,
   shutdownCellSandbox,
-  withoutAmbientProviderState,
 } from "./cellSandbox.js";
 import { runHsrHost } from "./host.js";
 import { hsrRunDir, type HsrStartupFailure } from "./runDir.js";
@@ -31,6 +36,11 @@ export type HsrRunPayload = {
   model?: string;
   /** Trusted execution-protocol filesystem boundary. */
   filesystemWriteScope?: "cwd";
+  /** Run identity and exact runtime credential authority for execution Cells. */
+  executionRunId?: string;
+  runtimeCredentialLeaseIds?: string[];
+  /** Runtime-only bearer capability for the local Cell broker. */
+  cellBrokerCapability?: string;
   /**
    * Extra allow-listed sandbox write roots (`hive spawn --sandbox-write`) —
    * Apiary Cell Layout v2 wrapper dirs. Additive and only meaningful together
@@ -44,6 +54,193 @@ export type HsrRunPayload = {
   parent?: string;
   spec: { command: string; args: string[]; env: Record<string, string> };
 };
+
+/**
+ * Non-authority-bearing process settings reviewed for execution Cells. This is
+ * intentionally a list, never a prefix match: API tokens, SSH/keychain agents,
+ * provider homes, Node preload hooks, and arbitrary gateway variables must not
+ * cross from the Honeybee daemon merely because they exist in process.env.
+ *
+ * `inherit-node` retains the node's proxy and public trust configuration. The
+ * execution Cell sandbox replaces HOME/tmp/cache later, and Honeybee stamps
+ * its own HIVE_BEE/HIVE_CELL identity after this filter.
+ */
+export const EXECUTION_CELL_AMBIENT_ENV_KEYS = [
+  "PATH",
+  // Runner-host only credential discovery. hsrHarnessEnvironment removes all
+  // three before the provider child and the Cell sandbox installs scratch HOME.
+  "HOME",
+  "GH_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "TERM",
+  "COLORTERM",
+  "NO_COLOR",
+  "FORCE_COLOR",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+  "CURL_CA_BUNDLE",
+  "REQUESTS_CA_BUNDLE",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+  "MISE_DATA_DIR",
+  "HIVE_STORE_ROOT",
+  "HIVE_HSR_OBSERVATION_CONCURRENCY",
+  "HIVE_CODEX_START_CONCURRENCY",
+  "HIVE_CODEX_START_QUEUE_TIMEOUT_MS",
+] as const;
+
+const EXECUTION_CELL_PROXY_ENV_KEYS = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+] as const;
+
+type EnvironmentSource = Readonly<Record<string, string | undefined>>;
+
+function copyStringEnvironment(source: EnvironmentSource): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+function proxyUrlContainsCredentials(value: string): boolean {
+  // `new URL("user:pass@host:8080")` treats `user:` as a custom scheme and
+  // reports no username/password. Proxy implementations commonly accept that
+  // scheme-less authority form, so raw `@` is a fail-closed userinfo signal.
+  if (value.includes("@")) return true;
+  try {
+    const parsed = new URL(value);
+    return parsed.username.length > 0 || parsed.password.length > 0;
+  } catch {
+    // Preserve existing support for odd but credential-free node proxy
+    // syntax. An authority containing `@` is nevertheless an unmistakable
+    // userinfo shape even when the rest of the URL is malformed.
+    const authority = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i.exec(value)?.[1];
+    return authority?.includes("@") === true;
+  }
+}
+
+/**
+ * `inherit-node` authorizes node routing, not ambient credential material.
+ * Refuse before execution launch dispatch instead of silently stripping
+ * userinfo into a broken proxy or leaking it without a signed credential
+ * lease. Ordinary HSR never calls this policy gate.
+ */
+export function assertExecutionCellProxyEnvironment(
+  inherited: EnvironmentSource = process.env,
+): void {
+  for (const key of EXECUTION_CELL_PROXY_ENV_KEYS) {
+    const value = inherited[key];
+    if (typeof value === "string" && proxyUrlContainsCredentials(value)) {
+      throw new Error(
+        `execution Cell refuses credential-bearing ${key}; inherit-node permits proxy routing but not ambient proxy credentials`,
+      );
+    }
+  }
+}
+
+/** Environment inherited by the detached runner host itself. */
+export function hsrHostEnvironment(
+  payload: Pick<HsrRunPayload, "filesystemWriteScope">,
+  inherited: EnvironmentSource = process.env,
+): Record<string, string> {
+  if (payload.filesystemWriteScope !== "cwd") return copyStringEnvironment(inherited);
+  assertExecutionCellProxyEnvironment(inherited);
+  const env: Record<string, string> = {};
+  for (const key of EXECUTION_CELL_AMBIENT_ENV_KEYS) {
+    const value = inherited[key];
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * Provider env authorized by this execution launch. Accountless Cells get no
+ * provider identity variables at all: resolveAgent may have adopted a daemon
+ * home or merged a gateway, neither of which is lease authority. An explicit
+ * signed account selection is reduced to the selected driver's exact identity
+ * keys; cross-provider and arbitrary variables remain excluded.
+ */
+export function executionCellProviderEnvironment(
+  payload: Pick<HsrRunPayload, "kind" | "accountId" | "spec">,
+): Record<string, string> {
+  if (!payload.accountId) return {};
+  const env: Record<string, string> = {};
+  for (const key of driverIdentityEnvKeysForAgent(payload.kind)) {
+    const value = payload.spec.env[key];
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+/** Remove unleased env bytes before an execution payload is handed off. */
+export function sanitizeExecutionCellPayload(payload: HsrRunPayload): HsrRunPayload {
+  if (payload.filesystemWriteScope !== "cwd") return payload;
+  return {
+    ...payload,
+    spec: {
+      ...payload.spec,
+      env: executionCellProviderEnvironment(payload),
+    },
+  };
+}
+
+/** Final pre-sandbox harness environment (sandbox HOME/tmp are added next). */
+export function hsrHarnessEnvironment(
+  payload: HsrRunPayload,
+  inherited: EnvironmentSource = process.env,
+): Record<string, string> {
+  if (payload.filesystemWriteScope !== "cwd") {
+    const env = { ...copyStringEnvironment(inherited), ...payload.spec.env };
+    // Broker authority belongs only to the exact execution Cell payload. Never
+    // let an ambient parent capability flow into an ordinary HSR child.
+    delete env.HIVE_CELL_BROKER_SOCKET;
+    delete env[CELL_BROKER_CAPABILITY_ENV];
+    return env;
+  }
+  const env = {
+    ...hsrHostEnvironment(payload, inherited),
+    ...executionCellProviderEnvironment(payload),
+  };
+  // The host needs the canonical store for run metadata and startup locks, but
+  // exposing HIVE_STORE_ROOT to arbitrary Cell subprocesses turns a shared-read
+  // sandbox into a discoverable control-plane database. Cells reach exactly
+  // the authenticated broker socket instead; non-brokered hive reads resolve
+  // against the isolated HOME created by the sandbox.
+  const storeRoot = env.HIVE_STORE_ROOT;
+  delete env.HIVE_STORE_ROOT;
+  delete env.HOME;
+  delete env.GH_CONFIG_DIR;
+  delete env.XDG_CONFIG_HOME;
+  if (storeRoot && isCellBrokerCapabilityToken(payload.cellBrokerCapability)) {
+    env.HIVE_CELL_BROKER_SOCKET = join(storeRoot, "daemon", "hsr-control.sock");
+    env[CELL_BROKER_CAPABILITY_ENV] = payload.cellBrokerCapability;
+  }
+  return env;
+}
 
 function payloadStrings(value: unknown, found = new Set<string>()): Set<string> {
   if (typeof value === "string") {
@@ -133,45 +330,54 @@ export function applyCellEnvironmentStamp(
 }
 
 /**
- * Stamp the operator's GitHub credential into a managed Cell.
- *
- * gh inside a Cell resolves its config from the bee's HOME (the per-account
- * hive home), which holds no gh session — bees were observed ssh-hopping to
- * other machines just to reach an authenticated gh. gh accepts a token by
- * env, so borrow the HOST session's token (`gh auth token` under the
- * operator HOME) and stamp GH_TOKEN. This is the LOCAL trust model only
- * (Cells are anti-footgun containment); cloud Cells mint short-lived
- * repo-scoped GitHub App installation tokens instead. Fail-soft throughout:
- * no gh on PATH, no session, or a slow probe leaves the env unstamped and gh
- * degrades to its normal unauthenticated errors. HIVE_CELL_GH=0 in the host
- * env opts out; an explicit GH_TOKEN/GITHUB_TOKEN in the spawn env wins.
+ * Resolve local-core-v1's sole ambient credential compatibility grant. The
+ * operator explicitly chose host `gh` OAuth for local Cells; unlike the old
+ * implicit fallback, injection now requires Apiary's signed, Run-bound
+ * local-gh-session-v1 lease to survive all the way into this exact payload.
+ * No GH_* or GITHUB_* variable is inherited from the daemon.
  */
 export async function applyCellGithubCredential(
   env: Record<string, string>,
-  payload: Pick<HsrRunPayload, "filesystemWriteScope">,
+  payload: Pick<
+    HsrRunPayload,
+    "filesystemWriteScope" | "executionRunId" | "runtimeCredentialLeaseIds"
+  >,
   resolveToken: () => Promise<string> = hostGithubSessionToken,
 ): Promise<void> {
   if (payload.filesystemWriteScope !== "cwd") return;
-  if (env.GH_TOKEN || env.GITHUB_TOKEN) return;
-  if (process.env.HIVE_CELL_GH === "0") return;
+  if (!hasExactLocalGithubSessionCredentialLease(payload.executionRunId, payload.runtimeCredentialLeaseIds)) return;
   try {
     const token = (await resolveToken()).trim();
     // A credential is a single opaque line; anything else is not a token.
     if (token.length === 0 || /[\s\u0000-\u001f\u007f]/.test(token)) return;
     env.GH_TOKEN = token;
   } catch {
-    // Fail-soft by design: an unauthenticated Cell is degraded, not broken.
+    // The signed lease grants resolution; it does not fabricate a missing host
+    // session. The provider starts unauthenticated and gh reports normally.
   }
 }
 
-function hostGithubSessionToken(): Promise<string> {
+/** Exact host-only environment used to locate gh's authenticated config. */
+export function hostGithubCredentialResolverEnvironment(
+  inherited: EnvironmentSource = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of ["PATH", "HOME", "GH_CONFIG_DIR", "XDG_CONFIG_HOME"] as const) {
+    const value = inherited[key];
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+/** Invoke the real gh CLI through the reviewed resolver-only environment. */
+export function hostGithubSessionToken(inherited: EnvironmentSource = process.env): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     execFile(
       "gh",
       ["auth", "token"],
-      // The HOST environment on purpose: the operator HOME owns the gh
-      // session; the bee env points HOME at a hive home with no session.
-      { timeout: 3000, env: process.env, encoding: "utf8" },
+      // Exactly one validated token line crosses into the Cell; the host
+      // discovery roots themselves never enter the provider child.
+      { timeout: 3000, env: hostGithubCredentialResolverEnvironment(inherited), encoding: "utf8" },
       (error, stdout) => {
         if (error) rejectPromise(error);
         else resolvePromise(stdout);
@@ -229,7 +435,7 @@ export async function consumeHsrRunPayload(payloadPath: string): Promise<HsrRunP
     throw new Error("hive __hsr-run: unable to securely consume payload");
   }
   try {
-    return JSON.parse(raw) as HsrRunPayload;
+    return sanitizeExecutionCellPayload(JSON.parse(raw) as HsrRunPayload);
   } catch {
     // JSON parser diagnostics can quote source fragments. Never let bytes from
     // a credential-bearing payload reach stderr or a parent error result.
@@ -308,16 +514,10 @@ async function hydrateAndStartConsumedPayload(
     // provider child receives the same absolute cwd below.
     process.chdir(realpathSync(payload.cwd));
   }
-  // The harness child needs a complete env (PATH etc.), not just the spawn
-  // overrides. Overlay the payload's resolved spec on the inherited host env.
-  let childEnv: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === "string") childEnv[key] = value;
-  }
-  if (payload.filesystemWriteScope === "cwd") {
-    childEnv = withoutAmbientProviderState(payload.kind, childEnv, payload.spec.env);
-  }
-  Object.assign(childEnv, payload.spec.env);
+  // Ordinary HSR preserves its historical full environment. Execution Cells
+  // start from the reviewed ambient allowlist plus the exact selected-provider
+  // identity env; no daemon/gateway credential is an implicit fallback.
+  let childEnv = hsrHarnessEnvironment(payload);
   // HSR children have no pane, so HIVE_BEE is the pane-less identity anchor.
   childEnv.HIVE_BEE = payload.bee;
   childEnv.HIVE_COMB = payload.comb ?? payload.bee;

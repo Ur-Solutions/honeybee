@@ -7,6 +7,7 @@ import { liveTargetKey, type BeeState, type StateContext } from "../src/state.js
 import type { SessionRecord } from "../src/store.js";
 import { projectBeeView, type BeeViewProjectionSources } from "../src/view/project.js";
 import type { BeeDisplayState } from "../src/view/types.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const NOW = Date.parse("2026-07-28T12:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -189,6 +190,8 @@ for (const row of rows) {
       view.interactionState,
       row.displayState === "retired"
         ? "archived"
+        : row.displayState === "stop-failed"
+          ? "blocked"
         : row.displayState === "working"
           ? "working"
           : "idle",
@@ -206,14 +209,14 @@ for (const row of rows) {
   });
 }
 
-test("a live kill_failed bee stays idle when no turn is running", () => {
+test("a live kill_failed bee is non-interactive when no turn is running", () => {
   const rec = record({ status: "kill_failed", lastError: "tmux kill failed" });
   const view = project({ record: rec, context: liveCtx(rec) });
   assert.equal(view.displayState, "stop-failed");
-  assert.equal(view.interactionState, "idle");
+  assert.equal(view.interactionState, "blocked");
 });
 
-test("a live kill_failed bee stays working while its turn is running", () => {
+test("a live kill_failed bee is non-interactive while its turn is still running", () => {
   const rec = record({
     status: "kill_failed",
     lastError: "tmux kill failed",
@@ -222,14 +225,14 @@ test("a live kill_failed bee stays working while its turn is running", () => {
   });
   const view = project({ record: rec, context: liveCtx(rec) });
   assert.equal(view.displayState, "stop-failed");
-  assert.equal(view.interactionState, "working");
+  assert.equal(view.interactionState, "blocked");
 });
 
-test("an exited kill_failed bee maps to archived by liveness", () => {
+test("an exited kill_failed bee stays active but non-interactive until stop proof resolves", () => {
   const rec = record({ status: "kill_failed", lastError: "tmux kill failed" });
   const view = project({ record: rec, context: ctx() });
   assert.equal(view.displayState, "stop-failed");
-  assert.equal(view.interactionState, "archived");
+  assert.equal(view.interactionState, "blocked");
 });
 
 // ---------------------------------------------------------------------------
@@ -362,6 +365,67 @@ test("crashed without mid-turn evidence has no fabricated turn result", () => {
   const view = project({ record: record({ lastObservedState: "idle_with_output" }), context: ctx() });
   assert.equal(view.displayState, "crashed");
   assert.equal(view.latestTurnResult, undefined);
+});
+
+test("BeeView preserves stop doubt while canonical archive still wins", () => {
+  const active = record({
+    status: "kill_failed",
+    stateMachine: lifecycleCursor("bee1", "active", iso(NOW - 20_000)),
+  });
+  const activeView = project({ record: active, context: liveCtx(active) });
+  assert.equal(activeView.displayState, "stop-failed");
+  assert.equal(activeView.latestRuntime.stopFailed, true);
+  assert.equal(activeView.interactionState, "blocked");
+
+  const archived = record({
+    status: "running",
+    stateMachine: lifecycleCursor("bee1", "archived", iso(NOW - 20_000)),
+  });
+  const archivedView = project({ record: archived, context: liveCtx(archived) });
+  assert.equal(archivedView.displayState, "retired");
+  assert.equal(archivedView.interactionState, "archived");
+});
+
+test("stop doubt outranks every active runtime and observer projection", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const cases: Array<{
+    label: string;
+    rec: SessionRecord;
+    context: StateContext;
+  }> = [
+    {
+      label: "recovering",
+      rec: record({ status: "kill_failed", stateMachine: { ...cursor, runtime: "recovering" } }),
+      context: ctx(),
+    },
+    {
+      label: "parked",
+      rec: record({ status: "kill_failed", stateMachine: { ...cursor, runtime: "parked" } }),
+      context: ctx(),
+    },
+    {
+      label: "lost",
+      rec: record({ status: "kill_failed", stateMachine: { ...cursor, runtime: "lost" } }),
+      context: ctx(),
+    },
+    {
+      label: "unreachable",
+      rec: record({ status: "kill_failed", node: "mini01", stateMachine: cursor }),
+      context: ctx({ unreachableNodes: new Set(["mini01"]) }),
+    },
+    {
+      label: "held",
+      rec: record({ status: "kill_failed", substrate: "hsr", stateMachine: cursor }),
+      context: ctx({ hsrUnavailable: new Set(["bee1"]) }),
+    },
+  ];
+
+  for (const row of cases) {
+    const view = project({ record: row.rec, context: row.context });
+    assert.equal(view.latestRuntime.stopFailed, true, row.label);
+    assert.equal(view.displayState, "stop-failed", row.label);
+    assert.equal(view.interactionState, "blocked", row.label);
+  }
 });
 
 test("accepted cold mail projects starting without fabricating a runtime observation", () => {

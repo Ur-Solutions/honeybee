@@ -54,8 +54,10 @@ export type CodexRpcPeer = {
   onNotificationCatchAll(handler: (method: string, params: unknown) => void): void;
   /** Handler for inbound server requests (approvals); MUST respond/respondError. */
   onServerRequest(handler: (method: string, id: JsonRpcId, params: unknown) => void): void;
-  /** Send the success response for an inbound server request. */
-  respond(id: JsonRpcId, result: unknown): void;
+  /** True only while a response can still be prepared without provider I/O. */
+  canRespond(): boolean;
+  /** Send the success response and resolve after the stream write callback. */
+  respond(id: JsonRpcId, result: unknown): Promise<void>;
   /** Send an error response for an inbound server request. */
   respondError(id: JsonRpcId, code: number, message: string): void;
   /** Reject all pending requests and stop reading. */
@@ -87,6 +89,19 @@ export function createCodexRpcPeer(stdin: Writable, stdout: Readable): CodexRpcP
     } catch {
       // A write on a closing pipe (EPIPE) must not throw into the caller.
     }
+  };
+
+  const writeConfirmed = (value: unknown): Promise<void> => {
+    if (disposed || !stdin.writable || stdin.destroyed || stdin.writableEnded) {
+      return Promise.reject(new Error("codex rpc response failed: child stdin not writable"));
+    }
+    return new Promise<void>((resolve, reject) => {
+      try {
+        stdin.write(`${JSON.stringify(value)}\n`, (error) => error ? reject(error) : resolve());
+      } catch (error) {
+        reject(error);
+      }
+    });
   };
 
   const handleLine = (line: string): void => {
@@ -138,7 +153,9 @@ export function createCodexRpcPeer(stdin: Writable, stdout: Readable): CodexRpcP
     }
   };
 
-  stdout.on("data", makeLineReader(handleLine));
+  const lineReader = makeLineReader(handleLine);
+  stdout.on("data", lineReader);
+  stdout.once("end", () => lineReader.end());
 
   function respondError(id: JsonRpcId, code: number, message: string): void {
     write({ jsonrpc: "2.0", id, error: { code, message } });
@@ -193,8 +210,11 @@ export function createCodexRpcPeer(stdin: Writable, stdout: Readable): CodexRpcP
     onServerRequest(handler: (method: string, id: JsonRpcId, params: unknown) => void): void {
       serverRequestHandler = handler;
     },
-    respond(id: JsonRpcId, result: unknown): void {
-      write({ jsonrpc: "2.0", id, result: result === undefined ? null : result });
+    canRespond(): boolean {
+      return !disposed && stdin.writable && !stdin.destroyed && !stdin.writableEnded;
+    },
+    respond(id: JsonRpcId, result: unknown): Promise<void> {
+      return writeConfirmed({ jsonrpc: "2.0", id, result: result === undefined ? null : result });
     },
     respondError,
     dispose,

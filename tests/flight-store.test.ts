@@ -8,6 +8,10 @@ import { parse } from "../src/parse.js";
 import { ledgerPath, saveSession, type SessionRecord } from "../src/store.js";
 import { withFileLock } from "../src/lock.js";
 import { appendHsrEvent, ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
+import {
+  persistHsrEventIntegrityFailure,
+  readHsrEventIntegrityReceipt,
+} from "../src/hsr/eventIntegrity.js";
 import { registerNode } from "../src/node.js";
 import {
   allocateFlightId,
@@ -226,6 +230,133 @@ test("flight status API waits on the sweep lock before mutating status", async (
     });
 
     assert.equal((await loadFlight(id))?.status, "draining");
+  });
+});
+
+test("flight resolve cannot release a retry slot across unresolved HSR event ownership", async () => {
+  await withTempStore(async () => {
+    const id = allocateFlightId();
+    const beeName = slotBeeName(id, "s1", 0, 1);
+    const now = "2026-08-15T23:00:00.000Z";
+    const host = {
+      hostPid: 2_147_000_000,
+      startedAt: "2026-08-15T22:59:00.000Z",
+      hostFingerprint: { pgid: 2_147_000_000, startedAt: "flight-integrity-host" },
+    };
+    const slot: SlotRecord = {
+      flightId: id,
+      slotId: "s1",
+      mixKey: "missing",
+      generation: 0,
+      attempt: 1,
+      beeName,
+      state: "escalated",
+      since: now,
+      evidence: {},
+      history: [],
+    };
+    await saveFlight(workerFlight(id));
+    await saveSlot(slot);
+    await saveSession(session(beeName, {
+      substrate: "hsr",
+      runnerPid: host.hostPid,
+      runnerFingerprint: host.hostFingerprint,
+      runtimeGeneration: 1,
+    }));
+    await ensureHsrRunDir(beeName);
+    await writeHsrMeta(beeName, {
+      bee: beeName,
+      harness: "stub",
+      tier: "stream",
+      ...host,
+      childAdmission: "none",
+      startupFailure: { stage: "adapter-start", message: "fixture provider never started" },
+      controlSocket: "",
+      status: "exited",
+      endedAt: now,
+    });
+    await persistHsrEventIntegrityFailure({
+      bee: beeName,
+      host,
+      deliveryIds: [],
+      reason: "operator must settle missing provider events before retrying the slot",
+    });
+
+    await assert.rejects(
+      () => runQuietly(() => cmdFlight(parse(["flight", "resolve", id, "s1", "--retry"]))),
+      /strict retire.*failed|unresolved HSR event history/,
+    );
+
+    assert.deepEqual((await listSlots(id))[0], slot, "failed retire leaves slot ownership and generation unchanged");
+    assert.equal((await readHsrEventIntegrityReceipt(beeName))?.stopState, "confirmed");
+    const ledger = await readFile(ledgerPath(), "utf8").catch(() => "");
+    assert.doesNotMatch(ledger, /"type":"flight\.slot\.resolved"/);
+  });
+});
+
+test("flight resolve preserves archived and recordless slots while an outside HSR integrity head survives", async () => {
+  await withTempStore(async () => {
+    for (const shape of ["archived", "recordless"] as const) {
+      const id = allocateFlightId();
+      const beeName = slotBeeName(id, "s1", 0, 1);
+      const now = "2026-08-15T23:10:00.000Z";
+      const host = {
+        hostPid: shape === "archived" ? 2_147_000_001 : 2_147_000_002,
+        startedAt: `2026-08-15T23:0${shape === "archived" ? "8" : "9"}:00.000Z`,
+        hostFingerprint: {
+          pgid: shape === "archived" ? 2_147_000_001 : 2_147_000_002,
+          startedAt: `flight-${shape}-integrity-host`,
+        },
+      };
+      const slot: SlotRecord = {
+        flightId: id,
+        slotId: "s1",
+        mixKey: "missing",
+        generation: 0,
+        attempt: 1,
+        beeName,
+        state: "escalated",
+        since: now,
+        evidence: {},
+        history: [],
+      };
+      await saveFlight(workerFlight(id));
+      await saveSlot(slot);
+      if (shape === "archived") {
+        await saveSession(session(beeName, {
+          substrate: "hsr",
+          status: "done",
+          runnerPid: host.hostPid,
+          runnerFingerprint: host.hostFingerprint,
+          runtimeGeneration: 1,
+        }));
+      }
+      await ensureHsrRunDir(beeName);
+      await writeHsrMeta(beeName, {
+        bee: beeName,
+        harness: "stub",
+        tier: "stream",
+        ...host,
+        childAdmission: "none",
+        startupFailure: { stage: "adapter-start", message: "fixture provider never started" },
+        controlSocket: "",
+        status: "exited",
+        endedAt: now,
+      });
+      await persistHsrEventIntegrityFailure({
+        bee: beeName,
+        host,
+        deliveryIds: [],
+        reason: `${shape} source still owns unknown provider effects`,
+      });
+
+      await assert.rejects(
+        () => runQuietly(() => cmdFlight(parse(["flight", "resolve", id, "s1", "--retry"]))),
+        /unresolved HSR event history/,
+      );
+      assert.deepEqual((await listSlots(id))[0], slot, `${shape} head keeps its exact slot bound`);
+      assert.equal((await readHsrEventIntegrityReceipt(beeName))?.phase, "unresolved");
+    }
   });
 });
 

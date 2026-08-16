@@ -2,10 +2,12 @@
 // account/profile resolution, homogeneous swarms, and frame-driven cohorts.
 // Extracted from cli.ts (HIVE-15).
 import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, clearAccountBootFailure, defaultHomeForAccount, findAccount, listAccounts, recordAccountBootFailure, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
+import { mintCellBrokerCapability } from "../cellBrokerCapability.js";
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
 import { beeConfig } from "../config.js";
 import { parseContractFlag, withContractPostscript, type BeeContract } from "../contract.js";
+import { deliverSessionText, deliverSessionTextInAdmission, withRunnableSessionAdmission } from "../delivery.js";
 import { agentKinds, defaultsToSoleCredentialedAccount, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
 import { listFlows } from "../flow/index.js";
@@ -20,6 +22,13 @@ import { kitMaterializeHome, readKitHomeStamp } from "../kit.js";
 import { chooseLaunch, type LaunchTemplate } from "../launchTui.js";
 import { cachedAccountLimits, isFableModel, pickLeastLoadedAccount, windowRolledOver, type AccountLimits, type WindowUsage } from "../limits.js";
 import { LOCAL_NODE_NAME, authPolicyOf, type NodeRecord } from "../node.js";
+import { withBeeNameLaunchAdmission } from "../nameAdmission.js";
+import {
+  cleanupLaunchedRemoteHsrIncarnation,
+  cleanupLaunchedTmuxIncarnation,
+  launchPublicationError,
+  rollbackFreshLaunchPublication,
+} from "../launchPublication.js";
 import { isWellFormedPaneId } from "../paneId.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { planSpawnPreamble } from "../spawnPreamble.js";
@@ -29,10 +38,15 @@ import { createProSlot, deleteProSlot, listProRepoEntries, listProRepos, prewarm
 import { pickRoundRobinAccount } from "../limits/autoPick.js";
 import { startSpawnTimer, type SpawnTimer } from "../spawnTiming.js";
 import { chooseNewBee, type SpawnTuiAccount } from "../spawnTui.js";
-import { appendLedger, loadSession, safeName, saveSession, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, loadSession, safeName, saveSession, type SessionRecord } from "../store.js";
 import { resolveSpawningBeeId } from "../spawnParent.js";
 import { resolveRemoteCwd } from "../hsr/remoteWorkingCopy.js";
 import { localSubstrate, remoteHsrSubstrateForNode, substrateForRecord } from "../substrates/index.js";
+import {
+  RemoteSpawnIndeterminateError,
+  RemoteSpawnNotAdmittedError,
+  type RemoteSpawnResult,
+} from "../substrates/remote-hsr.js";
 import { createSwarm } from "../swarm.js";
 import { tmux } from "../tmux.js";
 import { linkHere } from "../spawnLink.js";
@@ -50,11 +64,11 @@ import { validateContract } from "../comb/schema.js";
 import type { JsonValue, StoredCombVersion } from "../comb/types.js";
 import { resolveCellSandboxExtraWriteRoots } from "../hsr/cellSandbox.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
+import { assertExecutionCellProxyEnvironment } from "../hsr/runner-entry.js";
 import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
-import { readHsrMetaStrict } from "../hsr/runDir.js";
+import { readHsrMetaStrict, removeConfirmedStoppedHsrRunDir } from "../hsr/runDir.js";
 import { stopHsrIncarnationByPid } from "../hsr/substrate.js";
 import { transactionalRetire } from "../kill.js";
-import { withSessionLifecycleTransaction } from "../lifecycle.js";
 import { SpawnAfterForkError, type SpawnedRuntimeHandle } from "../spawnRuntime.js";
 import { attachTrack, loadTrack } from "../track.js";
 
@@ -213,6 +227,10 @@ export type SpawnOptions = {
    * run.start reservation. Only the in-process protocol launcher sets this.
    */
   executionRunId?: string;
+  /** Signed, non-secret execution runtime credential lease identifiers. */
+  executionRuntimeCredentialLeaseIds?: string[];
+  /** Trusted in-process execution launch; bypasses local command/env overlays. */
+  protocolLaunch?: boolean;
   /**
    * Extra Cell-sandbox write roots (`--sandbox-write`, repeatable): absolute
    * directories merged into the OS write allow-list when this spawn runs under
@@ -296,6 +314,8 @@ export type SpawnRuntimeDependencies = {
   saveSession?: typeof saveSession;
   writeSpawnOptions?: typeof writeSpawnOptions;
   stopHsrIncarnationByPid?: typeof stopHsrIncarnationByPid;
+  /** Deterministic crash seam after rollback stop dispatch, before purge. */
+  afterLaunchRollbackStopDispatch?: () => void | Promise<void>;
 };
 
 /** Account activation failed before any harness process was forked. */
@@ -379,7 +399,8 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     yolo: opts.yolo,
     identity: Boolean(opts.account),
     env: opts.env,
-    ...(opts.model ? { model: opts.model } : {}),
+    protocolLaunch: opts.protocolLaunch,
+    ...(!opts.protocolLaunch && opts.model ? { model: opts.model } : {}),
     ...(opts.provider ? { provider: opts.provider } : {}),
   });
   if (opts.node?.kind === "remote-hsr" && !harnessSupportsRemoteHsr(spec.kind)) {
@@ -432,7 +453,7 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
       // timestamp fence prevents this success from erasing a newer concurrent
       // activation failure after the per-account activation lock was released.
       await clearAccountBootFailure(opts.account.id, "activation", activationStartedAt).catch(() => undefined);
-      refreshIdentityEnv(spec, opts.env);
+      refreshIdentityEnv(spec, opts.env, { protocolLaunch: opts.protocolLaunch });
     }
   }
   // trmdy/kit: an explicit capability profile re-materializes the home before
@@ -498,6 +519,11 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     await assertExecutableAvailable(spec.command);
     await assertAgentAuthFreshForSpawn(spec, opts.account?.id);
   }
+  // The signed inherit-node policy permits routing through the node's proxy,
+  // but it does not lease credentials embedded in ambient proxy URLs. Refuse
+  // before name admission/dispatch so an unsupported secret never crosses the
+  // Cell boundary and no false launch journal is left behind.
+  if (opts.executionRunId) assertExecutionCellProxyEnvironment(process.env);
   timer.mark("exec-check");
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   timer.mark("allocate");
@@ -526,17 +552,10 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
   // keep recording what was actually ASKED, and transcript matching keeps
   // working (rowsContainPrompt is a substring test, so a prefixed row matches).
 
-  // Pane-less spawns (HSR / remote-hsr) have no tmux hasSession guard, so a
-  // duplicate name would silently OVERWRITE the existing session record and
-  // orphan its live runner host (two hosts, one run dir — review CR-1). Refuse
-  // while a running record holds the name; a dead or done (filed) record may be
-  // reused (the overwrite is then deliberate re-creation).
-  if (opts.substrate === "hsr" || opts.node?.kind === "remote-hsr") {
-    const existing = await loadSession(name);
-    if (existing && existing.status === "running") {
-      throw new Error(`session record already exists and is running: ${name} (retire it first, or pick another --name)`);
-    }
-  }
+  // Reserve the logical name through the irreversible launch and durable
+  // SessionRecord publication on every substrate. Tmux target checks alone do
+  // not protect an escaped launcher group or two concurrent same-name spawns.
+  return withBeeNameLaunchAdmission(name, async (reservation) => {
 
   // Remote HSR (APIA-92): the runner host lives ON the remote node. Resolve the
   // AgentSpec LOCALLY (above), then hand the resolved spec to the remote `spawn`
@@ -586,42 +605,194 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
         if (isPretty()) console.error(note(resolved.note));
       }
     }
-    const spawnResult = await substrate.spawnRemote({
+    const command = shellCommand(spec);
+    const remoteLaunchId = randomUUID();
+
+    const buildRemoteRecord = (authority: {
+      cwd: string;
+      launchId: string;
+      incarnation?: string;
+      tier?: string;
+    }): SessionRecord => {
+      const now = new Date().toISOString();
+      const runnerTier = adapter?.tier() ?? authority.tier;
+      return {
+        name,
+        agent: spec.kind,
+        cwd: authority.cwd,
+        launchArgv,
+        command,
+        tmuxTarget: name,
+        node: opts.node!.name,
+        remoteLaunchId: authority.launchId,
+        ...(authority.incarnation ? { remoteIncarnation: authority.incarnation } : {}),
+        ...(runnerTier ? { runnerTier } : {}),
+        combId: name,
+        createdAt: now,
+        updatedAt: now,
+        status: "running",
+        id: identity.id,
+        prefix: identity.prefix,
+        uuid: identity.uuid,
+        requestedAgent: spec.requestedKind,
+        homePath: spec.homePath,
+        ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
+        ...(opts.colony ? { colony: opts.colony } : {}),
+        ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
+        ...(opts.caste ? { caste: opts.caste } : {}),
+        ...(brief ? { brief } : {}),
+        ...(opts.contract ? { contract: opts.contract } : {}),
+        ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
+        ...(spawnedById ? { spawnedById } : {}),
+        ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
+        ...(opts.account ? { accountId: opts.account.id } : {}),
+        ...(remoteCreds?.expiresAt ? { remoteTokenExpiresAt: remoteCreds.expiresAt } : {}),
+      };
+    };
+
+    const failRemoteLaunch = async (
+      cause: unknown,
+      locator: { launchId: string; incarnation?: string },
+      provisional: SessionRecord,
+    ): Promise<never> => {
+      const rollback = await rollbackFreshLaunchPublication(reservation, provisional, {
+        context: `remote HSR launch publication failed for ${name}`,
+        cleanup: () => cleanupLaunchedRemoteHsrIncarnation(substrate, name, locator),
+        retainStopDoubt: (detail) => reservation.retainRemoteStopDoubt({
+          node: opts.node!.name,
+          remoteLaunchId: locator.launchId,
+          ...(locator.incarnation ? { remoteIncarnation: locator.incarnation } : {}),
+        }, detail),
+        ...(runtimeDeps.afterLaunchRollbackStopDispatch
+          ? { afterStopDispatch: runtimeDeps.afterLaunchRollbackStopDispatch }
+          : {}),
+      });
+      throw launchPublicationError(
+        cause,
+        rollback.cleanup,
+        rollback.ownershipPersisted,
+        rollback,
+      );
+    };
+
+    await reservation.markRemoteLaunchDispatch({ node: opts.node.name, remoteLaunchId });
+    let spawnResult: RemoteSpawnResult | undefined;
+    try {
+      spawnResult = await substrate.spawnRemote({
+        bee: name,
+        launchId: remoteLaunchId,
+        kind: spec.kind,
+        ...(spawnCwd ? { cwd: spawnCwd } : {}),
+        comb: name,
+        ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
+        authKind: "subscription",
+        ...(!opts.protocolLaunch && opts.model ? { model: opts.model } : {}),
+        ...(remoteCreds ? { creds: { ...(remoteCreds.files.length ? { files: remoteCreds.files } : {}), ...(remoteCreds.env ? { env: remoteCreds.env } : {}) } } : {}),
+        spec: { command: spec.command, args: spec.args, env: spec.env },
+      });
+      await reservation.recordRemoteLaunch({
+        node: opts.node.name,
+        remoteLaunchId,
+        remoteIncarnation: spawnResult.incarnation,
+      });
+    } catch (error) {
+      if (error instanceof RemoteSpawnNotAdmittedError) {
+        // The capability/admission boundary proved this launch id never owned a
+        // remote runtime. Do not send a token-bearing kill to an old serve that
+        // could ignore the new fields and tear down an unrelated same-name bee.
+        await reservation.clearAfterConfirmedStop();
+        throw error;
+      }
+      const incarnation = spawnResult?.incarnation
+        ?? (error instanceof RemoteSpawnIndeterminateError ? error.incarnation : undefined);
+      const provisional = buildRemoteRecord({
+        cwd: spawnCwd && isAbsolute(spawnCwd) ? spawnCwd : "/",
+        launchId: remoteLaunchId,
+        ...(incarnation ? { incarnation } : {}),
+      });
+      return failRemoteLaunch(error, { launchId: remoteLaunchId, ...(incarnation ? { incarnation } : {}) }, provisional);
+    }
+
+    if (!spawnResult) throw new Error(`remote HSR spawn of ${name} returned no authority receipt`);
+    timer.mark("session-create");
+    const record = buildRemoteRecord({
+      cwd: spawnResult.cwd,
+      launchId: spawnResult.launchId,
+      incarnation: spawnResult.incarnation,
+      ...(spawnResult.tier ? { tier: spawnResult.tier } : {}),
+    });
+    try {
+      await saveSession(record);
+      timer.mark("persist");
+      if (ownsTimer) await persistSpawnTiming(timer, record.name);
+      await reservation.promoteExternallyPublished(record);
+      return record;
+    } catch (error) {
+      return failRemoteLaunch(
+        error,
+        { launchId: spawnResult.launchId, incarnation: spawnResult.incarnation },
+        record,
+      );
+    }
+  }
+
+  // HSR: fork a detached runner host instead of a tmux session. The bee is a
+  // normal SessionRecord with substrate:"hsr", tmuxTarget=name (a logical id, no
+  // tmux target), no pane. resolveAgent / account activation / session-id
+  // pinning / exec-check above are reused verbatim (HSR_EXPLORATION.md §7).
+  if (opts.substrate === "hsr") {
+    // The runner host inherits this process's env — record the effective home
+    // (see adoptInheritedHome) before spec.env is shipped and command rendered.
+    if (!opts.protocolLaunch) adoptInheritedHome(spec);
+    // adoptInheritedHome may set spec.homePath to an inherited home (e.g. a bee
+    // spawning a sub-bee) that the earlier kitStamp read didn't see — re-read so
+    // the record pins the capability set the bee actually runs with.
+    const hsrKitStamp = spec.homePath ? await readKitHomeStamp(spec.homePath) : kitStamp;
+    const adapter = adapterFor(spec.kind);
+    const runnerTier = adapter?.tier();
+    // Fail a bad --sandbox-write grant HERE, with the caller's error surface,
+    // instead of letting the detached runner die on the same guard behind a
+    // startup-failure meta. The runner re-validates authoritatively.
+    if (opts.sandboxWriteRoots?.length && opts.executionRunId) {
+      resolveCellSandboxExtraWriteRoots(opts.sandboxWriteRoots, opts.cwd, process.env as Record<string, string | undefined>);
+    }
+    const brokerCapability = opts.executionRunId
+      ? mintCellBrokerCapability(name, 0)
+      : undefined;
+    await reservation.markLaunchDispatch();
+    const hostPid = await (runtimeDeps.spawnHsrHost ?? spawnHsrHost)({
       bee: name,
+      comb: name, // solo comb — a forked sub-bee will carry its parent's comb
       kind: spec.kind,
-      // Only a provisioned checkout (a real remote path) is sent; otherwise the
-      // remote derives the cwd. The isolated home is likewise derived remotely —
-      // we never ship spec.homePath (a local path).
-      ...(spawnCwd ? { cwd: spawnCwd } : {}),
-      comb: name, // solo comb
+      cwd: opts.cwd,
       ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
       authKind: "subscription",
-      ...(opts.model ? { model: opts.model } : {}),
-      // APIA-93: ephemeral credential material for an account-bound remote spawn.
-      // Delivered to the remote-derived isolated home at spawn, shredded on kill.
-      ...(remoteCreds ? { creds: { ...(remoteCreds.files.length ? { files: remoteCreds.files } : {}), ...(remoteCreds.env ? { env: remoteCreds.env } : {}) } } : {}),
+      ...(opts.account ? { accountId: opts.account.id } : {}),
+      ...(!opts.protocolLaunch && opts.model ? { model: opts.model } : {}),
+      ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
+      ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
+      ...(opts.executionRuntimeCredentialLeaseIds?.length
+        ? { runtimeCredentialLeaseIds: [...opts.executionRuntimeCredentialLeaseIds] }
+        : {}),
+      ...(brokerCapability ? { cellBrokerCapability: brokerCapability.token } : {}),
+      ...(opts.sandboxWriteRoots?.length ? { extraWriteRoots: [...opts.sandboxWriteRoots] } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
-    // The remote resolves+returns the actual cwd it ran the bee in (the derived
-    // per-bee dir, or the checkout we sent). Record that remote path; fall back to
-    // the checkout path if an older serve didn't echo one.
-    const recordCwd = spawnResult.cwd ?? spawnCwd ?? "";
-    timer.mark("session-create");
-    const runnerTier = adapter?.tier() ?? spawnResult.tier;
     const command = shellCommand(spec);
-    const now = new Date().toISOString();
-    const record: SessionRecord = {
+    const publishedAt = new Date().toISOString();
+    const provisionalRecord: SessionRecord = {
       name,
       agent: spec.kind,
-      cwd: recordCwd,
+      cwd: opts.cwd,
       launchArgv,
       command,
-      tmuxTarget: name, // logical id — remote HSR has no tmux target
-      node: opts.node.name,
+      tmuxTarget: name,
+      substrate: "hsr",
+      runnerPid: hostPid,
       ...(runnerTier ? { runnerTier } : {}),
       combId: name,
-      createdAt: now,
-      updatedAt: now,
+      createdAt: publishedAt,
+      updatedAt: publishedAt,
       status: "running",
       id: identity.id,
       prefix: identity.prefix,
@@ -637,51 +808,17 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
       ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
+      ...(opts.executionRuntimeCredentialLeaseIds?.length
+        ? { executionRuntimeCredentialLeaseIds: [...opts.executionRuntimeCredentialLeaseIds] }
+        : {}),
+      ...(brokerCapability ? { cellBrokerCapabilityHash: brokerCapability.hash } : {}),
+      ...(opts.sandboxWriteRoots?.length ? { sandboxWriteRoots: [...opts.sandboxWriteRoots] } : {}),
       ...(opts.account ? { accountId: opts.account.id } : {}),
-      // UNIT 2: persist the delivered access token's expiry (unix seconds) so the
-      // daemon can proactively re-deliver before it dies. Only the ephemeral-token
-      // codex path sets remoteCreds.expiresAt; absent otherwise → refresher skips.
-      ...(remoteCreds?.expiresAt ? { remoteTokenExpiresAt: remoteCreds.expiresAt } : {}),
+      ...(opts.autoswap ? { autoswap: true } : {}),
+      ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
+      ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
+      ...hsrKitStamp,
     };
-    await saveSession(record);
-    timer.mark("persist");
-    if (ownsTimer) await persistSpawnTiming(timer, record.name);
-    return record;
-  }
-
-  // HSR: fork a detached runner host instead of a tmux session. The bee is a
-  // normal SessionRecord with substrate:"hsr", tmuxTarget=name (a logical id, no
-  // tmux target), no pane. resolveAgent / account activation / session-id
-  // pinning / exec-check above are reused verbatim (HSR_EXPLORATION.md §7).
-  if (opts.substrate === "hsr") {
-    // The runner host inherits this process's env — record the effective home
-    // (see adoptInheritedHome) before spec.env is shipped and command rendered.
-    adoptInheritedHome(spec);
-    // adoptInheritedHome may set spec.homePath to an inherited home (e.g. a bee
-    // spawning a sub-bee) that the earlier kitStamp read didn't see — re-read so
-    // the record pins the capability set the bee actually runs with.
-    const hsrKitStamp = spec.homePath ? await readKitHomeStamp(spec.homePath) : kitStamp;
-    const adapter = adapterFor(spec.kind);
-    const runnerTier = adapter?.tier();
-    // Fail a bad --sandbox-write grant HERE, with the caller's error surface,
-    // instead of letting the detached runner die on the same guard behind a
-    // startup-failure meta. The runner re-validates authoritatively.
-    if (opts.sandboxWriteRoots?.length && opts.executionRunId) {
-      resolveCellSandboxExtraWriteRoots(opts.sandboxWriteRoots, opts.cwd, process.env as Record<string, string | undefined>);
-    }
-    const hostPid = await (runtimeDeps.spawnHsrHost ?? spawnHsrHost)({
-      bee: name,
-      comb: name, // solo comb — a forked sub-bee will carry its parent's comb
-      kind: spec.kind,
-      cwd: opts.cwd,
-      ...(pinnedSessionId ? { sessionId: pinnedSessionId } : {}),
-      authKind: "subscription",
-      ...(opts.account ? { accountId: opts.account.id } : {}),
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
-      ...(opts.sandboxWriteRoots?.length ? { extraWriteRoots: [...opts.sandboxWriteRoots] } : {}),
-      spec: { command: spec.command, args: spec.args, env: spec.env },
-    });
     // The detached host exists before its metadata can be read. Construct the
     // exact pid-scoped teardown handle immediately so a corrupt/unreadable
     // admission record cannot escape the post-fork cleanup protocol and be
@@ -708,65 +845,49 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     const provisionalRuntime = runtimeForFingerprint();
     let admittedMeta: Awaited<ReturnType<typeof readHsrMetaStrict>>;
     try {
+      await reservation.recordHsrLaunch({ hostPid });
       admittedMeta = await (runtimeDeps.readHsrMetaStrict ?? readHsrMetaStrict)(name);
     } catch (error) {
-      const cleanup = await provisionalRuntime.stop();
-      throw new SpawnAfterForkError("runtime-admission", provisionalRuntime, cleanup, error);
+      const rollback = await rollbackFreshLaunchPublication(reservation, provisionalRecord, {
+        context: `local HSR runtime admission failed for ${name}`,
+        cleanup: () => provisionalRuntime.stop(),
+        cleanupPrepublicationArtifacts: () => removeConfirmedStoppedHsrRunDir(name, hostPid),
+        ...(runtimeDeps.afterLaunchRollbackStopDispatch
+          ? { afterStopDispatch: runtimeDeps.afterLaunchRollbackStopDispatch }
+          : {}),
+      });
+      throw new SpawnAfterForkError("runtime-admission", provisionalRuntime, rollback.cleanup, error, rollback);
     }
     const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
     const runtime = runtimeForFingerprint(runnerFingerprint);
     if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
-      const cleanup = await runtime.stop();
+      const rollback = await rollbackFreshLaunchPublication(reservation, provisionalRecord, {
+        context: `local HSR birth admission was incomplete for ${name}`,
+        cleanup: () => runtime.stop(),
+        cleanupPrepublicationArtifacts: () => removeConfirmedStoppedHsrRunDir(name, hostPid, runnerFingerprint),
+        ...(runtimeDeps.afterLaunchRollbackStopDispatch
+          ? { afterStopDispatch: runtimeDeps.afterLaunchRollbackStopDispatch }
+          : {}),
+      });
       throw new SpawnAfterForkError(
         "runtime-admission",
         runtime,
-        cleanup,
+        rollback.cleanup,
         new Error(`HSR host ${hostPid} has no complete birth admission`),
+        rollback,
       );
     }
     let postForkPhase: SpawnAfterForkError["phase"] = "runtime-publish";
     let publishedRecord: SessionRecord | undefined;
     try {
+      await reservation.recordHsrLaunch({
+        hostPid,
+        hostFingerprint: runnerFingerprint,
+        childAdmission: admittedMeta.childAdmission,
+      });
       await opts.onRuntimeLaunched?.(runtime);
       timer.mark("session-create");
-      const command = shellCommand(spec);
-      const now = new Date().toISOString();
-      const record: SessionRecord = {
-        name,
-        agent: spec.kind,
-        cwd: opts.cwd,
-        launchArgv,
-        command,
-        tmuxTarget: name, // logical id — HSR has no tmux target
-        substrate: "hsr",
-        runnerPid: hostPid,
-        runnerFingerprint,
-        ...(runnerTier ? { runnerTier } : {}),
-        combId: name,
-        createdAt: now,
-        updatedAt: now,
-        status: "running",
-        id: identity.id,
-        prefix: identity.prefix,
-        uuid: identity.uuid,
-        requestedAgent: spec.requestedKind,
-        homePath: spec.homePath,
-        ...(pinnedSessionId ? { providerSessionId: pinnedSessionId } : {}),
-        ...(opts.colony ? { colony: opts.colony } : {}),
-        ...(opts.swarmId ? { swarmId: opts.swarmId } : {}),
-        ...(opts.caste ? { caste: opts.caste } : {}),
-        ...(brief ? { brief } : {}),
-        ...(opts.contract ? { contract: opts.contract } : {}),
-        ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
-        ...(spawnedById ? { spawnedById } : {}),
-        ...(opts.executionRunId ? { executionRunId: opts.executionRunId } : {}),
-        ...(opts.sandboxWriteRoots?.length ? { sandboxWriteRoots: [...opts.sandboxWriteRoots] } : {}),
-        ...(opts.account ? { accountId: opts.account.id } : {}),
-        ...(opts.autoswap ? { autoswap: true } : {}),
-        ...(opts.poolKey ? { poolKey: opts.poolKey } : {}),
-        ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
-        ...hsrKitStamp,
-      };
+      const record: SessionRecord = { ...provisionalRecord, runnerFingerprint };
       postForkPhase = "session-save";
       await (runtimeDeps.saveSession ?? saveSession)(record);
       publishedRecord = record;
@@ -782,24 +903,27 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
         console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
       }
       if (ownsTimer) await persistSpawnTiming(timer, record.name);
+      await reservation.promotePublished(record);
       return record;
     } catch (error) {
-      const cleanup = await runtime.stop();
-      if (cleanup.stopped && publishedRecord) {
-        // The runtime was stopped by INFRASTRUCTURE failure, not by a
-        // retire/kill — status stays "running" so the record derives `crashed`
-        // (status:"dead" here made rollbacks look like deliberate stops,
-        // hiding them from `hive revive --crashed` and operators — review
-        // §1.5). lastError records the rollback cause for `state explain`.
-        // Lifecycle CAS prevents a same-name/new-generation replacement from
-        // being rewritten by this rollback.
-        const cause = error instanceof Error ? error.message : String(error);
-        await withSessionLifecycleTransaction(publishedRecord, (lifecycle) => lifecycle.commit({
-          lastError: `spawn rolled back after post-fork ${postForkPhase} failure: ${cause}`,
-          updatedAt: new Date().toISOString(),
-        })).catch(() => undefined);
-      }
-      throw new SpawnAfterForkError(postForkPhase, runtime, cleanup, error);
+      // `saveSession` may have completed its atomic rename before surfacing an
+      // error, so never trust the block-scoped publication flag here. The
+      // rollback helper re-reads and birth-qualifies the canonical row, writes
+      // kill_failed before the first signal, then purges it only after exact
+      // runtime absence while this callback still owns the name lifecycle.
+      const rollback = await rollbackFreshLaunchPublication(
+        reservation,
+        publishedRecord ?? { ...provisionalRecord, runnerFingerprint },
+        {
+          context: `local HSR post-fork ${postForkPhase} publication failed for ${name}`,
+          cleanup: () => runtime.stop(),
+          cleanupPrepublicationArtifacts: () => removeConfirmedStoppedHsrRunDir(name, hostPid, runnerFingerprint),
+          ...(runtimeDeps.afterLaunchRollbackStopDispatch
+            ? { afterStopDispatch: runtimeDeps.afterLaunchRollbackStopDispatch }
+            : {}),
+        },
+      );
+      throw new SpawnAfterForkError(postForkPhase, runtime, rollback.cleanup, error, rollback);
     }
   }
 
@@ -808,6 +932,7 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
   const locationHint = isRemote && opts.node ? ` on ${opts.node.name}` : "";
   if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
+  await reservation.markLaunchDispatch();
   const launch = await substrate.newSession(tmuxTarget, opts.cwd, {
     command: spec.command,
     args: spec.args,
@@ -860,13 +985,32 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     ...(opts.poolMember !== undefined ? { poolMember: opts.poolMember } : {}),
     ...kitStamp,
   };
-  await saveSession(record);
-  await writeSpawnOptions(record);
-  timer.mark("persist");
-  // Owned timers (swarm/internal callers) report here; a caller-threaded timer
-  // is reported by the caller once the readiness wait has also been measured.
-  if (ownsTimer) await persistSpawnTiming(timer, record.name);
-  return record;
+  try {
+    await reservation.recordTmuxLaunch({
+      substrate: substrate.kind === "ssh-tmux" ? "ssh-tmux" : "local-tmux",
+      target: tmuxTarget,
+      ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+      launch,
+    });
+    await saveSession(record);
+    await writeSpawnOptions(record);
+    timer.mark("persist");
+    // Owned timers (swarm/internal callers) report here; a caller-threaded timer
+    // is reported by the caller once the readiness wait has also been measured.
+    if (ownsTimer) await persistSpawnTiming(timer, record.name);
+    await reservation.promotePublished(record);
+    return record;
+  } catch (error) {
+    const rollback = await rollbackFreshLaunchPublication(reservation, record, {
+      context: `tmux launch publication failed for ${name}`,
+      cleanup: () => cleanupLaunchedTmuxIncarnation(substrate, tmuxTarget, launch),
+      ...(runtimeDeps.afterLaunchRollbackStopDispatch
+        ? { afterStopDispatch: runtimeDeps.afterLaunchRollbackStopDispatch }
+        : {}),
+    });
+    throw launchPublicationError(error, rollback.cleanup, rollback.ownershipPersisted, rollback);
+  }
+  }, { operation: "spawn" });
 }
 
 
@@ -1200,6 +1344,7 @@ export async function spawnSingleBee(
   trustedContext: {
     spawnedById?: string;
     executionRunId?: string;
+    executionRuntimeCredentialLeaseIds?: string[];
     protocolLaunch?: boolean;
     onRuntimeLaunched?: (runtime: SpawnedRuntimeHandle) => void | Promise<void>;
     runtimeDependencies?: SpawnRuntimeDependencies;
@@ -1231,7 +1376,12 @@ export async function spawnSingleBee(
   // Parsed flag and cannot arrive through generic spawn flags or child env.
   const spawnedById = trustedContext.spawnedById;
   const colony = await resolveSpawnColony(parsed);
-  const spec = resolveAgent(agent, extraArgs, { home, yolo, env });
+  const spec = resolveAgent(agent, extraArgs, {
+    home,
+    yolo,
+    env,
+    protocolLaunch: trustedContext.protocolLaunch,
+  });
   // HSR is a substrate, not a node: `--substrate hsr` skips node resolution and
   // runs the bee pane-lessly on the local runner host (HSR_EXPLORATION.md §7).
   // Origin-based default (agents → HSR, humans → local-tmux) with explicit
@@ -1288,6 +1438,10 @@ export async function spawnSingleBee(
       ...(sandboxWriteRoots ? { sandboxWriteRoots } : {}),
       ...(spawnedById ? { spawnedById } : {}),
       ...(trustedContext.executionRunId ? { executionRunId: trustedContext.executionRunId } : {}),
+      ...(trustedContext.executionRuntimeCredentialLeaseIds?.length
+        ? { executionRuntimeCredentialLeaseIds: [...trustedContext.executionRuntimeCredentialLeaseIds] }
+        : {}),
+      ...(trustedContext.protocolLaunch ? { protocolLaunch: true } : {}),
       ...(trustedContext.onRuntimeLaunched ? { onRuntimeLaunched: trustedContext.onRuntimeLaunched } : {}),
       node,
       account: selectedAccount,
@@ -1439,25 +1593,23 @@ export async function spawnSingleBee(
   }
   if (trackAttachment) {
     try {
-      await attachTrack(trackAttachment.name, {
-        bee: record.name,
-        ...(record.id ? { beeId: record.id } : {}),
-        ...(trackAttachment.version !== undefined ? { version: trackAttachment.version } : {}),
-        deliver: async (postscript) => {
-          const prompt = truthy(flag(parsed, "track-prompt")) && briefText
-            ? `${briefText}\n\n${postscript}`
-            : postscript;
-          await deliverPromptText(record, prompt);
-          const at = new Date().toISOString();
-          record = await updateSession(record.name, {
-            updatedAt: at,
-            status: "running",
-            lastPrompt: prompt,
-            lastPromptAt: at,
-          }) ?? { ...record, updatedAt: at, status: "running", lastPrompt: prompt, lastPromptAt: at };
-          await writeHiveState(record, "working");
-        },
-      });
+      await withRunnableSessionAdmission(record, async (lifecycle, admitted) => {
+        record = admitted;
+        await attachTrack(trackAttachment.name, {
+          bee: record.name,
+          ...(record.id ? { beeId: record.id } : {}),
+          ...(trackAttachment.version !== undefined ? { version: trackAttachment.version } : {}),
+          deliver: async (postscript) => {
+            const prompt = truthy(flag(parsed, "track-prompt")) && briefText
+              ? `${briefText}\n\n${postscript}`
+              : postscript;
+            record = (await deliverSessionTextInAdmission(lifecycle, record, prompt, {
+              deliver: deliverPromptText,
+            })).record;
+            await writeHiveState(record, "working");
+          },
+        });
+      }, { operation: "spawn track attach" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await appendLedger({

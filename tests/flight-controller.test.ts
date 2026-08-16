@@ -13,6 +13,7 @@ import {
 } from "../src/flight/types.js";
 import type { BeeState } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import { SpawnAfterForkError } from "../src/spawnRuntime.js";
 
 const T0 = Date.parse("2026-07-20T10:00:00.000Z");
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -176,6 +177,35 @@ test("spawn failure burns the attempt and abandons at maxAttempts with a mix vio
   assert.ok(h.ledger.some((e) => e.type === "flight.mix.violation"));
 });
 
+test("unconfirmed launch cleanup holds the slot and later sweeps never spawn another attempt", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const h = harness(f, [vacantSlot("s1")], T0);
+  let calls = 0;
+  h.spawnImpl = async () => {
+    calls += 1;
+    throw new SpawnAfterForkError(
+      "runtime-publish",
+      {
+        identity: { kind: "hsr", beeName: slotBeeName(f.id, "s1", 0, 1), hostPid: 9001 },
+        stop: async () => ({ stopped: false, detail: "still live" }),
+      },
+      { stopped: false, detail: "host absence unconfirmed" },
+      new Error("session publication failed"),
+    );
+  };
+
+  await sweepFlights(h.deps, [], new Map());
+  await sweepFlights(h.deps, [], new Map());
+
+  const held = h.slots.get("s1")!;
+  assert.equal(calls, 1, "a different attempt is never spawned across unresolved ownership");
+  assert.equal(held.state, "provisioning");
+  assert.equal(held.attempt, 1);
+  assert.equal(held.launchOwnership?.status, "indeterminate");
+  assert.ok(h.ledger.some((event) => event.type === "flight.slot.spawn_indeterminate"));
+  assert.equal(h.ledger.some((event) => event.type === "flight.slot.spawn_failed"), false);
+});
+
 test("simultaneous batch completion: all slots seal in one sweep → all done + flight.complete + closed", async () => {
   const f = flight({ target: { slots: 3, mix: [{ key: "fable", agent: "claude", count: 3 }] } });
   const names = ["s1", "s2", "s3"].map((slotId) => slotBeeName(f.id, slotId, 0, 1));
@@ -228,6 +258,81 @@ test("stalled slots get exactly one deterministic nudge", async () => {
   // Second sweep shortly after: no repeat nudge.
   await sweepFlights(h.deps, [bee(name)], new Map([[name, "idle_with_output" as BeeState]]));
   assert.equal(h.nudged.length, 1);
+});
+
+test("stop doubt holds lane ownership past replacement deadlines until exact death", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const working: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "working",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0) },
+  };
+  const pastEveryReplacementClock = T0 + 10 * Math.max(f.contract.readinessDeadlineMs, f.contract.stallMs);
+  const h = harness(f, [working], pastEveryReplacementClock);
+  const retired: string[] = [];
+  h.deps.retireBee = async (beeName) => {
+    retired.push(beeName);
+  };
+
+  const held = await sweepFlights(
+    h.deps,
+    [bee(name, { status: "kill_failed", lastError: "exact process-group stop unconfirmed" })],
+    new Map([[name, "kill_failed" as BeeState]]),
+  );
+
+  assert.equal(h.spawned.length, 0, "stop doubt must not fill the still-owned lane");
+  assert.equal(h.nudged.length, 0, "stop doubt must not nudge an indeterminate runtime");
+  assert.equal(retired.length, 0, "stop doubt must not issue another lifecycle side effect");
+  assert.equal(h.saved.length, 0, "the owned attempt remains byte-for-byte unchanged");
+  assert.equal(h.slots.get("s1")?.state, "working");
+  assert.equal(h.slots.get("s1")?.beeName, name);
+  assert.equal(h.ledger.some((event) => event.type === "flight.slot.crashed" || event.type === "flight.vacancy"), false);
+  assert.ok(held.some((outcome) => outcome.action === "skipped" && outcome.detail === "ownership-held: stop-unconfirmed"));
+
+  await sweepFlights(h.deps, [bee(name, { status: "dead" })], new Map([[name, "dead" as BeeState]]));
+  assert.equal(h.spawned.length, 1, "only resolved exact death releases and refills the lane");
+  assert.equal(h.slots.get("s1")?.attempt, 2);
+  assert.notEqual(h.slots.get("s1")?.beeName, name);
+});
+
+test("frozen vacancy evidence cannot write off or replace a source that became kill_failed before spawn", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const working: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "working",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+    evidence: { firstEvidenceAt: iso(T0), lastActivityAt: iso(T0) },
+  };
+  const h = harness(f, [working], T0 + f.contract.stallMs + 1_000);
+  let admissions = 0;
+  h.deps.withSourceBeeAdmission = async (source, _fn) => {
+    admissions += 1;
+    assert.equal(source.name, name);
+    // This is the canonical state after the frozen tick evidence was built.
+    throw new Error("flight automatic replacement: source has unresolved stop state");
+  };
+
+  const outcomes = await sweepFlights(
+    h.deps,
+    [bee(name, { status: "dead" })],
+    new Map([[name, "dead" as BeeState]]),
+  );
+
+  assert.equal(admissions, 1);
+  assert.equal(h.spawned.length, 0);
+  assert.equal(h.saved.length, 0, "vacancy/provisioning/publication all remain unwritten");
+  assert.equal(h.slots.get("s1")?.state, "working");
+  assert.equal(h.slots.get("s1")?.beeName, name);
+  assert.equal(h.ledger.length, 0, "kill wins without vacancy or ownership ledger mutation");
+  assert.ok(outcomes.some((outcome) =>
+    outcome.action === "skipped" && outcome.detail === "source lifecycle admission refused"));
 });
 
 test("active slots with unchanged activity do not save or emit working-to-working outcomes", async () => {
@@ -444,6 +549,54 @@ test("grok M2: a wedged replacement retires the written-off live bee", async () 
   };
   await sweepFlights(h.deps, [bee(name)], new Map([[name, "booting" as BeeState]]));
   assert.deepEqual(retired, [name]);
+});
+
+test("a wedged predecessor whose retire is unconfirmed retains the slot and blocks replacement", async () => {
+  const f = flight({ target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] } });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const stuck: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "booting",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+  };
+  const h = harness(f, [stuck], T0 + f.contract.readinessDeadlineMs + 1_000);
+  h.deps.retireBee = async () => {
+    throw new Error("exact cleanup unconfirmed");
+  };
+
+  const outcomes = await sweepFlights(h.deps, [bee(name)], new Map([[name, "booting" as BeeState]]));
+  assert.equal(h.spawned.length, 0);
+  assert.deepEqual(h.slots.get("s1"), stuck, "vacancy is not published before exact predecessor cleanup");
+  assert.ok(outcomes.some((outcome) => outcome.error?.includes("predecessor cleanup unconfirmed")));
+  assert.equal(h.ledger.some((event) => event.type === "flight.vacancy"), false);
+});
+
+test("a draining flight cannot vacate or close over a wedged Bee whose retire is unconfirmed", async () => {
+  const f = flight({
+    status: "draining",
+    target: { slots: 1, mix: [{ key: "fable", agent: "claude", count: 1 }] },
+  });
+  const name = slotBeeName(f.id, "s1", 0, 1);
+  const stuck: SlotRecord = {
+    ...vacantSlot("s1"),
+    attempt: 1,
+    state: "booting",
+    beeName: name,
+    attemptStartedAt: iso(T0),
+  };
+  const h = harness(f, [stuck], T0 + f.contract.readinessDeadlineMs + 1_000);
+  h.deps.retireBee = async () => {
+    throw new Error("retire returned stop doubt");
+  };
+
+  const outcomes = await sweepFlights(h.deps, [bee(name)], new Map([[name, "booting" as BeeState]]));
+  assert.deepEqual(h.slots.get("s1"), stuck);
+  assert.equal(h.flights.get(f.id)?.status, "draining");
+  assert.equal(h.spawned.length, 0);
+  assert.equal(h.ledger.some((event) => event.type === "flight.vacancy" || event.type === "flight.complete"), false);
+  assert.ok(outcomes.some((outcome) => outcome.error?.includes("predecessor cleanup unconfirmed")));
 });
 
 test("CR-1: sweeps run under the flight lock when provided", async () => {

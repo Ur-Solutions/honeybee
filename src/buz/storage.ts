@@ -219,12 +219,18 @@ export async function listMessages(
   const results: { message: BuzMessage; path: string }[] = [];
   for (const file of files) {
     const path = join(dir, file);
-    const text = await readFile(path, "utf8").catch(() => null);
-    if (text === null) continue;
+    let text: string;
+    try {
+      text = await readFile(path, "utf8");
+    } catch (error) {
+      if (options.strict) throw new Error(`buz message ${file} in ${mailbox} is unreadable`, { cause: error });
+      continue;
+    }
     let message: BuzMessage;
     try {
       message = parseBuzMessage(text);
-    } catch {
+    } catch (error) {
+      if (options.strict) throw new Error(`buz message ${file} in ${mailbox} is malformed`, { cause: error });
       continue;
     }
     if (options.fromFilter && !senderMatchesFilter(message.from, options.fromFilter)) {
@@ -235,6 +241,32 @@ export async function listMessages(
   if (typeof options.limit === "number" && options.limit >= 0) {
     return results.slice(0, options.limit);
   }
+  return results;
+}
+
+/** Strictly list one sender's audit rows, including the external-human root. */
+export async function listSenderOutboxMessages(
+  sender: BuzSender,
+  options: ListMessagesOptions = {},
+): Promise<{ message: BuzMessage; path: string }[]> {
+  const dir = sender.kind === "bee" ? beeMailboxDir(sender.id, "outbox") : externalOutboxDir(sender.name);
+  const entries = await readdir(dir).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  });
+  const files = entries.filter((file) => file.endsWith(".md")).sort().reverse();
+  const results: { message: BuzMessage; path: string }[] = [];
+  for (const file of files) {
+    const path = join(dir, file);
+    try {
+      const message = parseBuzMessage(await readFile(path, "utf8"));
+      if (options.fromFilter && !senderMatchesFilter(message.from, options.fromFilter)) continue;
+      results.push({ message, path });
+    } catch (error) {
+      if (options.strict) throw new Error(`sender outbox message ${file} is unreadable or malformed`, { cause: error });
+    }
+  }
+  if (typeof options.limit === "number" && options.limit >= 0) return results.slice(0, options.limit);
   return results;
 }
 
@@ -256,7 +288,20 @@ export async function readMessageById(
   id: string,
   options: { strict?: boolean } = {},
 ): Promise<{ message: BuzMessage; path: string; mailbox: BuzMailbox } | null> {
-  for (const mailbox of BUZ_MAILBOXES) {
+  // This lookup is an acceptance/receipt authority, not a filesystem browser.
+  // Prefer recipient settlement over transient stages and audit copies:
+  // delivered (inbox/read) > definitively undeliverable (quarantine) > queued
+  // > sender-only outbox. In particular, a self-send leaves both an outbox and
+  // a recipient copy; the audit row must never mask the stronger recipient
+  // verdict and turn a delivered replay into ambiguity.
+  const receiptPrecedence: readonly BuzMailbox[] = [
+    "inbox",
+    "read",
+    "quarantine",
+    "queue",
+    "outbox",
+  ];
+  for (const mailbox of receiptPrecedence) {
     const dir = beeMailboxDir(beeName, mailbox);
     let entries: string[];
     try {
@@ -294,6 +339,32 @@ export async function readMessageById(
         }
         continue;
       }
+    }
+  }
+  return null;
+}
+
+/** Strict sender-side lookup for an exact audit id (including human outbox). */
+export async function readSenderOutboxById(
+  sender: BuzSender,
+  id: string,
+  options: { strict?: boolean } = {},
+): Promise<{ message: BuzMessage; path: string; mailbox: "outbox" } | null> {
+  const dir = sender.kind === "bee" ? beeMailboxDir(sender.id, "outbox") : externalOutboxDir(sender.name);
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  for (const file of entries) {
+    if (!file.endsWith(`-${id}.md`)) continue;
+    const path = join(dir, file);
+    try {
+      return { message: parseBuzMessage(await readFile(path, "utf8")), path, mailbox: "outbox" };
+    } catch (error) {
+      if (options.strict) throw new Error(`sender outbox message ${id} is unreadable or malformed`, { cause: error });
     }
   }
   return null;

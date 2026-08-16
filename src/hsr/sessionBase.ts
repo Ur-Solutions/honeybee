@@ -26,6 +26,7 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { cleanupCellSandboxCommand, wrapCellSandboxCommand } from "./cellSandbox.js";
+import type { HsrAnswerHostIdentity } from "../answerReceipt.js";
 import type { RunnerEvent } from "./types.js";
 import { appendHsrEvent, appendRingText, writeHsrRing } from "./runDir.js";
 import { listProcessRows, type ProcessRow } from "./processIdentity.js";
@@ -291,16 +292,26 @@ export async function spawnSessionChild(
   opts: {
     cwd: string;
     env: Record<string, string>;
+    onChildSpawnPending?: () => Promise<void>;
+    onChildSpawnFailure?: () => Promise<void>;
     onChildSpawn?: (identity: { pid: number; pgid: number }) => Promise<void>;
   },
 ): Promise<ChildProcess> {
   const wrapped = await wrapCellSandboxCommand(command, args);
-  const child: ChildProcess = spawn(wrapped.command, wrapped.args, {
-    cwd: opts.cwd,
-    env: opts.env,
-    detached: true,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  await opts.onChildSpawnPending?.();
+  let child: ChildProcess;
+  try {
+    child = spawn(wrapped.command, wrapped.args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (error) {
+    cleanupCellSandboxCommand();
+    await opts.onChildSpawnFailure?.();
+    throw error;
+  }
   try {
     await new Promise<void>((resolve, reject) => {
       const onError = (err: Error): void => reject(err);
@@ -312,6 +323,7 @@ export async function spawnSessionChild(
     });
   } catch (error) {
     cleanupCellSandboxCommand();
+    await opts.onChildSpawnFailure?.();
     throw error;
   }
   child.on("error", () => undefined);
@@ -364,27 +376,46 @@ export type SessionPlumbingCore = {
   /** Rendered text tail (RunnerSession.snapshot). */
   snapshot(lines?: number): string;
   /** Flush any debounced ring.txt write immediately. */
-  flushRing(): void;
+  flushRing(): Promise<void>;
+  /** Await every event accepted before this call becoming durable/published. */
+  drain(): Promise<void>;
+  /** Fail the stream after every already-accepted event becomes durable. */
+  fail(error: unknown): Promise<void>;
   /** End the event stream (idempotent); waiters see done immediately. */
-  endStream(): void;
+  endStream(): Promise<void>;
 };
 
-export function createSessionPlumbing(bee: string): SessionPlumbingCore {
+export function createSessionPlumbing(
+  bee: string,
+  eventHost?: HsrAnswerHostIdentity,
+  onEventPersistenceFailure?: (event: RunnerEvent, error: unknown) => Promise<void>,
+): SessionPlumbingCore {
   // --- structured event queue (backs the AsyncIterable) ----------------------
   const queue: RunnerEvent[] = [];
-  const waiters: Array<(r: IteratorResult<RunnerEvent>) => void> = [];
+  const waiters: Array<{
+    resolve: (r: IteratorResult<RunnerEvent>) => void;
+    reject: (error: unknown) => void;
+  }> = [];
   let ended = false;
+  let endRequested = false;
+  let streamError: unknown;
 
   const pushEvent = (event: RunnerEvent): void => {
     if (ended) return;
     const waiter = waiters.shift();
-    if (waiter) waiter({ value: event, done: false });
+    if (waiter) waiter.resolve({ value: event, done: false });
     else queue.push(event);
   };
-  const endStream = (): void => {
+  const finishStream = (): void => {
     if (ended) return;
     ended = true;
-    for (const waiter of waiters.splice(0)) waiter({ value: undefined as never, done: true });
+    for (const waiter of waiters.splice(0)) waiter.resolve({ value: undefined as never, done: true });
+  };
+  const failStream = (error: unknown): void => {
+    if (streamError !== undefined) return;
+    streamError = error;
+    ended = true;
+    for (const waiter of waiters.splice(0)) waiter.reject(error);
   };
 
   const events: AsyncIterable<RunnerEvent> = {
@@ -393,8 +424,9 @@ export function createSessionPlumbing(bee: string): SessionPlumbingCore {
         next(): Promise<IteratorResult<RunnerEvent>> {
           const buffered = queue.shift();
           if (buffered !== undefined) return Promise.resolve({ value: buffered, done: false });
+          if (streamError !== undefined) return Promise.reject(streamError);
           if (ended) return Promise.resolve({ value: undefined as never, done: true });
-          return new Promise((resolve) => waiters.push(resolve));
+          return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
         },
       };
     },
@@ -403,34 +435,91 @@ export function createSessionPlumbing(bee: string): SessionPlumbingCore {
   // --- ring buffer (rendered text tail) --------------------------------------
   let ringText = "";
   let ringTimer: NodeJS.Timeout | null = null;
+  let ringWriteChain: Promise<void> = Promise.resolve();
+  let ingestChain: Promise<void> = Promise.resolve();
 
   const scheduleRingWrite = (): void => {
     if (ringTimer) return;
     ringTimer = setTimeout(() => {
       ringTimer = null;
-      void writeHsrRing(bee, ringText).catch(() => undefined);
+      const snapshot = ringText;
+      ringWriteChain = ringWriteChain.catch(() => undefined).then(() => writeHsrRing(bee, snapshot));
+      void ringWriteChain.catch(() => undefined);
     }, RING_DEBOUNCE_MS);
   };
-  const flushRing = (): void => {
+  const drain = async (): Promise<void> => {
+    await ingestChain;
+  };
+  const flushRing = async (): Promise<void> => {
+    await drain();
     if (ringTimer) {
       clearTimeout(ringTimer);
       ringTimer = null;
     }
-    void writeHsrRing(bee, ringText).catch(() => undefined);
+    const snapshot = ringText;
+    ringWriteChain = ringWriteChain.catch(() => undefined).then(() => writeHsrRing(bee, snapshot));
+    await ringWriteChain;
   };
 
   // --- ingest one produced event: stamp, persist, queue, ring ----------------
-  const ingestEvent = (event: RunnerEvent): void => {
+  const ingestEvent = (rawEvent: RunnerEvent): void => {
+    if (ended || endRequested) return;
+    // Copy before stamping so provider-owned protocol objects cannot mutate or
+    // forge the durable runner epoch supplied by the host.
+    const event: RunnerEvent = eventHost ? { ...rawEvent, host: eventHost } : { ...rawEvent };
     if (typeof (event as { ts?: unknown }).ts !== "number" || (event as { ts: number }).ts === 0) {
       (event as { ts: number }).ts = Date.now();
     }
-    pushEvent(event);
-    // The runner is the single writer of the durable event log (see file docs).
-    void appendHsrEvent(bee, event).catch(() => undefined);
-    if (event.type === "text") {
-      ringText = appendRingText(ringText, event.text);
-      scheduleRingWrite();
+    // Persist before publication. The host broadcasts from the stamped append
+    // tap, and the iterator drives lifecycle bookkeeping; neither may observe
+    // an event that exact replay cannot recover after a crash.
+    const operation = ingestChain.then(async () => {
+      try {
+        await appendHsrEvent(bee, event);
+      } catch (error) {
+        // Establish the durable, outside-run-dir ambiguity authority before
+        // exposing this rejection to the host iterator. Otherwise a process
+        // crash between append failure and the asynchronous event-pump catch
+        // can look like an ordinary dead runtime and auto-revive over a lost
+        // provider event.
+        await onEventPersistenceFailure?.(event, error);
+        throw error;
+      }
+      if (event.type === "text") {
+        ringText = appendRingText(ringText, event.text);
+        scheduleRingWrite();
+      }
+      pushEvent(event);
+    });
+    ingestChain = operation.catch((error) => {
+      failStream(error);
+      throw error;
+    });
+    void ingestChain.catch(() => undefined);
+  };
+
+  const endStream = async (): Promise<void> => {
+    if (endRequested) return drain();
+    endRequested = true;
+    try {
+      await drain();
+      finishStream();
+    } catch (error) {
+      failStream(error);
+      throw error;
     }
+  };
+
+  const fail = async (error: unknown): Promise<void> => {
+    if (ended || streamError !== undefined) return;
+    endRequested = true;
+    try {
+      await drain();
+    } catch (ingestError) {
+      failStream(ingestError);
+      return;
+    }
+    failStream(error);
   };
 
   function snapshot(lines?: number): string {
@@ -441,7 +530,7 @@ export function createSessionPlumbing(bee: string): SessionPlumbingCore {
     return all.slice(Math.max(0, all.length - lines)).join("\n");
   }
 
-  return { events, ingestEvent, snapshot, flushRing, endStream };
+  return { events, ingestEvent, snapshot, flushRing, drain, fail, endStream };
 }
 
 /**
@@ -471,17 +560,23 @@ export type SessionPlumbing = {
 
 /**
  * Install the shared plumbing on a freshly spawned session child: event queue,
- * ring buffer, ingest, exit teardown, and group stop. `onChildExit` runs FIRST
- * in the exit handler, before the exit event is ingested — a runner disposes
- * its transport there (e.g. the codex RPC peer). For tiers whose session spans
- * MANY children (turn), use createSessionPlumbing + stopChildGroup directly.
+ * ring buffer, ingest, exit teardown, and group stop. Process status is
+ * recorded on `exit`, but protocol disposal and terminal event persistence
+ * wait for `close`: Node may deliver stdout/stderr after `exit`. `onChildExit`
+ * runs after verified pipe EOF and before the exit event is ingested. For tiers
+ * whose session spans MANY children (turn), use createSessionPlumbing +
+ * stopChildGroup directly.
  */
 export function attachSessionPlumbing(
   bee: string,
   child: ChildProcess,
-  hooks: { onChildExit?: () => void } = {},
+  hooks: {
+    onChildExit?: () => void | Promise<void>;
+    eventHost?: HsrAnswerHostIdentity;
+    onEventPersistenceFailure?: (event: RunnerEvent, error: unknown) => Promise<void>;
+  } = {},
 ): SessionPlumbing {
-  const core = createSessionPlumbing(bee);
+  const core = createSessionPlumbing(bee, hooks.eventHost, hooks.onEventPersistenceFailure);
   const ingestEvent = (event: RunnerEvent): void => {
     noteChildProcessEvent(child, event);
     core.ingestEvent(event);
@@ -493,20 +588,67 @@ export function attachSessionPlumbing(
   const exitedPromise = new Promise<void>((resolve) => {
     resolveExited = resolve;
   });
+  let exitCode: number | null = null;
+  let exitSignal: NodeJS.Signals | null = null;
+  let reapAfterExit: Promise<void> = Promise.resolve();
+  let outputDrainError: Error | undefined;
+  const watchOutput = (name: "stdout" | "stderr", stream: NodeJS.ReadableStream | null): void => {
+    if (!stream) return;
+    let reachedEof = false;
+    stream.once("end", () => { reachedEof = true; });
+    stream.once("error", (error) => {
+      outputDrainError ??= new Error(`HSR child ${name} failed before EOF`, { cause: error });
+    });
+    stream.once("close", () => {
+      if (!reachedEof) outputDrainError ??= new Error(`HSR child ${name} closed before EOF`);
+    });
+  };
+  watchOutput("stdout", child.stdout);
+  watchOutput("stderr", child.stderr);
   child.once("exit", (code, signal) => {
     exited = true;
-    hooks.onChildExit?.();
+    exitCode = code ?? null;
+    exitSignal = signal ?? null;
+    // stdin carries no provider output and can be closed as soon as the child
+    // exits. stdout/stderr stay attached until EOF so late kernel-buffered or
+    // inherited-pipe bytes cannot be discarded.
+    child.stdin?.destroy();
+    // A natural/crash exit must also reap groups which escaped the harness
+    // PGID. Event-driven snapshots retain their identity after reparenting.
+    reapAfterExit = terminateChildProcessTree(child, () => true).catch(() => undefined);
+  });
+  child.once("close", (code, signal) => {
+    if (!exited) {
+      exited = true;
+      exitCode = code ?? null;
+      exitSignal = signal ?? null;
+      reapAfterExit = terminateChildProcessTree(child, () => true).catch(() => undefined);
+    }
     void (async () => {
-      // A natural/crash exit must also reap groups which escaped the harness
-      // PGID. Event-driven snapshots retain their identity after reparenting.
-      await terminateChildProcessTree(child, () => true).catch(() => undefined);
-      ingestEvent({ type: "exit", ts: Date.now(), code: code ?? null, signal: signal ?? undefined });
-      core.flushRing();
-      core.endStream();
-      // Node does NOT auto-close the parent-side stdio pipes on child exit — the
-      // stdin write pipe in particular stays an open handle and would keep the
-      // host's event loop alive forever (a zombie __hsr-run process that never
-      // exits after its session ends). Destroy them so the host exits cleanly.
+      await reapAfterExit;
+      // Disposal may reject in-flight provider requests whose catch handlers
+      // synchronously publish their final classified event/turn boundary. Await
+      // the hook (including one microtask turn for a void hook) before stamping
+      // exit so those settlements cannot land above the terminal high-water.
+      try {
+        await hooks.onChildExit?.();
+      } catch (error) {
+        outputDrainError ??= new Error("HSR child protocol teardown failed after pipe EOF", { cause: error });
+      }
+      if (outputDrainError) {
+        await core.fail(outputDrainError).catch(() => undefined);
+      } else {
+        ingestEvent({
+          type: "exit",
+          ts: Date.now(),
+          code: exitCode,
+          signal: exitSignal ?? undefined,
+        });
+      }
+      await core.flushRing().catch(() => undefined);
+      await core.endStream().catch(() => undefined);
+      // All readable EOFs have now been observed. Destroying the already-closed
+      // handles is only resource cleanup and cannot discard protocol bytes.
       child.stdin?.destroy();
       child.stdout?.destroy();
       child.stderr?.destroy();

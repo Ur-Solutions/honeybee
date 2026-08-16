@@ -13,6 +13,22 @@ export class BuzDeliveryRejectedError extends Error {
   }
 }
 
+/**
+ * A no-id caller collided with a durable, still-unsettled logical intent.
+ * The caller must retry with `messageId`, or explicitly opt into a distinct
+ * intent (`--new`) when the repeated payload is deliberate.
+ */
+export class BuzUnresolvedIntentError extends Error {
+  readonly code = "HIVE_BUZ_UNRESOLVED_INTENT";
+  readonly messageId: string;
+
+  constructor(messageId: string, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "BuzUnresolvedIntentError";
+    this.messageId = messageId;
+  }
+}
+
 export type BuzDeliveryFailureClass = "transport" | "delivery-rejected";
 
 export function classifyBuzDeliveryFailure(error: unknown): BuzDeliveryFailureClass {

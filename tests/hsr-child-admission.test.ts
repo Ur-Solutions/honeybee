@@ -13,7 +13,7 @@ import {
   inspectProcessBirth,
 } from "../src/hsr/processIdentity.js";
 import { spawnHsrHost } from "../src/hsr/runnerHost.js";
-import { ensureHsrRunDir, hsrControlSocketPath, hsrMetaPath, hsrRunDir, readHsrMetaStrict, writeHsrMeta } from "../src/hsr/runDir.js";
+import { ensureHsrRunDir, hsrControlSocketPath, hsrMetaPath, hsrMetaProvesProviderNeverStarted, hsrRunDir, readHsrMetaStrict, writeHsrMeta } from "../src/hsr/runDir.js";
 import { stopHsrIncarnationByPid } from "../src/hsr/substrate.js";
 import type { ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import type { RunnerOpts } from "../src/hsr/types.js";
@@ -67,7 +67,9 @@ test("detached runner publishes an OS-comparable host birth fingerprint", { skip
       },
       {
         resolveEntry: async () => ({
-          path: join(process.cwd(), "src", "hsr", "runner-entry.ts"),
+          path: process.env.HIVE_TEST_BUILT_CLI === "1"
+            ? join(process.cwd(), ".test-dist", "src", "hsr", "runner-entry.js")
+            : join(process.cwd(), "src", "hsr", "runner-entry.ts"),
           mode: "dedicated",
         }),
       },
@@ -277,6 +279,7 @@ test("adapter failure before spawn publishes a safe cause and completed no-child
       code: "ENOENT",
       message: "HSR harness executable could not be started",
     });
+    assert.equal(hsrMetaProvesProviderNeverStarted(meta!), true);
   });
 });
 

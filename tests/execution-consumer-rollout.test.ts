@@ -87,7 +87,7 @@ test("canonical execution validation surface matches the reviewed Apiary certifi
   assert.equal(EXECUTION_VALIDATION_SURFACE_VERSION, 1);
   assert.equal(
     computeExecutionValidationSurfaceDigest(contract),
-    "sha256:cd91d2b5e3c3d7a849c9b513992c841c0aafcc1462cbc30931bc41cafcb21cdf",
+    "sha256:423714315c8c2e704424acf56ce0783e1cea2018a9a3978e6773bdeadeacb6db",
   );
   assert.deepEqual(executionBaselineFeatures(contract), ["local-core-v1", "kit-profile-v1"]);
 });

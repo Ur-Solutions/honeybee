@@ -1,24 +1,29 @@
 import { realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   DEFAULT_BUZ_TIER,
   countQuarantinedMessages,
   isBuzTier,
   listMessages,
-  sendBuzMessage,
+  sendBuzMessageInAdmission,
   type BuzSendResult,
   type BuzTier,
 } from "../buz.js";
+import { matchesCellBrokerCapability } from "../cellBrokerCapability.js";
 import { resolveSession } from "../cli/shared.js";
+import { withRunnableSessionAdmission } from "../delivery.js";
+import { storeRoot } from "../fsx.js";
 import { writeHiveState } from "../hiveState.js";
 import { inspectHsrHostProcess } from "../hsr/observe.js";
 import type { RpcMethodHandler } from "../hsr/rpc.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import type { Parsed } from "../parse.js";
+import { withFileLock } from "../lock.js";
 import { recordSeal, validateSealArtifact } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
-import type { SessionRecord } from "../store.js";
+import { safeName, type SessionRecord } from "../store.js";
+import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "../lifecycle.js";
 import { substrateFor } from "../substrates/index.js";
 import { getBeeView, listBeeViews } from "../view/index.js";
 import {
@@ -33,7 +38,7 @@ import {
 
 export type BrokerHandlerOptions = {
   loadAcl?: () => Promise<BrokerAcl>;
-  verifyCaller?: (callerBee: string) => Promise<void>;
+  verifyCaller?: (caller: SessionRecord, capability: unknown) => Promise<void>;
   spawnFilesystem?: BrokerSpawnLauncher;
 };
 
@@ -53,6 +58,25 @@ export type BrokerSpawnLauncher = (
 ) => Promise<Pick<SessionRecord, "name" | "id">>;
 
 type FlatBrokerReply = { ok: boolean; error?: string } & Record<string, unknown>;
+
+type BrokerMutationAdmission = {
+  lifecycle: SessionLifecycleTransaction;
+  caller: SessionRecord;
+};
+
+function brokerMutationLockPath(): string {
+  return join(storeRoot(), "broker-mutation.lock");
+}
+
+/**
+ * Broker mutations may hold the caller lifecycle lock while acquiring a
+ * recipient/name lifecycle lock. One durable outer lock gives every broker
+ * request the same order, preventing A -> B / B -> A cycles while a kill waits
+ * on the caller lock. Read-only inbox/state calls deliberately bypass it.
+ */
+function withBrokerMutationLock<T>(fn: () => Promise<T>): Promise<T> {
+  return withFileLock(brokerMutationLockPath(), fn, { timeoutMs: 120_000, staleMs: 180_000 });
+}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -161,40 +185,50 @@ async function spawnFilesystemBee(
 }
 
 /**
- * Verify the pragmatic v1 caller identity tier against the claimed bee's HSR
- * runner. Node's net.Socket exposes no peer-credential API, and macOS
- * LOCAL_PEERPID requires getsockopt on the accepted fd through native code.
- * Until the RPC transport has that native seam, this proves that the claimed
- * canonical bee has a currently running, birth-verified host. It does not yet
- * attribute this exact socket connection to the host's child process; full
- * socket-peer attribution is deliberately deferred.
+ * Authenticate the caller as one exact canonical runtime generation. The
+ * unguessable token attributes the request; the birth probe prevents a stale
+ * but not-yet-rotated environment from acting after its host is gone.
  *
- * HIVE_BROKER_VERIFY=0 is a daemon-side emergency compatibility opt-out. Any
- * other value (including malformed values) keeps verification enabled.
+ * HIVE_BROKER_VERIFY=0 is only an emergency liveness-probe opt-out. Capability
+ * verification remains mandatory so claimed names never become authority.
  */
-export async function verifyBrokerCallerClaim(callerBee: string): Promise<void> {
+async function verifyBrokerCallerAdmission(caller: SessionRecord, capability: unknown): Promise<void> {
+  if (!matchesCellBrokerCapability(caller, capability)) {
+    throw new Error(
+      `broker capability for ${caller.name} is missing, stale, or invalid; revive this Cell with the current Honeybee runtime`,
+    );
+  }
+  // The emergency flag may skip only the process-liveness probe. It must never
+  // restore the old claimed-name authority model or bypass the capability.
   if (process.env.HIVE_BROKER_VERIFY === "0") return;
-  const meta = await readHsrMeta(callerBee);
+  const meta = await readHsrMeta(caller.name);
   const live = !!meta &&
-    meta.bee === callerBee &&
+    meta.bee === caller.name &&
     meta.status === "running" &&
     !meta.mirrorOfNode &&
     await inspectHsrHostProcess(meta) === "match";
   if (!live) {
     throw new Error(
-      `claimed bee ${callerBee} has no live birth-verified HSR runner (daemon emergency opt-out: HIVE_BROKER_VERIFY=0)`,
+      `claimed bee ${caller.name} has no live birth-verified HSR runner (daemon emergency liveness opt-out: HIVE_BROKER_VERIFY=0)`,
     );
   }
 }
 
+/** Test/operator seam for the exact default claimed-name + capability check. */
+export async function verifyBrokerCallerClaim(callerBee: string, capability: unknown): Promise<void> {
+  const caller = await resolveSession(callerBee);
+  await verifyBrokerCallerAdmission(caller, capability);
+}
+
 async function authorizeSubject(
   op: BrokerOp,
-  callerRef: string,
+  caller: SessionRecord,
   subjectRef: string,
   options: BrokerHandlerOptions,
 ) {
-  const caller = await resolveSession(callerRef);
-  const subject = callerRef === subjectRef ? caller : await resolveSession(subjectRef);
+  const subject = caller.name === subjectRef || caller.id === subjectRef
+    ? caller
+    : await resolveSession(subjectRef);
   const acl = await (options.loadAcl ?? loadBrokerAcl)();
   const decision = decideBrokerPolicy({
     op,
@@ -205,12 +239,16 @@ async function authorizeSubject(
   return { caller, subject };
 }
 
-async function handleBuzSend(params: Record<string, unknown>, options: BrokerHandlerOptions): Promise<FlatBrokerReply> {
-  const callerBee = requiredString(params, "callerBee");
+async function handleBuzSend(
+  params: Record<string, unknown>,
+  options: BrokerHandlerOptions,
+  admission: BrokerMutationAdmission,
+): Promise<FlatBrokerReply> {
+  const callerBee = admission.caller.name;
   const senderBee = typeof params.senderBee === "string" && params.senderBee.length > 0
     ? params.senderBee
     : callerBee;
-  const { subject: sender } = await authorizeSubject("broker:buz-send", callerBee, senderBee, options);
+  const { subject: sender } = await authorizeSubject("broker:buz-send", admission.caller, senderBee, options);
   const target = requiredString(params, "target");
   const body = requiredString(params, "body");
   const tierValue = params.tier ?? DEFAULT_BUZ_TIER;
@@ -219,6 +257,8 @@ async function handleBuzSend(params: Record<string, unknown>, options: BrokerHan
   }
   const tier: BuzTier = tierValue;
   const subject = typeof params.subject === "string" ? params.subject : undefined;
+  const messageId = typeof params.messageId === "string" ? params.messageId : undefined;
+  const forceNewIntent = params.forceNewIntent === true;
 
   const resolved = await resolveSelector(target);
   const records = resolved.kind === "bee" ? [resolved.record] : resolved.records;
@@ -226,18 +266,36 @@ async function handleBuzSend(params: Record<string, unknown>, options: BrokerHan
 
   const results: Array<{ recordName: string; result: BuzSendResult }> = [];
   for (const record of records) {
-    const transport = tier === "interrupt" || tier === "next-tool"
-      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
-      : undefined;
-    const result = await sendBuzMessage({
-      recipient: record,
-      sender: { kind: "bee", id: sender.id ?? sender.name },
-      tier,
-      body,
-      ...(subject ? { subject } : {}),
-      ...(transport ? { transport } : {}),
-      ...(record.node ? { node: record.node } : {}),
-    });
+    const sendToAdmittedRecipient = async (
+      current: SessionRecord,
+      lifecycle: SessionLifecycleTransaction,
+    ): Promise<BuzSendResult> => {
+      const transport = tier === "interrupt" || tier === "next-tool"
+        ? { substrate: substrateFor(current), tmuxTarget: current.tmuxTarget, agentPaneId: current.agentPaneId }
+        : undefined;
+      return sendBuzMessageInAdmission({
+        recipient: current,
+        sender: { kind: "bee", id: sender.id ?? sender.name },
+        tier,
+        body,
+        ...(messageId ? { messageId } : {}),
+        ...(forceNewIntent ? { forceNewIntent: true } : {}),
+        ...(subject ? { subject } : {}),
+        ...(transport ? { transport } : {}),
+        ...(current.node ? { node: current.node } : {}),
+      }, { lifecycle });
+    };
+    // The common self-send path already owns this lifecycle lock. Re-entering
+    // the non-reentrant file lock would deadlock; refresh under the existing
+    // transaction instead. Cross-target mutations acquire their recipient lock
+    // beneath the single broker-mutation lock.
+    const result = record.name === admission.caller.name
+      ? await sendToAdmittedRecipient(await admission.lifecycle.refresh(), admission.lifecycle)
+      : await withRunnableSessionAdmission(
+          record,
+          async (lifecycle, current) => sendToAdmittedRecipient(current, lifecycle),
+          { operation: "broker buz send", ...(messageId ? { deliveryId: messageId } : {}) },
+        );
     results.push({ recordName: record.name, result });
   }
   return { ok: true, results };
@@ -246,7 +304,8 @@ async function handleBuzSend(params: Record<string, unknown>, options: BrokerHan
 async function handleBuzInbox(params: Record<string, unknown>, options: BrokerHandlerOptions): Promise<FlatBrokerReply> {
   const callerBee = requiredString(params, "callerBee");
   const target = typeof params.target === "string" && params.target.length > 0 ? params.target : callerBee;
-  const { subject } = await authorizeSubject("broker:buz-inbox", callerBee, target, options);
+  const caller = await resolveSession(callerBee);
+  const { subject } = await authorizeSubject("broker:buz-inbox", caller, target, options);
   const limit = params.limit;
   if (limit !== undefined && (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 0)) {
     throw new Error("buz inbox limit must be a non-negative integer");
@@ -263,7 +322,8 @@ async function handleBuzInbox(params: Record<string, unknown>, options: BrokerHa
 async function handleState(params: Record<string, unknown>, options: BrokerHandlerOptions): Promise<FlatBrokerReply> {
   const callerBee = requiredString(params, "callerBee");
   const target = typeof params.target === "string" && params.target.length > 0 ? params.target : callerBee;
-  const { subject } = await authorizeSubject("broker:state", callerBee, target, options);
+  const caller = await resolveSession(callerBee);
+  const { subject } = await authorizeSubject("broker:state", caller, target, options);
   const mode = params.mode;
   if (mode === "explain") {
     return { ok: true, mode, view: await getBeeView(subject.name) };
@@ -284,20 +344,41 @@ async function handleState(params: Record<string, unknown>, options: BrokerHandl
   throw new Error("Usage: hive state ls [self] | hive state explain [self]");
 }
 
-async function handleSeal(params: Record<string, unknown>, options: BrokerHandlerOptions): Promise<FlatBrokerReply> {
-  const callerBee = requiredString(params, "callerBee");
+async function handleSeal(
+  params: Record<string, unknown>,
+  options: BrokerHandlerOptions,
+  admission: BrokerMutationAdmission,
+): Promise<FlatBrokerReply> {
+  const callerBee = admission.caller.name;
   const target = typeof params.target === "string" && params.target.length > 0 ? params.target : callerBee;
-  const { subject } = await authorizeSubject("broker:seal", callerBee, target, options);
+  const { subject } = await authorizeSubject("broker:seal", admission.caller, target, options);
   const artifact = validateSealArtifact(params.artifact);
-  const stored = await recordSeal(subject.name, artifact);
-  await writeHiveState(subject, "done");
+  const sealAdmittedSubject = async (current: SessionRecord) => {
+    const stored = await recordSeal(current.name, artifact);
+    await writeHiveState(current, "done");
+    return stored;
+  };
+  const stored = subject.name === admission.caller.name
+    ? await sealAdmittedSubject(await admission.lifecycle.refresh())
+    : await withRunnableSessionAdmission(subject, async (_lifecycle, current) => sealAdmittedSubject(current));
   return { ok: true, recordName: subject.name, stored };
 }
 
-async function handleSpawn(params: Record<string, unknown>, options: BrokerHandlerOptions): Promise<FlatBrokerReply> {
-  const callerRef = requiredString(params, "callerBee");
+async function handleSpawn(
+  params: Record<string, unknown>,
+  options: BrokerHandlerOptions,
+  admission: BrokerMutationAdmission,
+): Promise<FlatBrokerReply> {
   const requested = brokerSpawnArgs(params.spawnArgs);
-  const caller = await resolveSession(callerRef);
+  const caller = admission.caller;
+  // The broker already holds the caller's non-reentrant lifecycle lock through
+  // this launch. A same-name spawn would enter spawnSingleBee's name admission
+  // and wait on that exact lock until timeout, wedging every broker mutation
+  // behind the global outer lock. Reject the post-sanitization name before any
+  // filesystem or launcher side effect.
+  if (requested.name && safeName(requested.name) === caller.name) {
+    throw new Error("broker:spawn cannot reuse the caller bee name");
+  }
   const cwd = await realpath(requested.cwd);
   let acl: BrokerAcl;
   try {
@@ -340,19 +421,55 @@ export async function handleBrokerOperation(
     // Resolve first so an id/alias claim is verified against the canonical HSR
     // run-dir name, and arbitrary caller text never becomes a filesystem path.
     const caller = await resolveSession(requiredString(value, "callerBee"));
-    await (options.verifyCaller ?? verifyBrokerCallerClaim)(caller.name);
-    switch (op as BrokerOp) {
-      case "broker:buz-send":
-        return await handleBuzSend(value, options);
-      case "broker:buz-inbox":
-        return await handleBuzInbox(value, options);
-      case "broker:state":
-        return await handleState(value, options);
-      case "broker:seal":
-        return await handleSeal(value, options);
-      case "broker:spawn":
-        return await handleSpawn(value, options);
+    const callerCapability = value.callerCapability;
+    const verifyCaller = options.verifyCaller ?? verifyBrokerCallerAdmission;
+    // Inbox/state are diagnostic reads and remain available to a live escaped
+    // runner while its failed stop is being investigated. Every mutation is
+    // serialized beneath one broker-wide outer lock, then holds the canonical
+    // caller lifecycle admission through its last side effect. A failed/retired
+    // caller therefore cannot create work after its explicit stop intent.
+    if (op === "broker:buz-inbox" || op === "broker:state") {
+      // State projection gathers exact HSR observations, which takes the same
+      // non-reentrant per-Bee lifecycle lock used for caller authentication.
+      // Authenticate the immutable caller generation first, release the lock
+      // while performing the read-only projection, then re-enter and verify
+      // that exact generation before returning any bytes. This preserves the
+      // capability/lifecycle fence without deadlocking state ls/explain on its
+      // own observation pass. Inbox does not re-enter lifecycle authority and
+      // can retain the simpler single-lock read boundary.
+      if (op === "broker:state") {
+        await withSessionLifecycleTransaction(caller, async (lifecycle) => {
+          await verifyCaller(await lifecycle.refresh(), callerCapability);
+        });
+        const reply = await handleState(value, options);
+        return withSessionLifecycleTransaction(caller, async (lifecycle) => {
+          await verifyCaller(await lifecycle.refresh(), callerCapability);
+          return reply;
+        });
+      }
+      return await withSessionLifecycleTransaction(caller, async (lifecycle) => {
+        const admittedCaller = await lifecycle.refresh();
+        await verifyCaller(admittedCaller, callerCapability);
+        return handleBuzInbox(value, options);
+      });
     }
+    return await withBrokerMutationLock(() =>
+      withRunnableSessionAdmission(caller, async (lifecycle, admittedCaller) => {
+        await verifyCaller(admittedCaller, callerCapability);
+        const admission = { lifecycle, caller: admittedCaller };
+        switch (op as BrokerOp) {
+          case "broker:buz-send":
+            return handleBuzSend(value, options, admission);
+          case "broker:seal":
+            return handleSeal(value, options, admission);
+          case "broker:spawn":
+            return handleSpawn(value, options, admission);
+          case "broker:buz-inbox":
+          case "broker:state":
+            throw new Error(`unreachable read-only broker operation: ${op}`);
+        }
+      }),
+    );
   } catch (error) {
     return { ok: false, error: messageOf(error) };
   }

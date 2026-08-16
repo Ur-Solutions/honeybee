@@ -21,6 +21,19 @@ export type KillResult = {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /** Remote authority proved this exact launch generation is stopped. */
+  incarnationStopped?: boolean;
+  /** Exact stopped history is retained by at least one durable event consumer. */
+  terminalHistoryPending?: boolean;
+  /** Actionable durable consumers which still pin the stopped event suffix. */
+  pendingConsumers?: Array<{ consumerId: string; ackedSeq: number; throughSeq: number }>;
+};
+
+export type KillOptions = {
+  launcherPgid?: number;
+  launcherFingerprint?: ProcessBirthFingerprint;
+  remoteLaunchId?: string;
+  remoteIncarnation?: string;
 };
 
 /**
@@ -31,7 +44,15 @@ export type KillResult = {
  *   that cannot MUST ignore the option, and callers that need deterministic
  *   semantics (buz) gate on `supportsNextTool` first.
  */
-export type SendTextOptions = { mode?: "now" | "next-tool" };
+export type SendTextOptions = {
+  mode?: "now" | "next-tool";
+  /** Stable logical delivery identity (Buz uses its caller message UUID). */
+  deliveryId?: string;
+  /** Keep an external queue item until the durable turn reaches completion. */
+  completionRequired?: boolean;
+  remoteLaunchId?: string;
+  remoteIncarnation?: string;
+};
 
 export type Substrate = {
   readonly kind: SubstrateKind;
@@ -42,7 +63,7 @@ export type Substrate = {
   probe(): Promise<ProbeResult>;
   hasSession(target: string): Promise<boolean>;
   newSession(target: string, cwd: string, spec: LaunchSpec): Promise<NewSessionResult>;
-  kill(target: string, options?: { launcherPgid?: number; launcherFingerprint?: ProcessBirthFingerprint }): Promise<KillResult>;
+  kill(target: string, options?: KillOptions): Promise<KillResult>;
   /**
    * Tear down only the exact pane/process returned by newSession. Lifecycle
    * rollback uses this after a launched runtime loses its generation CAS; it

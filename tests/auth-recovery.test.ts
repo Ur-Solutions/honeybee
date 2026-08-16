@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -9,7 +9,7 @@ import {
   inspectClaudeDiskCredentials,
   planClaudeRecoveryCredentials,
 } from "../src/accounts/credentialHealth.js";
-import { collectAuthRecoveryPrompts, legacyPromptForAuthFailure } from "../src/commands/migrate.js";
+import { collectAuthRecoveryPrompts, legacyPromptForAuthFailure, recoverAuthNeededBee } from "../src/commands/migrate.js";
 import {
   createAuthRecoveryDispatcher,
   hadSuccessfulInterveningTurn,
@@ -17,9 +17,13 @@ import {
   type AuthRecoveryAttemptState,
 } from "../src/daemon/authRecovery.js";
 import { pendingNeedsInputFromEvents, type HsrObservation } from "../src/hsr/observe.js";
+import { appendHsrEvent, ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
+import type { HsrAnswerHostIdentity } from "../src/answerReceipt.js";
 import type { RunnerEvent } from "../src/hsr/types.js";
+import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
+import { readBeeNameLaunchReservation } from "../src/nameAdmission.js";
 import type { BeeState } from "../src/state.js";
-import type { SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, transitionSession, type SessionRecord } from "../src/store.js";
 
 const NOW = Date.parse("2026-08-02T10:00:00.000Z");
 const AUTH_MESSAGE = "Not logged in · Please run /login";
@@ -204,6 +208,52 @@ test("a staged auth replay survives the stop/revive gap and outranks legacy fall
         source: "journal",
         authEventTs: NOW - 200,
       });
+    } finally {
+      if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+      else process.env.HIVE_STORE_ROOT = previous;
+    }
+  });
+});
+
+test("human auth recovery never replays a predecessor host's retained auth prompt", async () => {
+  await withTempDir(async (store) => {
+    const previous = process.env.HIVE_STORE_ROOT;
+    process.env.HIVE_STORE_ROOT = store;
+    try {
+      const bee = "CL.auth-host-refresh";
+      const hostA: HsrAnswerHostIdentity = {
+        hostPid: 101,
+        startedAt: new Date(NOW - 10_000).toISOString(),
+        hostFingerprint: { pgid: 101, startedAt: "auth-host-a" },
+      };
+      const hostB: HsrAnswerHostIdentity = {
+        hostPid: 202,
+        startedAt: new Date(NOW).toISOString(),
+        hostFingerprint: { pgid: 202, startedAt: "auth-host-b" },
+      };
+      await ensureHsrRunDir(bee);
+      await writeHsrMeta(bee, {
+        bee,
+        harness: "claude",
+        tier: "stream",
+        hostPid: hostB.hostPid,
+        hostFingerprint: hostB.hostFingerprint,
+        startedAt: hostB.startedAt,
+        controlSocket: "/tmp/auth-host-b.sock",
+        status: "running",
+      });
+      await appendHsrEvent(bee, { type: "turn_start", ts: NOW - 9_000, host: hostA });
+      await appendHsrEvent(bee, { type: "error", ts: NOW - 8_000, message: AUTH_MESSAGE, host: hostA });
+      await appendHsrEvent(bee, { type: "host_epoch", ts: NOW, host: hostB });
+
+      const recovered = await collectAuthRecoveryPrompts({
+        ...record(join(store, "home")),
+        name: bee,
+        lastPrompt: "must not reach host B",
+        lastPromptAt: new Date(NOW - 8_500).toISOString(),
+      });
+      assert.deepEqual(recovered.prompts, []);
+      assert.equal(recovered.source, "unrecoverable");
     } finally {
       if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
       else process.env.HIVE_STORE_ROOT = previous;
@@ -454,5 +504,100 @@ test("daemon recovery activates a newer vault chain before replay", async () => 
     );
     assert.equal(activated, true);
     assert.equal(outcomes[0]?.credentialSource, "vault");
+  });
+});
+
+test("automatic auth recovery loses to an unrelated kill after its tick snapshot without staging or launch", async () => {
+  await withTempDir(async (store) => {
+    const previous = process.env.HIVE_STORE_ROOT;
+    process.env.HIVE_STORE_ROOT = store;
+    try {
+      const home = join(store, "home");
+      await mkdir(home, { recursive: true });
+      const snapshot = record(home);
+      snapshot.name = "CL.auth-kill-wins";
+      snapshot.tmuxTarget = snapshot.name;
+      await saveSession(snapshot);
+      await withSessionLifecycleTransaction(snapshot, (lifecycle) => lifecycle.commit({
+        status: "kill_failed",
+        lastError: "operator kill owns an escaped predecessor",
+        updatedAt: new Date(NOW).toISOString(),
+      }));
+      const account: AccountRecord = {
+        id: "claude-test",
+        tool: "claude",
+        label: "test@example.com",
+        addedAt: new Date(NOW - 100_000).toISOString(),
+      };
+
+      await assert.rejects(
+        recoverAuthNeededBee(snapshot, account, {
+          source: "auto",
+          activateCredentials: true,
+          events: authTurn(NOW - 10_000),
+        }),
+        /unresolved stop ownership/,
+      );
+
+      assert.equal((await loadSession(snapshot.name))?.lastError, "operator kill owns an escaped predecessor");
+      assert.equal(await readBeeNameLaunchReservation(snapshot.name), null);
+      await assert.rejects(stat(join(store, "hsr", snapshot.name)), { code: "ENOENT" });
+    } finally {
+      if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+      else process.env.HIVE_STORE_ROOT = previous;
+    }
+  });
+});
+
+test("auth resume refuses an archived canonical cursor even when its legacy status says kill_failed", async () => {
+  await withTempDir(async (store) => {
+    const previous = process.env.HIVE_STORE_ROOT;
+    process.env.HIVE_STORE_ROOT = store;
+    try {
+      const home = join(store, "home");
+      await mkdir(home, { recursive: true });
+      const snapshot = record(home);
+      snapshot.name = "CL.auth-archived-kill-failed";
+      snapshot.tmuxTarget = snapshot.name;
+      await saveSession(snapshot);
+      const archivedAt = new Date(NOW).toISOString();
+      await transitionSession(snapshot.name, {
+        type: "bee.archived",
+        eventId: "auth-archived-before-resume",
+        at: archivedAt,
+        cause: "retire",
+        evidence: { kind: "operator", actionId: "auth-archive", observedAt: archivedAt, action: "retire" },
+        probe: {
+          kind: "probe",
+          probeId: "auth-archive-dead",
+          observerId: "auth-test",
+          observedAt: archivedAt,
+          outcome: "dead",
+          target: { substrate: "hsr", tmuxTarget: snapshot.name },
+        },
+      });
+      const archived = (await loadSession(snapshot.name))!;
+      await withSessionLifecycleTransaction(archived, (lifecycle) => lifecycle.commit({
+        status: "kill_failed",
+        lastError: "legacy scalar drift after archive",
+      }));
+      const mixed = (await loadSession(snapshot.name))!;
+      const account: AccountRecord = {
+        id: "claude-test",
+        tool: "claude",
+        label: "test@example.com",
+        addedAt: new Date(NOW - 100_000).toISOString(),
+      };
+
+      await assert.rejects(
+        recoverAuthNeededBee(mixed, account, { source: "human-login", activateCredentials: true }),
+        /is archived/,
+      );
+      assert.equal(await readBeeNameLaunchReservation(snapshot.name), null);
+      await assert.rejects(stat(join(store, "hsr", snapshot.name)), { code: "ENOENT" });
+    } finally {
+      if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+      else process.env.HIVE_STORE_ROOT = previous;
+    }
   });
 });

@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
-import { serve } from "../src/hsr/remoteHost.js";
+import { serve, versionCore } from "../src/hsr/remoteHost.js";
 import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import type { NodeRecord } from "../src/node.js";
 import type { TunnelChild, TunnelSpawnHook, SshExecHook } from "../src/hsr/remoteTransport.js";
@@ -83,7 +83,7 @@ function makeNode(): NodeRecord {
     kind: "remote-hsr",
     endpoint: "me@remote-host",
     capabilities: ["*"],
-    runnerHostVersion: "0.0.1+deadbeef1234",
+    runnerHostVersion: versionCore(),
     status: "unknown",
     createdAt: "2026-07-03T00:00:00.000Z",
     updatedAt: "2026-07-03T00:00:00.000Z",
@@ -208,7 +208,7 @@ test("remote HSR provision: clone → reuse → listCheckouts → path-escape gu
       // The remote meta records the cwd the runner was started in.
       const metaRaw = await readFile(join(dir, "hsr", bee, "meta.json"), "utf8").catch(() => "");
       assert.ok(metaRaw.length > 0, "remote meta.json exists for the spawned bee");
-      await sub.kill(bee);
+      await sub.kill(bee, { remoteLaunchId: res.launchId, remoteIncarnation: res.incarnation });
       await waitFor(async () => (await sub.hasSession(bee)) === false, "hasSession false after kill");
     } finally {
       await sub.close();

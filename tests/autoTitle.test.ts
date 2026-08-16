@@ -12,6 +12,7 @@ import {
 } from "../src/daemon/autoTitle.js";
 import type { TitleContext } from "../src/naming.js";
 import type { SessionRecord } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -90,6 +91,18 @@ test("isAutoTitleCandidate: authoritative titles are done; provider fallbacks re
 test("isAutoTitleCandidate: historical records are never rescanned", () => {
   assert.equal(isAutoTitleCandidate(bee({ status: "done" }), NOW), false);
   assert.equal(isAutoTitleCandidate(bee({ status: "dead" }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({
+    status: "done",
+    stateMachine: lifecycleCursor("auto-title-active", "active", new Date(NOW).toISOString()),
+  }), NOW), true);
+  assert.equal(isAutoTitleCandidate(bee({
+    status: "running",
+    stateMachine: lifecycleCursor("auto-title-archived", "archived", new Date(NOW).toISOString()),
+  }), NOW), false);
+  assert.equal(isAutoTitleCandidate(bee({
+    status: "kill_failed",
+    stateMachine: lifecycleCursor("auto-title-stop-doubt", "active", new Date(NOW).toISOString()),
+  }), NOW), false, "failed-stop doubt is not eligible for new title work");
 });
 
 test("isAutoTitleCandidate: respects the attempt cap", () => {

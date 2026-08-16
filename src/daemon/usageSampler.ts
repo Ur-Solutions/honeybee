@@ -18,6 +18,7 @@ import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { resolveSessionTranscript } from "../sessionMetadata.js";
 import type { PaneCaptureMap } from "../state.js";
+import { isActiveSessionLifecycle } from "../stateMachine.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { readJsonl, type TranscriptRow } from "../transcripts.js";
 import { appendUsageEvent, transcriptTokenTotals, type TokenTotals, type UsageEvent } from "../usage.js";
@@ -176,7 +177,7 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
       // Historical records cannot produce new usage or exhaustion edges. A
       // cold daemon previously re-read hundreds of archived HSR logs (and, on
       // a cache miss, their full transcripts) before its first useful sample.
-      if (!record.accountId || record.status !== "running") continue;
+      if (!record.accountId || !isActiveSessionLifecycle(record)) continue;
       const hsrObservation = hsrObservations?.get(record.name);
 
       // When the tick supplied its coherent HSR observation batch, absence is

@@ -11,6 +11,7 @@ import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
 import { activeSessionIndexPath, rebuildActiveSessionIndex, saveSession, TERMINAL_OBSERVED_STATES, type SessionRecord } from "../src/store.js";
 import { appendUsageEvent, isRecentlyAuthFailed, usageSummary } from "../src/usage.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -1494,6 +1495,43 @@ test("sessionCommitmentPercent weighs busy/parked work and explicitly zeros comp
   assert.equal(sessionCommitmentPercent({ ...liveSession("kill-failed", "a", "active"), status: "kill_failed" }), 0);
   assert.equal(sessionCommitmentPercent({ ...liveSession("s4", "a", "active"), status: "dead" }), 0);
   assert.equal(sessionCommitmentPercent({ ...liveSession("s5", "a", "active"), accountId: undefined }), 0);
+});
+
+test("session commitments use canonical lifecycle over stale mixed-version status scalars", () => {
+  const at = "2026-06-10T10:00:00.000Z";
+  const active = liveSession("canonical-active", "a", "active");
+  const archived = liveSession("canonical-archived", "a", "active");
+
+  for (const status of ["done", "dead"] as const) {
+    assert.equal(
+      sessionCommitmentPercent({
+        ...active,
+        status,
+        stateMachine: lifecycleCursor(`${active.name}-${status}`, "active", at),
+      }),
+      AUTO_COMMITMENT_BUSY_PERCENT,
+      `canonical active must outrank stale ${status}`,
+    );
+  }
+  assert.equal(
+    sessionCommitmentPercent({
+      ...active,
+      status: "kill_failed",
+      stateMachine: lifecycleCursor(`${active.name}-kill-failed`, "active", at),
+    }),
+    0,
+    "current failed-stop doubt never contributes account commitment",
+  );
+  assert.equal(
+    sessionCommitmentPercent({
+      ...archived,
+      status: "running",
+      stateMachine: lifecycleCursor(archived.name, "archived", at),
+    }),
+    0,
+    "canonical archive must outrank stale running",
+  );
+  assert.equal(sessionCommitmentPercent({ ...active, status: "dead" }), 0, "legacy dead fallback is preserved");
 });
 
 test("accountCommitments sums per account and filters by tool", async () => {

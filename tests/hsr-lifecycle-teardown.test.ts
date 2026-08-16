@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createHsrSubstrate } from "../src/hsr/substrate.js";
+import { readHsrEventIntegrityReceipt } from "../src/hsr/eventIntegrity.js";
 import { ensureHsrRunDir, hsrMetaPath, readHsrMetaStrict, writeHsrMeta } from "../src/hsr/runDir.js";
 import { transactionalKill, transactionalRetire } from "../src/kill.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
@@ -82,11 +83,14 @@ for (const operation of ["kill", "retire"] as const) {
         ? await transactionalKill(session, { substrate, pollIntervalMs: 0, emitLedger: false })
         : await transactionalRetire(session, { substrate, pollIntervalMs: 0, emitLedger: false });
 
-      assert.equal(outcome.ok, true);
+      assert.equal(outcome.ok, false, "physical cleanup cannot convert missing provider-stream history into a clean kill/retire");
+      assert.equal(outcome.stillRunning, false, "the exact host and child group are nevertheless stopped");
       assert.deepEqual(signals, [[-childBirth.pgid, "SIGTERM"]]);
       assert.equal(childGroupLive, false);
-      if (operation === "kill") assert.equal(await loadSession(session.name), null);
-      else assert.equal((await loadSession(session.name))?.status, "done");
+      const receipt = await readHsrEventIntegrityReceipt(session.name);
+      assert.equal(receipt?.phase, "unresolved");
+      assert.equal(receipt?.stopState, "confirmed");
+      assert.equal((await loadSession(session.name))?.status, "kill_failed", "manual event-history authority survives both operations");
     });
   });
 }
@@ -104,9 +108,11 @@ test("confirmed exact HSR child absence permits retire without signalling", asyn
     });
 
     const outcome = await transactionalRetire(session, { substrate, pollIntervalMs: 0, emitLedger: false });
-    assert.equal(outcome.ok, true);
+    assert.equal(outcome.ok, false, "child absence is stop proof, not event-stream closure proof");
+    assert.equal(outcome.stillRunning, false);
     assert.deepEqual(signals, []);
-    assert.equal((await loadSession(session.name))?.status, "done");
+    assert.equal((await readHsrEventIntegrityReceipt(session.name))?.stopState, "confirmed");
+    assert.equal((await loadSession(session.name))?.status, "kill_failed");
   });
 });
 
@@ -136,9 +142,11 @@ test("exited legacy HSR metadata reconciles only from exact PID and group absenc
     });
 
     const outcome = await transactionalRetire(session, { substrate, pollIntervalMs: 0, emitLedger: false });
-    assert.equal(outcome.ok, true);
+    assert.equal(outcome.ok, false, "legacy exited metadata is not positive durable terminal-event proof");
+    assert.equal(outcome.stillRunning, false);
     assert.deepEqual(signals, [], "legacy absence reconciliation never signals numeric identities");
-    assert.equal((await loadSession(session.name))?.status, "done");
+    assert.equal((await readHsrEventIntegrityReceipt(session.name))?.stopState, "confirmed");
+    assert.equal((await loadSession(session.name))?.status, "kill_failed");
   });
 });
 

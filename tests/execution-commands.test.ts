@@ -168,29 +168,73 @@ test("run.command: effect key reuse with different content conflicts; distinct e
   });
 });
 
-test("run.command answer is CAPABILITY_MISMATCH until needs_input.opened is bridged — schema-valid, never dispatched, no durable effect", async () => {
+test("run.command answer refuses before admission across a same-request-id host restart", async () => {
   await withTempStore(async () => {
-    // Even with an open input request on the legacy control socket, the
-    // protocol path must refuse: needs_input.opened never reaches protocol
-    // consumers, so an advertised answer command could not be driven honestly.
+    // Host A is waiting on r1, but v1 cannot bind the signed answer intent to
+    // A's birth identity. The command stays schema vocabulary while the node
+    // refuses the unsupported authority contract before creating an effect.
     const control = fakeControl({ pendingInput: "inp-0001" });
     const { ctx, service } = await startRunningRun({ control });
 
-    const envelope = buildOperationEnvelope(ctx, `${RUN_ID}/command/answer-0001`, {
+    const hostA = buildOperationEnvelope(ctx, `${RUN_ID}/command/answer-host-a`, {
       runId: RUN_ID,
       command: { kind: "answer", inputRequestId: "inp-0001", answer: { approved: true } },
     });
-    // The vocabulary still validates answer (like checkpoint) — the refusal is
-    // a capability fact, not a schema gap.
-    assert.deepEqual(validator.validate("run-command-body", envelope.body).errors, []);
+    assert.deepEqual(validator.validate("run-command-body", hostA.body).errors, []);
 
-    const refused = (await service.runCommand(envelope)) as JsonObject;
-    assert.equal((refused.error as JsonObject).code, "CAPABILITY_MISMATCH");
-    // Refused BEFORE any durable effect or delivery attempt.
-    assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/answer-0001`), null);
+    const refusedA = (await service.runCommand(hostA)) as JsonObject;
+    assert.equal((refusedA.error as JsonObject).code, "CAPABILITY_MISMATCH");
+    assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/answer-host-a`), null);
+
+    // Provider recovery replaces A with host B and its request counter reuses
+    // r1. A distinct delayed effect still receives the same pre-admission
+    // refusal; current pending state is never consulted and B is untouched.
+    control.behavior.pendingInput = "inp-0001";
+    const hostB = buildOperationEnvelope(ctx, `${RUN_ID}/command/answer-host-b`, {
+      runId: RUN_ID,
+      command: { kind: "answer", inputRequestId: "inp-0001", answer: { approved: true } },
+    });
+    const refusedB = (await service.runCommand(hostB)) as JsonObject;
+    assert.equal((refusedB.error as JsonObject).code, "CAPABILITY_MISMATCH");
+    assert.equal(await readOperation(RUN_ID, `${RUN_ID}/command/answer-host-b`), null);
+    assert.equal(control.calls.filter((call) => call.method === "pendingInputId").length, 0);
+    assert.equal(control.calls.filter((call) => call.method === "answer").length, 0);
+
+    // A mixed-version predecessor may already have written `accepted` before
+    // dying. Replaying that exact signed envelope under the hardened binary
+    // durably fails the residue before dispatch instead of bypassing the
+    // new-record admission guard.
+    const legacyEffectKey = `${RUN_ID}/command/answer-legacy-accepted`;
+    const legacyAccepted = buildOperationEnvelope(ctx, legacyEffectKey, {
+      runId: RUN_ID,
+      command: { kind: "answer", inputRequestId: "inp-0001", answer: { approved: true } },
+    });
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.command",
+      effectKey: legacyEffectKey,
+      requestDigest: String(legacyAccepted.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: computeSchemaDigest(contract),
+      init: {
+        commandKind: "answer",
+        commandState: "accepted",
+        deliveryId: `op-${effectKeyHash(legacyEffectKey).slice(0, 16)}`,
+      },
+    });
+    const refusedLegacy = (await service.runCommand(legacyAccepted)) as JsonObject;
+    assert.equal((refusedLegacy.error as JsonObject).code, "CAPABILITY_MISMATCH");
+    const legacyRecord = await readOperation(RUN_ID, legacyEffectKey);
+    assert.equal(legacyRecord?.commandState, "failed");
+    assert.match(legacyRecord?.cause ?? "", /expected runner-host epoch is absent/);
+    assert.equal(control.calls.filter((call) => call.method === "pendingInputId").length, 0);
+    assert.equal(control.calls.filter((call) => call.method === "answer").length, 0);
+
+    const replayLegacy = (await service.runCommand(legacyAccepted)) as JsonObject;
+    assert.equal((replayLegacy.error as JsonObject).code, "CAPABILITY_MISMATCH");
     assert.equal(control.calls.filter((call) => call.method === "answer").length, 0);
     const events = await readRunEvents(RUN_ID);
-    assert.ok(!events.some((event) => event.type.startsWith("needs_input.")), "no needs_input events without the bridge");
+    assert.ok(!events.some((event) => event.type.startsWith("needs_input.")));
   });
 });
 

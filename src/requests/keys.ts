@@ -9,14 +9,22 @@
  * them first) and every persisted record depends on them.
  */
 
+import { createHash } from "node:crypto";
+import type { HsrAnswerHostIdentity } from "../answerReceipt.js";
+
 /**
  * Structured needs_input (question/permission), scope turn. The adapter's own
  * requestId is preferred; an empty or `"pending"` placeholder (id-less
  * adapters) falls back to `ni:<bee>:<event ts>` so a bee that unblocks and
  * re-blocks gets a fresh id per event.
  */
-export function needsInputRequestId(bee: string, pending: { requestId?: string; ts: number }): string {
-  return pending.requestId && pending.requestId !== "pending" ? pending.requestId : `ni:${bee}:${pending.ts}`;
+export function needsInputRequestId(
+  bee: string,
+  pending: { requestId?: string; ts: number; host?: HsrAnswerHostIdentity },
+): string {
+  if (!pending.requestId || pending.requestId === "pending") return `ni:${bee}:${pending.ts}`;
+  if (!pending.host) return pending.requestId;
+  return `ni:${bee}:${pending.requestId}:${answerHostEpoch(pending.host)}`;
 }
 
 /** Structured auth (login required), scope runtime-generation, keyed by the grounding event's ts. */
@@ -37,6 +45,26 @@ export function stopFailedRequestId(bee: string, generation: number): string {
 /** Bee-scoped manual action: one durably accepted buz message is undeliverable. */
 export function messageDeliveryRequestId(bee: string, messageId: string): string {
   return `manual:${bee}:message-delivery:${messageId}`;
+}
+
+/** Bee-scoped manual action: a non-mail turn crossed an unprovable provider boundary. */
+export function deliveryAmbiguityRequestId(bee: string, deliveryId: string): string {
+  return `manual:${bee}:delivery-ambiguous:${deliveryId}`;
+}
+
+/** Runtime-scoped manual action: an exact needs-input answer crossed dispatch. */
+export function answerAmbiguityRequestId(
+  bee: string,
+  generation: number,
+  requestId: string,
+  answerDigest: string,
+  host: HsrAnswerHostIdentity,
+): string {
+  return `manual:${bee}:${generation}:answer-ambiguous:${requestId}:${answerDigest.slice(0, 16)}:${answerHostEpoch(host)}`;
+}
+
+function answerHostEpoch(host: HsrAnswerHostIdentity): string {
+  return createHash("sha256").update(JSON.stringify(host)).digest("hex").slice(0, 16);
 }
 
 /** Bee-scoped manual action: automatic runtime recovery exhausted its budget. */

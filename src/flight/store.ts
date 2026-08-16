@@ -320,6 +320,22 @@ function normalizeSlot(value: unknown): SlotRecord | null {
   const attempt = typeof object.attempt === "number" && Number.isSafeInteger(object.attempt) && object.attempt >= 0 ? object.attempt : 0;
   const generation = typeof object.generation === "number" && Number.isSafeInteger(object.generation) && object.generation >= 0 ? object.generation : 0;
   const evidenceRaw = (object.evidence ?? {}) as Record<string, unknown>;
+  const launchOwnershipRaw = object.launchOwnership && typeof object.launchOwnership === "object"
+    ? object.launchOwnership as Record<string, unknown>
+    : null;
+  const launchOwnership = object.launchOwnership === undefined
+    ? undefined
+    : launchOwnershipRaw?.status === "dispatching" && typeof launchOwnershipRaw.at === "string"
+      ? { status: "dispatching" as const, at: launchOwnershipRaw.at }
+      : launchOwnershipRaw?.status === "indeterminate" &&
+        typeof launchOwnershipRaw.at === "string" &&
+        typeof launchOwnershipRaw.error === "string"
+      ? { status: "indeterminate" as const, at: launchOwnershipRaw.at, error: launchOwnershipRaw.error }
+      : {
+          status: "indeterminate" as const,
+          at: object.since as string,
+          error: "malformed persisted launch-ownership fence",
+        };
   const history = Array.isArray(object.history)
     ? (object.history as unknown[]).flatMap((entry) => {
         if (!entry || typeof entry !== "object") return [];
@@ -354,6 +370,7 @@ function normalizeSlot(value: unknown): SlotRecord | null {
       ...(typeof evidenceRaw.sealFilename === "string" ? { sealFilename: evidenceRaw.sealFilename } : {}),
     },
     ...(typeof object.idempotencyKey === "string" ? { idempotencyKey: object.idempotencyKey } : {}),
+    ...(launchOwnership ? { launchOwnership } : {}),
     ...(typeof object.nudgedAt === "string" ? { nudgedAt: object.nudgedAt } : {}),
     history,
   };

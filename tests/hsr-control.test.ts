@@ -5,15 +5,44 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { runHsrHost } from "../src/hsr/host.js";
+import { HsrDeliveryAmbiguousError } from "../src/hsr/pendingTurns.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
-import { hsrRunDir } from "../src/hsr/runDir.js";
+import { hsrRunDir, readHsrMetaStrict } from "../src/hsr/runDir.js";
 import { acceptHsrMessage, startHsrControlServer } from "../src/daemon/hsrControl.js";
-import { cancelQueuedBuzMessage, generateMessageId, listMessages } from "../src/buz.js";
-import { readBeeRequests } from "../src/requests/store.js";
+import { cancelQueuedBuzMessage, generateMessageId, listMessages, sendBuzMessageInAdmission } from "../src/buz.js";
+import { needsInputRequestId } from "../src/requests/keys.js";
+import { openRequest, readBeeRequests } from "../src/requests/store.js";
 import { loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
+import type { HsrAnswerHostIdentity } from "../src/answerReceipt.js";
 import type { RunnerEvent, RunnerOpts } from "../src/hsr/types.js";
+import type { SendTextOptions, Substrate } from "../src/substrates/types.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function fakeSubstrate(impl: Partial<Substrate> = {}): Substrate {
+  return {
+    kind: "local-tmux",
+    node: "local",
+    probe: async () => ({ ok: true }),
+    hasSession: async () => true,
+    newSession: async () => ({ paneId: "%1" }),
+    kill: async () => ({ ok: true, stdout: "", stderr: "", exitCode: 0 }),
+    capture: async () => "",
+    sendText: async () => undefined,
+    sendEnter: async () => undefined,
+    sendKey: async () => undefined,
+    listSessions: async () => [],
+    listPanes: async () => new Set(),
+    listSessionStates: async () => new Map(),
+    setUserOptions: async () => undefined,
+    setWindowOptions: async () => undefined,
+    renameWindow: async () => undefined,
+    attachCommand: () => [],
+    attachSession: async () => undefined,
+    ...impl,
+  };
+}
 
 /** Set HIVE_STORE_ROOT to a fresh mkdtemp dir for the duration of `fn`. */
 async function withTempStore(fn: (root: string) => Promise<void>): Promise<void> {
@@ -53,6 +82,22 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
     const bee = "ctltest";
     const server = await startHsrControlServer();
     const host = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee) });
+    const meta = await readHsrMetaStrict(bee);
+    assert.ok(meta);
+    const now = new Date().toISOString();
+    await saveSession({
+      name: bee,
+      agent: "stub",
+      cwd: process.cwd(),
+      command: "stub",
+      tmuxTarget: bee,
+      substrate: "hsr",
+      runnerPid: meta.hostPid,
+      ...(meta.hostFingerprint ? { runnerFingerprint: meta.hostFingerprint } : {}),
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+    });
     const client = await connectRpcClient(server.path);
     // Relayed bee events arrive as `hsr.event` { bee, event }.
     const relayed: Array<{ bee: string; event: RunnerEvent }> = [];
@@ -66,7 +111,7 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
         spawnEnv: 1,
         spawnParent: 1,
         message: 1,
-        broker: 2,
+        broker: 3,
         fork: 1,
         handoff: 1,
         execution: 1,
@@ -153,7 +198,59 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
       assert.equal(pending.requestId, "r1");
       assert.equal(pending.question, "proceed?");
       assert.equal(pending.kind, "question");
-      assert.equal((await client.call("answer", { bee, requestId: "r1", answer: "yes" }) as { ok: boolean }).ok, true);
+      assert.equal((await client.call("answer", { bee, answer: "stale" }) as { ok: boolean }).ok, false);
+      assert.equal(
+        ((await client.call("pendingInput", { bee })) as Record<string, unknown> | null)?.requestId,
+        "r1",
+        "source-less aggregate answer must perform zero provider I/O",
+      );
+      assert.equal((await client.call("answer", {
+        bee,
+        requestId: "r1",
+        source: pending.source,
+        host: pending.host,
+        answer: "yes",
+      }) as { ok: boolean }).ok, true);
+
+      // A later prompt on the same host must not be resolved when an accepted
+      // r1 answer is replayed from its terminal receipt.
+      await client.call("send", { bee, text: "ask different" });
+      await waitFor(async () => {
+        const next = await client.call("pendingInput", { bee }) as Record<string, unknown> | null;
+        return next?.requestId === "r2";
+      }, "second pending input persisted");
+      const next = await client.call("pendingInput", { bee }) as Record<string, unknown> | null;
+      assert.ok(next);
+      const nextRequestId = needsInputRequestId(bee, {
+        requestId: String(next.requestId),
+        ts: Number(next.ts),
+        host: next.host as HsrAnswerHostIdentity,
+      });
+      await openRequest(bee, {
+        id: nextRequestId,
+        kind: "question",
+        scope: "turn",
+        generation: 0,
+        question: String(next.question),
+        evidence: { grade: "structured", source: "test", detail: "second-pending" },
+      });
+      assert.equal((await client.call("answer", {
+        bee,
+        requestId: "r1",
+        source: pending.source,
+        host: pending.host,
+        answer: "yes",
+      }) as { ok: boolean }).ok, true);
+      assert.equal(
+        ((await client.call("pendingInput", { bee })) as Record<string, unknown> | null)?.requestId,
+        "r2",
+        "settled r1 replay performs zero provider I/O against r2",
+      );
+      assert.equal(
+        (await readBeeRequests(bee)).find((request) => request.id === nextRequestId)?.status,
+        "open",
+        "settled r1 replay resolves only r1's request id",
+      );
 
       // send to a non-existent bee → { ok:false } (no throw).
       const bad = (await client.call("send", { bee: "nope", text: "x" })) as { ok: boolean };
@@ -165,6 +262,84 @@ test("hsr-control: liveness/list/observe-relay/send across the aggregate endpoin
       assert.equal(after[bee], false, "liveness should show the bee not alive after stop");
     } finally {
       client.close();
+      await host.stop().catch(() => undefined);
+      await server.close();
+    }
+  });
+});
+
+test("hsr-control rejects a delayed predecessor-host answer when r1 is reused", async () => {
+  await withTempStore(async () => {
+    const bee = "ctl-answer-refresh";
+    const server = await startHsrControlServer();
+    let host = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee) });
+    const now = new Date().toISOString();
+    await saveSession({
+      name: bee,
+      agent: "stub",
+      cwd: process.cwd(),
+      command: "stub",
+      tmuxTarget: bee,
+      substrate: "hsr",
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+    });
+    const aggregate = await connectRpcClient(server.path);
+    try {
+      let direct = await connectRpcClient(host.controlSocket);
+      try {
+        await direct.call("send", { text: "ask first" });
+      } finally {
+        direct.close();
+      }
+      await waitFor(async () => {
+        const first = await aggregate.call("pendingInput", { bee }) as Record<string, unknown> | null;
+        return first?.requestId === "r1";
+      }, "first host aggregate pending");
+      const first = await aggregate.call("pendingInput", { bee }) as Record<string, unknown> | null;
+      assert.ok(first);
+      assert.equal(first?.question, "proceed?");
+
+      await host.stop();
+      host = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee) });
+      assert.equal(await aggregate.call("pendingInput", { bee }), null, "old unresolved r1 is not rebound during refresh");
+      direct = await connectRpcClient(host.controlSocket);
+      try {
+        await direct.call("send", { text: "ask different" });
+      } finally {
+        direct.close();
+      }
+      await waitFor(async () => {
+        const second = await aggregate.call("pendingInput", { bee }) as Record<string, unknown> | null;
+        return second?.question === "different prompt?";
+      }, "second host aggregate pending");
+      const second = await aggregate.call("pendingInput", { bee }) as Record<string, unknown> | null;
+      assert.ok(second);
+      assert.equal(second?.requestId, "r1");
+
+      const stale = await aggregate.call("answer", {
+        bee,
+        requestId: "r1",
+        source: first!.source,
+        host: first!.host,
+        answer: "stale-a",
+      }) as { ok: boolean };
+      assert.equal(stale.ok, false);
+      assert.equal(
+        ((await aggregate.call("pendingInput", { bee })) as Record<string, unknown> | null)?.question,
+        "different prompt?",
+        "stale A envelope performs zero provider I/O against B",
+      );
+      assert.equal((await aggregate.call("answer", {
+        bee,
+        requestId: "r1",
+        source: second!.source,
+        host: second!.host,
+        answer: "yes",
+      }) as { ok: boolean }).ok, true);
+    } finally {
+      aggregate.close();
       await host.stop().catch(() => undefined);
       await server.close();
     }
@@ -316,6 +491,64 @@ test("hsr-control message accepts canonical active lifecycle despite a stale don
   });
 });
 
+test("hsr-control message fences canonical-active stop doubt and settles an exact queued replay undeliverable", async () => {
+  await withTempStore(async (root) => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "message-canonical-stop-doubt",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "message-canonical-stop-doubt",
+      substrate: "hsr",
+      providerSessionId: "thread-canonical-stop-doubt",
+      createdAt: now,
+      updatedAt: now,
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("message-canonical-stop-doubt", "active", now),
+    };
+    const legacy = { ...record };
+    delete legacy.stateMachine;
+    await saveSession(legacy);
+    await writeFile(
+      join(root, "sessions", `${record.name}.json`),
+      `${JSON.stringify(record, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const refused = await acceptHsrMessage({ bee: record.name, text: "do not launch across stop doubt" });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.accepted, false);
+    assert.match(String(refused.error), /stop state unresolved/);
+    assert.equal((await listMessages(record.name, "queue")).length, 0);
+
+    const messageId = generateMessageId();
+    await sendBuzMessageInAdmission({
+      recipient: record,
+      sender: { kind: "human", name: "apiary" },
+      tier: "queue",
+      body: "accepted before stop doubt",
+      messageId,
+    });
+    const replay = await acceptHsrMessage({
+      bee: record.name,
+      text: "accepted before stop doubt",
+      messageId,
+    });
+    assert.equal(replay.ok, true);
+    assert.equal(replay.accepted, true);
+    assert.equal(replay.messageId, messageId);
+    assert.equal(replay.delivery, "undeliverable");
+    assert.equal(replay.outcome, "UNDELIVERABLE");
+    assert.equal((await listMessages(record.name, "queue")).length, 0);
+    assert.deepEqual(
+      (await listMessages(record.name, "quarantine")).map((entry) => entry.message.id),
+      [messageId],
+      "a definitive terminal verdict must remove the exact id from future drain work",
+    );
+  });
+});
+
 test("hsr-control repairs a fault after queue persistence into an idempotent receipt", async () => {
   await withTempStore(async () => {
     const now = new Date().toISOString();
@@ -413,6 +646,44 @@ test("hsr-control types persistent post-persist failure as keyed ambiguity until
   });
 });
 
+test("hsr-control propagates post-dispatch Buz ambiguity and opens manual action immediately", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "message-provider-ambiguous",
+      agent: "codex",
+      cwd: process.cwd(),
+      command: "codex",
+      tmuxTarget: "message-provider-ambiguous",
+      providerSessionId: "thread-provider-ambiguous",
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+    };
+    await saveSession(record);
+    const messageId = generateMessageId();
+    const substrate = fakeSubstrate({
+      supportsNextTool: true,
+      sendText: async () => {
+        throw new HsrDeliveryAmbiguousError(messageId, "provider dispatch reply was lost");
+      },
+    });
+
+    const result = await acceptHsrMessage(
+      { bee: record.name, text: "do not auto-land this", messageId },
+      { substrateFor: () => substrate },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.accepted, true);
+    assert.equal(result.acceptanceAmbiguous, true);
+    assert.equal(result.messageId, messageId);
+    assert.equal(result.delivery, undefined, "ambiguity is never mislabeled as an ordinary queued acceptance");
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
+    assert.ok((await readBeeRequests(record.name)).some((request) =>
+      request.status === "open" && request.evidence.detail === "delivery-ambiguous"));
+  });
+});
+
 test("hsr-control recovery keeps A authoritative and promotes A if legacy B is cancelled", async () => {
   await withTempStore(async () => {
     const now = new Date().toISOString();
@@ -475,13 +746,73 @@ test("hsr-control message reports missing cwd as durable UNDELIVERABLE needs-act
     assert.equal(result.accepted, true);
     assert.equal(result.outcome, "UNDELIVERABLE");
     assert.equal(result.delivery, "undeliverable");
-    assert.equal((await listMessages(record.name, "queue")).length, 1, "persist-first keeps the exact message queued");
+    assert.equal((await listMessages(record.name, "queue")).length, 0, "terminal settlement removes doomed work from queue");
+    assert.deepEqual(
+      (await listMessages(record.name, "quarantine")).map((entry) => entry.message.id),
+      [result.messageId],
+      "the idempotency receipt remains durable after terminal settlement",
+    );
     assert.equal((await loadSession(record.name))?.recoveryRequestedAt, undefined, "doomed work is explicitly failed, not left in the hot set");
     const request = (await readBeeRequests(record.name))[0]!;
     assert.equal(request.kind, "manual-action");
     assert.equal(request.scope, "bee");
     assert.equal(request.evidence.detail, "missing-cwd");
     assert.match(request.question ?? "", /Restore or recreate the working copy/);
+  });
+});
+
+test("hsr-control delivers a live remote bee without locally statting its remote cwd and carries authority tokens", async () => {
+  await withTempStore(async () => {
+    const now = new Date().toISOString();
+    const record: SessionRecord = {
+      name: "remote-cwd-message",
+      agent: "codex",
+      cwd: "/remote/node/only/working-copy",
+      command: "codex",
+      tmuxTarget: "remote-cwd-message",
+      node: "cell-one",
+      remoteLaunchId: "11111111-1111-4111-8111-111111111111",
+      remoteIncarnation: "22222222-2222-4222-8222-222222222222",
+      providerSessionId: "thread-remote",
+      createdAt: now,
+      updatedAt: now,
+      status: "running",
+    };
+    await saveSession(record);
+    let delivered: SendTextOptions | undefined;
+    const substrate: Substrate = {
+      kind: "remote-hsr",
+      node: "cell-one",
+      supportsNextTool: true,
+      probe: async () => ({ ok: true }),
+      hasSession: async () => true,
+      newSession: async () => ({ paneId: "%1" }),
+      kill: async () => ({ ok: true, stdout: "", stderr: "", exitCode: 0 }),
+      capture: async () => "",
+      sendText: async (_target, _text, _pane, options) => { delivered = options; },
+      sendEnter: async () => undefined,
+      sendKey: async () => undefined,
+      listSessions: async () => [record.name],
+      listPanes: async () => new Set(),
+      listSessionStates: async () => new Map(),
+      setUserOptions: async () => undefined,
+      setWindowOptions: async () => undefined,
+      renameWindow: async () => undefined,
+      attachCommand: () => [],
+      attachSession: async () => undefined,
+    };
+    const result = await acceptHsrMessage(
+      { bee: record.name, text: "continue remotely" },
+      { substrateFor: () => substrate },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.delivery, "delivered");
+    assert.equal(delivered?.mode, "next-tool");
+    assert.equal(delivered?.completionRequired, true);
+    assert.match(delivered?.deliveryId ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    assert.equal(delivered?.remoteLaunchId, record.remoteLaunchId);
+    assert.equal(delivered?.remoteIncarnation, record.remoteIncarnation);
+    assert.equal((await readBeeRequests(record.name)).length, 0);
   });
 });
 
@@ -566,6 +897,11 @@ test("hsr-control receipts an exact accepted id even if the bee archives before 
     assert.equal(replay.messageId, messageId);
     assert.equal(replay.delivery, "undeliverable");
     assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "archive-unresolved");
-    assert.equal((await listMessages(record.name, "queue")).length, 1);
+    assert.equal((await listMessages(record.name, "queue")).length, 0);
+    assert.deepEqual(
+      (await listMessages(record.name, "quarantine")).map((entry) => entry.message.id),
+      [messageId],
+      "revive cannot later drain an id already settled UNDELIVERABLE",
+    );
   });
 });

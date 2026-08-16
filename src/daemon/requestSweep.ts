@@ -51,6 +51,8 @@ import {
 import { lastAuthNeededEvent } from "../view/requests.js";
 import type { BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
+import { substrateFor } from "../substrates/index.js";
+import type { RemoteHsrSubstrate } from "../substrates/remote-hsr.js";
 
 export type RequestReconcileOutcome = {
   bee: string;
@@ -117,7 +119,20 @@ export function createRequestReconciler(): RequestReconciler {
     const cached = knownCache.get(bee);
     const snapshot = obs?.eventSnapshot;
     const live = obs?.live === true;
-    const pending = live ? snapshot?.pendingNeedsInput ?? null : null;
+    let pending = live ? snapshot?.pendingNeedsInput ?? null : null;
+    if (pending && !pending.host && record.substrate !== "hsr") {
+      const substrate = substrateFor(record);
+      if (substrate.kind === "remote-hsr") {
+        const envelope = await (substrate as RemoteHsrSubstrate).pendingInputRemote(bee, {
+          ...(record.remoteLaunchId ? { remoteLaunchId: record.remoteLaunchId } : {}),
+          ...(record.remoteIncarnation ? { remoteIncarnation: record.remoteIncarnation } : {}),
+        });
+        if (!envelope.pending || envelope.pending.requestId !== pending.requestId) {
+          throw new Error(`remote needs-input host authority changed while reconciling ${bee}`);
+        }
+        pending = { ...envelope.pending, host: envelope.host };
+      }
+    }
     const authEvent = live ? lastAuthNeededEvent(snapshot?.events ?? []) : undefined;
 
     // Steady-state zero-IO skip: touch a bee only when (a) the snapshot shows

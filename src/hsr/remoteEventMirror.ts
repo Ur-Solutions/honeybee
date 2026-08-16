@@ -21,11 +21,11 @@
  *
  * Lifecycle (idempotent, never throws — per-bee errors are captured):
  *   subscribe — a live remote bee with no mirror yet gets ONE observe
- *               subscription; a `running` mirror meta is written first so the
- *               local readers pick it up immediately.
+ *               subscription; a non-live/syncing mirror meta is written before
+ *               replay and flips to `running` only after exact catch-up.
  *   append    — each relayed event → appendHsrEvent + (for `text`) a bounded
- *               ring.txt (debounced), reusing the same ring bounding as the
- *               local stream runner.
+ *               ring.txt persisted before the remote acknowledgement, reusing
+ *               the same ring bounding as the local stream runner.
  *   teardown  — when the bee leaves the node's live list (or its record/node is
  *               gone) the subscription is torn down and the mirror meta flips to
  *               "exited" so deriveState settles it dead/done.
@@ -44,23 +44,41 @@
  * Node builtins + local HSR/substrate modules only.
  */
 
+import { readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { atomicWriteFile } from "../fsx.js";
+import {
+  LifecycleConflictError,
+  withSessionLifecycleTransactionIfPresent,
+} from "../lifecycle.js";
 import { loadNode as defaultLoadNode, LOCAL_NODE_NAME, type NodeRecord } from "../node.js";
-import { remoteHsrSubstrateForNode, type RemoteHsrSubstrate } from "../substrates/index.js";
+import {
+  remoteHsrSubstrateForNode,
+  type RemoteHsrSubstrate,
+} from "../substrates/index.js";
 import type { SessionRecord } from "../store.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import {
+  RemoteObservationDetachedError,
+  RemoteObservationIntegrityError,
+  type RemoteListRow,
+} from "../substrates/remote-hsr.js";
 import {
   appendHsrEvent,
   appendRingText,
   ensureHsrRunDir,
+  hsrEventsPath,
+  hsrRingPath,
+  hsrRunDir,
   readHsrMeta,
+  readHsrMetaStrict,
+  resetHsrMirrorGeneration,
   writeHsrMeta,
   writeHsrRing,
   type HsrMeta,
 } from "./runDir.js";
-import { readEventTail } from "./observe.js";
 import type { RunnerEvent } from "./types.js";
-
-/** Debounce ring.txt writes so a chatty remote bee does not thrash the disk. */
-const RING_DEBOUNCE_MS = 50;
+import { importRemoteHsrEventIntegrityReceipt } from "./eventIntegrity.js";
 
 export type RemoteEventMirrorDeps = {
   /** Resolve a node record by name (injected in tests). */
@@ -78,15 +96,41 @@ export type RemoteEventMirrorDispatcher = {
 /** One live mirror: its node, unsubscribe fn, and in-memory ring state. */
 type MirrorEntry = {
   node: string;
-  off: () => void;
+  remoteLaunchId?: string;
+  remoteIncarnation?: string;
+  off: () => void | Promise<void>;
   ring: string;
-  ringTimer: NodeJS.Timeout | null;
-  /**
-   * While the post-attach backfill runs, live events are buffered here instead
-   * of appended, so the backfilled tail and the live stream can be merged
-   * without duplicates. `null` once armed (backfill done) — the steady state.
-   */
-  pending: RunnerEvent[] | null;
+  /** Highest remote-origin seq durably appended locally (cursor write may lag). */
+  remoteSeq: number;
+  record: SessionRecord;
+};
+
+type RemoteMirrorCursor = {
+  version: 1;
+  node: string;
+  remoteLaunchId: string;
+  remoteIncarnation: string;
+  lastSeq: number;
+};
+
+const REMOTE_MIRROR_CURSOR_FILE = "remote-events-cursor.json";
+const REMOTE_MIRROR_RING_STATE_FILE = "remote-ring-state.json";
+
+function remoteMirrorCursorPath(bee: string): string {
+  return join(hsrRunDir(bee), REMOTE_MIRROR_CURSOR_FILE);
+}
+
+function remoteMirrorRingStatePath(bee: string): string {
+  return join(hsrRunDir(bee), REMOTE_MIRROR_RING_STATE_FILE);
+}
+
+type RemoteMirrorRingState = {
+  version: 1;
+  node: string;
+  remoteLaunchId: string;
+  remoteIncarnation: string;
+  throughRemoteSeq: number;
+  text: string;
 };
 
 type SubstrateEntry = {
@@ -148,131 +192,678 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
     return substrate;
   }
 
-  function scheduleRingWrite(bee: string, entry: MirrorEntry): void {
-    if (entry.ringTimer) return;
-    entry.ringTimer = setTimeout(() => {
-      entry.ringTimer = null;
-      void writeHsrRing(bee, entry.ring).catch(() => undefined);
-    }, RING_DEBOUNCE_MS);
+  function exactMirrorGeneration(current: SessionRecord, entry: MirrorEntry): boolean {
+    return current.node === entry.node
+      && current.remoteLaunchId === entry.remoteLaunchId
+      && current.remoteIncarnation === entry.remoteIncarnation;
   }
 
-  function appendMirrored(bee: string, entry: MirrorEntry, event: RunnerEvent): void {
-    // The runner is the single writer locally too — appendHsrEvent serializes
-    // per bee, so mirrored events land in production order.
-    void appendHsrEvent(bee, event).catch(() => undefined);
-    if (event.type === "text" && typeof event.text === "string" && event.text.length > 0) {
-      entry.ring = appendRingText(entry.ring, event.text);
-      scheduleRingWrite(bee, entry);
+  function isMirrorIntegrityFence(current: SessionRecord): boolean {
+    return current.status === "kill_failed"
+      && current.lastError?.startsWith("remote event observation integrity failed:") === true;
+  }
+
+  async function withExactMirrorOwner<T>(
+    bee: string,
+    entry: MirrorEntry,
+    fn: (current: SessionRecord) => Promise<T>,
+  ): Promise<T> {
+    try {
+      const result = await withSessionLifecycleTransactionIfPresent(entry.record, async (lifecycle) => {
+        const current = await lifecycle.refresh();
+        if (
+          !exactMirrorGeneration(current, entry)
+          || isArchivedSessionLifecycle(current)
+        ) return { owned: false } as const;
+        return { owned: true, value: await fn(current) } as const;
+      });
+      if (!result || !result.owned) {
+        throw new RemoteObservationDetachedError(
+          `remote mirror generation for ${bee} no longer owns the canonical session`,
+        );
+      }
+      return result.value;
+    } catch (error) {
+      if (error instanceof RemoteObservationDetachedError) throw error;
+      if (error instanceof LifecycleConflictError) {
+        throw new RemoteObservationDetachedError(
+          `remote mirror generation for ${bee} lost its lifecycle race`,
+        );
+      }
+      throw error;
     }
   }
 
-  function onEvent(bee: string, entry: MirrorEntry, raw: unknown): void {
+  async function fenceMirrorIntegrity(bee: string, entry: MirrorEntry, reason: string): Promise<boolean> {
+    const detail = `remote event observation integrity failed: ${reason}`;
+    try {
+      const fenced = await withSessionLifecycleTransactionIfPresent(entry.record, async (lifecycle) => {
+        let current = await lifecycle.refresh();
+        if (!exactMirrorGeneration(current, entry)) return false;
+        if (isArchivedSessionLifecycle(current)) return false;
+        if (current.status !== "kill_failed" || current.lastError !== detail) {
+          current = await lifecycle.commit({ status: "kill_failed", lastError: detail });
+        }
+        // Quarantine the derived cache while the same lifecycle lock still
+        // excludes retirement/replacement. No late A fence may erase B's files.
+        await resetHsrMirrorGeneration(bee);
+        await writeMirrorMetaUnchecked(bee, entry.node, "exited", {
+          remoteLaunchId: entry.remoteLaunchId,
+          remoteIncarnation: entry.remoteIncarnation,
+        });
+        return current.status === "kill_failed";
+      });
+      return fenced === true;
+    } catch (error) {
+      if (error instanceof LifecycleConflictError) return false;
+      throw error;
+    }
+  }
+
+  function cursorRecord(entry: MirrorEntry, lastSeq: number): RemoteMirrorCursor {
+    if (!entry.remoteLaunchId || !entry.remoteIncarnation) {
+      throw new Error("remote mirror cursor requires exact launch/incarnation authority");
+    }
+    return {
+      version: 1,
+      node: entry.node,
+      remoteLaunchId: entry.remoteLaunchId,
+      remoteIncarnation: entry.remoteIncarnation,
+      lastSeq,
+    };
+  }
+
+  async function persistMirrorCursor(bee: string, entry: MirrorEntry): Promise<void> {
+    await atomicWriteFile(
+      remoteMirrorCursorPath(bee),
+      `${JSON.stringify(cursorRecord(entry, entry.remoteSeq))}\n`,
+      { mode: 0o600 },
+    );
+  }
+
+  async function persistMirrorRingState(bee: string, entry: MirrorEntry): Promise<void> {
+    if (!entry.remoteLaunchId || !entry.remoteIncarnation) {
+      throw new Error("remote mirror ring state requires exact launch/incarnation authority");
+    }
+    const state: RemoteMirrorRingState = {
+      version: 1,
+      node: entry.node,
+      remoteLaunchId: entry.remoteLaunchId,
+      remoteIncarnation: entry.remoteIncarnation,
+      throughRemoteSeq: entry.remoteSeq,
+      text: entry.ring,
+    };
+    await atomicWriteFile(remoteMirrorRingStatePath(bee), `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  }
+
+  async function initialMirrorCursor(
+    bee: string,
+    entry: MirrorEntry,
+  ): Promise<{
+    afterSeq: number;
+    resetLegacy: boolean;
+    persistAfterAuthorization: boolean;
+    persistRingAfterAuthorization: boolean;
+    ring: string;
+  }> {
+    let cursor: RemoteMirrorCursor | null = null;
+    try {
+      const parsed = JSON.parse(await readFile(remoteMirrorCursorPath(bee), "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      const candidate = parsed as Partial<RemoteMirrorCursor>;
+      if (
+        candidate.version !== 1
+        || candidate.node !== entry.node
+        || candidate.remoteLaunchId !== entry.remoteLaunchId
+        || candidate.remoteIncarnation !== entry.remoteIncarnation
+        || !Number.isSafeInteger(candidate.lastSeq)
+        || Number(candidate.lastSeq) < 0
+      ) throw new Error("identity/high-water mismatch");
+      cursor = candidate as RemoteMirrorCursor;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`local remote-event cursor for ${bee} is unreadable or malformed`, { cause: error });
+      }
+    }
+
+    let raw = "";
+    try {
+      raw = await readFile(hsrEventsPath(bee), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`local remote-event mirror for ${bee} is unreadable`, { cause: error });
+      }
+    }
+    const local: RunnerEvent[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line) as unknown;
+        if (!isRunnerEvent(event)) throw new Error("not an event");
+        local.push(event);
+      } catch (error) {
+        throw new Error(`local remote-event mirror for ${bee} is malformed`, { cause: error });
+      }
+    }
+    const originSeqs: number[] = [];
+    let compactedThrough = 0;
+    let checkpointSeen = false;
+    let originSeen = false;
+    for (const event of local) {
+      if (event.type === "remote_cursor_checkpoint") {
+        if (checkpointSeen || originSeen) {
+          throw new Error(`local remote-event compaction proof for ${bee} is duplicated or out of order`);
+        }
+        if (
+          event.node !== entry.node
+          || event.remoteLaunchId !== entry.remoteLaunchId
+          || event.remoteIncarnation !== entry.remoteIncarnation
+          || !Number.isSafeInteger(event.throughRemoteSeq)
+          || event.throughRemoteSeq <= 0
+        ) {
+          throw new Error(`local remote-event compaction proof for ${bee} has the wrong generation`);
+        }
+        checkpointSeen = true;
+        compactedThrough = event.throughRemoteSeq;
+        continue;
+      }
+      if (event.remoteSeq === undefined) continue;
+      if (!Number.isSafeInteger(event.remoteSeq) || Number(event.remoteSeq) <= 0) {
+        throw new Error(`local remote-event mirror for ${bee} contains an invalid origin sequence`);
+      }
+      originSeen = true;
+      originSeqs.push(Number(event.remoteSeq));
+    }
+    const seen = new Set<number>();
+    for (const seq of originSeqs) {
+      if (seen.has(seq)) throw new Error(`local remote-event mirror for ${bee} contains duplicate origin seq ${seq}`);
+      seen.add(seq);
+    }
+    // The cursor is an optimization, never evidence. Prove the complete local
+    // origin chain independently: absent a compaction checkpoint it starts at
+    // one; with a checkpoint the retained suffix starts exactly at through+1.
+    // Only after that proof may a lagging cursor be healed to the proven high.
+    let lastSeq = compactedThrough;
+    for (const seq of originSeqs) {
+      if (seq !== lastSeq + 1) {
+        throw new Error(
+          seq > lastSeq + 1
+            ? `local remote-event proof for ${bee} has a gap ${lastSeq + 1}..${seq - 1}`
+            : `local remote-event proof for ${bee} is out of order at origin seq ${seq}`,
+        );
+      }
+      lastSeq = seq;
+    }
+    if (cursor && cursor.lastSeq > lastSeq) {
+      throw new Error(
+        `local remote-event cursor ${cursor.lastSeq} for ${bee} is ahead of durable proof ${lastSeq}`,
+      );
+    }
+
+    let ringState: RemoteMirrorRingState | null = null;
+    try {
+      const parsed = JSON.parse(await readFile(remoteMirrorRingStatePath(bee), "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      const candidate = parsed as Partial<RemoteMirrorRingState>;
+      if (
+        candidate.version !== 1
+        || candidate.node !== entry.node
+        || candidate.remoteLaunchId !== entry.remoteLaunchId
+        || candidate.remoteIncarnation !== entry.remoteIncarnation
+        || !Number.isSafeInteger(candidate.throughRemoteSeq)
+        || Number(candidate.throughRemoteSeq) < 0
+        || typeof candidate.text !== "string"
+      ) throw new Error("identity/high-water mismatch");
+      ringState = candidate as RemoteMirrorRingState;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`local remote-event ring state for ${bee} is unreadable or malformed`, { cause: error });
+      }
+    }
+    let rebuiltRing = ringState?.text ?? "";
+    const ringThrough = ringState?.throughRemoteSeq ?? 0;
+    if (ringThrough < compactedThrough || ringThrough > lastSeq) {
+      throw new Error(
+        `local remote-event ring proof ${ringThrough} for ${bee} is outside durable origin proof ${compactedThrough}..${lastSeq}`,
+      );
+    }
+    for (const event of local) {
+      if (
+        event.type === "text"
+        && event.text.length > 0
+        && typeof event.remoteSeq === "number"
+        && event.remoteSeq > ringThrough
+      ) rebuiltRing = appendRingText(rebuiltRing, event.text);
+    }
+    if (!ringState) {
+      let existingRing = "";
+      try {
+        existingRing = await readFile(hsrRingPath(bee), "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new Error(`local remote-event ring for ${bee} is unreadable`, { cause: error });
+        }
+      }
+      if (compactedThrough > 0) {
+        throw new Error(`local remote-event ring proof for ${bee} is missing after compaction`);
+      }
+      if (existingRing && existingRing !== rebuiltRing) {
+        throw new Error(`local remote-event ring for ${bee} does not match durable event proof`);
+      }
+    }
+
+    const legacy = local.length > 0 && !checkpointSeen && originSeqs.length === 0;
+    entry.remoteSeq = lastSeq;
+    return {
+      afterSeq: legacy ? 0 : lastSeq,
+      resetLegacy: legacy,
+      persistAfterAuthorization: legacy || !cursor || cursor.lastSeq !== lastSeq,
+      persistRingAfterAuthorization: legacy || !ringState || ringThrough !== lastSeq,
+      ring: rebuiltRing,
+    };
+  }
+
+  async function appendMirrored(bee: string, entry: MirrorEntry, event: RunnerEvent): Promise<void> {
+    const originSeq = event.seq;
+    if (!Number.isSafeInteger(originSeq) || Number(originSeq) <= 0) {
+      throw new Error(`remote mirror event for ${bee} has no exact origin sequence`);
+    }
+    await withExactMirrorOwner(bee, entry, async () => {
+      if (Number(originSeq) <= entry.remoteSeq) {
+        // Cursor persistence may have failed after local append. Retry the
+        // cursor write without appending a second local copy.
+        await persistMirrorCursor(bee, entry);
+        return;
+      }
+      if (Number(originSeq) !== entry.remoteSeq + 1) {
+        throw new Error(`remote mirror event gap for ${bee}: expected ${entry.remoteSeq + 1}, received ${originSeq}`);
+      }
+      await ensureHsrRunDir(bee);
+      await appendHsrEvent(bee, { ...event, remoteSeq: Number(originSeq) });
+      entry.remoteSeq = Number(originSeq);
+      if (event.type === "text" && typeof event.text === "string" && event.text.length > 0) {
+        entry.ring = appendRingText(entry.ring, event.text);
+      }
+      // Bind the independent ring bytes to the exact remote origin high-water
+      // before the cursor/ack can advance. A crash can reconstruct ring.txt
+      // from this state plus the retained origin suffix.
+      await persistMirrorRingState(bee, entry);
+      await writeHsrRing(bee, entry.ring);
+      // The cursor is the final durability commit. A crash before it causes
+      // exact replay; event and ring bytes are already durable at that point.
+      await persistMirrorCursor(bee, entry);
+    });
+  }
+
+  async function onEvent(bee: string, entry: MirrorEntry, raw: unknown): Promise<void> {
     if (!isRunnerEvent(raw)) return;
-    // Backfill in flight: hold the live event until the remote tail is merged,
-    // so an event present in both never lands twice.
-    if (entry.pending !== null) {
-      entry.pending.push(raw);
+    if ((raw as RunnerEvent & { remoteObservationIntegrityFailure?: unknown }).remoteObservationIntegrityFailure === true) {
+      try {
+        await fenceMirrorIntegrity(bee, entry, raw.type === "error" ? raw.message : "unknown resume failure");
+      } catch (error) {
+        // Make the next daemon tick retry the canonical fence instead of
+        // treating this poisoned in-memory subscription as healthy.
+        if (mirrors.get(bee) === entry) mirrors.delete(bee);
+        throw error;
+      }
+      if (mirrors.get(bee) === entry) mirrors.delete(bee);
       return;
     }
-    appendMirrored(bee, entry, raw);
+    await appendMirrored(bee, entry, raw);
   }
 
-  /**
-   * Merge the remote events.jsonl tail into the local mirror file. Events
-   * emitted between spawn and the first mirror tick predate the observe
-   * subscription and would otherwise be lost locally (they exist only on the
-   * remote). Boundary discipline: only events with ts strictly greater than the
-   * newest local ts are appended, and live events buffered during the backfill
-   * are flushed through the same boundary — dedupe is by timestamp, which the
-   * runner stamps monotonically enough per bee (same-ms boundary collisions are
-   * the accepted residual, versus losing the whole pre-attach tail today).
-   */
-  async function backfill(bee: string, entry: MirrorEntry, substrate: RemoteHsrSubstrate): Promise<void> {
-    let boundary = 0;
-    try {
-      // A daemon restart re-arms mirrors for bees whose local file already has
-      // history — resume after the newest local event instead of re-fetching.
-      const local = await readEventTail(bee);
-      for (const event of local) {
-        if (typeof event.ts === "number" && event.ts > boundary) boundary = event.ts;
-      }
-      const missed = await substrate.eventsTail(bee, boundary > 0 ? boundary : undefined);
-      for (const event of missed) {
-        if (!isRunnerEvent(event)) continue;
-        if (typeof event.ts === "number") {
-          if (event.ts <= boundary) continue;
-          boundary = event.ts;
-        }
-        appendMirrored(bee, entry, event);
-      }
-    } catch {
-      // Transient tunnel failure or an older runner-host without the events
-      // RPC: live events still flow; only the pre-attach tail stays remote.
-    } finally {
-      const buffered = entry.pending ?? [];
-      entry.pending = null; // armed — onEvent appends directly from here on.
-      for (const event of buffered) {
-        if (typeof event.ts === "number" && event.ts <= boundary) continue;
-        appendMirrored(bee, entry, event);
-      }
+  async function writeMirrorMetaUnchecked(
+    bee: string,
+    node: string,
+    status: "running" | "exited",
+    generation?: {
+      remoteLaunchId?: string;
+      remoteIncarnation?: string;
+      syncPhase?: "resetting" | "syncing";
+    },
+  ): Promise<void> {
+    let existing = await readHsrMeta(bee).catch(() => null);
+    const launchId = generation?.remoteLaunchId ?? existing?.mirrorRemoteLaunchId;
+    const incarnation = generation?.remoteIncarnation ?? existing?.mirrorRemoteIncarnation;
+    const sameGeneration = existing?.mirrorOfNode === node
+      && existing.mirrorRemoteLaunchId === launchId
+      && existing.mirrorRemoteIncarnation === incarnation;
+    if (status === "running" && existing?.mirrorOfNode && !sameGeneration) {
+      await resetHsrMirrorGeneration(bee);
+      await rm(remoteMirrorCursorPath(bee), { force: true });
+      existing = null;
     }
-  }
-
-  async function writeMirrorMeta(bee: string, node: string, status: "running" | "exited"): Promise<void> {
-    const existing = await readHsrMeta(bee).catch(() => null);
     const meta: HsrMeta = {
       bee,
       harness: existing?.harness ?? "",
       tier: existing?.tier ?? "stream",
       ...(existing?.sessionId ? { sessionId: existing.sessionId } : {}),
       hostPid: 0, // sentinel: a mirror has no local host (see runDir.ts HsrMeta)
-      startedAt: existing?.startedAt ?? new Date(now()).toISOString(),
+      startedAt: sameGeneration && existing?.startedAt ? existing.startedAt : new Date(now()).toISOString(),
       controlSocket: "",
       status,
       mirrorOfNode: node,
+      ...(launchId ? { mirrorRemoteLaunchId: launchId } : {}),
+      ...(incarnation ? { mirrorRemoteIncarnation: incarnation } : {}),
+      ...(generation?.syncPhase ? { mirrorSyncPhase: generation.syncPhase } : {}),
       ...(status === "exited" ? { endedAt: new Date(now()).toISOString() } : {}),
     };
     await ensureHsrRunDir(bee);
     await writeHsrMeta(bee, meta);
   }
 
-  async function ensureMirror(node: NodeRecord, substrate: RemoteHsrSubstrate, bee: string): Promise<void> {
-    if (mirrors.has(bee)) return; // already mirrored — dedupe.
+  async function ensureMirror(node: NodeRecord, substrate: RemoteHsrSubstrate, record: SessionRecord): Promise<void> {
+    const bee = record.name;
+    if (!record.remoteLaunchId || !record.remoteIncarnation) return;
+    const existing = mirrors.get(bee);
+    if (
+      existing
+      && existing.remoteLaunchId === record.remoteLaunchId
+      && existing.remoteIncarnation === record.remoteIncarnation
+    ) return; // already mirroring this exact remote generation.
+    if (existing) {
+      // Do not tear down a known-good exact subscription merely because a stale
+      // SessionRecord with the same bee name appears in one tick. First require
+      // a token-qualified RPC under the remote lifecycle lock; unlike ordinary
+      // best-effort tailing, a qualified rejection throws.
+      try {
+        await substrate.eventsTail(bee, Number.MAX_SAFE_INTEGER, {
+          remoteLaunchId: record.remoteLaunchId,
+          remoteIncarnation: record.remoteIncarnation,
+        });
+      } catch {
+        return;
+      }
+      await teardown(bee, existing, { markExited: false });
+    }
+    const probe: MirrorEntry = {
+      node: node.name,
+      remoteLaunchId: record.remoteLaunchId,
+      remoteIncarnation: record.remoteIncarnation,
+      off: () => undefined,
+      ring: "",
+      remoteSeq: 0,
+      record,
+    };
+    let cursorPlan = {
+      afterSeq: 0,
+      resetLegacy: true,
+      persistAfterAuthorization: true,
+      persistRingAfterAuthorization: true,
+      ring: "",
+    };
+    try {
+      cursorPlan = await withExactMirrorOwner(bee, probe, async (current) => {
+        // Delivery/cleanup doubt must not stop an exact observation from
+        // collecting evidence. A fence raised by this mirror itself is
+        // different: its local projection has been quarantined and the source
+        // proof is already known bad, so admitting a fresh subscription would
+        // retry poisoned authority forever (and can attach a second callback
+        // to an entry whose failure was already reported).
+        if (isMirrorIntegrityFence(current)) {
+          throw new RemoteObservationDetachedError(
+            `remote mirror generation for ${bee} is already integrity-fenced`,
+          );
+        }
+        const meta = await readHsrMetaStrict(bee);
+        const sameGeneration = meta?.mirrorOfNode === node.name
+          && meta.mirrorRemoteLaunchId === record.remoteLaunchId
+          && meta.mirrorRemoteIncarnation === record.remoteIncarnation;
+        return sameGeneration
+          ? meta?.mirrorSyncPhase === "resetting"
+            ? {
+                afterSeq: 0,
+                resetLegacy: true,
+                persistAfterAuthorization: true,
+                persistRingAfterAuthorization: true,
+                ring: "",
+              }
+            : initialMirrorCursor(bee, probe)
+          : {
+              afterSeq: 0,
+              resetLegacy: true,
+              persistAfterAuthorization: true,
+              persistRingAfterAuthorization: true,
+              ring: "",
+            };
+      });
+    } catch (error) {
+      if (error instanceof RemoteObservationDetachedError) return;
+      // An unreadable local authority cursor cannot be healed by retrying from
+      // an assumed zero. Fence the exact canonical generation before clearing
+      // derived state; a retired/replaced generation is left untouched.
+      await fenceMirrorIntegrity(
+        bee,
+        probe,
+        error instanceof Error ? error.message : String(error),
+      ).catch(() => undefined);
+      process.stderr.write(
+        `hive: remote event mirror admission for ${bee} failed closed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return;
+    }
     // Reserve the slot BEFORE the async observe so a re-entrant call this tick
     // can't double-subscribe.
-    const entry: MirrorEntry = { node: node.name, off: () => undefined, ring: "", ringTimer: null, pending: [] };
+    const entry: MirrorEntry = {
+      node: node.name,
+      remoteLaunchId: record.remoteLaunchId,
+      remoteIncarnation: record.remoteIncarnation,
+      off: () => undefined,
+      ring: cursorPlan.ring,
+      remoteSeq: cursorPlan.afterSeq,
+      record,
+    };
     mirrors.set(bee, entry);
-    // Seed a `running` mirror meta so the local readers see the bee at once,
-    // even before the first event arrives.
-    await writeMirrorMeta(bee, node.name, "running").catch(() => undefined);
     try {
-      entry.off = await substrate.observe(bee, (event) => onEvent(bee, entry, event));
-    } catch {
+      entry.off = await substrate.observe(
+        bee,
+        (event) => onEvent(bee, entry, event),
+        {
+          remoteLaunchId: record.remoteLaunchId,
+          remoteIncarnation: record.remoteIncarnation,
+        },
+        {
+          afterSeq: cursorPlan.afterSeq,
+          afterAuthorized: async () => {
+            try {
+              await withExactMirrorOwner(bee, entry, async (current) => {
+                if (cursorPlan.resetLegacy) {
+                  // Publish the successor's non-live reset intent BEFORE any
+                  // predecessor projection is removed. Restart may safely redo
+                  // a resetting phase because no successor replay/ack began.
+                  await writeMirrorMetaUnchecked(bee, node.name, "exited", {
+                    remoteLaunchId: record.remoteLaunchId,
+                    remoteIncarnation: record.remoteIncarnation,
+                    syncPhase: "resetting",
+                  });
+                  await resetHsrMirrorGeneration(bee);
+                  await rm(remoteMirrorCursorPath(bee), { force: true });
+                  await rm(remoteMirrorRingStatePath(bee), { force: true });
+                  entry.remoteSeq = 0;
+                  entry.ring = "";
+                }
+                // Non-live/syncing projection: only the post-replay exact write
+                // below flips this generation to running.
+                await writeMirrorMetaUnchecked(bee, node.name, "exited", {
+                  remoteLaunchId: record.remoteLaunchId,
+                  remoteIncarnation: record.remoteIncarnation,
+                  syncPhase: "syncing",
+                });
+                if (cursorPlan.persistRingAfterAuthorization) await persistMirrorRingState(bee, entry);
+                await writeHsrRing(bee, entry.ring);
+                if (cursorPlan.persistAfterAuthorization) await persistMirrorCursor(bee, entry);
+              });
+            } catch (error) {
+              if (error instanceof RemoteObservationDetachedError) throw error;
+              throw new RemoteObservationIntegrityError(
+                `local mirror authorization projection failed for ${bee}`,
+                { cause: error },
+              );
+            }
+          },
+          afterSynchronized: async () => {
+            try {
+              await withExactMirrorOwner(bee, entry, () => writeMirrorMetaUnchecked(bee, node.name, "running", {
+                remoteLaunchId: record.remoteLaunchId,
+                remoteIncarnation: record.remoteIncarnation,
+              }));
+            } catch (error) {
+              if (error instanceof RemoteObservationDetachedError) throw error;
+              throw new RemoteObservationIntegrityError(`local mirror activation failed for ${bee}`, { cause: error });
+            }
+          },
+        },
+      );
+    } catch (error) {
       // Subscribe failed (transient tunnel / no live host): drop the reservation
       // so a later tick retries. The `running` meta stays — it flips to exited
       // once the bee genuinely leaves the remote list.
-      mirrors.delete(bee);
+      try {
+        await entry.off();
+      } catch {
+        // best-effort subscription rollback
+      }
+      if (mirrors.get(bee) === entry) mirrors.delete(bee);
+      if (error instanceof RemoteObservationIntegrityError) {
+        await fenceMirrorIntegrity(bee, entry, error.message).catch(() => undefined);
+      }
+      const classification = error instanceof RemoteObservationIntegrityError
+        ? "failed closed"
+        : "is temporarily unavailable and will retry";
+      process.stderr.write(
+        `hive: remote event mirror subscription for ${bee} ${classification}: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`,
+      );
       return;
     }
-    // Recover the pre-attach tail (spawn → first mirror tick) before going live.
-    await backfill(bee, entry, substrate).catch(() => undefined);
+  }
+
+  /**
+   * Import the final exact suffix for a generation that ended before (or while)
+   * this daemon held a live subscription. The spawn-time stable consumer keeps
+   * the source prefix retained, so this path needs no live control socket.
+   */
+  async function syncTerminalMirror(
+    node: NodeRecord,
+    substrate: RemoteHsrSubstrate,
+    record: SessionRecord,
+  ): Promise<void> {
+    const bee = record.name;
+    if (!record.remoteLaunchId || !record.remoteIncarnation) {
+      throw new RemoteObservationIntegrityError(`terminal remote mirror for ${bee} lacks launch authority`);
+    }
+    const existing = mirrors.get(bee);
+    if (existing) {
+      if (!exactMirrorGeneration(record, existing)) {
+        throw new RemoteObservationDetachedError(`terminal remote mirror generation changed for ${bee}`);
+      }
+      await substrate.syncObservation(bee, {
+        remoteLaunchId: record.remoteLaunchId,
+        remoteIncarnation: record.remoteIncarnation,
+      });
+      await withExactMirrorOwner(bee, existing, () => writeMirrorMetaUnchecked(bee, node.name, "exited", {
+        remoteLaunchId: record.remoteLaunchId,
+        remoteIncarnation: record.remoteIncarnation,
+      }));
+      return;
+    }
+
+    const entry: MirrorEntry = {
+      node: node.name,
+      remoteLaunchId: record.remoteLaunchId,
+      remoteIncarnation: record.remoteIncarnation,
+      off: () => undefined,
+      ring: "",
+      remoteSeq: 0,
+      record,
+    };
+    let cursorPlan = {
+      afterSeq: 0,
+      resetLegacy: true,
+      persistAfterAuthorization: true,
+      persistRingAfterAuthorization: true,
+      ring: "",
+    };
+    cursorPlan = await withExactMirrorOwner(bee, entry, async () => {
+      const meta = await readHsrMetaStrict(bee);
+      const sameGeneration = meta?.mirrorOfNode === node.name
+        && meta.mirrorRemoteLaunchId === record.remoteLaunchId
+        && meta.mirrorRemoteIncarnation === record.remoteIncarnation;
+      return sameGeneration
+        ? meta?.mirrorSyncPhase === "resetting"
+          ? {
+              afterSeq: 0,
+              resetLegacy: true,
+              persistAfterAuthorization: true,
+              persistRingAfterAuthorization: true,
+              ring: "",
+            }
+          : initialMirrorCursor(bee, entry)
+        : {
+            afterSeq: 0,
+            resetLegacy: true,
+            persistAfterAuthorization: true,
+            persistRingAfterAuthorization: true,
+            ring: "",
+          };
+    });
+    entry.remoteSeq = cursorPlan.afterSeq;
+    entry.ring = cursorPlan.ring;
+    mirrors.set(bee, entry);
+    try {
+      await withExactMirrorOwner(bee, entry, async () => {
+        if (cursorPlan.resetLegacy) {
+          await writeMirrorMetaUnchecked(bee, node.name, "exited", {
+            remoteLaunchId: record.remoteLaunchId,
+            remoteIncarnation: record.remoteIncarnation,
+            syncPhase: "resetting",
+          });
+          await resetHsrMirrorGeneration(bee);
+          await rm(remoteMirrorCursorPath(bee), { force: true });
+          await rm(remoteMirrorRingStatePath(bee), { force: true });
+          entry.remoteSeq = 0;
+          entry.ring = "";
+        }
+        await writeMirrorMetaUnchecked(bee, node.name, "exited", {
+          remoteLaunchId: record.remoteLaunchId,
+          remoteIncarnation: record.remoteIncarnation,
+          syncPhase: "syncing",
+        });
+        if (cursorPlan.persistRingAfterAuthorization) await persistMirrorRingState(bee, entry);
+        await writeHsrRing(bee, entry.ring);
+        if (cursorPlan.persistAfterAuthorization) await persistMirrorCursor(bee, entry);
+      });
+      await substrate.replayTerminalEvents(
+        bee,
+        (event) => onEvent(bee, entry, event),
+        { remoteLaunchId: record.remoteLaunchId, remoteIncarnation: record.remoteIncarnation },
+        entry.remoteSeq,
+        () => withExactMirrorOwner(bee, entry, () => writeMirrorMetaUnchecked(bee, node.name, "exited", {
+          remoteLaunchId: record.remoteLaunchId,
+          remoteIncarnation: record.remoteIncarnation,
+        })),
+      );
+    } finally {
+      if (mirrors.get(bee) === entry) mirrors.delete(bee);
+    }
   }
 
   async function teardown(bee: string, entry: MirrorEntry, options: { markExited: boolean }): Promise<void> {
     try {
-      entry.off();
+      await entry.off();
     } catch {
       // best-effort
     }
-    if (entry.ringTimer) {
-      clearTimeout(entry.ringTimer);
-      entry.ringTimer = null;
-      await writeHsrRing(bee, entry.ring).catch(() => undefined);
-    }
-    mirrors.delete(bee);
+    if (mirrors.get(bee) === entry) mirrors.delete(bee);
     if (options.markExited) {
       // Flip the mirror meta to exited so deriveState settles it dead/done.
-      await writeMirrorMeta(bee, entry.node, "exited").catch(() => undefined);
+      await withExactMirrorOwner(
+        bee,
+        entry,
+        () => writeMirrorMetaUnchecked(bee, entry.node, "exited", {
+          remoteLaunchId: entry.remoteLaunchId,
+          remoteIncarnation: entry.remoteIncarnation,
+        }),
+      ).catch(() => undefined);
     }
   }
 
@@ -317,10 +908,31 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
         continue;
       }
       const substrate = await substrateForNode(node);
-      let liveBees: Set<string>;
+      let rows: RemoteListRow[];
       try {
-        liveBees = new Set(await substrate.listSessions());
-      } catch {
+        rows = await substrate.listRemoteRows();
+      } catch (error) {
+        if (error instanceof RemoteObservationIntegrityError) {
+          // A typed authority/storage failure is not an empty remote node. Fence
+          // every exact generation on that authority and tear down poisoned
+          // relays; ordinary tunnel loss below remains retryable.
+          for (const record of nodeRecords) {
+            if (!record.remoteLaunchId || !record.remoteIncarnation) continue;
+            const entry = mirrors.get(record.name) ?? {
+              node: nodeName,
+              remoteLaunchId: record.remoteLaunchId,
+              remoteIncarnation: record.remoteIncarnation,
+              off: () => undefined,
+              ring: "",
+              remoteSeq: 0,
+              record,
+            };
+            await fenceMirrorIntegrity(record.name, entry, error.message).catch(() => undefined);
+            const active = mirrors.get(record.name);
+            if (active) await teardown(record.name, active, { markExited: false });
+          }
+          continue;
+        }
         // Tunnel down this tick: don't tear existing mirrors down (the transport
         // is reconnecting) and don't add new ones. Keep what we have.
         for (const record of nodeRecords) {
@@ -328,10 +940,97 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
         }
         continue;
       }
+      const rowByBee = new Map(rows.map((row) => [row.bee, row]));
       for (const record of nodeRecords) {
-        if (!liveBees.has(record.name)) continue;
-        wanted.add(record.name);
-        await ensureMirror(node, substrate, record.name);
+        const row = rowByBee.get(record.name);
+        const exactRow = row
+          && row.launchId === record.remoteLaunchId
+          && row.incarnation === record.remoteIncarnation
+          ? row
+          : undefined;
+        if (row && !exactRow) {
+          // A same-name remote successor is not evidence about this canonical
+          // generation. Preserve an exact existing mirror until lifecycle
+          // reconciliation resolves the token mismatch.
+          if (mirrors.has(record.name)) wanted.add(record.name);
+          continue;
+        }
+        if (exactRow?.transitional) {
+          if (mirrors.has(record.name)) wanted.add(record.name);
+          continue;
+        }
+        if (exactRow?.unavailable === "busy") {
+          // A writer owns the exact source authority right now. Preserve an
+          // existing projection and retry; absence/busy is not corruption.
+          if (mirrors.has(record.name)) wanted.add(record.name);
+          continue;
+        }
+        if (exactRow?.unavailable === "integrity" || exactRow?.integrityFailure === true) {
+          const probe = mirrors.get(record.name) ?? {
+            node: nodeName,
+            remoteLaunchId: record.remoteLaunchId,
+            remoteIncarnation: record.remoteIncarnation,
+            off: () => undefined,
+            ring: "",
+            remoteSeq: 0,
+            record,
+          };
+          await fenceMirrorIntegrity(
+            record.name,
+            probe,
+            exactRow.error ?? "remote per-Bee authority storage failed",
+          ).catch(() => undefined);
+          const active = mirrors.get(record.name);
+          if (active) await teardown(record.name, active, { markExited: false });
+          continue;
+        }
+        if (exactRow?.eventIntegrityReceipt) {
+          try {
+            await importRemoteHsrEventIntegrityReceipt(exactRow.eventIntegrityReceipt, record.name);
+          } catch (error) {
+            const probe = mirrors.get(record.name) ?? {
+              node: nodeName,
+              remoteLaunchId: record.remoteLaunchId,
+              remoteIncarnation: record.remoteIncarnation,
+              off: () => undefined,
+              ring: "",
+              remoteSeq: 0,
+              record,
+            };
+            await fenceMirrorIntegrity(record.name, probe, `remote event-integrity import failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+          }
+          const active = mirrors.get(record.name);
+          if (active) await teardown(record.name, active, { markExited: true });
+          continue;
+        }
+        if (exactRow?.live) {
+          wanted.add(record.name);
+          await ensureMirror(node, substrate, record);
+          continue;
+        }
+        if (exactRow) {
+          try {
+            await syncTerminalMirror(node, substrate, record);
+          } catch (error) {
+            if (error instanceof RemoteObservationIntegrityError) {
+              const probe = mirrors.get(record.name) ?? {
+                node: nodeName,
+                remoteLaunchId: record.remoteLaunchId,
+                remoteIncarnation: record.remoteIncarnation,
+                off: () => undefined,
+                ring: "",
+                remoteSeq: 0,
+                record,
+              };
+              await fenceMirrorIntegrity(record.name, probe, error.message).catch(() => undefined);
+            } else if (!(error instanceof RemoteObservationDetachedError)) {
+              // Exact terminal history is still remotely retained. Keep an
+              // existing projection alive and retry on the next daemon tick.
+              if (mirrors.has(record.name)) wanted.add(record.name);
+            }
+          }
+          continue;
+        }
       }
     }
 

@@ -117,6 +117,34 @@ test("spawnBee threads --sandbox-write into the HSR payload and stamps the recor
   });
 });
 
+test("protocol spawn argv ignores an ambient account-model overlay", async () => {
+  await withTempStore(async (dir) => {
+    const checkout = join(dir, "checkout");
+    await mkdir(checkout, { recursive: true });
+    const captured: HsrRunPayload[] = [];
+    await spawnBee({
+      agent: "claude",
+      extraArgs: ["--model", "claude-sonnet-5", "--effort", "high"],
+      cwd: checkout,
+      yolo: false,
+      name: "protocol-model-authority",
+      substrate: "hsr",
+      executionRunId: "run-protocol-model-authority",
+      protocolLaunch: true,
+      // This is the shape spawnSingleBee previously derived from the selected
+      // account. It must not add a second selector or enter payload.model.
+      model: "ambient-account-default",
+    }, admissionDeps(captured));
+
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0]!.model, undefined);
+    assert.equal(captured[0]!.spec.args.includes("ambient-account-default"), false);
+    const modelIndexes = captured[0]!.spec.args.flatMap((value, index) => value === "--model" ? [index] : []);
+    assert.equal(modelIndexes.length, 1);
+    assert.equal(captured[0]!.spec.args[modelIndexes[0]! + 1], "claude-sonnet-5");
+  });
+});
+
 test("spawnBee fails fast on a guard-refused grant instead of launching the host", async () => {
   await withTempStore(async (dir) => {
     const cellsRoot = join(dir, "cells");
@@ -194,6 +222,10 @@ test("revive replays the Cell write boundary and --sandbox-write grants from the
       hostPid: 999_983,
       hostFingerprint: { pgid: 999_983, startedAt: "Fri Aug  7 10:00:00 2026" },
       childAdmission: "none",
+      startupFailure: {
+        stage: "adapter-start",
+        message: "fixture provider was durably never started",
+      },
       startedAt: "2026-08-07T00:00:00.000Z",
       controlSocket: join(dir, "gone.sock"),
       status: "exited",

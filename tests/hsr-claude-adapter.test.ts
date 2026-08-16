@@ -136,6 +136,12 @@ test("configured Claude encodeAnswer requires a live request and preserves multi
   }));
   const encoded = JSON.parse(config.encodeAnswer!("permission-2", JSON.stringify({ Where: "ignored", "Where?": "Prod", "Which checks?": ["A", "B"] })));
   assert.deepEqual(encoded.response.response.updatedInput.answers, { "Where?": "Prod", "Which checks?": "A, B" });
+  assert.doesNotThrow(
+    () => config.encodeAnswer!("permission-2", "retry-before-write-callback"),
+    "pre-write preparation must retain the pending request",
+  );
+  config.commitAnswer!("permission-2");
+  assert.throws(() => config.encodeAnswer!("permission-2", "answer"), /no pending question/);
   assert.throws(() => config.encodeAnswer!("missing", "answer"), /no pending question/);
 });
 

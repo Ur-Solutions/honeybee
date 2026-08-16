@@ -3,6 +3,7 @@
 // proves content equality between the local build and the installed tree —
 // stamp AND re-hash — with bounded retries.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -155,6 +156,37 @@ test("deploy installs an immutable package archive, never a worktree symlink", a
     source.indexOf("writeBuildStamp(localDist)") < source.indexOf('["pack", "--json"'),
     "the packed archive must contain the certified build stamp",
   );
+});
+
+test("the deploy archive allowlist excludes workstation state and retains runtime assets", () => {
+  const packed = JSON.parse(execFileSync(
+    "npm",
+    ["pack", "--dry-run", "--json"],
+    { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  )) as Array<{ files?: Array<{ path?: string }> }>;
+  const paths = new Set(
+    (packed[0]?.files ?? [])
+      .map((entry) => entry.path)
+      .filter((path): path is string => typeof path === "string"),
+  );
+
+  for (const required of [
+    "package.json",
+    "dist/cli.js",
+    "dist/hsr/runner-entry.js",
+    "dist/hsr/artifacts/runner-host.mjs",
+    "dist/hsr/artifacts/runner-host.manifest.json",
+    "dist/execution/service.js",
+    "contracts/execution/v1/profile.json",
+    "docs/honeybee.tmux.conf",
+  ]) {
+    assert.ok(paths.has(required), `deploy archive is missing ${required}`);
+  }
+  for (const path of paths) {
+    assert.doesNotMatch(path, /(^|\/)\.(?:local|claude|git)(?:\/|$)/, `deploy archive leaked local dot-state: ${path}`);
+    assert.doesNotMatch(path, /(^|\/)(?:tests?|src|\.test-dist)(?:\/|$)/, `deploy archive leaked a development tree: ${path}`);
+    assert.doesNotMatch(path, /(?:device-id|credentials?|auth\.json|settings\.local\.json)$/i, `deploy archive leaked a credential-shaped path: ${path}`);
+  }
 });
 
 test("deploy preflight certifies candidate corpus bytes before the global install mutates", async () => {

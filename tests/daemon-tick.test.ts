@@ -18,6 +18,7 @@ import type { ProbeEvidence } from "../src/stateMachine.js";
 import type { SessionRecord } from "../src/store.js";
 import type { NodeRecord } from "../src/node.js";
 import { nextRuntimeIncarnationPatch } from "../src/seal.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-daemon-tick-"));
@@ -294,6 +295,39 @@ test("tick: a sealed HSR record without transcript metadata is neither observed 
     assert.equal(capture.touches[0]?.fields.lastObservedState, "done");
     assert.equal(capture.touches[0]?.probeEvidence?.kind, "probe");
     assert.equal(capture.touches[0]?.probeEvidence?.target.substrate, "hsr");
+  });
+});
+
+test("tick HSR observation eligibility obeys canonical lifecycle despite stale status and observation scalars", async () => {
+  await withTempStore(async () => {
+    const at = "2026-06-03T09:59:00.000Z";
+    const active = bee({
+      name: "tick-active-stale-done",
+      tmuxTarget: "tick-active-stale-done",
+      substrate: "hsr",
+      status: "done",
+      lastObservedState: "done",
+      stateMachine: lifecycleCursor("tick-active-stale-done", "active", at),
+    });
+    const archived = bee({
+      name: "tick-archived-stale-running",
+      tmuxTarget: "tick-archived-stale-running",
+      substrate: "hsr",
+      status: "running",
+      stateMachine: lifecycleCursor("tick-archived-stale-running", "archived", at),
+    });
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records: [active, archived], liveTargets: new Set(), capture });
+    const batches: string[][] = [];
+    deps.hsrObservations = async (beeNames) => {
+      batches.push([...beeNames]);
+      return new Map([[active.name, { live: true, state: "active", snapshot: "working" }]]);
+    };
+
+    const result = await tick(deps, new Map());
+    assert.deepEqual(batches, [[active.name]]);
+    assert.equal(result.observed.get(active.name), "active");
+    assert.equal(result.observed.get(archived.name), "done");
   });
 });
 

@@ -1,5 +1,6 @@
 import type { SealRecord } from "../seal.js";
 import type { BeeState } from "../state.js";
+import { isArchivedSessionLifecycle, isRunnableSessionRecord } from "../stateMachine.js";
 import type { SessionRecord } from "../store.js";
 import { withContractPostscript } from "../contract.js";
 import { combTrackPostscript } from "./attachment.js";
@@ -31,6 +32,7 @@ import type {
   ForumPacketQuarantine,
 } from "./forum.js";
 import { classifyForumCommandError } from "./forum.js";
+import { isLaunchOwnershipIndeterminate } from "../launchAmbiguity.js";
 
 export type LatestCombSeal = { filename: string; seal: SealRecord } | null;
 
@@ -75,8 +77,29 @@ export type CombSweepDeps = {
   notifyPacketQuarantine?: (notice: HumanPacketQuarantineNotice) => Promise<void>;
   releaseClaim?: (claimId: string, runId: string) => Promise<void>;
   withRunSweepLock?: <T>(runId: string, fn: () => Promise<T>) => Promise<T>;
+  /** Lifecycle admission for the prior Bees of an automatic retry. */
+  withAgentSourceAdmission?: <T>(
+    sources: SessionRecord[],
+    fn: (current: SessionRecord[]) => Promise<T>,
+  ) => Promise<T>;
   now: () => number;
 };
+
+/** A Bee is durably published, but its Comb binding/brief outcome is unknown. */
+export class AgentActivationAmbiguousError extends Error {
+  constructor(
+    readonly spawned: { name: string; id?: string },
+    readonly original: unknown,
+  ) {
+    super(
+      `bee ${spawned.name} was already published before Comb activation failed: ${
+        original instanceof Error ? original.message : String(original)
+      }`,
+      { cause: original },
+    );
+    this.name = "AgentActivationAmbiguousError";
+  }
+}
 
 type PreparedAgentEffect = {
   runId: string;
@@ -180,8 +203,35 @@ export async function sweepCombs(
   const recordsByName = new Map(records.map((record) => [record.name, record]));
   for (const listed of runs) {
     try {
-      const sweep = () => sweepOneRun(deps, listed.id, recordsByName, observed, packetsById);
-      outcomes.push(...await (deps.withRunSweepLock ? deps.withRunSweepLock(listed.id, sweep) : sweep()));
+      const sourceRecords = automaticRetrySourceRecords(listed, recordsByName, observed, new Date(deps.now()).toISOString());
+      const lockedSweep = (
+        currentRecords: ReadonlyMap<string, SessionRecord> = recordsByName,
+        deferCleanup = false,
+      ) => {
+        const sweep = () => sweepOneRun(deps, listed.id, currentRecords, observed, packetsById, { deferCleanup });
+        return deps.withRunSweepLock ? deps.withRunSweepLock(listed.id, sweep) : sweep();
+      };
+      // Lifecycle is deliberately outermost: once frozen tick evidence says a
+      // prior activation may be terminal/stalled, fresh canonical ownership is
+      // held across classification, run/effect writes, successor spawn, and
+      // publication. A concurrent failed stop therefore wins with zero run or
+      // spawn side effects.
+      outcomes.push(...await (
+        sourceRecords.length > 0 && deps.withAgentSourceAdmission
+          ? deps.withAgentSourceAdmission(sourceRecords, async (freshSources) => {
+              const currentRecords = new Map(recordsByName);
+              for (const source of freshSources) currentRecords.set(source.name, source);
+              return lockedSweep(currentRecords, true);
+            })
+          : lockedSweep()
+      ));
+      // Cleanup retirement acquires Bee lifecycle. Never run it while the
+      // automatic-retry source admission above still owns that same lock.
+      // Re-enter only the run lock after lifecycle admission has exited.
+      if (sourceRecords.length > 0 && deps.withAgentSourceAdmission) {
+        const cleanup = () => driveCleanup(deps, listed.id);
+        outcomes.push(...await (deps.withRunSweepLock ? deps.withRunSweepLock(listed.id, cleanup) : cleanup()));
+      }
     } catch (error) {
       outcomes.push({ run: listed.id, action: "error", error: error instanceof Error ? error.message : String(error) });
     }
@@ -195,6 +245,7 @@ async function sweepOneRun(
   records: ReadonlyMap<string, SessionRecord>,
   observed: ReadonlyMap<string, BeeState>,
   packets: ReadonlyMap<string, ForumPacket>,
+  options: { deferCleanup?: boolean } = {},
 ): Promise<CombSweepOutcome[]> {
   const outcomes: CombSweepOutcome[] = [];
   const now = new Date(deps.now()).toISOString();
@@ -254,7 +305,7 @@ async function sweepOneRun(
     outcomes.push(await executeHumanEffect(deps, plan));
   }
   outcomes.push(...await reconcileTerminalEffects(deps, runId));
-  outcomes.push(...await driveCleanup(deps, runId));
+  if (!options.deferCleanup) outcomes.push(...await driveCleanup(deps, runId));
   if (outcomes.length === 0) outcomes.push({ run: runId, action: "noop" });
   return outcomes;
 }
@@ -490,34 +541,99 @@ function reconcileDeadOrStalledAgents(
   for (const activation of currentActivations(run)) {
     const node = run.currentSnapshot.definition.nodes.find((candidate) => candidate.id === activation.address.nodeId);
     if (node?.executor !== "agent" || activation.status !== "active") continue;
-    const terminalBee = activation.beeHandles.find((handle) => {
-      const state = observed.get(handle.name);
-      const record = records.get(handle.name);
-      return state === "dead" || state === "crashed" || state === "error" || state === "done" || record?.status === "dead" || record?.status === "done";
-    });
-    if (terminalBee) {
+    const failure = automaticAgentFailure(run, activation, records, observed, now);
+    if (!failure) continue;
+    if (failure.code === "bee-terminal-without-seal") {
       activation.status = "failed";
       activation.endedAt = now;
       activation.failure = {
-        code: "bee-terminal-without-seal",
-        message: `bee ${terminalBee.name} became terminal without a matching completion seal`,
+        code: failure.code,
+        message: failure.message,
         retryable: true,
       };
-      recordRunEvent(run, "comb.activation.failed", activation.address, { code: "bee-terminal-without-seal", bee: terminalBee.name });
+      recordRunEvent(run, "comb.activation.failed", activation.address, {
+        code: failure.code,
+        ...(failure.bee ? { bee: failure.bee } : {}),
+      });
       continue;
     }
-    if (activation.startedAt && Date.parse(now) - Date.parse(activation.startedAt) >= run.policies.stallMs) {
-      activation.status = "failed";
-      activation.endedAt = now;
-      activation.failure = {
-        code: "idle-without-completion",
-        message: `activation ${activation.id} exceeded stallMs without matching completion evidence`,
-        retryable: true,
-      };
-      recordRunEvent(run, "comb.violation", activation.address, { code: "idle-without-completion" });
-      recordRunEvent(run, "comb.activation.failed", activation.address, { code: "idle-without-completion" });
+    activation.status = "failed";
+    activation.endedAt = now;
+    activation.failure = { code: failure.code, message: failure.message, retryable: true };
+    recordRunEvent(run, "comb.violation", activation.address, { code: failure.code });
+    recordRunEvent(run, "comb.activation.failed", activation.address, { code: failure.code });
+  }
+}
+
+function automaticAgentFailure(
+  run: RunRecord,
+  activation: ActivationRecord,
+  records: ReadonlyMap<string, SessionRecord>,
+  observed: ReadonlyMap<string, BeeState>,
+  now: string,
+): { code: "bee-terminal-without-seal" | "idle-without-completion"; message: string; bee?: string } | null {
+  // A launch or post-publication delivery with unresolved ownership is a
+  // manual reconciliation state, never evidence authorizing another attempt.
+  if (activation.effectKeys.some((key) => {
+    const effect = run.effects[key];
+    return (effect?.status === "executing" || effect?.status === "ambiguous") &&
+      (effect.kind === "agent-spawn" || effect.kind === "agent-adopt");
+  })) return null;
+  // A failed stop leaves ownership unresolved even when the bounded lifecycle
+  // cursor remains active. It is never retryable ownership evidence.
+  if (activation.beeHandles.some((handle) => records.get(handle.name)?.status === "kill_failed")) return null;
+  const terminalBee = activation.beeHandles.find((handle) => {
+    const state = observed.get(handle.name);
+    const record = records.get(handle.name);
+    return state === "dead" || state === "crashed" || state === "error" || state === "done" ||
+      (record !== undefined && (
+        isArchivedSessionLifecycle(record) ||
+        (record.stateMachine === undefined && record.status === "dead")
+      ));
+  });
+  if (terminalBee) {
+    return {
+      code: "bee-terminal-without-seal",
+      message: `bee ${terminalBee.name} became terminal without a matching completion seal`,
+      bee: terminalBee.name,
+    };
+  }
+  if (activation.startedAt && Date.parse(now) - Date.parse(activation.startedAt) >= run.policies.stallMs) {
+    return {
+      code: "idle-without-completion",
+      message: `activation ${activation.id} exceeded stallMs without matching completion evidence`,
+    };
+  }
+  return null;
+}
+
+function automaticRetrySourceRecords(
+  run: RunRecord,
+  records: ReadonlyMap<string, SessionRecord>,
+  observed: ReadonlyMap<string, BeeState>,
+  now: string,
+): SessionRecord[] {
+  const sources = new Map<string, SessionRecord>();
+  for (const activation of currentActivations(run)) {
+    const node = run.currentSnapshot.definition.nodes.find((candidate) => candidate.id === activation.address.nodeId);
+    if (node?.executor !== "agent" || activation.status !== "active") continue;
+    if (!automaticAgentFailure(run, activation, records, observed, now)) continue;
+    if (activation.beeHandles.length === 0) {
+      throw new Error(
+        `comb automatic retry: activation ${activation.id} has no source Bee ownership proof`,
+      );
+    }
+    for (const handle of activation.beeHandles) {
+      const source = records.get(handle.name);
+      if (!source) {
+        throw new Error(
+          `comb automatic retry: cannot prove lifecycle ownership for missing source bee ${handle.name}`,
+        );
+      }
+      sources.set(source.name, source);
     }
   }
+  return [...sources.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function planAgentEffects(
@@ -677,7 +793,7 @@ function resolveAgentAdoptTarget(
   const record = [...records.values()].find(
     (candidate) => candidate.name === destination.sessionId || candidate.id === destination.sessionId,
   );
-  if (record?.status === "running") return record.name;
+  if (record && isRunnableSessionRecord(record)) return record.name;
   if (run.policies.attachedRetryOnDead === "fail") {
     activation.status = "failed";
     activation.endedAt = now;
@@ -1351,6 +1467,15 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
 
   let spawned: { name: string; id?: string };
   if (plan.mode === "adopt") {
+    if (recover) {
+      return holdAmbiguousAgentEffect(
+        deps,
+        plan,
+        new Error(
+          `executing adoption of ${plan.request.name} has no durable delivery receipt; manual reconciliation required`,
+        ),
+      );
+    }
     if (!deps.adoptAgent) {
       return failAgentEffect(
         deps,
@@ -1362,6 +1487,9 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
     try {
       spawned = await deps.adoptAgent(plan.request as AgentAdoptRequest);
     } catch (error) {
+      if (error instanceof AgentActivationAmbiguousError) {
+        return holdAmbiguousAgentEffect(deps, plan, error, error.spawned);
+      }
       return failAgentEffect(deps, plan, error, "adopt-failed");
     }
   } else if (recover) {
@@ -1378,26 +1506,39 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
         };
       }
     }
-    if (!existing || existing.contract?.taskId !== plan.request.taskId || existing.contract?.attempt !== plan.request.attempt) {
-      await mutateRun(plan.runId, (run) => {
-        const effect = run.effects[plan.effectKey];
-        const activation = run.activations[plan.activationId];
-        if (!effect || !activation || effect.status !== "executing") return;
-        effect.status = "failed";
-        effect.error = "executing spawn was not adoptable after restart";
-        activation.status = "failed";
-        activation.endedAt = new Date(deps.now()).toISOString();
-        activation.failure = { code: "spawn-adoption-missing", message: effect.error, retryable: true };
-        recordRunEvent(run, "comb.effect.failed", activation.address, { effectKey: effect.key });
-        recordRunEvent(run, "comb.activation.failed", activation.address, { code: "spawn-adoption-missing" });
-      });
-      return { run: plan.runId, action: "failed", activation: plan.activationId, error: "executing spawn was not adoptable" };
+    const deliveredBinding = existing?.combActivations?.find((binding) =>
+      binding.runId === plan.runId &&
+      binding.nodeId === plan.request.activation.nodeId &&
+      binding.attempt === plan.request.activation.attempt &&
+      binding.itemIndex === plan.request.activation.itemIndex &&
+      binding.taskId === plan.request.taskId &&
+      typeof binding.deliveredAt === "string"
+    );
+    if (
+      !existing ||
+      existing.contract?.taskId !== plan.request.taskId ||
+      existing.contract?.attempt !== plan.request.attempt ||
+      !deliveredBinding
+    ) {
+      return holdAmbiguousAgentEffect(
+        deps,
+        plan,
+        new Error(
+          `executing spawn ${plan.request.name} has no exact durable launch-and-delivery receipt; outcome is unknown`,
+        ),
+      );
     }
     spawned = { name: existing.name, ...(existing.id ? { id: existing.id } : {}) };
   } else {
     try {
       spawned = await deps.spawnAgent(plan.request);
     } catch (error) {
+      if (error instanceof AgentActivationAmbiguousError) {
+        return holdAmbiguousAgentEffect(deps, plan, error, error.spawned);
+      }
+      if (isLaunchOwnershipIndeterminate(error)) {
+        return holdAmbiguousAgentEffect(deps, plan, error);
+      }
       return failAgentEffect(deps, plan, error, "spawn-failed");
     }
   }
@@ -1409,7 +1550,7 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
     const now = new Date(deps.now()).toISOString();
     if (effect.status !== "executing") {
       if (
-        run.status !== "active" &&
+        (effect.status === "ambiguous" || run.status !== "active") &&
         effect.status !== "confirmed" &&
         !activation.beeHandles.some((handle) => handle.name === spawned.name)
       ) {
@@ -1461,6 +1602,41 @@ async function executeAgentEffect(deps: CombSweepDeps, plan: PreparedAgentEffect
     activation: plan.activationId,
     bee: spawned.name,
     detail: confirmed.result,
+  };
+}
+
+async function holdAmbiguousAgentEffect(
+  deps: CombSweepDeps,
+  plan: PreparedAgentEffect,
+  error: unknown,
+  spawned?: { name: string; id?: string },
+): Promise<CombSweepOutcome> {
+  const message = error instanceof Error ? error.message : String(error);
+  await mutateRun(plan.runId, (run) => {
+    const effect = run.effects[plan.effectKey];
+    const activation = run.activations[plan.activationId];
+    if (!effect || !activation || effect.status !== "executing") return;
+    effect.status = "ambiguous";
+    effect.error = message;
+    effect.externalRef = spawned?.name ?? effect.externalRef ?? plan.request.name;
+    if (spawned && !activation.beeHandles.some((handle) => handle.name === spawned.name)) {
+      activation.beeHandles.push({
+        name: spawned.name,
+        ...(spawned.id ? { id: spawned.id } : {}),
+        source: "spawn",
+      });
+    }
+    recordRunEvent(run, "comb.effect.failed", activation.address, {
+      effectKey: effect.key,
+      outcome: "ambiguous-launch-ownership",
+    });
+  });
+  return {
+    run: plan.runId,
+    action: "error",
+    activation: plan.activationId,
+    ...(spawned ? { bee: spawned.name } : {}),
+    error: message,
   };
 }
 

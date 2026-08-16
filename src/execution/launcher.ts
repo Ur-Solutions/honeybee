@@ -22,7 +22,10 @@ import { nativeIsolationManifest, NATIVE_PROVIDER_ID } from "./describe.js";
 import { claimWorkingCopy, readWorkingCopy, type WorkingCopyRecord } from "./workingCopies.js";
 import type { RunLaunchRequest, RunLaunchResult, RunLauncher } from "./service.js";
 import { runKey, type RunEnvironmentFacts } from "./runStore.js";
-import { SpawnAfterForkError, type SpawnRuntimeCleanup, type SpawnedRuntimeHandle } from "../spawnRuntime.js";
+import { SpawnAfterForkError, type SpawnedRuntimeHandle } from "../spawnRuntime.js";
+import { executionReasoningArgs } from "./harnessPolicy.js";
+import { stopAndSettleExecutionRuntime } from "./runtimeSettlement.js";
+import { isHsrDeliveryAmbiguous } from "../hsr/pendingTurns.js";
 
 function asObject(value: JsonValue | undefined): JsonObject | undefined {
   if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -32,6 +35,7 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
 export type HsrHarnessLaunchConfig = {
   driverId: string;
   model?: string;
+  reasoning?: string;
   brief?: string;
   account?: string;
   preamble?: string;
@@ -62,6 +66,10 @@ export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLau
   const model = typeof harness?.model === "string" ? harness.model : undefined;
   const config = asObject(harness?.config);
   const brief = typeof config?.brief === "string" ? config.brief : undefined;
+  const reasoning = config?.reasoning;
+  // Admission has already checked the same table. Re-run the pure translator
+  // here so direct launcher callers cannot silently discard signed semantics.
+  executionReasoningArgs(driverId, model, reasoning);
   const account = config?.account;
   if (account !== undefined && (typeof account !== "string" || account.length === 0)) {
     throw executionError("HARNESS_UNAVAILABLE", "harness config.account must be a non-empty account query string");
@@ -82,6 +90,7 @@ export function resolveHsrHarnessLaunchConfig(intent: JsonObject): HsrHarnessLau
     driverId,
     ...(model !== undefined ? { model } : {}),
     ...(brief !== undefined ? { brief } : {}),
+    ...(typeof reasoning === "string" ? { reasoning: reasoning.toLowerCase() } : {}),
     ...(account !== undefined ? { account } : {}),
     ...(preamble !== undefined ? { preamble } : {}),
     ...(kitProfile !== undefined ? { kitProfile } : {}),
@@ -106,6 +115,14 @@ export function buildHsrSpawnFlags(
   // as an extra Cell-sandbox write root (repeatable --sandbox-write shape).
   if (config.cellLayout === "v2") flags.set("sandbox-write", [dirname(cwd)]);
   return flags;
+}
+
+/** Exact model/reasoning argv selected by the signed HarnessRequest. */
+export function buildHsrHarnessArgs(config: HsrHarnessLaunchConfig): string[] {
+  return [
+    ...(config.model ? ["--model", config.model] : []),
+    ...executionReasoningArgs(config.driverId, config.model, config.reasoning),
+  ];
 }
 
 /**
@@ -219,10 +236,17 @@ type SpawnedExecutionBee = { name: string; id?: string; runtime?: SpawnedRuntime
 export type HsrRunLauncherDependencies = {
   nodeId: () => Promise<string>;
   /** Test seam; production imports the ordinary spawn path lazily. */
-  spawn?: (request: RunLaunchRequest, config: HsrHarnessLaunchConfig, cwd: string) => Promise<SpawnedExecutionBee>;
+  spawn?: (
+    request: RunLaunchRequest,
+    config: HsrHarnessLaunchConfig,
+    cwd: string,
+    onRuntimeLaunched?: (runtime: SpawnedRuntimeHandle) => void | Promise<void>,
+  ) => Promise<SpawnedExecutionBee>;
   waitForReadiness?: (beeName: string, timeoutMs: number) => Promise<boolean>;
   stop?: (beeName: string) => Promise<{ stopped: boolean; detail: string }>;
   readinessTimeoutMs?: number;
+  /** Deterministic crash seam after stop dispatch, before canonical purge. */
+  afterRuntimeStopDispatch?: () => void | Promise<void>;
 };
 
 /**
@@ -240,12 +264,23 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     // harness config — never from daemon profiles or ambient configuration.
     // Keeping the preamble separate from brief lets spawn preserve host-owned
     // session envelopes beside Honeybee's identity before the operator prompt.
-    const { driverId, model, brief, account, preamble, kitProfile, cellLayout } = resolveHsrHarnessLaunchConfig(intent);
+    const { driverId, model, reasoning, brief, account, preamble, kitProfile, cellLayout } = resolveHsrHarnessLaunchConfig(intent);
 
     let record: SpawnedExecutionBee;
+    // `spawnSingleBee` can still fail after spawnBee has durably published the
+    // SessionRecord: positional/brief delivery happens afterward. Retain the
+    // exact birth-qualified runtime handle outside the spawn await so that
+    // this post-publication error cannot be flattened into a definite
+    // no-runtime failure while the Bee keeps running.
+    let launchedRuntime: SpawnedRuntimeHandle | undefined;
     try {
       if (deps.spawn) {
-        record = await deps.spawn(request, { driverId, ...(model ? { model } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}), ...(kitProfile ? { kitProfile } : {}), ...(cellLayout ? { cellLayout } : {}) }, copy.path);
+        record = await deps.spawn(
+          request,
+          { driverId, ...(model ? { model } : {}), ...(reasoning ? { reasoning } : {}), ...(brief ? { brief } : {}), ...(account ? { account } : {}), ...(preamble ? { preamble } : {}), ...(kitProfile ? { kitProfile } : {}), ...(cellLayout ? { cellLayout } : {}) },
+          copy.path,
+          (runtime) => { launchedRuntime = runtime; },
+        );
       } else {
         const { spawnSingleBee } = await import("../commands/spawn.js");
         // The registry locator is the node-private path; it is used here to run
@@ -256,13 +291,15 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
           ...(kitProfile ? { kitProfile } : {}),
           ...(cellLayout ? { cellLayout } : {}),
         });
-        let runtime: SpawnedRuntimeHandle | undefined;
+        const runtimeCredentialLeaseIds = Array.isArray(request.lease.runtimeCredentialLeaseIds)
+          ? request.lease.runtimeCredentialLeaseIds.filter((value): value is string => typeof value === "string")
+          : [];
         const spawned = await spawnSingleBee(
           {
             command: "spawn",
             args: brief ? [driverId, brief] : [driverId],
             flags,
-            rest: model ? ["--model", model] : [],
+            rest: buildHsrHarnessArgs({ driverId, ...(model ? { model } : {}), ...(reasoning ? { reasoning } : {}) }),
           },
           // executionRunId also pins lineage: the parent edge is exactly the
           // coordinator-resolved spawnedById (or none) — ambient never applies.
@@ -272,36 +309,90 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
           // harness, account, args, or yolo underneath the lease.
           {
             executionRunId: runId,
+            ...(runtimeCredentialLeaseIds.length > 0
+              ? { executionRuntimeCredentialLeaseIds: [...runtimeCredentialLeaseIds] }
+              : {}),
             protocolLaunch: true,
             ...(request.spawnedById ? { spawnedById: request.spawnedById } : {}),
-            onRuntimeLaunched: (launched) => { runtime = launched; },
+            onRuntimeLaunched: (launched) => { launchedRuntime = launched; },
           },
         );
-        record = { name: spawned.name, ...(spawned.id ? { id: spawned.id } : {}), ...(runtime ? { runtime } : {}) };
+        record = {
+          name: spawned.name,
+          ...(spawned.id ? { id: spawned.id } : {}),
+          ...(launchedRuntime ? { runtime: launchedRuntime } : {}),
+        };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (error instanceof SpawnAfterForkError && !error.cleanup.stopped) {
-        throw indeterminateExecutionError(
+      const runtime = error instanceof SpawnAfterForkError ? error.runtime : launchedRuntime;
+      if (runtime) {
+        const initialDeliveryAmbiguous = isHsrDeliveryAmbiguous(error);
+        // Fresh-name publication owns the lifecycle lock and may already have
+        // exact-stopped the forked incarnation, purged its canonical row/run
+        // state, and settled the launch journal before surfacing this error.
+        // Re-running pid-scoped teardown after that proof was removed cannot
+        // confirm the same absence and would incorrectly turn a definite
+        // rollback into a lost Run. Trust only the complete carried proof;
+        // every partial or unconfirmed rollback still enters settlement below.
+        if (
+          error instanceof SpawnAfterForkError
+          && error.cleanup.stopped
+          && error.canonicalSettlement?.settled === true
+        ) {
+          throw executionError(
+            "HARNESS_UNAVAILABLE",
+            `harness ${driverId} failed after runtime launch; fresh publication rollback already confirmed exact cleanup: ${message}`,
+          );
+        }
+        const settlement = await stopAndSettleExecutionRuntime(
+          request,
+          runtime,
+          `execution launch failed after runtime publication: ${message}`,
+          {
+            ...(deps.afterRuntimeStopDispatch ? { afterStopDispatch: deps.afterRuntimeStopDispatch } : {}),
+            ...(initialDeliveryAmbiguous
+              ? {
+                  retainCanonicalAfterConfirmedStop:
+                    "initial delivery crossed provider dispatch; preserving its receipt and working-copy authority for manual reconciliation",
+                }
+              : {}),
+          },
+        );
+        if (initialDeliveryAmbiguous) {
+          throw indeterminateExecutionError(
+            "HARNESS_UNAVAILABLE",
+            `harness ${driverId} initial delivery outcome is ambiguous: ${message}`,
+            "initial_delivery_ambiguous",
+            {
+              phase: "initial-delivery",
+              runtime: runtime.identity,
+              detail: settlement.detail,
+              runtimeStopped: settlement.cleanup.stopped,
+              stopDoubtPersisted: !settlement.settled && settlement.stopDoubtPersisted,
+            },
+          );
+        }
+        if (!settlement.settled) {
+          throw indeterminateExecutionError(
+            "HARNESS_UNAVAILABLE",
+            `harness ${driverId} failed after runtime launch and exact canonical cleanup was unconfirmed: ${message}`,
+            "spawn_cleanup_unconfirmed",
+            {
+              phase: error instanceof SpawnAfterForkError ? error.phase : "post-publication",
+              runtime: runtime.identity,
+              detail: settlement.detail,
+              stopDoubtPersisted: settlement.stopDoubtPersisted,
+            },
+          );
+        }
+        throw executionError(
           "HARNESS_UNAVAILABLE",
-          `harness ${driverId} failed after host fork and exact cleanup was unconfirmed: ${message}`,
-          "spawn_cleanup_unconfirmed",
-          { phase: error.phase, runtime: error.runtime.identity, detail: error.cleanup.detail },
+          `harness ${driverId} failed after runtime launch; exact cleanup and canonical SessionRecord purge confirmed: ${message}`,
         );
       }
       throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} failed to start: ${message}`);
     }
-
-    const stopLaunched = async (): Promise<SpawnRuntimeCleanup> => {
-      if (record.runtime) return record.runtime.stop();
-      try {
-        if (deps.stop) return await deps.stop(record.name);
-        const result = await (await import("../hsr/substrate.js")).stopKnownHsrExecution(record.name);
-        return { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
-      } catch (error) {
-        return { stopped: false, detail: error instanceof Error ? error.message : String(error) };
-      }
-    };
 
     // spawnSingleBee durably publishes queued/booting before the detached host
     // is ready. Execution must not turn that early record into harness.running:
@@ -312,30 +403,72 @@ export function createHsrRunLauncher(deps: HsrRunLauncherDependencies): RunLaunc
     const timeoutMs = deps.readinessTimeoutMs ?? (Number.isFinite(readinessTimeout) && readinessTimeout > 0 ? readinessTimeout : 120_000);
     const waitForReadiness = deps.waitForReadiness ?? (await import("../hsr/runnerHost.js")).waitForHsrReadiness;
     if (!(await waitForReadiness(record.name, timeoutMs))) {
-      const stop = await stopLaunched();
-      if (!stop.stopped) {
+      const settlement = record.runtime
+        ? await stopAndSettleExecutionRuntime(
+            request,
+            record.runtime,
+            `execution harness readiness timed out after ${timeoutMs}ms`,
+            ...(deps.afterRuntimeStopDispatch
+              ? [{ afterStopDispatch: deps.afterRuntimeStopDispatch }]
+              : []),
+          )
+        : {
+            settled: false as const,
+            detail: "launcher returned no exact runtime handle; no unfenced stop was dispatched",
+            cleanup: { stopped: false, detail: "stop was not dispatched" },
+            stopDoubtPersisted: false,
+          };
+      if (!settlement.settled) {
         throw indeterminateExecutionError(
           "HARNESS_UNAVAILABLE",
-          `harness ${driverId} did not reach HSR readiness within ${timeoutMs}ms and stop was unconfirmed`,
+          `harness ${driverId} did not reach HSR readiness within ${timeoutMs}ms and exact canonical cleanup was unconfirmed`,
           "readiness_stop_unconfirmed",
-          { detail: stop.detail },
+          {
+            detail: settlement.detail,
+            ...(record.runtime ? { runtime: record.runtime.identity } : {}),
+            stopDoubtPersisted: settlement.stopDoubtPersisted,
+          },
         );
       }
-      throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} did not reach HSR readiness within ${timeoutMs}ms`);
+      throw executionError(
+        "HARNESS_UNAVAILABLE",
+        `harness ${driverId} did not reach HSR readiness within ${timeoutMs}ms; exact runtime and canonical generation cleanup confirmed`,
+      );
     }
 
     const environment = environmentFactsForWorkingCopy(nodeId, runId, copy);
     if (!record.id) {
-      const stop = await stopLaunched();
-      if (!stop.stopped) {
+      const settlement = record.runtime
+        ? await stopAndSettleExecutionRuntime(
+            request,
+            record.runtime,
+            "execution harness reached readiness without a canonical SessionRecord id",
+            ...(deps.afterRuntimeStopDispatch
+              ? [{ afterStopDispatch: deps.afterRuntimeStopDispatch }]
+              : []),
+          )
+        : {
+            settled: false as const,
+            detail: "launcher returned no exact runtime handle; no unfenced stop was dispatched",
+            cleanup: { stopped: false, detail: "stop was not dispatched" },
+            stopDoubtPersisted: false,
+          };
+      if (!settlement.settled) {
         throw indeterminateExecutionError(
           "HARNESS_UNAVAILABLE",
           `harness ${driverId} reached readiness without a canonical SessionRecord.id and exact cleanup was unconfirmed`,
           "session_ref_missing",
-          { detail: stop.detail, ...(record.runtime ? { runtime: record.runtime.identity } : {}) },
+          {
+            detail: settlement.detail,
+            ...(record.runtime ? { runtime: record.runtime.identity } : {}),
+            stopDoubtPersisted: settlement.stopDoubtPersisted,
+          },
         );
       }
-      throw executionError("HARNESS_UNAVAILABLE", `harness ${driverId} reached readiness without a canonical SessionRecord.id; exact cleanup confirmed`);
+      throw executionError(
+        "HARNESS_UNAVAILABLE",
+        `harness ${driverId} reached readiness without a canonical SessionRecord.id; exact runtime and canonical generation cleanup confirmed`,
+      );
     }
     return { sessionRef: record.id, environment, ...(record.runtime ? { runtime: record.runtime } : {}) };
   };

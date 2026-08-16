@@ -9,6 +9,7 @@ import { effectiveHiveState, hiveStateFor } from "../hiveState.js";
 import { highlightUniqueSessionReference } from "../ids.js";
 import { extractUrls } from "../keybindings.js";
 import { transactionalKill, transactionalRetire } from "../kill.js";
+import { withSessionLifecycleTransaction } from "../lifecycle.js";
 import { sessionDisplayName, shouldShowNodeColumn, substrateLabelFor } from "../listView.js";
 import { DEFAULT_ATTENTION_STATES, attentionCount, parseStateList, pickNextBee, type BeeStateEntry } from "../next.js";
 import { LOCAL_NODE_NAME, listNodes, loadNode } from "../node.js";
@@ -18,11 +19,12 @@ import { listProRepoEntries, resolveProSlotForCwd, type ProRepoEntry, type ProSl
 import { repoTagFor } from "../repoTag.js";
 import { transcriptRowsFromEvents } from "../hsr/eventTranscript.js";
 import { readEventTail } from "../hsr/observe.js";
-import { compactHsrEvents, hsrEventsPath } from "../hsr/runDir.js";
+import { compactHsrEvents, hsrEventsPath, type HsrEventsCompactLimits } from "../hsr/runDir.js";
 import { loadLatestSeal } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
 import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "../sessionMetadata.js";
 import { deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, stateLabel, type DerivedState } from "../state.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
 import { listSessions, loadSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { effectiveTags, normalizeTagArg } from "../tags.js";
@@ -92,7 +94,7 @@ export async function cmdList(parsed: Parsed) {
   // filed records can be removed before the state pass; a sealed bee's done
   // state is derived from seal evidence and is removed below.
   const showDone = truthy(flag(parsed, "done")) || truthy(flag(parsed, "archived")) || stateFilter === "done";
-  if (!showDone) records = records.filter((r) => r.status !== "done");
+  if (!showDone) records = records.filter((record) => !isArchivedSessionLifecycle(record));
   if (colonyFilter) records = records.filter((r) => r.colony === colonyFilter);
   if (swarmFilter) records = records.filter((r) => r.swarmId === swarmFilter);
   if (nodeFilter) records = records.filter((r) => (r.node ?? LOCAL_NODE_NAME) === nodeFilter);
@@ -553,6 +555,30 @@ export async function cmdWait(parsed: Parsed) {
 
 
 /**
+ * Compact only while the exact retired generation still owns the Bee name.
+ * The HSR writer lives in a detached process, so runDir's in-memory append
+ * chain cannot serialize a command-side compactor with a concurrently revived
+ * successor. Holding the cross-process lifecycle lock from the fresh archived
+ * check through the atomic replacement prevents that successor from starting
+ * until compaction has finished.
+ */
+export async function compactRetiredHsrEvents(
+  record: SessionRecord,
+  limits?: HsrEventsCompactLimits,
+): Promise<void> {
+  await withSessionLifecycleTransaction(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    if (!isArchivedSessionLifecycle(current)) {
+      throw new Error(
+        `refusing to compact ${record.name}: the retired generation was revived or replaced`,
+      );
+    }
+    await compactHsrEvents(current.name, limits);
+  });
+}
+
+
+/**
  * hive retire <bee|@swarm|colony:name|tag> — the everyday way to end bees.
  * Stops the runtime (tmux session / HSR runner) and archives the record;
  * seals, ledger history, and the provider session all survive, and the bee
@@ -582,7 +608,7 @@ export async function cmdRetire(parsed: Parsed) {
     // Optional, non-deleting historical HSR compaction: folds old events into
     // semantic checkpoints and keeps the bounded tail. Record, seals, run dir,
     // meta, restart descriptor, and ring all remain available for revive/read.
-    if (compact) await compactHsrEvents(record.name);
+    if (compact) await compactRetiredHsrEvents(record);
     if (isPretty()) {
       console.log(actionLine("ok", "retire", [bold(record.name), dim(outcome.alreadyGone ? "already stopped — filed as done" : "stopped and filed as done")]));
     } else {

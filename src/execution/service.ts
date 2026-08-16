@@ -78,6 +78,12 @@ import {
   type RunOperations,
 } from "./operations.js";
 import type { SignatureVerifier } from "./signing.js";
+import {
+  stopAndRetireExecutionSession,
+  stopAndSettleExecutionRuntime,
+  type ExecutionRuntimeOwner,
+  type ExecutionRuntimeSettlement,
+} from "./runtimeSettlement.js";
 
 /* ---------------------------------------------------------------- */
 /* Injected seams                                                    */
@@ -133,6 +139,11 @@ export type ExecutionServiceOptions = {
   stopKnownExecution?: (beeName: string) => Promise<{ stopped: boolean; detail: string }>;
   /** Exact SessionRecord archival after a release stop proof. */
   retireSession?: (reservation: RunReservation) => Promise<ExecutionSessionRetirementResult>;
+  /** @internal complete pre-fence -> clean stop -> exact archive seam. */
+  stopAndRetireSession?: (
+    reservation: RunReservation,
+    context: string,
+  ) => Promise<ExecutionRuntimeSettlement>;
   harnessProbe?: HarnessProbe;
   verifySignature?: SignatureVerifier;
   now?: () => Date;
@@ -145,6 +156,8 @@ export type ExecutionServiceOptions = {
   afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
   /** Test seam for a transient launch-lifecycle event-store rejection. */
   appendLaunchEvents?: typeof appendRunEvents;
+  /** Deterministic crash seam after exact runtime stop dispatch, before purge. */
+  afterRuntimeStopDispatch?: () => void | Promise<void>;
   /** @deprecated Elapsed time no longer grants launch authority. */
   launchGraceMs?: number;
 };
@@ -266,6 +279,20 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     return { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
   });
   const retireSession = options.retireSession ?? retireExecutionSessionRecord;
+  const stopAndRetireSession = options.stopAndRetireSession ?? (async (
+    reservation: RunReservation,
+    context: string,
+  ) => stopAndRetireExecutionSession(
+    {
+      runId: reservation.runId,
+      beeName: reservation.beeName,
+      ...(reservation.sessionRef ? { sessionRef: reservation.sessionRef } : {}),
+    },
+    context,
+    ...(options.afterRuntimeStopDispatch
+      ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
+      : []),
+  ));
   const inFlight = new Map<string, Promise<void>>();
   let launchOwnerPromise: Promise<RunLaunchOwner> | undefined;
   const launchOwner = (): Promise<RunLaunchOwner> => (launchOwnerPromise ??= (async () => {
@@ -530,26 +557,36 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
 
   async function cleanupUncommittedLaunch(
     result: RunLaunchResult,
+    owner: ExecutionRuntimeOwner,
     cause: string,
     indeterminateCause = "launch_commit_cleanup_unconfirmed",
   ): Promise<void> {
-    let stopped = false;
+    let settled = false;
     let detail = "launcher returned no exact runtime cleanup handle";
+    let stopDoubtPersisted = false;
     if (result.runtime) {
-      try {
-        const cleanup = await result.runtime.stop();
-        stopped = cleanup.stopped;
-        detail = cleanup.detail;
-      } catch (error) {
-        detail = error instanceof Error ? error.message : String(error);
-      }
+      const canonical = await stopAndSettleExecutionRuntime(
+        owner,
+        result.runtime,
+        cause,
+        ...(options.afterRuntimeStopDispatch
+          ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
+          : []),
+      );
+      settled = canonical.settled;
+      detail = canonical.detail;
+      if (!canonical.settled) stopDoubtPersisted = canonical.stopDoubtPersisted;
     }
-    if (!stopped) {
+    if (!settled) {
       throw indeterminateExecutionError(
         "HARNESS_UNAVAILABLE",
         `launched runtime could not commit ${cause} and exact cleanup was unconfirmed`,
         indeterminateCause,
-        { detail, ...(result.runtime ? { runtime: result.runtime.identity } : {}) },
+        {
+          detail,
+          ...(result.runtime ? { runtime: result.runtime.identity } : {}),
+          stopDoubtPersisted,
+        },
       );
     }
   }
@@ -653,7 +690,12 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         const result = await launched;
         launchedResult = result;
         if (!result.sessionRef) {
-          await cleanupUncommittedLaunch(result, "without a canonical session reference", "session_ref_missing");
+          await cleanupUncommittedLaunch(
+            result,
+            { runId, beeName: fresh.beeName },
+            "without a canonical session reference",
+            "session_ref_missing",
+          );
           runtimeCleanupConfirmed = true;
           throw executionError("HARNESS_UNAVAILABLE", "harness reached readiness without a canonical session reference; exact cleanup confirmed");
         }
@@ -669,6 +711,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           // tear down only the concrete incarnation returned by this attempt.
           await cleanupUncommittedLaunch(
             result,
+            { runId, beeName: fresh.beeName },
             "because launch ownership was lost",
             started.reservation.cancel ? "cancel_stop_unconfirmed" : "launch_commit_cleanup_unconfirmed",
           );
@@ -723,11 +766,24 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             // Prefer the launcher-returned incarnation handle while it is
             // available. The bound control path remains the compatibility
             // fallback for injected launchers that predate exact handles.
-            const stop = result.runtime
-              ? await result.runtime.stop()
-              : await control.stop(fresh.beeName);
-            stopConfirmed = stop.stopped;
-            detail = stop.detail;
+            if (result.runtime) {
+              const canonical = await stopAndSettleExecutionRuntime(
+                { runId, beeName: fresh.beeName },
+                result.runtime,
+                "cancel won after execution runtime publication",
+                ...(options.afterRuntimeStopDispatch
+                  ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
+                  : []),
+              );
+              stopConfirmed = canonical.settled;
+              detail = canonical.detail;
+            } else {
+              // A legacy/injected launcher without an incarnation handle
+              // cannot birth-qualify the canonical row before signalling it.
+              // Keep the Run lost + occupied for reconciliation instead of
+              // reviving the stop-before-fence crash window.
+              detail = "launcher returned no exact runtime handle; no unfenced cancel stop was dispatched";
+            }
           } catch (error) {
             detail = error instanceof Error ? error.message : String(error);
           }
@@ -780,6 +836,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           try {
             await cleanupUncommittedLaunch(
               launchedResult,
+              { runId, beeName: fresh.beeName },
               "after coordinator persistence failed before readiness commit",
               "launch_commit_cleanup_unconfirmed",
             );
@@ -971,10 +1028,13 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // outcome evidence proves the process is down.
       if (current.indeterminateCause === "readiness_stop_unconfirmed") {
         const outcome = await options.sessions.outcome(current.beeName);
-        let stopConfirmed = Boolean(outcome && !outcome.live);
-        if (outcome?.live) {
+        let stopConfirmed = false;
+        if (outcome) {
           try {
-            stopConfirmed = (await stopKnownExecution(current.beeName)).stopped;
+            stopConfirmed = (await stopAndRetireSession(
+              current,
+              "reconcile readiness-timeout execution runtime",
+            )).settled;
           } catch {
             stopConfirmed = false;
           }
@@ -1026,10 +1086,13 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       const ours = evidence.sessionExists &&
         (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
       const outcome = ours ? await options.sessions.outcome(current.beeName) : null;
-      let stopConfirmed = Boolean(outcome && !outcome.live);
-      if (ours && outcome?.live) {
+      let stopConfirmed = false;
+      if (ours && outcome) {
         try {
-          stopConfirmed = (await stopKnownExecution(current.beeName)).stopped;
+          stopConfirmed = (await stopAndRetireSession(
+            current,
+            "reconcile cancelled indeterminate launch",
+          )).settled;
         } catch {
           stopConfirmed = false;
         }
@@ -1081,15 +1144,17 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       if (!current.result || terminalCancelStopDoubt) {
         const evidence = await options.sessions.evidence(current.beeName);
         const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
-        const outcome = ours ? await options.sessions.outcome(current.beeName) : null;
-        let stopConfirmed = Boolean(outcome && !outcome.live);
-        let detail = stopConfirmed
-          ? "durable session outcome proves the harness exited"
-          : "no durable session evidence proves the activated runtime is down";
-        if (ours && !stopConfirmed) {
+        let stopConfirmed = false;
+        let detail = "no durable session evidence proves the activated runtime is down";
+        if (ours) {
           try {
-            const stop = await control.stop(current.beeName);
-            stopConfirmed = stop.stopped;
+            const stop = await stopAndRetireSession(
+              current,
+              current.cancel?.reason === "lease_expired"
+                ? "reconcile expired execution lease"
+                : "reconcile cancelled execution runtime",
+            );
+            stopConfirmed = stop.settled;
             detail = stop.detail;
           } catch (error) {
             stopConfirmed = false;
@@ -1294,6 +1359,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     control,
     sessions: options.sessions,
     retireSession,
+    stopAndRetireSession,
     settle: async (reservation) => {
       const settled = await reconcile(reservation);
       return { reservation: settled, state: deriveState(settled, inFlight.has(settled.runId)).state };
@@ -1640,7 +1706,22 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
         import("../hsr/runDir.js"),
         import("../hsr/observe.js"),
       ]);
-      const meta = await readHsrMeta(beeName);
+      const [record, meta] = await Promise.all([loadSession(beeName), readHsrMeta(beeName)]);
+
+      // The durable SessionRecord owns lifecycle and unresolved-stop intent.
+      // HSR meta is process evidence only and must never override an archive,
+      // an exact stop-doubt fence, or a legacy terminal fact.
+      if (record?.stateMachine !== undefined && isArchivedSessionLifecycle(record)) {
+        return { live: false, exitCode: null };
+      }
+      if (record?.status === "kill_failed") return null;
+      if (
+        record?.stateMachine === undefined
+        && (record?.status === "dead" || record?.status === "done")
+      ) {
+        return { live: false, exitCode: null };
+      }
+
       if (meta) {
         if (meta.status === "exited") return { live: false, exitCode: meta.exitCode ?? null };
         if (!meta.mirrorOfNode) {
@@ -1650,11 +1731,20 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
         }
         return { live: true };
       }
-      const record = await loadSession(beeName);
       if (!record) return null;
-      // A record-only HSR session proves identity/ownership, not process
-      // liveness. Its host meta may be delayed; wait for it (or a later record
-      // terminal state) instead of treating the label "running" as proof.
+      if (record.stateMachine !== undefined) {
+        // A canonical-active record-only HSR session proves identity and
+        // ownership, not process liveness. Its host meta may be delayed, so a
+        // stale scalar must never turn it into positive or negative proof.
+        if (record.substrate === "hsr") return null;
+        return record.stateMachine.runtime === "live" || record.stateMachine.runtime === "recovering"
+          ? { live: true }
+          : { live: false, exitCode: null };
+      }
+      // Cursor-less records retain the exact legacy contract: running HSR is
+      // identity-only/unknown, while a durable non-running scalar is the old
+      // terminal evidence used to resolve pre-cursor loss episodes. The
+      // kill_failed exception was fenced before process-meta inspection.
       if (record.substrate === "hsr" && record.status === "running") return null;
       return record.status === "running" ? { live: true } : { live: false, exitCode: null };
     },

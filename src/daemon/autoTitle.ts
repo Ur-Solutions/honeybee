@@ -8,6 +8,7 @@
 import { namingConfig } from "../config.js";
 import { writeHiveTitle } from "../hiveState.js";
 import { canWriteTitle, gatherTitleContext, generateTitle, type TitleContext } from "../naming.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
 import { loadSession, touchSession, updateSession, type SessionRecord } from "../store.js";
 
 export type AutoTitleOutcome = {
@@ -80,7 +81,7 @@ function contextProbeSignature(record: SessionRecord): string {
 export function isAutoTitleCandidate(record: SessionRecord, now: number, backoffMs = AUTO_TITLE_RETRY_BACKOFF_MS): boolean {
   // Archived/dead history is immutable and cannot acquire a new exchange.
   // Scanning it on every cold daemon start only reopens old transcripts.
-  if (record.status !== "running") return false;
+  if (!isRunnableSessionRecord(record)) return false;
   const provisionalProviderTitle = record.titleSource === "provider" && record.providerTitleKind === "fallback";
   if (!provisionalProviderTitle && (record.title || record.titleSource)) return false;
   if ((record.autoTitleAttempts ?? 0) >= MAX_AUTO_TITLE_ATTEMPTS) return false;

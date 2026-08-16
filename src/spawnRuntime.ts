@@ -32,11 +32,15 @@ export class SpawnAfterForkError extends Error {
     readonly runtime: SpawnedRuntimeHandle,
     readonly cleanup: SpawnRuntimeCleanup,
     readonly original: unknown,
+    readonly canonicalSettlement?: { settled: boolean; detail: string },
   ) {
     const cause = original instanceof Error ? original.message : String(original);
     super(
       `${cause}; exact launched ${runtime.identity.kind} incarnation cleanup `
-      + `${cleanup.stopped ? "confirmed" : `unconfirmed: ${cleanup.detail}`}`,
+      + `${cleanup.stopped ? "confirmed" : `unconfirmed: ${cleanup.detail}`}`
+      + (canonicalSettlement && !canonicalSettlement.settled
+        ? `; canonical publication settlement unconfirmed: ${canonicalSettlement.detail}`
+        : ""),
       { cause: original },
     );
     this.name = "SpawnAfterForkError";

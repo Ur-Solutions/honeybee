@@ -87,6 +87,13 @@ export type BuzSendInput = {
   body: string;
   /** Optional caller-owned UUIDv7 for idempotent acceptance/retry protocols. */
   messageId?: string;
+  /**
+   * Explicitly declare a new logical intent even when an unresolved no-id
+   * message has the same immutable payload. Without this opt-in, Honeybee
+   * fails closed and reports the durable prior UUID so a crash retry cannot
+   * manufacture a second provider operation.
+   */
+  forceNewIntent?: boolean;
   subject?: string;
   transport?: BuzTransportContext;
   node?: string;
@@ -110,6 +117,8 @@ export type DowngradeResult = {
 export type ListMessagesOptions = {
   limit?: number;
   fromFilter?: string;
+  /** Treat unreadable/malformed durable rows as ownership, never absence. */
+  strict?: boolean;
 };
 
 export type PurgeOptions = {
@@ -146,6 +155,12 @@ export type DaemonDrainContext = {
    * terminates.
    */
   stopOnFirstFailure?: boolean;
+  /**
+   * Caller already owns the recipient lifecycle lock. Defer recovery-cursor
+   * settlement until that lock is released, preserving the global order
+   * lifecycle -> delivery -> mailbox/session.
+   */
+  deferRecoveryClear?: boolean;
   /** Override the transport-vs-definite-refusal classifier in tests/adapters. */
   classifyFailure?: (error: unknown) => BuzDeliveryFailureClass;
 };
@@ -176,10 +191,12 @@ export {
   externalOutboxDir,
   inboxFilename,
   listMessages,
+  listSenderOutboxMessages,
   outboxFilename,
   parseBuzMessage,
   purgeMailbox,
   readMessageById,
+  readSenderOutboxById,
   recipientMailboxFilename,
   recipientWriteLockPath,
   sanitizeHumanName,
@@ -188,9 +205,15 @@ export {
   serializeBuzMessage,
 } from "./buz/storage.js";
 
-export { sendBuzMessage } from "./buz/send.js";
+export { sendBuzMessage, sendBuzMessageInAdmission } from "./buz/send.js";
 
 export { cancelQueuedBuzMessage } from "./buz/cancel.js";
+export { reconcileAmbiguousBuzDelivery, type AmbiguousBuzDeliveryVerdict } from "./buz/reconcile.js";
+
+export {
+  settleQueuedBuzMessageUndeliverable,
+  type UndeliverableMessageSettlement,
+} from "./buz/undeliverable.js";
 
 export {
   countQuarantinedMessages,
@@ -208,6 +231,7 @@ export {
 
 export {
   BuzDeliveryRejectedError,
+  BuzUnresolvedIntentError,
   classifyBuzDeliveryFailure,
   type BuzDeliveryFailureClass,
 } from "./buz/errors.js";

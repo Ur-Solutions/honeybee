@@ -1,6 +1,7 @@
 /** Shared, lifecycle-serialized lazy wake for direct and queued sends. */
 
 import { randomUUID } from "node:crypto";
+import { assertNoUnresolvedHsrAnswerOwnership } from "../answerReceipt.js";
 import {
   assertReviveWorkingDirectory,
   reviveRecordInTransaction,
@@ -10,6 +11,8 @@ import {
   withSessionLifecycleTransaction,
   type SessionLifecycleTransaction,
 } from "../lifecycle.js";
+import { assertNoUnresolvedBeeNameLaunchReservationInAdmission } from "../nameAdmission.js";
+import { assertNoUnresolvedHsrEventIntegrity } from "../hsr/eventIntegrity.js";
 import { rebindOpenRequestsToGeneration } from "../requests/store.js";
 import {
   legacyStateMachineSeed,
@@ -19,8 +22,9 @@ import {
   type SessionRecord,
 } from "../store.js";
 import { substrateFor } from "../substrates/index.js";
-import { probeHsrReAdoption } from "../daemon/reAdoption.js";
-import { isArchivedSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
+import type { Substrate } from "../substrates/types.js";
+import { isArchivedSessionLifecycle, isRunnableSessionRecord, type ProbeEvidence } from "../stateMachine.js";
+import { probeRecoverableRuntime } from "./runtimeProbe.js";
 
 export type EnsureLiveRuntimeDeps = {
   isLive?: (record: SessionRecord) => Promise<boolean>;
@@ -36,6 +40,7 @@ export type EnsureLiveRuntimeDeps = {
   now?: () => number;
   makeActionId?: () => string;
   rebindRequests?: typeof rebindOpenRequestsToGeneration;
+  resolveSubstrate?: (record: SessionRecord) => Substrate;
 };
 
 export type EnsureLiveRuntimeResult = {
@@ -48,19 +53,20 @@ function axes(record: SessionRecord) {
   return record.stateMachine ?? legacyStateMachineSeed(record);
 }
 
-async function markNeedsYouRuntimeResumed(
+async function markParkedRuntimeResumed(
   record: SessionRecord,
   probe: ProbeEvidence,
   deps: EnsureLiveRuntimeDeps,
 ): Promise<SessionRecord> {
-  if (axes(record).work !== "needs-you") return record;
-  const actionId = `needs-you-runtime-revived:${probe.probeId}`;
+  const state = axes(record);
+  if (state.runtime !== "parked" || (state.work !== "needs-you" && state.work !== "done")) return record;
+  const actionId = `parked-runtime-revived:${probe.probeId}`;
   const transitioned = await (deps.transition ?? transitionSession)(record.name, {
     type: "bee.revived",
-    eventId: `needs-you-runtime-revived:${probe.probeId}`,
+    eventId: `parked-runtime-revived:${probe.probeId}`,
     at: probe.observedAt,
     cause: "revive",
-    resume: "needs-you",
+    resume: state.work,
     evidence: { kind: "operator", actionId, observedAt: probe.observedAt, action: "revive" },
     probe,
   });
@@ -103,30 +109,52 @@ export async function ensureLiveRuntimeForSend(
       if (isArchivedSessionLifecycle(record)) {
         throw new Error(`hive send: ${record.name} is archived`);
       }
-
-      const isLive = deps.isLive ?? ((candidate: SessionRecord) =>
-        substrateFor(candidate).hasSession(candidate.tmuxTarget));
-      if (state.runtime !== "parked" && await isLive(record)) {
-        return { record, woke: false };
+      await assertNoUnresolvedBeeNameLaunchReservationInAdmission(record, "hive send wake");
+      await assertNoUnresolvedHsrEventIntegrity(record.name, "hive send wake");
+      await assertNoUnresolvedHsrAnswerOwnership(record, "hive send wake");
+      // `kill_failed` means an explicit stop was requested but exact process
+      // ownership is unresolved. Positive liveness proves existence, not
+      // permission to resume or admit more work; only explicit stop repair or
+      // revive may clear this fence.
+      if (!isRunnableSessionRecord(record)) {
+        throw new Error(`hive send: ${record.name} has unresolved stop state`);
       }
-      if (record.substrate !== "hsr") {
+
+      const resolveRuntimeSubstrate = deps.resolveSubstrate ?? substrateFor;
+      const runtimeSubstrate = resolveRuntimeSubstrate(record);
+      let earlyProbe: ProbeEvidence | undefined;
+      if (state.runtime !== "parked") {
+        if (deps.isLive) {
+          if (await deps.isLive(record)) return { record, woke: false };
+        } else if (runtimeSubstrate.kind === "remote-hsr") {
+          earlyProbe = await probeRecoverableRuntime(record, `hive-send:${process.pid}`, {
+            resolveSubstrate: resolveRuntimeSubstrate,
+          });
+          if (earlyProbe.outcome === "alive") return { record, woke: false, probe: earlyProbe };
+        } else if (await runtimeSubstrate.hasSession(record.tmuxTarget)) {
+          return { record, woke: false };
+        }
+      }
+      if (record.substrate !== "hsr" && runtimeSubstrate.kind !== "remote-hsr") {
         throw new Error(`tmux session is not running: ${record.tmuxTarget}`);
       }
 
-      const probe = await (deps.probe ?? (async (candidate) =>
-        (await probeHsrReAdoption(candidate, `hive-send:${process.pid}`)).evidence))(record);
+      const probe = earlyProbe ?? await (deps.probe ?? (async (candidate) =>
+        probeRecoverableRuntime(candidate, `hive-send:${process.pid}`, {
+          resolveSubstrate: resolveRuntimeSubstrate,
+        })))(record);
       if (probe.outcome === "unreachable") {
         throw new Error(`hive send: runtime state is unverified for ${record.name}: ${probe.detail ?? "probe unreachable"}`);
       }
       if (probe.outcome === "alive") {
         await (deps.markVerified ?? markSessionVerified)(record.name, probe);
-        if (state.work === "needs-you") {
+        if (state.runtime === "parked" && state.work === "needs-you") {
           await (deps.rebindRequests ?? rebindOpenRequestsToGeneration)(
             record.name,
             record.runtimeGeneration ?? 0,
           );
-          record = await markNeedsYouRuntimeResumed(record, probe, deps);
         }
+        if (state.runtime === "parked") record = await markParkedRuntimeResumed(record, probe, deps);
         return { record, woke: false, probe };
       }
 
@@ -161,29 +189,31 @@ export async function ensureLiveRuntimeForSend(
         await (deps.markVerified ?? markSessionVerified)(record.name, probe);
       }
 
-      await (deps.assertCwd ?? assertReviveWorkingDirectory)(record);
+      if (deps.assertCwd) await deps.assertCwd(record);
+      else if (runtimeSubstrate.kind !== "remote-hsr") await assertReviveWorkingDirectory(record);
       const revived = await (deps.reviveInTransaction ?? reviveRecordInTransaction)(lifecycle, {
         fresh: false,
         deferRequestClosure: true,
+        replacementOperation: "lazy-wake",
       });
       const after = await (deps.probe ?? (async (candidate) =>
-        (await probeHsrReAdoption(candidate, `hive-send:${process.pid}`)).evidence))(revived);
+        probeRecoverableRuntime(candidate, `hive-send:${process.pid}`, {
+          resolveSubstrate: resolveRuntimeSubstrate,
+        })))(revived);
       if (after.outcome !== "alive") {
         throw new Error(`hive send: replacement runtime probe returned ${after.outcome} for ${record.name}`);
       }
       await (deps.markVerified ?? markSessionVerified)(record.name, after);
-      if (currentAxes.work === "needs-you") {
+      if (currentAxes.runtime === "parked" && currentAxes.work === "needs-you") {
         await (deps.rebindRequests ?? rebindOpenRequestsToGeneration)(
           record.name,
           revived.runtimeGeneration ?? 0,
         );
-        return {
-          record: await markNeedsYouRuntimeResumed(revived, after, deps),
-          woke: true,
-          probe: after,
-        };
       }
-      return { record: revived, woke: true, probe: after };
+      const resumed = currentAxes.runtime === "parked"
+        ? await markParkedRuntimeResumed(revived, after, deps)
+        : revived;
+      return { record: resumed, woke: true, probe: after };
     }));
 }
 
@@ -196,6 +226,11 @@ export async function markLiveRuntimeSteered(
   return retryLifecycleConflict(snapshot, loadRecord, (current) =>
     withSessionLifecycleTransaction(current, async (lifecycle) => {
       const record = await lifecycle.refresh();
+      await assertNoUnresolvedBeeNameLaunchReservationInAdmission(record, "hive send steer");
+      await assertNoUnresolvedHsrEventIntegrity(record.name, "hive send steer");
+      if (!isRunnableSessionRecord(record)) {
+        throw new Error(`hive send: ${record.name} has unresolved stop state`);
+      }
       const state = axes(record);
       if (state.lifecycle !== "active" || state.work !== "done") return record;
       const at = new Date((deps.now ?? Date.now)()).toISOString();

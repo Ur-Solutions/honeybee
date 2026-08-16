@@ -1,7 +1,8 @@
-import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { stageRunnerHostArtifact } from "./runner-host-artifact.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const outDir = join(root, ".test-dist");
@@ -45,6 +46,19 @@ await Promise.all([
 ]);
 await mkdir(join(outDir, "src", "flow"), { recursive: true });
 await cp(join(root, "src", "flow", "background.ts"), join(outDir, "src", "flow", "background.ts"));
+
+// Tests execute the same prebuilt artifact contract as a production install.
+// Stage once under dist for npm-pack assertions, then mirror the exact bytes
+// beside the transpiled module graph used by this test run.
+const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+const stagedArtifacts = join(root, "dist", "hsr", "artifacts");
+await stageRunnerHostArtifact({
+  root,
+  outDir: stagedArtifacts,
+  entryPoint: join(root, "src", "hsr", "remoteHost.ts"),
+  packageVersion: pkg.version,
+});
+await cp(stagedArtifacts, join(outDir, "src", "hsr", "artifacts"), { recursive: true, force: true });
 
 const compiledTests = testFiles
   .filter((path) => path.endsWith(".test.ts"))

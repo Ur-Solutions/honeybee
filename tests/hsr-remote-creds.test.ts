@@ -25,7 +25,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { serve } from "../src/hsr/remoteHost.js";
+import { serve, versionCore } from "../src/hsr/remoteHost.js";
 import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import { clearSubstrateCache } from "../src/substrates/index.js";
 import { mintEphemeralCredential } from "../src/hsr/remoteCreds.js";
@@ -391,7 +391,7 @@ function makeNode(overrides: Partial<NodeRecord> = {}): NodeRecord {
     kind: "remote-hsr",
     endpoint: "me@remote-host",
     capabilities: ["*"],
-    runnerHostVersion: "0.0.1+deadbeef1234",
+    runnerHostVersion: versionCore(),
     status: "unknown",
     createdAt: "2026-07-03T00:00:00.000Z",
     updatedAt: "2026-07-03T00:00:00.000Z",
@@ -486,8 +486,12 @@ test("remote HSR delivery: spawnRemote writes the fake credential into the isola
       assert.equal(await readFile(credPath, "utf8"), SECRET);
 
       // kill shreds the delivered credential — nothing persists remotely.
-      const kr = await sub.kill(bee);
-      assert.equal(kr.ok, true);
+      const kr = await sub.kill(bee, {
+        remoteLaunchId: res.launchId,
+        remoteIncarnation: res.incarnation,
+      });
+      assert.equal(kr.ok, false, "terminal history remains pinned until this pre-admitted consumer acknowledges it");
+      assert.equal(kr.incarnationStopped, true, "credential cleanup follows exact provider stop even while history is retained");
       await waitFor(async () => !(await fileExists(credPath)), "credential file GONE after kill");
     } finally {
       await sub.close();

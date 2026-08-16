@@ -24,10 +24,13 @@ import {
   processQueueForBee,
   purgeMailbox,
   readMessageById,
+  reconcileAmbiguousBuzDelivery,
   requeueQuarantinedMessages,
   resolveBuzAccept,
   sanitizeHumanName,
-  sendBuzMessage,
+  sendBuzMessageInAdmission as sendBuzMessage,
+  sendBuzMessage as sendBuzMessageWithAdmission,
+  settleQueuedBuzMessageUndeliverable,
   senderDisplay,
   serializeBuzMessage,
   validateAcceptList,
@@ -35,9 +38,19 @@ import {
   type BuzSender,
   type BuzTier,
 } from "../src/buz.js";
+import { readDeliveryDoubt } from "../src/deliveryDoubt.js";
+import {
+  acknowledgeHsrEventIntegrityLoss,
+  persistHsrEventIntegrityFailure,
+  readHsrEventIntegrityReceipt,
+  recordHsrEventIntegrityStop,
+} from "../src/hsr/eventIntegrity.js";
+import { purgeSessionData } from "../src/kill.js";
+import { reviveRecord } from "../src/commands/migrate.js";
 import { parseBuzDocument } from "../src/buz_format.js";
-import { saveSession, transitionSession, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
+import { readBeeRequests } from "../src/requests/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-buz-"));
@@ -306,6 +319,42 @@ test("sendBuzMessage preserves a client-supplied UUIDv7 message id", async () =>
   });
 });
 
+test("readMessageById prefers recipient settlement over a self-send outbox audit", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.self-receipt");
+    const delivered = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: recipient.name },
+      tier: "passive",
+      body: "delivered self message",
+    });
+    await consumeMessage(recipient.name, delivered.message.id);
+    assert.equal(
+      (await readMessageById(recipient.name, delivered.message.id, { strict: true }))?.mailbox,
+      "read",
+      "sender outbox must not mask the recipient's delivered/read receipt",
+    );
+
+    const queued = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: recipient.name },
+      tier: "queue",
+      body: "terminal self message",
+    });
+    const settled = await settleQueuedBuzMessageUndeliverable(
+      recipient.name,
+      queued.message.id,
+      "test-terminal-verdict",
+    );
+    assert.equal(settled.outcome, "undeliverable");
+    assert.equal(
+      (await readMessageById(recipient.name, queued.message.id, { strict: true }))?.mailbox,
+      "quarantine",
+      "sender outbox must not mask the recipient's terminal receipt",
+    );
+  });
+});
+
 test("sendBuzMessage rejects a malformed client-supplied message id", async () => {
   await withTempStore(async () => {
     await assert.rejects(
@@ -340,6 +389,422 @@ test("sendBuzMessage tier=interrupt with transport delivers and copies to inbox/
     assert.ok(pasted.endsWith("\n\nINTR"));
     const inbox = await readdir(beeMailboxDir("CO.aaa", "inbox"));
     assert.equal(inbox.length, 1);
+  });
+});
+
+test("post-provider interrupt mailbox failure retains one exact id and fences a fresh send", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.post-provider", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    let sends = 0;
+    const substrate = fakeSubstrate({ sendText: async () => { sends += 1; } });
+
+    let deliveryId: string | undefined;
+    await assert.rejects(
+      sendBuzMessage({
+        recipient,
+        sender: { kind: "bee", id: "CL.sender" },
+        tier: "interrupt",
+        body: "accepted exactly once",
+        transport: { substrate, tmuxTarget: recipient.tmuxTarget },
+      }, {
+        finalizeQueuedDelivery: async () => {
+          throw new Error("injected inbox publication failure");
+        },
+      }),
+      (error: unknown) => {
+        deliveryId = (error as { deliveryId?: string }).deliveryId;
+        return (error as { code?: unknown }).code === "HIVE_HSR_DELIVERY_AMBIGUOUS" && !!deliveryId;
+      },
+    );
+
+    assert.equal(sends, 1);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 1);
+    assert.equal((await readDeliveryDoubt(recipient.name, deliveryId!))?.phase, "ambiguous");
+    await assert.rejects(
+      sendBuzMessageWithAdmission({
+        recipient,
+        sender: { kind: "bee", id: "CL.sender" },
+        tier: "interrupt",
+        body: "fresh retry must not pass",
+        transport: { substrate, tmuxTarget: recipient.tmuxTarget },
+      }),
+      /unresolved delivery ownership/,
+    );
+    assert.equal(sends, 1, "fresh-id retry performs zero transport work");
+
+    const staged = await readMessageById(recipient.name, deliveryId!, { strict: true });
+    assert.equal(staged?.mailbox, "queue");
+    staged!.message.deliveredAs = "queue";
+    await writeFile(staged!.path, serializeBuzMessage(staged!.message));
+    const reconciled = await reconcileAmbiguousBuzDelivery(recipient.name, deliveryId!, "delivered");
+    assert.equal(reconciled.mailbox, "inbox");
+    assert.equal((await readDeliveryDoubt(recipient.name, deliveryId!))?.phase, "delivered");
+  });
+});
+
+test("crash after durable Buz offer but before provider call adopts the old UUID on retry", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.offer-crash", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    let sends = 0;
+    const input = {
+      recipient,
+      sender: { kind: "bee" as const, id: "CL.sender" },
+      tier: "interrupt" as const,
+      body: "one logical operation",
+      messageId: generateMessageId(1_760_000_000_000),
+      transport: {
+        substrate: fakeSubstrate({ sendText: async () => { sends += 1; } }),
+        tmuxTarget: recipient.tmuxTarget,
+      },
+    };
+    await assert.rejects(
+      sendBuzMessage(input, {
+        afterQueueBeforeTransport: async () => { throw new Error("injected coordinator crash"); },
+      }),
+      /injected coordinator crash/,
+    );
+    const offered = await listMessages(recipient.name, "queue");
+    assert.equal(offered.length, 1);
+    assert.equal(sends, 0);
+
+    const retry = await sendBuzMessageWithAdmission(input);
+    assert.equal(retry.message.id, offered[0]?.message.id);
+    assert.equal(sends, 0, "retry adopts the durable offer instead of inline-delivering a fresh UUID");
+    assert.equal((await listMessages(recipient.name, "queue")).length, 1);
+  });
+});
+
+test("no-id retry after a durable offer fails closed on the named UUID; explicit new intent stays distinct", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.no-id-offer-crash", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    const sender = { kind: "bee" as const, id: "CL.sender" };
+    let sends = 0;
+    const input = {
+      recipient,
+      sender,
+      tier: "interrupt" as const,
+      body: "same text does not prove same intent",
+      transport: {
+        substrate: fakeSubstrate({ sendText: async () => { sends += 1; } }),
+        tmuxTarget: recipient.tmuxTarget,
+      },
+    };
+
+    await assert.rejects(
+      sendBuzMessage(input, {
+        afterQueueBeforeTransport: async () => { throw new Error("injected after-offer crash"); },
+      }),
+      /injected after-offer crash/,
+    );
+    const [offered] = await listMessages(recipient.name, "queue", { strict: true });
+    assert.ok(offered);
+    assert.equal(sends, 0);
+
+    await assert.rejects(
+      sendBuzMessageWithAdmission(input),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, "HIVE_BUZ_UNRESOLVED_INTENT");
+        assert.equal((error as { messageId?: unknown }).messageId, offered.message.id);
+        assert.match((error as Error).message, new RegExp(offered.message.id));
+        return true;
+      },
+    );
+    assert.equal(sends, 0);
+    assert.equal((await listMessages(recipient.name, "queue", { strict: true })).length, 1, "retry creates no second durable UUID");
+    assert.equal((await listMessages(sender.id, "outbox", { strict: true })).length, 1, "retry creates no second audit UUID");
+
+    const explicitNew = await sendBuzMessageWithAdmission({ ...input, forceNewIntent: true });
+    assert.notEqual(explicitNew.message.id, offered.message.id);
+    assert.equal(sends, 1, "only the explicit new intent crosses the provider boundary");
+  });
+});
+
+test("outbox-only exact-id replay safely resumes recipient admission", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.outbox-resume");
+    const input = {
+      recipient,
+      sender: { kind: "human" as const, name: "apiary" },
+      tier: "queue" as const,
+      body: "resume after sender audit",
+      messageId: generateMessageId(1_760_000_000_005),
+    };
+    await assert.rejects(
+      sendBuzMessage(input, {
+        afterOutboxBeforeRecipient: async () => { throw new Error("injected outbox-only crash"); },
+      }),
+      /injected outbox-only crash/,
+    );
+    assert.equal((await listMessages(recipient.name, "queue")).length, 0);
+
+    const resumed = await sendBuzMessage(input);
+    assert.equal(resumed.message.id, input.messageId);
+    assert.equal((await listMessages(recipient.name, "queue")).length, 1);
+  });
+});
+
+test("queue identity remains the fallback fence when post-provider doubt persistence itself fails", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.doubt-store-fail", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    let sends = 0;
+    const input = {
+      recipient,
+      sender: { kind: "bee" as const, id: "CL.sender" },
+      tier: "interrupt" as const,
+      body: "accepted before every sidecar failed",
+      messageId: generateMessageId(1_760_000_000_001),
+      transport: {
+        substrate: fakeSubstrate({ sendText: async () => { sends += 1; } }),
+        tmuxTarget: recipient.tmuxTarget,
+      },
+    };
+    await assert.rejects(
+      sendBuzMessage(input, {
+        finalizeQueuedDelivery: async () => { throw new Error("injected inbox failure"); },
+        persistDeliveryDoubt: async () => { throw new Error("injected doubt-store failure"); },
+      }),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_HSR_DELIVERY_AMBIGUOUS",
+    );
+    const retained = await listMessages(recipient.name, "queue");
+    assert.equal(retained.length, 1);
+    assert.equal(sends, 1);
+
+    const retry = await sendBuzMessageWithAdmission(input);
+    assert.equal(retry.message.id, retained[0]?.message.id);
+    assert.equal(sends, 1, "same-intent retry performs zero second provider calls");
+    await assert.rejects(
+      sendBuzMessageWithAdmission({
+        ...input,
+        messageId: generateMessageId(1_760_000_000_101),
+        body: "fresh id cannot bypass the manual ownership fence",
+      }),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_HSR_DELIVERY_AMBIGUOUS",
+    );
+    assert.equal(sends, 1, "a different id is blocked by the durable manual request fallback");
+  });
+});
+
+test("canonical lifecycle becomes non-runnable when every post-provider Buz fence sidecar fails", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.all-buz-fences-fail", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    let sends = 0;
+    const input = {
+      recipient,
+      sender: { kind: "bee" as const, id: "CL.sender" },
+      tier: "interrupt" as const,
+      body: "provider accepted before all receipts failed",
+      messageId: generateMessageId(1_760_000_000_102),
+      transport: {
+        substrate: fakeSubstrate({ sendText: async () => { sends += 1; } }),
+        tmuxTarget: recipient.tmuxTarget,
+      },
+    };
+
+    await assert.rejects(
+      sendBuzMessageWithAdmission(input, {
+        finalizeQueuedDelivery: async () => { throw new Error("injected inbox failure"); },
+        persistDeliveryDoubt: async () => { throw new Error("injected doubt failure"); },
+        openMessageDeliveryRequest: async () => { throw new Error("injected request failure"); },
+      }),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_HSR_DELIVERY_AMBIGUOUS",
+    );
+    assert.equal(sends, 1);
+    const fenced = await loadSession(recipient.name);
+    assert.equal(fenced?.status, "kill_failed");
+    assert.match(fenced?.lastError ?? "", new RegExp(input.messageId));
+    assert.equal(fenced?.deliveryStopDoubt?.deliveryId, input.messageId);
+    assert.equal(fenced?.deliveryStopDoubt?.source.runtimeGeneration, recipient.runtimeGeneration ?? 0);
+
+    // The structured marker is independently non-runnable: a stray scalar
+    // repair cannot reopen work, and generic revive may not reinterpret it as
+    // an ordinary failed stop.
+    await updateSession(recipient.name, { status: "running" });
+    const scalarReopened = (await loadSession(recipient.name))!;
+    let launches = 0;
+    await assert.rejects(
+      reviveRecord(scalarReopened, {
+        fresh: true,
+        substrate: fakeSubstrate({ newSession: async () => { launches += 1; return { paneId: "%9" }; } }),
+      }),
+      new RegExp(input.messageId),
+    );
+    assert.equal(launches, 0);
+
+    await assert.rejects(
+      sendBuzMessageWithAdmission({
+        ...input,
+        messageId: generateMessageId(1_760_000_000_103),
+        body: "fresh id must not bypass canonical doubt",
+      }),
+      /not runnable|kill_failed|stop/i,
+    );
+    assert.equal(sends, 1, "canonical fallback blocks every fresh provider call");
+
+    const reconciled = await reconcileAmbiguousBuzDelivery(recipient.name, input.messageId, "delivered");
+    assert.equal(reconciled.mailbox, "inbox");
+    const repaired = await loadSession(recipient.name);
+    assert.equal(repaired?.status, "running");
+    assert.equal(repaired?.deliveryStopDoubt, undefined);
+    assert.equal(repaired?.lastError, undefined);
+  });
+});
+
+test("canonical delivery marker supports discard, survives archive, and never revives archived work", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.canonical-discard", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    const messageId = generateMessageId(1_760_000_000_104);
+    const input = {
+      recipient,
+      sender: { kind: "human" as const, name: "apiary" },
+      tier: "interrupt" as const,
+      body: "discard this uncertain answer",
+      messageId,
+      transport: { substrate: fakeSubstrate(), tmuxTarget: recipient.tmuxTarget },
+    };
+    await assert.rejects(
+      sendBuzMessageWithAdmission(input, {
+        finalizeQueuedDelivery: async () => { throw new Error("inbox failed"); },
+        persistDeliveryDoubt: async () => { throw new Error("doubt failed"); },
+        openMessageDeliveryRequest: async () => { throw new Error("request failed"); },
+      }),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_HSR_DELIVERY_AMBIGUOUS",
+    );
+    await updateSession(recipient.name, { status: "done" });
+
+    const result = await reconcileAmbiguousBuzDelivery(recipient.name, messageId, "discard");
+    assert.equal(result.mailbox, "quarantine");
+    const archived = await loadSession(recipient.name);
+    assert.equal(archived?.status, "done", "reconciliation never revives an archived lifecycle");
+    assert.equal(archived?.deliveryStopDoubt, undefined);
+    await assert.rejects(
+      sendBuzMessageWithAdmission(input),
+      /archived|not runnable|unresolved stop/i,
+    );
+  });
+});
+
+test("purge exports the only canonical delivery marker before deleting the SessionRecord", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.canonical-purge", { buzAccept: ["interrupt", "queue"] });
+    await saveSession(recipient);
+    const messageId = generateMessageId(1_760_000_000_105);
+    const input = {
+      recipient,
+      sender: { kind: "human" as const, name: "apiary" },
+      tier: "interrupt" as const,
+      body: "preserve across destructive cleanup",
+      messageId,
+      transport: { substrate: fakeSubstrate(), tmuxTarget: recipient.tmuxTarget },
+    };
+    await assert.rejects(
+      sendBuzMessageWithAdmission(input, {
+        finalizeQueuedDelivery: async () => { throw new Error("inbox failed"); },
+        persistDeliveryDoubt: async () => { throw new Error("doubt failed"); },
+        openMessageDeliveryRequest: async () => { throw new Error("request failed"); },
+      }),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_HSR_DELIVERY_AMBIGUOUS",
+    );
+    const fenced = (await loadSession(recipient.name))!;
+    assert.ok(await purgeSessionData(fenced));
+    assert.equal(await loadSession(recipient.name), null);
+    assert.equal((await readDeliveryDoubt(recipient.name, messageId))?.phase, "ambiguous");
+    assert.equal((await listMessages(recipient.name, "queue")).length, 1);
+
+    const reconciled = await reconcileAmbiguousBuzDelivery(recipient.name, messageId, "delivered");
+    assert.equal(reconciled.mailbox, "inbox");
+    assert.equal((await readDeliveryDoubt(recipient.name, messageId))?.phase, "delivered");
+  });
+});
+
+test("identical queued messages require an explicit new-intent override or a stable operation id", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.intent-identity");
+    const input = {
+      recipient,
+      sender: { kind: "bee" as const, id: "CL.sender" },
+      tier: "queue" as const,
+      body: "intentional repeated payload",
+    };
+    const first = await sendBuzMessage(input);
+    await assert.rejects(
+      sendBuzMessage(input),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_BUZ_UNRESOLVED_INTENT",
+    );
+    const second = await sendBuzMessage({ ...input, forceNewIntent: true });
+    assert.notEqual(first.message.id, second.message.id);
+    assert.equal((await listMessages(recipient.name, "queue")).length, 2);
+
+    const stableId = generateMessageId(1_760_000_000_002);
+    const stableFirst = await sendBuzMessage({ ...input, messageId: stableId, body: "stable operation" });
+    const stableRetry = await sendBuzMessage({ ...input, messageId: stableId, body: "stable operation" });
+    assert.equal(stableFirst.message.id, stableRetry.message.id);
+    assert.equal((await listMessages(recipient.name, "queue")).filter(({ message }) => message.id === stableId).length, 1);
+  });
+});
+
+test("explicit Buz id replays use inbox/read/quarantine terminal receipts without redelivery", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.terminal-receipts");
+    const sender = { kind: "bee" as const, id: "CL.sender" };
+    const deliveredId = generateMessageId(1_760_000_000_003);
+    const deliveredInput = { recipient, sender, tier: "passive" as const, body: "delivered once", messageId: deliveredId };
+    const first = await sendBuzMessage(deliveredInput);
+    const inboxReplay = await sendBuzMessage(deliveredInput);
+    assert.equal(inboxReplay.message.id, first.message.id);
+    assert.equal((await listMessages(recipient.name, "inbox")).length, 1);
+
+    await consumeMessage(recipient.name, deliveredId);
+    const readReplay = await sendBuzMessage(deliveredInput);
+    assert.equal(readReplay.message.id, deliveredId);
+    assert.equal((await listMessages(recipient.name, "read")).length, 1);
+    assert.equal((await listMessages(recipient.name, "inbox")).length, 0);
+
+    const quarantinedId = generateMessageId(1_760_000_000_004);
+    const quarantinedInput = { recipient, sender, tier: "queue" as const, body: "terminally refused", messageId: quarantinedId };
+    const queued = await sendBuzMessage(quarantinedInput);
+    const quarantineDir = beeMailboxDir(recipient.name, "quarantine");
+    await mkdir(quarantineDir, { recursive: true });
+    await rename(queued.queuePath!, join(quarantineDir, queued.queuePath!.split("/").at(-1)!));
+    await assert.rejects(
+      sendBuzMessage(quarantinedInput),
+      (error: unknown) => (error as { code?: unknown }).code === "HIVE_BUZ_DELIVERY_REJECTED",
+    );
+    assert.equal((await listMessages(recipient.name, "quarantine")).length, 1);
+    assert.equal((await listMessages(recipient.name, "queue")).filter(({ message }) => message.id === quarantinedId).length, 0);
+  });
+});
+
+test("post-accept Buz ledger failures are repair-only and never request a second delivery", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.ledger", { buzAccept: ["interrupt"] });
+    let sends = 0;
+    let ledgerAttempts = 0;
+    const result = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.sender" },
+      tier: "interrupt",
+      body: "provider accepted",
+      transport: {
+        substrate: fakeSubstrate({ sendText: async () => { sends += 1; } }),
+        tmuxTarget: recipient.tmuxTarget,
+      },
+    }, {
+      appendLedger: async () => {
+        ledgerAttempts += 1;
+        throw new Error("injected ledger failure");
+      },
+    });
+
+    assert.equal(result.message.deliveredAs, "interrupt");
+    assert.equal(sends, 1);
+    assert.equal(ledgerAttempts, 2);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 1);
   });
 });
 
@@ -632,6 +1097,38 @@ test("processQueueForBee drains queue/ in mtime order and moves to inbox/", asyn
   });
 });
 
+test("processQueueForBee carries remote authority tokens into queued delivery", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.remote-drain", {
+      node: "cell-one",
+      remoteLaunchId: "33333333-3333-4333-8333-333333333333",
+      remoteIncarnation: "44444444-4444-4444-8444-444444444444",
+    });
+    const queued = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.sender" },
+      tier: "queue",
+      body: "remote queued turn",
+    });
+    let options: Parameters<Substrate["sendText"]>[3];
+    const sub = fakeSubstrate({
+      kind: "remote-hsr",
+      node: "cell-one",
+      sendText: async (_target, _text, _pane, supplied) => { options = supplied; },
+    });
+    const result = await processQueueForBee(recipient, {
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.deepEqual(result.delivered, [queued.message.id]);
+    assert.deepEqual(options, {
+      deliveryId: queued.message.id,
+      completionRequired: true,
+      remoteLaunchId: recipient.remoteLaunchId,
+      remoteIncarnation: recipient.remoteIncarnation,
+    });
+  });
+});
+
 test("processQueueForBee quarantines a definite delivery rejection after 3 attempts", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.aaa");
@@ -676,6 +1173,149 @@ test("processQueueForBee retries transport failures forever without incrementing
       false,
       "transport failures never consume the delivery-rejected retry budget",
     );
+  });
+});
+
+test("processQueueForBee parks old-host delivery ambiguity for manual action without blind retry", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.ambiguous-drain", { substrate: "hsr" });
+    await saveSession(recipient);
+    const queued = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.sender" },
+      tier: "queue",
+      body: "do not replay across host death",
+    });
+    let attempts = 0;
+    let suppliedDeliveryId: string | undefined;
+    const sub = fakeSubstrate({
+      kind: "hsr",
+      sendText: async (_target, _text, _pane, options) => {
+        attempts += 1;
+        suppliedDeliveryId = options?.deliveryId;
+        throw Object.assign(new Error("provider acceptance on prior host is unknown"), {
+          code: "HIVE_HSR_DELIVERY_AMBIGUOUS",
+        });
+      },
+    });
+
+    const first = await processQueueForBee(recipient, {
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(suppliedDeliveryId, queued.message.id);
+    assert.equal(first.delivered.length, 0);
+    assert.equal(first.errors[0]?.code, "HIVE_HSR_DELIVERY_AMBIGUOUS");
+    assert.equal((await listMessages(recipient.name, "queue")).length, 1);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "quarantine")).catch(() => [])).length, 0);
+    const requests = await readBeeRequests(recipient.name);
+    assert.ok(requests.some((request) =>
+      request.status === "open" && request.evidence.detail === "delivery-ambiguous"));
+
+    // Another automatic drain encounters the same durable/manual fence. It
+    // never consumes quarantine budget or moves later mail ahead of it.
+    await processQueueForBee(recipient, {
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+    assert.equal(attempts, 1, "an open ambiguity request prevents another transport call");
+    assert.equal((await listMessages(recipient.name, "queue")).length, 1);
+    assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).some((file) => file.endsWith(".retries")), false);
+  });
+});
+
+test("Buz delivered verdict remains acknowledgeable after its completed HSR receipt is cleared", async () => {
+  await withTempStore(async () => {
+    const bee = "CO.event-loss-delivered";
+    const host = {
+      hostPid: 8123,
+      startedAt: "2026-08-15T18:00:00.000Z",
+      hostFingerprint: { pgid: 8123, startedAt: "birth-event-loss" },
+    };
+    const recipient = makeRecord(bee, {
+      substrate: "hsr",
+      runnerPid: host.hostPid,
+      runnerFingerprint: host.hostFingerprint,
+      buzAccept: ["queue"],
+    });
+    await saveSession(recipient);
+    const queued = await sendBuzMessage({
+      recipient,
+      sender: { kind: "bee", id: "CL.sender" },
+      tier: "queue",
+      body: "provider effect lost from source event history",
+    });
+    const sub = fakeSubstrate({
+      kind: "hsr",
+      sendText: async () => {
+        throw Object.assign(new Error("accepted provider outcome unknown"), {
+          code: "HIVE_HSR_DELIVERY_AMBIGUOUS",
+          deliveryId: queued.message.id,
+        });
+      },
+    });
+    await processQueueForBee(recipient, {
+      transport: { substrate: sub, tmuxTarget: recipient.tmuxTarget },
+    });
+
+    const integrity = await persistHsrEventIntegrityFailure({
+      bee,
+      host,
+      deliveryIds: [queued.message.id],
+      reason: "injected source append failure",
+    });
+    await recordHsrEventIntegrityStop(bee, integrity.integrityId, host, "confirmed", "test exact stop");
+
+    assert.deepEqual(await reconcileAmbiguousBuzDelivery(bee, queued.message.id, "delivered"), {
+      verdict: "delivered",
+      mailbox: "inbox",
+    });
+    assert.equal(
+      (await readHsrEventIntegrityReceipt(bee))?.deliveryVerdicts?.[queued.message.id],
+      "delivered",
+      "terminal mailbox verdict is copied before Buz clears its own tombstone",
+    );
+    const acknowledged = await acknowledgeHsrEventIntegrityLoss(bee, integrity.integrityId);
+    assert.equal(acknowledged.phase, "acknowledged");
+  });
+});
+
+test("an imported event-integrity delivery id is sufficient authority for mailbox-free reconciliation", async () => {
+  await withTempStore(async () => {
+    const host = {
+      hostPid: 8124,
+      startedAt: "2026-08-15T18:10:00.000Z",
+      hostFingerprint: { pgid: 8124, startedAt: "birth-remote-event-loss" },
+    };
+    for (const [suffix, verdict, terminal] of [
+      ["delivered", "delivered", "delivered"],
+      ["discarded", "discard", "discarded"],
+    ] as const) {
+      const bee = `CO.remote-event-loss-${suffix}`;
+      const deliveryId = `remote-direct-${suffix}`;
+      await saveSession(makeRecord(bee, {
+        substrate: "hsr",
+        node: "remote-node",
+        remoteLaunchId: "00000000-0000-4000-8000-000000000801",
+        remoteIncarnation: `00000000-0000-4000-8000-0000000008${suffix === "delivered" ? "02" : "03"}`,
+      }));
+      const integrity = await persistHsrEventIntegrityFailure({
+        bee,
+        host,
+        remoteAuthority: {
+          launchId: "00000000-0000-4000-8000-000000000801",
+          incarnation: `00000000-0000-4000-8000-0000000008${suffix === "delivered" ? "02" : "03"}`,
+        },
+        deliveryIds: [deliveryId],
+        reason: "remote source append failure after direct provider dispatch",
+      });
+      await recordHsrEventIntegrityStop(bee, integrity.integrityId, host, "confirmed", "remote exact stop proof");
+
+      assert.deepEqual(await reconcileAmbiguousBuzDelivery(bee, deliveryId, verdict), {
+        verdict,
+        mailbox: "absent",
+      });
+      assert.equal((await readHsrEventIntegrityReceipt(bee))?.deliveryVerdicts?.[deliveryId], terminal);
+      assert.equal((await acknowledgeHsrEventIntegrityLoss(bee, integrity.integrityId)).phase, "acknowledged");
+    }
   });
 });
 
@@ -830,12 +1470,17 @@ test("interrupt paste in flight does not block a concurrent send to the same rec
     // sendText) and threw "Timed out waiting for lock" after 10s.
     const queued = await sendBuzMessage({ recipient, sender: { kind: "bee", id: "CL.y" }, tier: "queue", body: "quick" });
     assert.equal(queued.message.deliveredAs, "queue");
-    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
+    assert.equal(
+      (await readdir(beeMailboxDir("CO.aaa", "queue"))).length,
+      2,
+      "the slow interrupt keeps its exact pre-provider queue identity while the concurrent message is admitted",
+    );
 
     releasePaste();
     const delivered = await interrupt;
     assert.equal(delivered.message.deliveredAs, "interrupt");
     assert.equal((await readdir(beeMailboxDir("CO.aaa", "inbox"))).length, 1);
+    assert.equal((await readdir(beeMailboxDir("CO.aaa", "queue"))).length, 1);
   });
 });
 

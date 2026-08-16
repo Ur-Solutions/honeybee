@@ -365,8 +365,10 @@ export function buildClaudeStreamConfig(opts: RunnerOpts): {
     encodeAnswer: (requestId, answer) => {
       const input = pendingQuestions.get(requestId);
       if (input === undefined) throw new Error(`hsr claude: no pending question for requestId ${requestId}`);
-      pendingQuestions.delete(requestId);
       return encodeClaudeQuestionAnswer(requestId, answer, input);
+    },
+    commitAnswer: (requestId) => {
+      pendingQuestions.delete(requestId);
     },
     sessionIdFromEvent: sessionIdFromClaudeEvent,
   };

@@ -21,6 +21,7 @@
  */
 
 import { join } from "node:path";
+import { CELL_BROKER_CAPABILITY_VERSION } from "../cellBrokerCapability.js";
 import {
   connectRpcClient,
   startRpcServer,
@@ -33,10 +34,16 @@ import { readHsrMeta } from "../hsr/runDir.js";
 import { assertCallerEnvAllowed } from "../spawnEnv.js";
 import { resolveExplicitSpawningBeeId } from "../spawnParent.js";
 import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import { readDeliveryDoubt } from "../deliveryDoubt.js";
+import { readPendingHsrTurn } from "../hsr/pendingTurns.js";
+import { readBeeRequestsStrict } from "../requests/store.js";
 import { createExecutionAdminMethods } from "../execution/adminMethods.js";
 import { createExecutionRpcMethods } from "../execution/rpcMethods.js";
 import { createProductionExecutionServiceProvider } from "../execution/production.js";
 import type { ExecutionService } from "../execution/service.js";
+import type { SessionRecord } from "../store.js";
+import type { Substrate } from "../substrates/types.js";
+import type { RemoteHsrSubstrate } from "../substrates/remote-hsr.js";
 import { createBrokerMethods, type BrokerHandlerOptions } from "./broker.js";
 import { daemonRoot } from "./log.js";
 
@@ -82,6 +89,8 @@ type HsrMessageParams = {
 type HsrMessageAcceptanceHooks = {
   /** Test-only fault boundary after queue persistence and before its recovery cursor. */
   beforeRecoveryCommit?: (messageId: string) => void | Promise<void>;
+  /** Deterministic transport injection for lifecycle/cross-node acceptance tests. */
+  substrateFor?: (record: SessionRecord) => Substrate;
 };
 
 function hsrMessageRefusal(
@@ -118,10 +127,12 @@ async function acceptHsrMessageOnce(
       isUuidV7,
       openMessageDeliveryRequest,
       readMessageById,
+      readSenderOutboxById,
       sanitizeHumanName,
-      sendBuzMessage,
+      sendBuzMessageInAdmission,
+      settleQueuedBuzMessageUndeliverable,
     },
-    { substrateFor },
+    { substrateFor: defaultSubstrateFor },
     { withSessionLifecycleTransaction },
     { assertReviveWorkingDirectory },
   ] = await Promise.all([
@@ -143,6 +154,7 @@ async function acceptHsrMessageOnce(
     let existing: Awaited<ReturnType<typeof readMessageById>> = null;
     if (params.messageId) {
       existing = await readMessageById(current.name, params.messageId, { strict: true });
+      existing ??= await readSenderOutboxById({ kind: "human", name: senderName }, params.messageId, { strict: true });
       if (existing) {
         const samePayload = existing.message.to === current.name &&
           existing.message.body === params.text &&
@@ -173,35 +185,66 @@ async function acceptHsrMessageOnce(
       };
     }
 
-    // `outbox` is an audit copy, not proof that recipient admission committed.
-    // Never turn an outbox-only observation into a queued acceptance receipt.
+    // `outbox` is an attempted audit copy, not recipient admission. Exact
+    // same-payload replay is safe to resume because strict lookup above proved
+    // queue/inbox/read/quarantine absent; a different payload was refused.
     if (existing?.mailbox === "outbox") {
-      return hsrMessageAmbiguity(
-        `messageId ${existing.message.id} has an outbox audit record but no recipient admission record`,
-        params.messageId,
-      );
+      existing = null;
     }
 
-    const substrate = substrateFor(current);
-    const live = await substrate.hasSession(current.tmuxTarget).catch(() => false);
+    if (existing?.mailbox === "queue") {
+      const [doubt, turn, requests] = await Promise.all([
+        readDeliveryDoubt(current.name, existing.message.id),
+        readPendingHsrTurn(current.name, existing.message.id),
+        readBeeRequestsStrict(current.name),
+      ]);
+      const manualFence = requests.find((request) => {
+        if (request.status !== "open" || request.evidence.detail !== "delivery-ambiguous") return false;
+        const input = request.input && typeof request.input === "object"
+          ? request.input as Record<string, unknown>
+          : {};
+        return input.messageId === existing!.message.id || input.deliveryId === existing!.message.id;
+      });
+      if (doubt?.phase === "ambiguous" || turn?.phase === "ambiguous" || manualFence) {
+        return hsrMessageAmbiguity(
+          `messageId ${existing.message.id} has unresolved provider delivery ownership`,
+          existing.message.id,
+          true,
+        );
+      }
+    }
+
     const terminalReason = isArchivedSessionLifecycle(current)
       ? `${current.name} is archived`
-      : current.stateMachine === undefined && current.status === "kill_failed" && !live
+      : current.status === "kill_failed"
         ? `${current.name} is archived (stop state unresolved)`
         : undefined;
     if (terminalReason && !existing) return hsrMessageRefusal(terminalReason);
 
+    // Do not probe or deliver through a stop-doubt record. An exact accepted
+    // replay still reaches the undeliverable settlement below, while a new
+    // logical message was refused above.
+    const substrate = hooks?.substrateFor?.(current) ?? defaultSubstrateFor(current);
+    const live = terminalReason
+      ? false
+      : await substrate.hasSession(current.tmuxTarget).catch(() => false);
+
     let cwdUnavailable = false;
-    try {
-      await assertReviveWorkingDirectory(current);
-    } catch {
-      cwdUnavailable = true;
+    // A remote-HSR cwd is authoritative on the node and commonly does not
+    // exist on this machine. Live delivery needs no cwd probe; cold recovery
+    // queues behind the remote authority instead of fabricating missing-cwd.
+    if (substrate.kind !== "remote-hsr") {
+      try {
+        await assertReviveWorkingDirectory(current);
+      } catch {
+        cwdUnavailable = true;
+      }
     }
     const missingProviderSession = !live && !current.providerSessionId;
 
     const sent = existing
       ? { message: existing.message }
-      : await sendBuzMessage({
+      : await sendBuzMessageInAdmission({
           recipient: current,
           sender: { kind: "human", name: senderName },
           // Known-undeliverable work is still persisted first, but must not
@@ -220,7 +263,7 @@ async function acceptHsrMessageOnce(
                 },
               }),
           ...(current.node ? { node: current.node } : {}),
-        });
+        }, { lifecycle });
 
     const messageId = sent.message.id;
     if (sent.message.deliveredAt) {
@@ -243,6 +286,25 @@ async function acceptHsrMessageOnce(
             ? "queued-message-missing" as const
             : undefined;
     if (undeliverableReason) {
+      // UNDELIVERABLE is a terminal delivery verdict, not merely a UI label.
+      // Remove the exact accepted id from queue/ under the same delivery lock
+      // as the daemon drainer, while retaining it in quarantine as the durable
+      // idempotency receipt. If a concurrent drain won first, report delivery
+      // instead of opening a contradictory manual-action request.
+      const settlement = await settleQueuedBuzMessageUndeliverable(
+        current.name,
+        messageId,
+        undeliverableReason,
+      );
+      if (settlement.outcome === "delivered") {
+        return {
+          ok: true,
+          accepted: true,
+          messageId,
+          delivery: "delivered",
+          idempotent: true,
+        };
+      }
       const requestId = await openMessageDeliveryRequest(current, messageId, undeliverableReason);
       return {
         ok: true,
@@ -421,8 +483,8 @@ export async function startHsrControlServer(opts?: {
     // rejects only an archived/destroyed bee. fork:1/handoff:1 = in-process
     // cmdFork/cmdHandoff (session-fork-and-handoff epic). An older daemon
     // rejects unknown methods outright, which reads as "CLI fallback".
-    // broker:2 = additive Cell broker: v1 buz/inbox/state/seal remain, while
-    // permission-gated host-side filesystem spawn adds broker:spawn.
+    // broker:3 = every Cell broker read/mutation requires a generation-bound
+    // runtime capability; broker:spawn remains the v2 additive verb.
     // execution:1 = the contracts/execution/v1 protocol methods
     // (protocol.hello, node.describe, run.start/get/events) are registered on
     // this socket; real capability negotiation is protocol.hello itself.
@@ -436,7 +498,7 @@ export async function startHsrControlServer(opts?: {
       spawnEnv: 1,
       spawnParent: 1,
       message: 1,
-      broker: 2,
+      broker: CELL_BROKER_CAPABILITY_VERSION,
       fork: 1,
       handoff: 1,
       execution: 1,
@@ -485,10 +547,16 @@ export async function startHsrControlServer(opts?: {
 
     send: guarded(async (params) => {
       const p = (params ?? {}) as { bee?: unknown; text?: unknown; mode?: unknown };
-      const result = await proxyCall(String(p.bee ?? ""), "send", {
+      const bee = String(p.bee ?? "");
+      const [{ resolveSession }, { withRunnableSessionAdmission }] = await Promise.all([
+        import("../cli/shared.js"),
+        import("../delivery.js"),
+      ]);
+      const record = await resolveSession(bee);
+      const result = await withRunnableSessionAdmission(record, async () => proxyCall(bee, "send", {
         text: String(p.text ?? ""),
         ...(p.mode === "next-tool" ? { mode: "next-tool" } : {}),
-      });
+      }));
       return result.ok ? { ok: true } : result;
     }),
 
@@ -499,21 +567,132 @@ export async function startHsrControlServer(opts?: {
     }),
 
     answer: guarded(async (params) => {
-      const p = (params ?? {}) as { bee?: unknown; requestId?: unknown; answer?: unknown };
+      const p = (params ?? {}) as { bee?: unknown; requestId?: unknown; source?: unknown; host?: unknown; answer?: unknown };
       const bee = String(p.bee ?? "");
-      let requestId = typeof p.requestId === "string" && p.requestId ? p.requestId : undefined;
-      if (!requestId) {
-        // No explicit id — resolve the request the bee is currently blocked on.
-        const pending = await pendingNeedsInput(bee).catch(() => null);
-        requestId = pending?.requestId;
-      }
-      const result = await proxyCall(bee, "answer", { requestId: requestId ?? "", answer: String(p.answer ?? "") });
-      return result.ok ? { ok: true } : result;
+      const [
+        { resolveSession },
+        { withRunnableSessionAdmission },
+        { answerLocalHsrSessionInAdmission, hsrAnswerHostFromMeta, persistHsrAnswerAmbiguity },
+        answerReceipts,
+        { substrateFor },
+      ] = await Promise.all([
+        import("../cli/shared.js"),
+        import("../delivery.js"),
+        import("../hsr/answer.js"),
+        import("../answerReceipt.js"),
+        import("../substrates/index.js"),
+      ]);
+      const record = await resolveSession(bee);
+      const result = await withRunnableSessionAdmission(record, async (_lifecycle, current) => {
+        const requestId = typeof p.requestId === "string" && p.requestId ? p.requestId : undefined;
+        if (!requestId || p.source === undefined || p.host === undefined) {
+          throw new Error("HSR control answer requires exact requestId, source, and host identities");
+        }
+        const expectedSource = answerReceipts.parseHsrAnswerExpectedSource(p.source);
+        if (!answerReceipts.hsrAnswerExpectedSourceOwnsRecord(expectedSource, current)) {
+          throw new Error(`stale HSR answer source does not own ${bee}'s current runtime generation`);
+        }
+        const currentSubstrate = substrateFor(current);
+        const locator = {
+          ...(current.remoteLaunchId ? { remoteLaunchId: current.remoteLaunchId } : {}),
+          ...(current.remoteIncarnation ? { remoteIncarnation: current.remoteIncarnation } : {}),
+        };
+        const pendingState = currentSubstrate.kind === "remote-hsr"
+          ? await (currentSubstrate as RemoteHsrSubstrate).pendingInputRemote(bee, locator)
+          : await (async () => {
+              const meta = await readHsrMeta(bee);
+              if (!meta) throw new Error(`No HSR host metadata for ${bee}`);
+              return { pending: await pendingNeedsInput(bee), host: hsrAnswerHostFromMeta(meta) };
+            })();
+        const { pending, host } = pendingState;
+        const expectedHost = answerReceipts.parseHsrAnswerHostIdentity(p.host);
+        if (!answerReceipts.sameHsrAnswerHostIdentity(expectedHost, host)) {
+          throw new Error(`stale HSR answer host does not own ${bee}'s current runner incarnation`);
+        }
+        const answer = typeof p.answer === "string"
+          ? p.answer
+          : Array.isArray(p.answer) && p.answer.every((row) =>
+              Array.isArray(row) && row.every((item) => typeof item === "string"))
+            ? p.answer as string[][]
+            : undefined;
+        if (answer === undefined) throw new Error("HSR control answer requires a string or string-matrix answer");
+        let delivered: Awaited<ReturnType<typeof answerLocalHsrSessionInAdmission>>;
+        if (currentSubstrate.kind === "remote-hsr") {
+          const operation = answerReceipts.createHsrAnswerOperation(current, requestId, answer, host);
+          await answerReceipts.assertNoUnresolvedHsrAnswerOwnership(current, "hsr control answer", operation);
+          await answerReceipts.offerHsrAnswerOperation(bee, operation);
+          const remoteResult = await (currentSubstrate as RemoteHsrSubstrate).answerRemote(bee, operation, answer, locator);
+          if (remoteResult.status === "settled") {
+            await answerReceipts.reconcileHsrAnswerOperation(bee, operation, "delivered");
+          } else if (remoteResult.status === "discarded") {
+            await answerReceipts.reconcileHsrAnswerOperation(bee, operation, "discard");
+          } else if (remoteResult.status === "ambiguous" || remoteResult.status === "in-flight") {
+            await persistHsrAnswerAmbiguity(
+              current,
+              operation,
+              remoteResult.status === "ambiguous" ? remoteResult.reason : `answer ${requestId} remains in flight`,
+              remoteResult.status === "ambiguous" ? remoteResult.host : undefined,
+            );
+          } else if (remoteResult.status === "conflict") {
+            await persistHsrAnswerAmbiguity(current, operation, remoteResult.reason);
+          }
+          delivered = { operation, result: remoteResult };
+        } else {
+          delivered = await answerLocalHsrSessionInAdmission(current, requestId, answer);
+        }
+        if (delivered.result.status === "settled") {
+          const [{ resolveRequest }, { needsInputRequestId }] = await Promise.all([
+            import("../requests/store.js"),
+            import("../requests/keys.js"),
+          ]);
+          await resolveRequest(
+            bee,
+            pending?.requestId === requestId
+              ? needsInputRequestId(bee, { ...pending, host })
+              : needsInputRequestId(bee, { requestId, ts: 0, host: delivered.operation.host }),
+            { by: "hsr-control-answer", resolution: typeof answer === "string" ? answer : JSON.stringify(answer) },
+          );
+          return { ok: true, operation: delivered.operation, result: delivered.result };
+        }
+        return { ok: false, operation: delivered.operation, result: delivered.result };
+      }, { operation: "hsr control answer", deferAnswerOwnershipToExactOperation: true });
+      return result;
     }),
 
     pendingInput: guarded(async (params) => {
       const p = (params ?? {}) as { bee?: unknown };
-      return pendingNeedsInput(String(p.bee ?? ""));
+      const bee = String(p.bee ?? "");
+      const [
+        { resolveSession },
+        { withSessionLifecycleTransaction },
+        { hsrAnswerExpectedSource },
+        { hsrAnswerHostFromMeta },
+        { substrateFor },
+      ] = await Promise.all([
+        import("../cli/shared.js"),
+        import("../lifecycle.js"),
+        import("../answerReceipt.js"),
+        import("../hsr/answer.js"),
+        import("../substrates/index.js"),
+      ]);
+      const snapshot = await resolveSession(bee);
+      return withSessionLifecycleTransaction(snapshot, async (lifecycle) => {
+        const current = await lifecycle.refresh();
+        const substrate = substrateFor(current);
+        const pendingState = substrate.kind === "remote-hsr"
+          ? await (substrate as RemoteHsrSubstrate).pendingInputRemote(bee, {
+              ...(current.remoteLaunchId ? { remoteLaunchId: current.remoteLaunchId } : {}),
+              ...(current.remoteIncarnation ? { remoteIncarnation: current.remoteIncarnation } : {}),
+            })
+          : await (async () => {
+              const meta = await readHsrMeta(bee);
+              if (!meta) throw new Error(`No HSR host metadata for ${bee}`);
+              return { pending: await pendingNeedsInput(bee), host: hsrAnswerHostFromMeta(meta) };
+            })();
+        return pendingState.pending
+          ? { ...pendingState.pending, source: hsrAnswerExpectedSource(current), host: pendingState.host }
+          : null;
+      });
     }),
 
     stop: guarded(async (params) => {

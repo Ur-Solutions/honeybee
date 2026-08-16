@@ -47,7 +47,8 @@ export type { SshExecHook };
 const unboundedSshExecHook: SshExecHook = (argv, input) => defaultSshExecHook(argv, input, { timeoutMs: 0 });
 
 const DEFAULT_MIN_NODE_MAJOR = 18;
-const REMOTE_DIR = "~/.hive/runner-host";
+export const REMOTE_RUNNER_HOST_DIR = "~/.hive/runner-host";
+export const DEFAULT_REMOTE_RUNNER_HOST_SOCKET = `${REMOTE_RUNNER_HOST_DIR}/control.sock`;
 const MISSING_MARKER = "__HIVE_RH_MISSING__";
 const REMOTE_SHA256_SCRIPT =
   "const { createHash } = require('node:crypto');" +
@@ -80,6 +81,10 @@ export type BootstrapDeps = {
   ensureBundle?: () => Promise<RunnerHostBundle>;
   /** Read the local bundle file to pipe to the remote. Defaults to fs readFile. */
   readBundle?: (path: string) => Promise<string>;
+  /** Injectable bounded poll sleep (tests). */
+  sleep?: (ms: number) => Promise<void>;
+  servePollAttempts?: number;
+  servePollIntervalMs?: number;
 };
 
 export type BootstrapResult = {
@@ -92,7 +97,7 @@ export type BootstrapResult = {
 
 /** The remote path a given version's bundle lands at (tilde-expanded remote-side). */
 export function remoteBundlePath(version: string): string {
-  return `${REMOTE_DIR}/hive-runner-host-${version}.mjs`;
+  return `${REMOTE_RUNNER_HOST_DIR}/hive-runner-host-${version}.mjs`;
 }
 
 function parseNodeMajor(versionOut: string): number | null {
@@ -118,6 +123,9 @@ export async function bootstrapRunnerHost(
   const exec = deps.execHook ?? unboundedSshExecHook;
   const ensureBundle = deps.ensureBundle ?? (() => ensureRunnerHostBundle());
   const readBundle = deps.readBundle ?? ((path: string) => readFile(path, "utf8"));
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const servePollAttempts = deps.servePollAttempts ?? 30;
+  const servePollIntervalMs = deps.servePollIntervalMs ?? 200;
   const minMajor = params.minNodeMajor ?? DEFAULT_MIN_NODE_MAJOR;
 
   const sshBinary = params.sshCommand ?? "ssh";
@@ -148,7 +156,7 @@ export async function bootstrapRunnerHost(
   }
 
   // 2. Ensure the remote runner-host dir exists.
-  const mkdir = await runRemote(`mkdir -p ${REMOTE_DIR}`);
+  const mkdir = await runRemote(`mkdir -p ${REMOTE_RUNNER_HOST_DIR}`);
   if (mkdir.exitCode !== 0) {
     throw new Error(`runner-host bootstrap: mkdir on remote failed (exit ${mkdir.exitCode}): ${mkdir.stderr.trim()}`);
   }
@@ -191,7 +199,76 @@ export async function bootstrapRunnerHost(
     throw new Error(`runner-host bootstrap: version handshake mismatch — remote reported "${reported}", expected "${expected}"`);
   }
 
-  // 5. Register / refresh the NodeRecord.
+  // 5. Prove the LIVE authority is this exact artifact. A stale serve is never
+  // accepted just because its socket or safety protocol exists. The deployed
+  // bundle's upgrade client asks the old authority for a two-phase quiescent
+  // handoff; that authority refuses without signalling anything while remote
+  // work is active/unresolved. Only an empty authority closes its own socket.
+  const socketBefore = await runRemote(`test -S ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET}`);
+  if (socketBefore.exitCode !== 0 && socketBefore.exitCode !== 1) {
+    throw new Error(
+      `runner-host bootstrap: live serve probe failed on ${params.endpoint} (exit ${socketBefore.exitCode}): `
+      + `${socketBefore.stderr.trim() || socketBefore.stdout.trim() || "no output"}`,
+    );
+  }
+  if (socketBefore.exitCode === 0) {
+    const upgrade = await runRemote(
+      `node ${remotePath} upgrade --socket ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET} --target-version ${bundle.version}`,
+    );
+    if (upgrade.exitCode !== 0) {
+      throw new Error(
+        `runner-host bootstrap: live authority upgrade refused (exit ${upgrade.exitCode}): `
+        + `${upgrade.stderr.trim() || upgrade.stdout.trim() || "the old serve cannot prove a quiescent handoff; stop/retire remote bees and retry"}`,
+      );
+    }
+  }
+
+  let socketNow = await runRemote(`test -S ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET}`);
+  if (socketNow.exitCode !== 0 && socketNow.exitCode !== 1) {
+    throw new Error(
+      `runner-host bootstrap: post-upgrade socket probe failed (exit ${socketNow.exitCode}): `
+      + `${socketNow.stderr.trim() || socketNow.stdout.trim() || "no output"}`,
+    );
+  }
+  if (socketNow.exitCode === 1) {
+    const start = await runRemote(
+      `setsid node ${remotePath} serve --socket ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET} >/dev/null 2>&1 < /dev/null &`,
+    );
+    if (start.exitCode !== 0) {
+      throw new Error(
+        `runner-host bootstrap: failed to start exact live authority (exit ${start.exitCode}): `
+        + `${start.stderr.trim() || start.stdout.trim() || "no output"}`,
+      );
+    }
+    for (let attempt = 0; attempt < servePollAttempts; attempt++) {
+      socketNow = await runRemote(`test -S ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET}`);
+      if (socketNow.exitCode === 0) break;
+      if (socketNow.exitCode !== 1) {
+        throw new Error(
+          `runner-host bootstrap: live authority socket poll failed (exit ${socketNow.exitCode}): `
+          + `${socketNow.stderr.trim() || socketNow.stdout.trim() || "no output"}`,
+        );
+      }
+      await sleep(servePollIntervalMs);
+    }
+    if (socketNow.exitCode !== 0) {
+      throw new Error(
+        `runner-host bootstrap: exact live authority socket ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET} did not appear after ${servePollAttempts} attempts`,
+      );
+    }
+  }
+
+  const liveHandshake = await runRemote(
+    `node ${remotePath} probe --socket ${DEFAULT_REMOTE_RUNNER_HOST_SOCKET} --expect-version ${bundle.version}`,
+  );
+  if (liveHandshake.exitCode !== 0) {
+    throw new Error(
+      `runner-host bootstrap: exact live authority handshake failed (exit ${liveHandshake.exitCode}): `
+      + `${liveHandshake.stderr.trim() || liveHandshake.stdout.trim() || "no output"}`,
+    );
+  }
+
+  // 6. Register / refresh the NodeRecord only after the live digest proof.
   const existing = await loadNode(params.name);
   const hasRealRecord = existing !== null && !(params.name === LOCAL_NODE_NAME && existing.createdAt === "1970-01-01T00:00:00.000Z");
 

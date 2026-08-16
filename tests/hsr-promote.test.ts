@@ -13,11 +13,21 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { buildClaudeStreamConfig } from "../src/hsr/adapters/claude.js";
 import { codexAdapter } from "../src/hsr/adapters/codex.js";
 import { resumeArgs } from "../src/swap.js";
 import { assertResumable, tmuxSessionSurvives } from "../src/cli.js";
+import { quiesceHsrBee } from "../src/commands/migrate.js";
+import {
+  __testOnlySetHsrEventAuthorityTimeout,
+  ensureHsrRunDir,
+  withHsrEventAuthorityLock,
+  writeHsrMeta,
+} from "../src/hsr/runDir.js";
 import type { RunnerOpts } from "../src/hsr/types.js";
 import type { SessionRecord } from "../src/store.js";
 
@@ -54,6 +64,50 @@ test("assertResumable: OpenCode REST and interactive sessions share a resumable 
 
 test("assertResumable: a non-resume-gated harness is rejected", () => {
   assert.throws(() => assertResumable(recordFor({ agent: "cursor" }), "demote"), /only codex, grok, opencode, and kimi/);
+});
+
+test("quiesce refuses an authority-busy event snapshot instead of treating a partial turn as idle", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hive-hsr-quiesce-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const acquired = new Promise<void>((resolve) => { entered = resolve; });
+  let holder: Promise<void> | undefined;
+  try {
+    const record = recordFor({ name: "quiesce-authority-busy", substrate: "hsr" });
+    await ensureHsrRunDir(record.name);
+    await writeHsrMeta(record.name, {
+      bee: record.name,
+      harness: "stub",
+      tier: "stream",
+      hostPid: process.pid,
+      hostFingerprint: { pgid: process.pid, startedAt: "quiesce-test-host" },
+      childAdmission: "none",
+      startedAt: "2026-08-15T12:00:00.000Z",
+      controlSocket: join(dir, "missing.sock"),
+      status: "running",
+    });
+    holder = withHsrEventAuthorityLock(record.name, async () => {
+      entered();
+      await released;
+    });
+    await acquired;
+    __testOnlySetHsrEventAuthorityTimeout(20);
+
+    await assert.rejects(
+      quiesceHsrBee(record, false),
+      /cannot prove quiesce-authority-busy is quiescent \(busy:/,
+    );
+  } finally {
+    __testOnlySetHsrEventAuthorityTimeout(undefined);
+    release();
+    await holder;
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 /** A minimal RunnerOpts; individual tests override command/args/resume/etc. */

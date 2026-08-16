@@ -6,9 +6,15 @@ import { mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { storeRoot } from "../fsx.js";
 import { ensureOrphanedChildGroupStopped } from "./observe.js";
 import { ensureHsrRunDir, hsrRunDir, readHsrMeta, readHsrMetaStrict } from "./runDir.js";
-import { redactHsrPayloadError, type HsrRunPayload } from "./runner-entry.js";
+import {
+  hsrHostEnvironment,
+  redactHsrPayloadError,
+  sanitizeExecutionCellPayload,
+  type HsrRunPayload,
+} from "./runner-entry.js";
 
 export { runHsrHostFromPayload } from "./runner-entry.js";
 export type { HsrRunPayload } from "./runner-entry.js";
@@ -132,10 +138,25 @@ export type SpawnHsrHostDependencies = {
  * along so a revived Layout-v2 Cell can still write its wrapper `box/`.
  */
 export function hsrCellPayloadFields(
-  record: { executionRunId?: string; sandboxWriteRoots?: string[] },
-): Pick<HsrRunPayload, "filesystemWriteScope" | "extraWriteRoots"> {
+  record: {
+    executionRunId?: string;
+    executionRuntimeCredentialLeaseIds?: string[];
+    sandboxWriteRoots?: string[];
+  },
+): Pick<
+  HsrRunPayload,
+  "filesystemWriteScope" | "executionRunId" | "runtimeCredentialLeaseIds" | "extraWriteRoots"
+> {
   return {
-    ...(record.executionRunId ? { filesystemWriteScope: "cwd" as const } : {}),
+    ...(record.executionRunId
+      ? {
+          filesystemWriteScope: "cwd" as const,
+          executionRunId: record.executionRunId,
+          ...(record.executionRuntimeCredentialLeaseIds?.length
+            ? { runtimeCredentialLeaseIds: [...record.executionRuntimeCredentialLeaseIds] }
+            : {}),
+        }
+      : {}),
     ...(record.sandboxWriteRoots?.length ? { extraWriteRoots: [...record.sandboxWriteRoots] } : {}),
   };
 }
@@ -151,32 +172,41 @@ export async function spawnHsrHost(
   payload: HsrRunPayload,
   dependencies: SpawnHsrHostDependencies = {},
 ): Promise<number> {
+  // Strip arbitrary caller/gateway env before the private handoff is even
+  // written. Ordinary HSR returns the original object unchanged.
+  const launchPayload = sanitizeExecutionCellPayload(payload);
   try {
-    await realpath(payload.cwd);
+    await realpath(launchPayload.cwd);
   } catch (error) {
     const reason = (error as NodeJS.ErrnoException).code === "ENOENT"
       ? "is no longer available"
       : "could not be verified";
     throw new Error(`HSR working directory ${reason}; restore or recreate the working copy before launch`);
   }
-  await ensureHsrRunDir(payload.bee);
+  await ensureHsrRunDir(launchPayload.bee);
   const dir = await (dependencies.makeTempDir ?? mkdtemp)(join(tmpdir(), "hive-hsr-payload-"));
   const payloadPath = join(dir, "payload.json");
   let logHandle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    await writeFile(payloadPath, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
-    logHandle = await open(join(hsrRunDir(payload.bee), "host.log"), "a", 0o600);
+    await writeFile(payloadPath, `${JSON.stringify(launchPayload)}\n`, { mode: 0o600 });
+    logHandle = await open(join(hsrRunDir(launchPayload.bee), "host.log"), "a", 0o600);
     const entry = await (dependencies.resolveEntry ?? (() => resolveHsrEntry()))();
     const childArgv = [...inheritableExecArgvForHsr(), ...hsrEntryArgv(entry, payloadPath)];
     const child = (dependencies.spawn ?? spawnChild)(process.execPath, childArgv, {
       detached: true,
       stdio: ["ignore", logHandle.fd, logHandle.fd],
-      env: { ...process.env },
+      env: hsrHostEnvironment(launchPayload, {
+        ...process.env,
+        // HOME becomes per-Cell scratch in the child. Keep the control-plane
+        // store explicit so hive buz/runtime locks still address Honeybee's
+        // canonical store instead of an isolated HOME fallback.
+        HIVE_STORE_ROOT: storeRoot(),
+      }),
     });
     // Async spawn failures surface via 'error' after spawn() returns; the
     // missing-pid check below converts them into a thrown error.
     child.once("error", () => undefined);
-    if (!child.pid) throw new Error(`hive __hsr-run: spawn failed (no pid for ${payload.bee})`);
+    if (!child.pid) throw new Error(`hive __hsr-run: spawn failed (no pid for ${launchPayload.bee})`);
     const pid = child.pid;
     recentlyExitedSpawnedHosts.delete(pid);
     spawnedHosts.set(pid, child);
@@ -188,10 +218,10 @@ export async function spawnHsrHost(
     });
     child.unref();
     try {
-      await waitForSpawnedHostChildAdmission(payload.bee, pid, HSR_CHILD_ADMISSION_TIMEOUT_MS);
+      await waitForSpawnedHostChildAdmission(launchPayload.bee, pid, HSR_CHILD_ADMISSION_TIMEOUT_MS);
     } catch (error) {
       const stopped = await stopSpawnedHsrHost(pid);
-      const meta = await readHsrMetaStrict(payload.bee).catch(() => null);
+      const meta = await readHsrMetaStrict(launchPayload.bee).catch(() => null);
       const childStopped = meta?.hostPid === pid
         ? await ensureOrphanedChildGroupStopped(meta)
         : false;

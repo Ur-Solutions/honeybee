@@ -1,5 +1,6 @@
 import { colonyExists, listColonies } from "./colony.js";
 import { matchesSessionReference } from "./ids.js";
+import { isArchivedSessionLifecycle } from "./stateMachine.js";
 import { listSessions, type SessionRecord } from "./store.js";
 import { swarmIds } from "./swarm.js";
 import { effectiveTags } from "./tags.js";
@@ -219,7 +220,7 @@ export async function resolveSelector(query: string): Promise<ResolvedTarget> {
   const selector = parseSelector(query);
   // Filed (done) bees are excluded from DEFAULT selector resolution
   // (send/kill/list <sel>): a filed bee is no longer a live send/kill target.
-  const records = (await listSessions()).filter((r) => r.status !== "done");
+  const records = (await listSessions()).filter((record) => !isArchivedSessionLifecycle(record));
   const state: SelectorState = { records };
 
   // The tag kind reuses colony:/swarm: existence sets for its unknown-value

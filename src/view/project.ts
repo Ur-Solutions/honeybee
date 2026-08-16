@@ -25,7 +25,7 @@ import { isWellFormedPaneId } from "../paneId.js";
 import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
-import { isArchivedSessionLifecycle, type BeeWorkState } from "../stateMachine.js";
+import { isActiveSessionLifecycle, isArchivedSessionLifecycle, type BeeWorkState } from "../stateMachine.js";
 import { legacyStateMachineSeed, type SessionRecord } from "../store.js";
 import { deriveOpenRequests, storedRequestView } from "./requests.js";
 import {
@@ -149,7 +149,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     ...(latestTurnResult ? { latestTurnResult } : {}),
     ...(latestContractResult ? { latestContractResult } : {}),
     inboxSummary,
-    interactionState: interactionStateFor(record, context, derived, latestRuntime),
+    interactionState: interactionStateFor(record, derived, latestRuntime),
     displayState,
     displayStateReason,
     observationFreshness: projectFreshness(sources, derived, { unreachable, held, hiveStateOption, nowMs }),
@@ -248,9 +248,14 @@ function projectRuntime(
       evidence: { grade: "legacy", source: "session-record", detail: 'record filed (status "done")' },
     };
   }
+  // `kill_failed` is orthogonal stop-doubt evidence, not a legacy lifecycle
+  // scalar. Keep it visible through every active-runtime projection (including
+  // recovering/parked/lost/unreachable/held) so the view cannot accidentally
+  // present an ownership-held Bee as ready or merely crashed.
+  const activeBase = record.status === "kill_failed" ? { ...base, stopFailed: true as const } : base;
   if (runtimeState === "recovering") {
     return {
-      ...base,
+      ...activeBase,
       state: "starting",
       evidence: {
         grade: "structured",
@@ -262,7 +267,7 @@ function projectRuntime(
   }
   if (runtimeState === "parked") {
     return {
-      ...base,
+      ...activeBase,
       state: "exited",
       exitClass: "stopped",
       evidence: {
@@ -275,7 +280,7 @@ function projectRuntime(
   }
   if (runtimeState === "lost") {
     return {
-      ...base,
+      ...activeBase,
       state: "exited",
       exitClass: "crashed",
       evidence: {
@@ -288,14 +293,14 @@ function projectRuntime(
   }
   if (facts.unreachable) {
     return {
-      ...base,
+      ...activeBase,
       state: "unknown",
       evidence: { grade: "observer", source: "node-probe", detail: `node ${record.node ?? LOCAL_NODE_NAME} did not respond this pass` },
     };
   }
   if (facts.held) {
     return {
-      ...base,
+      ...activeBase,
       state: "unknown",
       evidence: { grade: "legacy", source: "session-record", detail: "HSR observation batch failed this pass — state held" },
     };
@@ -306,8 +311,8 @@ function projectRuntime(
     // The stop failed; the runtime may still be alive (ADR: a failed stop
     // leaves the generation online). A negative probe means it finally exited
     // under the recorded stop intent.
-    if (live) return { ...base, state: "online", stopFailed: true, evidence };
-    return { ...base, state: "exited", exitClass: "stopped", stopFailed: true, evidence };
+    if (live) return { ...activeBase, state: "online", evidence };
+    return { ...activeBase, state: "exited", exitClass: "stopped", evidence };
   }
   if (!live && record.recoveryRequestedAt) {
     return {
@@ -325,7 +330,7 @@ function projectRuntime(
     return {
       ...base,
       state: "exited",
-      exitClass: record.status === "running" ? "crashed" : "stopped",
+      exitClass: isActiveSessionLifecycle(record) ? "crashed" : "stopped",
       evidence,
     };
   }
@@ -624,22 +629,16 @@ function derivedMeansRunningTurn(state: BeeState): boolean {
 
 function interactionStateFor(
   record: SessionRecord,
-  context: StateContext,
   derived: DerivedState,
   runtime: BeeViewRuntime,
 ): BeeViewV1["interactionState"] {
   if (isArchivedSessionLifecycle(record)) return "archived";
+  // Stop doubt is orthogonal to runtime liveness. A positive probe proves
+  // identity/existence, not permission to resume work after an explicit stop;
+  // expose a distinct active-but-non-interactive state on every runtime axis.
+  if (record.status === "kill_failed") return "blocked";
   if (runtime.runtimeState === "recovering") return "working";
-  if (record.status !== "kill_failed") {
-    return derivedMeansRunningTurn(derived.state) ? "working" : "idle";
-  }
-
-  // kill_failed records encode unresolved stop intent, not runtime death. A
-  // positive liveness probe keeps the bee interactive; re-derive without the
-  // diagnostic status override so a still-running turn remains `working`.
-  if (runtime.state === "exited") return "archived";
-  const liveState = deriveState({ ...record, status: "running" }, context);
-  return derivedMeansRunningTurn(liveState.state) ? "working" : "idle";
+  return derivedMeansRunningTurn(derived.state) ? "working" : "idle";
 }
 
 function projectFreshness(
@@ -687,7 +686,7 @@ function projectFreshness(
     const pane = context.panes?.get(paneKey);
     if (pane !== undefined) {
       entries.push({ source: "pane-capture", status: "fresh", observedAt: nowIso, ageMs: 0 });
-    } else if (!facts.unreachable && derived.state !== "dead" && derived.state !== "done" && record.status === "running") {
+    } else if (!facts.unreachable && derived.state !== "dead" && derived.state !== "done" && isActiveSessionLifecycle(record)) {
       entries.push({ source: "pane-capture", status: "missing", caveat: "pane capture unavailable this pass" });
     }
   }

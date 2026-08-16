@@ -226,6 +226,10 @@ const server = createServer(async (request, response) => {
     const pending = permissions.find((item) => item.id === requestID);
     permissions = permissions.filter((item) => item.id !== requestID);
     if (pending) broadcast({ type: "permission.replied", properties: { sessionID: pending.sessionID, requestID, reply: body?.reply } });
+    if (process.env.FAKE_OPENCODE_DROP_ANSWER_REPLY === "1") {
+      response.socket?.destroy();
+      return;
+    }
     return sendJson(response, 200, true);
   }
   const questionReply = path.match(/^\/question\/([^/]+)\/reply$/);

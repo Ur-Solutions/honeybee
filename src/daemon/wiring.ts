@@ -128,8 +128,15 @@ export function buildDefaultDeps(options: BuildDefaultDepsOptions = {}): TickDep
   const dispatchBuzDrain = createBuzDrainDispatcher();
   const executionService = options.executionService ?? createProductionExecutionServiceProvider();
   const observerId = `hive-daemon:${process.pid}`;
-  const probeRuntime = async (record: SessionRecord) =>
-    (await probeHsrReAdoption(record, observerId)).evidence;
+  const probeRuntime = async (record: SessionRecord) => {
+    const result = await probeHsrReAdoption(record, observerId);
+    return {
+      evidence: result.evidence,
+      ...(result.classification === "dead"
+        ? { deadHsr: { meta: result.diskMeta, hostVerdict: result.hostVerdict } }
+        : {}),
+    };
+  };
   return {
     listSessions: isolatedListSessions,
     listNodes,

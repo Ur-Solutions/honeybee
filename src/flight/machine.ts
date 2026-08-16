@@ -36,6 +36,8 @@ export type SlotPlan = {
   slot: SlotRecord;
   changed: boolean;
   events: SlotPlanEvent[];
+  /** Exact teardown is unresolved, so the current bee still owns this lane. */
+  ownershipHeld: boolean;
   /** The slot is vacant and eligible — the controller spawns under backpressure. */
   wantsSpawn: boolean;
   /** The slot just hit its stall deadline — send the deterministic nudge. */
@@ -64,13 +66,15 @@ export function judgeSeal(slot: SlotRecord, seal: SlotSealObservation | null | u
   );
 }
 
-const DEAD_BEE_STATES: ReadonlySet<BeeState> = new Set(["dead", "crashed", "error", "kill_failed"]);
+const DEAD_BEE_STATES: ReadonlySet<BeeState> = new Set(["dead", "crashed", "error"]);
 
 export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotEvidence, nowMs: number): SlotPlan {
   const nowIso = new Date(nowMs).toISOString();
   const next: SlotRecord = { ...slot, evidence: { ...slot.evidence }, history: [...slot.history] };
   const events: SlotPlanEvent[] = [];
   let wantsNudge = false;
+  const ownershipHeld = slot.launchOwnership !== undefined ||
+    evidence.beeStatus === "kill_failed" || evidence.beeState === "kill_failed";
 
   const beeData = () => ({
     slot: slot.slotId,
@@ -114,9 +118,16 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
     slot: next,
     changed: JSON.stringify(next) !== JSON.stringify(slot),
     events,
-    wantsSpawn: next.state === "vacant" && flight.status === "active",
-    wantsNudge,
+    ownershipHeld,
+    wantsSpawn: !ownershipHeld && next.state === "vacant" && flight.status === "active",
+    wantsNudge: !ownershipHeld && wantsNudge,
   });
+
+  // A failed stop is ownership evidence, not death evidence. Until an exact
+  // retry proves the old runtime absent, the current attempt continues to own
+  // its lane: completion, stall clocks, nudges, vacancy, and replacement are
+  // all fenced. A later clean `dead` observation releases the lane normally.
+  if (ownershipHeld) return finish();
 
   // Terminal states and closed flights: nothing to drive.
   if (slot.state === "done" || slot.state === "abandoned" || slot.state === "drained" || flight.status === "closed") return finish();
@@ -229,7 +240,6 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
   // 2c) Liveness: a dead host/record is unambiguous structured evidence.
   const beeDead =
     evidence.beeStatus === "dead" ||
-    evidence.beeStatus === "kill_failed" ||
     evidence.beeStatus === "done" ||
     (evidence.beeState !== undefined && DEAD_BEE_STATES.has(evidence.beeState));
   if (beeDead) {
@@ -240,8 +250,7 @@ export function planSlot(flight: FlightRecord, slot: SlotRecord, evidence: SlotE
     // clean `dead` record counts even without firstEvidenceAt (CR-10b) —
     // the exit contract's boundary is the exit itself.
     const crashFlavored =
-      evidence.beeStatus === "kill_failed" ||
-      (evidence.beeState !== undefined && evidence.beeState !== "dead" && DEAD_BEE_STATES.has(evidence.beeState));
+      evidence.beeState !== undefined && evidence.beeState !== "dead" && DEAD_BEE_STATES.has(evidence.beeState);
     if (flight.contract.completion === "exit" && !crashFlavored && (next.evidence.firstEvidenceAt || evidence.beeStatus === "dead")) {
       transition("done", { completion: "exit" });
       next.history.push({ attempt: next.attempt, generation: next.generation, ...(next.taskId ? { taskId: next.taskId } : {}), ...(next.beeName ? { beeName: next.beeName } : {}), outcome: "done", at: nowIso });

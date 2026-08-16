@@ -8,20 +8,35 @@ import {
   syncAccountCredentialsToVault,
   type AccountRecord,
 } from "./accounts.js";
+import { mintCellBrokerCapability } from "./cellBrokerCapability.js";
 import { isWellFormedPaneId } from "./paneId.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, resolveAgent, shellCommand, splitShellWords } from "./agents.js";
 import { resumeArgsForAgent } from "./drivers.js";
 import { hsrCellPayloadFields, spawnHsrHost, waitForHsrHost, type HsrRunPayload } from "./hsr/runnerHost.js";
 import { captureProcessBirthFingerprint, type ProcessBirthFingerprint } from "./hsr/processIdentity.js";
+import { readHsrMetaStrict } from "./hsr/runDir.js";
+import { mintEphemeralCredential } from "./hsr/remoteCreds.js";
 import { stopHsrIncarnationByPid } from "./hsr/substrate.js";
-import { withSessionLifecycleTransaction } from "./lifecycle.js";
+import { withSessionLifecycleTransaction, type SessionLifecycleTransaction } from "./lifecycle.js";
 import { closeRequestsForNewIncarnation } from "./requests/store.js";
 import { appendLedger, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
-import { stopRuntimeStrict } from "./substrates/stop.js";
+import { stopRuntimeForReplacement } from "./substrates/stop.js";
 import type { NewSessionResult } from "./substrates/types.js";
 import { nextRuntimeIncarnationPatch } from "./seal.js";
+import { isArchivedSessionLifecycle, isRunnableSessionRecord } from "./stateMachine.js";
 import { copyThreadForFork } from "./threadCopy.js";
+import {
+  beginBeeReplacementOperation,
+  type BeeNameLaunchReservation,
+} from "./nameAdmission.js";
+import {
+  RemoteSpawnNotAdmittedError,
+  RemoteSpawnIndeterminateError,
+  type RemoteHsrSubstrate,
+  type RemoteSpawnResult,
+} from "./substrates/remote-hsr.js";
+import { cleanupLaunchedRemoteHsrIncarnation } from "./launchPublication.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // swap-account: the req-1 MECHANISM. Stop the bee's process, activate the
@@ -34,6 +49,12 @@ import { copyThreadForFork } from "./threadCopy.js";
 // ──────────────────────────────────────────────────────────────────────────
 
 export type SwapAccountOptions = {
+  /** Automatic callers may not resolve stop doubt or revive archived work. */
+  authorization?: "operator" | "automatic";
+  /** Account whose exhaustion authorized an automatic replacement. Rechecked
+   * under the lifecycle lock so a newer explicit swap cannot inherit a stale
+   * sampler decision. */
+  automaticTriggerAccountId?: string;
   substrate?: Substrate;
   sleep?: (ms: number) => Promise<void>;
   pollAttempts?: number;
@@ -52,6 +73,15 @@ export type SwapAccountOptions = {
   copyThread?: typeof copyThreadForFork;
   /** Fresh provider id factory (tests). Defaults to randomUUID. */
   newProviderSessionId?: () => string;
+  /** Strict local HSR birth reader (tests). */
+  readHsrMeta?: typeof readHsrMetaStrict;
+  /** Fault/crash injection after the launch locator is durably journaled. */
+  afterLaunch?: (
+    launch:
+      | { kind: "tmux"; result: NewSessionResult }
+      | { kind: "hsr"; hostPid: number }
+      | { kind: "remote-hsr"; result: RemoteSpawnResult },
+  ) => Promise<void>;
 };
 
 const DEFAULT_POLL_ATTEMPTS = 8;
@@ -91,6 +121,296 @@ async function relocateSessionTranscript(
   await mkdir(dirname(targetTranscript), { recursive: true });
   await copyFile(sourceTranscript, targetTranscript);
   return targetTranscript;
+}
+
+async function withSwapLaunchReservation(input: {
+  lifecycle: SessionLifecycleTransaction;
+  current: SessionRecord;
+  incarnation: Partial<SessionRecord>;
+  substrate: Substrate;
+  localHsr: boolean;
+  remoteHsr: boolean;
+  spec: ReturnType<typeof resolveAgent>;
+  tool: string;
+  model?: string;
+  account: AccountRecord;
+  targetHomePath: string;
+  launchProviderSessionId?: string;
+  relocatedTranscriptPath?: string;
+  remoteCredentials?: Awaited<ReturnType<typeof mintEphemeralCredential>>;
+  options: SwapAccountOptions;
+  reservation: BeeNameLaunchReservation;
+}): Promise<SessionRecord> {
+  const {
+    lifecycle,
+    current,
+    incarnation,
+    substrate,
+    localHsr,
+    remoteHsr,
+    spec,
+    tool,
+    model,
+    account,
+    targetHomePath,
+    launchProviderSessionId,
+    relocatedTranscriptPath,
+    remoteCredentials,
+    options,
+    reservation,
+  } = input;
+  let runnerPid: number | undefined;
+  let runnerFingerprint: ProcessBirthFingerprint | undefined;
+  let tmuxLaunch: NewSessionResult | undefined;
+  let remoteResult: RemoteSpawnResult | undefined;
+  const remoteLaunchId = remoteHsr ? randomUUID() : undefined;
+  const brokerCapability = localHsr && current.executionRunId
+    ? mintCellBrokerCapability(current.name, incarnation.runtimeGeneration as number)
+    : undefined;
+
+  const runtimePatch = (
+    remoteLocator?: { launchId: string; incarnation?: string; cwd?: string },
+  ): Partial<SessionRecord> => {
+    if (remoteHsr) {
+      const locator = remoteLocator ?? (remoteResult
+        ? { launchId: remoteResult.launchId, incarnation: remoteResult.incarnation, cwd: remoteResult.cwd }
+        : undefined);
+      return {
+        ...incarnation,
+        substrate: undefined,
+        runnerPid: undefined,
+        runnerFingerprint: undefined,
+        launcherPgid: undefined,
+        launcherFingerprint: undefined,
+        agentPaneId: undefined,
+        node: current.node,
+        ...(locator ? { remoteLaunchId: locator.launchId } : {}),
+        ...(locator?.incarnation ? { remoteIncarnation: locator.incarnation } : {}),
+        ...(locator?.cwd ? { cwd: locator.cwd } : {}),
+      };
+    }
+    if (localHsr) {
+      return {
+        ...incarnation,
+        substrate: "hsr",
+        runnerPid,
+        runnerFingerprint,
+        agentPaneId: undefined,
+        launcherPgid: undefined,
+        launcherFingerprint: undefined,
+        remoteLaunchId: undefined,
+        remoteIncarnation: undefined,
+        ...(brokerCapability ? { cellBrokerCapabilityHash: brokerCapability.hash } : {}),
+      };
+    }
+    return {
+      ...incarnation,
+      substrate: undefined,
+      runnerPid: undefined,
+      runnerFingerprint: undefined,
+      runnerTier: undefined,
+      remoteLaunchId: undefined,
+      remoteIncarnation: undefined,
+      ...(tmuxLaunch?.paneId ? { agentPaneId: tmuxLaunch.paneId } : {}),
+      ...(tmuxLaunch?.launcherPgid ? { launcherPgid: tmuxLaunch.launcherPgid } : {}),
+      ...(tmuxLaunch?.launcherFingerprint ? { launcherFingerprint: tmuxLaunch.launcherFingerprint } : {}),
+    };
+  };
+
+  const persistStopDoubt = async (
+    detail: string,
+    remoteLocator?: { launchId: string; incarnation?: string; cwd?: string },
+  ): Promise<void> => {
+    if (remoteHsr && remoteLocator) {
+      await reservation.retainRemoteStopDoubt({
+        node: current.node!,
+        remoteLaunchId: remoteLocator.launchId,
+        ...(remoteLocator.incarnation ? { remoteIncarnation: remoteLocator.incarnation } : {}),
+      }, detail).catch(() => undefined);
+    } else {
+      await reservation.retainStopDoubt(detail).catch(() => undefined);
+    }
+    await lifecycle.commit({
+      ...runtimePatch(remoteLocator),
+      status: "kill_failed",
+      lastError: `account swap launch cleanup unconfirmed: ${detail}`,
+      updatedAt: new Date().toISOString(),
+    }).catch(() => undefined);
+  };
+
+  const cleanup = async (cause: unknown): Promise<never> => {
+    if (remoteHsr) {
+      const incarnationToken = remoteResult?.incarnation
+        ?? (cause instanceof RemoteSpawnIndeterminateError ? cause.incarnation : undefined);
+      const locator = {
+        launchId: remoteLaunchId!,
+        ...(incarnationToken ? { incarnation: incarnationToken } : {}),
+        ...(remoteResult?.cwd ? { cwd: remoteResult.cwd } : {}),
+      };
+      const proof = await cleanupLaunchedRemoteHsrIncarnation(
+        substrate as RemoteHsrSubstrate,
+        current.name,
+        locator,
+      );
+      if (proof.stopped) await reservation.clearAfterConfirmedStop();
+      else await persistStopDoubt(proof.detail, locator);
+      const message = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(
+        `${message}; exact remote swap cleanup ${proof.stopped ? "confirmed" : `unconfirmed: ${proof.detail}`}`,
+        { cause },
+      );
+    }
+    if (runnerPid) {
+      await cleanupHsrSwapLaunch(
+        current.name,
+        runnerPid,
+        cause,
+        (detail) => persistStopDoubt(detail),
+      );
+      await reservation.clearAfterConfirmedStop();
+    } else if (tmuxLaunch) {
+      await cleanupTmuxSwapLaunch(
+        substrate,
+        current.tmuxTarget,
+        tmuxLaunch,
+        cause,
+        (detail) => persistStopDoubt(detail),
+      );
+      await reservation.clearAfterConfirmedStop();
+    }
+    throw cause;
+  };
+
+  try {
+    if (remoteHsr) {
+      try {
+        await reservation.markRemoteLaunchDispatch({ node: current.node!, remoteLaunchId: remoteLaunchId! });
+      } catch (error) {
+        await reservation.clearAfterConfirmedStop().catch(() => undefined);
+        throw error;
+      }
+      try {
+        remoteResult = await (substrate as RemoteHsrSubstrate).spawnRemote({
+          bee: current.name,
+          launchId: remoteLaunchId,
+          ...(current.remoteLaunchId ? { previousLaunchId: current.remoteLaunchId } : {}),
+          kind: spec.kind,
+          cwd: current.cwd,
+          comb: current.combId ?? current.name,
+          ...(current.parentId ? { parent: current.parentId } : {}),
+          sessionId: launchProviderSessionId,
+          resume: true,
+          authKind: "subscription",
+          ...(model ? { model } : {}),
+          creds: {
+            ...(remoteCredentials?.files.length ? { files: remoteCredentials.files } : {}),
+            ...(remoteCredentials?.env ? { env: remoteCredentials.env } : {}),
+          },
+          spec: { command: spec.command, args: spec.args, env: spec.env },
+        });
+        await reservation.recordRemoteLaunch({
+          node: current.node!,
+          remoteLaunchId: remoteLaunchId!,
+          remoteIncarnation: remoteResult.incarnation,
+        });
+        await options.afterLaunch?.({ kind: "remote-hsr", result: remoteResult });
+      } catch (error) {
+        if (error instanceof RemoteSpawnNotAdmittedError) {
+          await reservation.clearAfterConfirmedStop();
+          throw error;
+        }
+        return cleanup(error);
+      }
+    } else {
+      try {
+        await reservation.markLaunchDispatch();
+      } catch (error) {
+        await reservation.clearAfterConfirmedStop().catch(() => undefined);
+        throw error;
+      }
+      if (localHsr) {
+        try {
+          runnerPid = await (options.spawnHsrHost ?? spawnHsrHost)({
+            bee: current.name,
+            comb: current.combId ?? current.name,
+            ...(current.parentId ? { parent: current.parentId } : {}),
+            kind: tool,
+            cwd: current.cwd,
+            sessionId: launchProviderSessionId!,
+            resume: true,
+            authKind: "subscription",
+            accountId: account.id,
+            ...(model ? { model } : {}),
+            ...hsrCellPayloadFields(current),
+            ...(brokerCapability ? { cellBrokerCapability: brokerCapability.token } : {}),
+            spec: { command: spec.command, args: spec.args, env: spec.env },
+          });
+          await reservation.recordHsrLaunch({ hostPid: runnerPid, childAdmission: "pending" });
+          const meta = await (options.readHsrMeta ?? readHsrMetaStrict)(current.name);
+          runnerFingerprint = meta?.hostPid === runnerPid ? meta.hostFingerprint : undefined;
+          if (!runnerFingerprint || (meta?.childAdmission !== "admitted" && meta?.childAdmission !== "none")) {
+            throw new Error("account swap HSR launch returned without complete process birth admission");
+          }
+          await reservation.recordHsrLaunch({
+            hostPid: runnerPid,
+            hostFingerprint: runnerFingerprint,
+            childAdmission: meta.childAdmission,
+          });
+          if (!(await (options.waitForHsrHost ?? waitForHsrHost)(current.name, 5_000))) {
+            console.error(`hsr host for ${current.name} did not report live within 5s; the daemon will reconcile`);
+          }
+          await options.afterLaunch?.({ kind: "hsr", hostPid: runnerPid });
+        } catch (error) {
+          return cleanup(error);
+        }
+      } else {
+        try {
+          tmuxLaunch = await substrate.newSession(current.tmuxTarget, current.cwd, {
+            command: spec.command,
+            args: spec.args,
+            env: spec.env,
+            tmuxOptions: spec.tmuxOptions,
+          });
+          await reservation.recordTmuxLaunch({
+            substrate: substrate.kind === "ssh-tmux" ? "ssh-tmux" : "local-tmux",
+            target: current.tmuxTarget,
+            ...(substrate.kind === "ssh-tmux" ? { node: substrate.node } : {}),
+            launch: tmuxLaunch,
+          });
+          if (!isWellFormedPaneId(tmuxLaunch.paneId)) {
+            throw new Error(`account swap returned malformed tmux pane id: ${tmuxLaunch.paneId}`);
+          }
+          await options.afterLaunch?.({ kind: "tmux", result: tmuxLaunch });
+        } catch (error) {
+          return cleanup(error);
+        }
+      }
+    }
+
+    let published: SessionRecord;
+    try {
+      published = await lifecycle.commit({
+        ...runtimePatch(),
+        accountId: account.id,
+        homePath: targetHomePath,
+        providerSessionId: launchProviderSessionId,
+        ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
+        command: shellCommand(spec),
+        ...(remoteCredentials?.expiresAt ? { remoteTokenExpiresAt: remoteCredentials.expiresAt } : {}),
+        ...(remoteResult?.tier ? { runnerTier: remoteResult.tier } : {}),
+        status: "running",
+        lastError: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      return cleanup(error);
+    }
+    if (remoteHsr) await reservation.promoteExternallyPublished(published);
+    else await reservation.promotePublished(published);
+    return published;
+  } catch (error) {
+    throw error;
+  }
 }
 
 export async function swapAccount(
@@ -137,6 +457,21 @@ export async function swapAccount(
     //    kill/clean may have deleted the record, and proceeding would respawn
     //    the session and resurrect the deleted bee.
     const current = await lifecycle.refresh();
+    if (isArchivedSessionLifecycle(current)) {
+      throw new Error(`Bee ${current.name} is archived; revive it explicitly before swapping accounts`);
+    }
+    if (options.authorization === "automatic") {
+      if (!isRunnableSessionRecord(current)) {
+        throw new Error(`Bee ${current.name} has unresolved stop state; automatic account swap is fenced`);
+      }
+      if (current.autoswap !== true) {
+        throw new Error(`Bee ${current.name} no longer permits automatic account swap`);
+      }
+      const expectedAccountId = options.automaticTriggerAccountId ?? record.accountId;
+      if (current.accountId !== expectedAccountId) {
+        throw new Error(`Bee ${current.name} changed account before automatic swap admission`);
+      }
+    }
     if (!current.homePath) {
       throw new Error(`Session ${record.name} lost its dedicated home; aborting swap`);
     }
@@ -153,16 +488,26 @@ export async function swapAccount(
       throw new Error(`Bee ${current.name} has no recorded provider session id; refusing to switch Claude accounts without thread continuity`);
     }
 
+    // Fence all direct/queued work before the predecessor receives a stop
+    // signal. The same attempt is carried through the successor publication.
+    const replacement = await beginBeeReplacementOperation(lifecycle, "swap-account");
+
     // 1. Ensure both the exact persisted launcher group and tmux target are
     //    positively absent before credentials are activated or a replacement
     //    runtime is launched.
-    await stopRuntimeStrict(substrate, current.tmuxTarget, {
-      launcherPgid: current.launcherPgid,
-      launcherFingerprint: current.launcherFingerprint,
+    await stopRuntimeForReplacement(current, substrate, current.tmuxTarget, {
       pollAttempts,
       pollIntervalMs,
       sleep,
       context: `Could not stop ${record.name} before swap`,
+      onStopUnconfirmed: async (message) => {
+        await replacement.noteFailure(`account swap stop unconfirmed: ${message}`).catch(() => undefined);
+        await lifecycle.commit({
+          status: "kill_failed",
+          lastError: `account swap stop unconfirmed: ${message}`,
+          updatedAt: new Date().toISOString(),
+        });
+      },
     });
 
     // Resume ids are backed by home-local transcript files for Claude/Codex.
@@ -202,14 +547,8 @@ export async function swapAccount(
         trustExtraHome: true,
       }).catch(() => undefined);
     }
-    let spec: ReturnType<typeof resolveAgent>;
-    let paneId: string | undefined;
-    let launcherPgid: number | undefined;
-    let launcherFingerprint: ProcessBirthFingerprint | undefined;
-    let runnerPid: number | undefined;
-    let runnerFingerprint: ProcessBirthFingerprint | undefined;
-    let tmuxLaunch: NewSessionResult | undefined;
     const incarnation = await nextRuntimeIncarnationPatch(current);
+    let updated: SessionRecord;
     try {
       await activate(account, targetHomePath);
 
@@ -225,13 +564,15 @@ export async function swapAccount(
       //    (that verb intentionally throws for pane-less HSR bees). The HSR
       //    adapter owns the provider-specific resume protocol, so do not append
       //    interactive CLI resume args to its base spec.
-      const hsr = current.substrate === "hsr";
-      if (hsr && !launchProviderSessionId) {
+      const localHsr = current.substrate === "hsr";
+      const remoteHsr = substrate.kind === "remote-hsr";
+      const headless = localHsr || remoteHsr;
+      if (headless && !launchProviderSessionId) {
         throw new Error(`Bee ${current.name} has no recorded provider session id; refusing to switch accounts without session continuity`);
       }
       const model = current.model ?? account.model;
       const modelExtra = current.modelExtraArgs ? splitShellWords(current.modelExtraArgs) : [];
-      spec = resolveAgent(current.requestedAgent ?? current.agent, [...modelExtra, ...(hsr ? [] : resumeArgs(tool, launchProviderSessionId))], {
+      const spec = resolveAgent(current.requestedAgent ?? current.agent, [...modelExtra, ...(headless ? [] : resumeArgs(tool, launchProviderSessionId))], {
         home: targetHomePath,
         yolo: sniffYolo(current.command),
         identity: true,
@@ -239,97 +580,35 @@ export async function swapAccount(
         ...(account.provider ? { provider: account.provider } : {}),
       });
       if (!current.node) await assertAgentAuthFreshForSpawn(spec, account.id);
-
-      if (hsr) {
-        await lifecycle.refresh();
-        runnerPid = await (options.spawnHsrHost ?? spawnHsrHost)({
-          bee: current.name,
-          comb: current.combId ?? current.name,
-          ...(current.parentId ? { parent: current.parentId } : {}),
-          kind: tool,
-          cwd: current.cwd,
-          sessionId: launchProviderSessionId!,
-          resume: true,
-          authKind: "subscription",
-          accountId: account.id,
-          ...(model ? { model } : {}),
-          // A swapped execution Cell keeps its OS write boundary + grants.
-          ...hsrCellPayloadFields(current),
-          spec: { command: spec.command, args: spec.args, env: spec.env },
-        });
-        runnerFingerprint = await captureProcessBirthFingerprint(runnerPid);
-        if (!(await (options.waitForHsrHost ?? waitForHsrHost)(current.name, 5_000))) {
-          console.error(`hsr host for ${current.name} did not report live within 5s; the daemon will reconcile`);
-        }
-      } else {
-        // The swap re-creates the session, so the agent runs in a fresh pane —
-        // re-pin to it (the old agentPaneId is now dead).
-        await lifecycle.refresh();
-        const launch = await substrate.newSession(current.tmuxTarget, current.cwd, {
-          command: spec.command,
-          args: spec.args,
-          env: spec.env,
-          tmuxOptions: spec.tmuxOptions,
-        });
-        paneId = launch.paneId;
-        launcherPgid = launch.launcherPgid;
-        launcherFingerprint = launch.launcherFingerprint;
-        tmuxLaunch = launch;
-      }
+      const remoteCredentials = remoteHsr ? await mintEphemeralCredential(account, tool) : undefined;
+      updated = await withSwapLaunchReservation({
+        lifecycle,
+        current,
+        incarnation,
+        substrate,
+        localHsr,
+        remoteHsr,
+        spec,
+        tool,
+        model,
+        account,
+        targetHomePath,
+        launchProviderSessionId: launchProviderSessionId!,
+        relocatedTranscriptPath,
+        remoteCredentials,
+        options,
+        reservation: replacement,
+      });
     } catch (error) {
-      // A wait/probe can fail after spawn returned. Roll back that exact host
-      // before restoring credentials; never leave a pre-commit HSR runtime
-      // alive and untracked.
-      let failure: unknown = error;
-      if (runnerPid) {
-        try {
-          await cleanupHsrSwapLaunch(current.name, runnerPid, error);
-        } catch (cleanupError) {
-          failure = cleanupError;
-        }
-      }
-      // Activation happens before relaunch. A normal swap uses a distinct
-      // target home, so the source was never overwritten and needs no rollback.
-      // Retain the old restoration only for a deliberately custom layout where
-      // both accounts resolve to the same home.
       if (currentAccount && resolve(sourceHomePath) === resolve(targetHomePath)) {
         try {
           await activate(currentAccount, sourceHomePath);
         } catch (rollbackError) {
-          const original = failure instanceof Error ? failure.message : String(failure);
+          const original = error instanceof Error ? error.message : String(error);
           const rollback = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
           throw new Error(`${original}; restoring account ${currentAccount.id} also failed: ${rollback}`);
         }
       }
-      throw failure;
-    }
-
-    // 4. Persist the new binding through a generation CAS. If an old binary or
-    // other non-participating writer changed lifecycle truth despite the
-    // lifecycle lock, tear down only the exact incarnation launched above.
-    let updated: SessionRecord;
-    try {
-      updated = await lifecycle.commit({
-        ...incarnation,
-        accountId: account.id,
-        homePath: targetHomePath,
-        providerSessionId: launchProviderSessionId,
-        ...(relocatedTranscriptPath ? { transcriptPath: relocatedTranscriptPath } : {}),
-        command: shellCommand(spec),
-        // Re-pin only to an exact #{pane_id}; a mis-shaped launch token must
-        // not replace the binding (review §1.1). The stale pre-swap pane id is
-        // covered by deriveState's session-liveness fallback.
-        ...(paneId && isWellFormedPaneId(paneId) ? { agentPaneId: paneId } : {}),
-        ...(launcherPgid ? { launcherPgid } : {}),
-        ...(launcherFingerprint ? { launcherFingerprint } : {}),
-        ...(runnerPid ? { runnerPid } : {}),
-        ...(runnerFingerprint ? { runnerFingerprint } : {}),
-        status: "running",
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (error) {
-      if (runnerPid) await cleanupHsrSwapLaunch(current.name, runnerPid, error);
-      else if (tmuxLaunch) await cleanupTmuxSwapLaunch(substrate, current.tmuxTarget, tmuxLaunch, error);
       throw error;
     }
     // The swap replaced the runtime: requests opened against the previous
@@ -354,11 +633,18 @@ export async function swapAccount(
   });
 }
 
-async function cleanupHsrSwapLaunch(bee: string, hostPid: number, cause: unknown): Promise<void> {
+async function cleanupHsrSwapLaunch(
+  bee: string,
+  hostPid: number,
+  cause: unknown,
+  onStopUnconfirmed?: (detail: string) => Promise<void>,
+): Promise<void> {
   const stopped = await stopHsrIncarnationByPid(bee, hostPid);
   if (stopped.ok) return;
   const original = cause instanceof Error ? cause.message : String(cause);
-  throw new Error(`${original}; exact launched HSR swap cleanup failed: ${stopped.stderr || stopped.stdout}`);
+  const detail = stopped.stderr || stopped.stdout || `exit ${stopped.exitCode}`;
+  await onStopUnconfirmed?.(detail);
+  throw new Error(`${original}; exact launched HSR swap cleanup failed: ${detail}`);
 }
 
 async function cleanupTmuxSwapLaunch(
@@ -366,15 +652,20 @@ async function cleanupTmuxSwapLaunch(
   target: string,
   launch: NewSessionResult,
   cause: unknown,
+  onStopUnconfirmed?: (detail: string) => Promise<void>,
 ): Promise<void> {
   if (!substrate.killIncarnation) {
     const original = cause instanceof Error ? cause.message : String(cause);
-    throw new Error(`${original}; substrate ${substrate.kind} cannot clean exact launched swap pane ${launch.paneId}`);
+    const detail = `substrate ${substrate.kind} cannot clean exact launched swap pane ${launch.paneId}`;
+    await onStopUnconfirmed?.(detail);
+    throw new Error(`${original}; ${detail}`);
   }
   const stopped = await substrate.killIncarnation(target, launch);
   if (stopped.ok) return;
   const original = cause instanceof Error ? cause.message : String(cause);
-  throw new Error(`${original}; exact launched tmux swap cleanup failed: ${stopped.stderr || stopped.stdout || launch.paneId}`);
+  const detail = stopped.stderr || stopped.stdout || launch.paneId;
+  await onStopUnconfirmed?.(detail);
+  throw new Error(`${original}; exact launched tmux swap cleanup failed: ${detail}`);
 }
 
 /**

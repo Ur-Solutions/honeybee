@@ -9,7 +9,8 @@ export type MessageUndeliverableReason =
   | "missing-provider-session"
   | "wake-retry-exhausted"
   | "queued-message-missing"
-  | "archive-unresolved";
+  | "archive-unresolved"
+  | "delivery-ambiguous";
 
 function undeliverableQuestion(record: SessionRecord, reason: MessageUndeliverableReason): string {
   switch (reason) {
@@ -21,6 +22,8 @@ function undeliverableQuestion(record: SessionRecord, reason: MessageUndeliverab
       return "The accepted message can no longer be found in the delivery queue. Inspect buz history before retrying it.";
     case "archive-unresolved":
       return "Message is queued, but the bee's archive request is unresolved and its runtime is no longer live. Resolve the stop state before retrying delivery.";
+    case "delivery-ambiguous":
+      return "Message crossed provider dispatch on a prior host, but acceptance or completion cannot be proven. Reconcile the provider conversation before choosing whether to redrive or file this message.";
     case "wake-retry-exhausted":
       return "Message is queued, but automatic runtime recovery failed repeatedly. Inspect daemon recovery logs, repair the runtime, then retry delivery.";
   }

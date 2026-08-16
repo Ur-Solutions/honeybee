@@ -388,6 +388,176 @@ test("run.start validation matrix fails closed before any reservation", async ()
         code: "LEASE_DENIED",
       },
       {
+        label: "signed resource limits without resource enforcement",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-resource",
+          mutateLease: (lease) => {
+            lease.resourceLimits = {
+              maxCpuCores: 2,
+              maxMemoryMb: 4096,
+              maxDiskMb: 8192,
+              maxProcesses: 64,
+            };
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "signed network allowlist without network enforcement",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-network",
+          mutateLease: (lease) => {
+            lease.networkPolicy = { mode: "allowlist", allow: ["api.example.test"] };
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "signed deny-external policy without network enforcement",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-network-deny",
+          mutateLease: (lease) => {
+            lease.networkPolicy = { mode: "deny-external" };
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "allow entries cannot decorate inherit-node policy",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-inherit-allow",
+          mutateLease: (lease) => {
+            lease.networkPolicy = { mode: "inherit-node", allow: ["api.example.test"] };
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "leased branch push mutation is unsupported",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-push",
+          mutateIntent: (intent) => {
+            (intent.mutationAuthority as JsonObject[]).push({ kind: "branch-push" });
+          },
+          mutateLease: (lease) => {
+            (lease.mutationAuthority as JsonObject[]).push({ kind: "branch-push" });
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "empty mutation authority cannot launch a writable Cell",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-readonly",
+          mutateIntent: (intent) => { intent.mutationAuthority = []; },
+          mutateLease: (lease) => { lease.mutationAuthority = []; },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "refined working-copy mutation grant is unsupported",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-mutation-refinement",
+          mutateIntent: (intent) => {
+            intent.mutationAuthority = [{ kind: "working-copy-write", resource: "checkout", actions: ["patch"] }];
+          },
+          mutateLease: (lease) => {
+            lease.mutationAuthority = [{ kind: "working-copy-write", resource: "checkout", actions: ["patch"] }];
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "materialization credential lease without negotiated broker",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-materialization-credential",
+          mutateLease: (lease) => {
+            lease.materializationCredentialLeaseIds = ["cred-materialize-1"];
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "runtime credential lease without negotiated broker",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-runtime-credential",
+          mutateLease: (lease) => {
+            lease.runtimeCredentialLeaseIds = ["cred-runtime-1"];
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "runtime GitHub credential lease bound to another Run",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-wrong-gh-lease",
+          mutateLease: (lease) => {
+            lease.runtimeCredentialLeaseIds = ["local-gh-session-v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"];
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "harness version requirement is not silently ignored",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-harness-version",
+          mutateIntent: (intent) => { (intent.harness as JsonObject).versionRange = ">=2.0.0"; },
+          mutateLease: (lease) => { (lease.allowedHarness as JsonObject).versionRange = ">=2.0.0"; },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "unsupported harness reasoning is not silently clamped",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-harness-reasoning",
+          mutateIntent: (intent) => {
+            ((intent.harness as JsonObject).config as JsonObject).reasoning = "warp-speed";
+          },
+          mutateLease: (lease) => {
+            ((lease.allowedHarness as JsonObject).config as JsonObject).reasoning = "warp-speed";
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "non-object harness config is not silently ignored",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-harness-config-shape",
+          mutateIntent: (intent) => { (intent.harness as JsonObject).config = "opaque-config"; },
+          mutateLease: (lease) => { (lease.allowedHarness as JsonObject).config = "opaque-config"; },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "signed run budgets are refused when unenforced",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-budget",
+          mutateIntent: (intent) => {
+            intent.budget = { maxDurationSeconds: 3600, maxTokens: 2_000_000, maxCostUsd: 25 };
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
+        label: "uncollectable signed evidence is refused before work",
+        envelope: buildRunStartEnvelope(ctx, {
+          runId: "run-policy-evidence",
+          mutateIntent: (intent) => {
+            intent.evidenceContract = {
+              collect: ["commands", "tests", "diff", "media"],
+              delivery: "local-manifest",
+            };
+          },
+          mutateLease: (lease) => {
+            lease.evidenceContract = {
+              collect: ["commands", "tests", "diff", "media"],
+              delivery: "local-manifest",
+            };
+          },
+        }),
+        code: "CAPABILITY_MISMATCH",
+      },
+      {
         label: "unadvertised harness driver",
         envelope: buildRunStartEnvelope(ctx, {
           runId: "run-v12",

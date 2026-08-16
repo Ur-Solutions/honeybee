@@ -20,6 +20,7 @@ import {
 } from "../accounts/credentialHarvestQueue.js";
 import type { SyncAccountCredentialsOptions } from "../accounts/credentialSync.js";
 import { candidateHomes, dedicatedHomesFor } from "../accounts/homes.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
 import { isActiveSessionRecord, listSessions, type SessionRecord } from "../store.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
 
@@ -109,6 +110,7 @@ function evidenceTime(record: SessionRecord): number {
 function evidenceIsCurrent(record: SessionRecord): boolean {
   // done/dead records describe closed runtimes. kill_failed is intentionally
   // current: the runtime may still be alive and rotating the home credential.
+  if (record.stateMachine !== undefined) return !isArchivedSessionLifecycle(record);
   return record.status !== "done" && record.status !== "dead";
 }
 

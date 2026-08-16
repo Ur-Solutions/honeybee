@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { chmod, copyFile, mkdir, readFile, rm, writeFile, mkdtemp } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, readdir, rm, writeFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -62,7 +62,10 @@ function hive(
   args: string[],
   envOverrides: Record<string, string> = {},
 ): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
+  const cliArgs = process.env.HIVE_TEST_BUILT_CLI === "1"
+    ? ["tests/cli-entry.mjs", ...args]
+    : ["--import", "tsx", "tests/cli-entry.mjs", ...args];
+  return execFileAsync(process.execPath, cliArgs, {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -103,6 +106,10 @@ async function seedStoppedHsrRuntime(store: string, bee: string): Promise<void> 
       hostPid: deadPid,
       hostFingerprint: { pgid: deadPid, startedAt: "Fri Aug  7 00:00:00 2026" },
       childAdmission: "none",
+      startupFailure: {
+        stage: "adapter-start",
+        message: "fixture provider was durably never started",
+      },
       startedAt: "2026-08-07T00:00:00.000Z",
       controlSocket: hsrControlSocketPath(bee),
       status: "exited",
@@ -194,6 +201,25 @@ test("set-model validates its inputs before touching anything", async () => {
   });
 });
 
+test("set-model refuses remote HSR before any stop fence or launch", async () => {
+  await withRig(async ({ store, socket }) => {
+    const bee = "CO.remote-model";
+    await seedBee(store, bee, {
+      status: "running",
+      node: "remote-one",
+      remoteLaunchId: "launch-old",
+      remoteIncarnation: "inc-old",
+      providerSessionId: "thread-old",
+    });
+    await assert.rejects(
+      hive(store, socket, ["set-model", bee, "gpt-5.5"]),
+      /remote node remote-one; set-model only supports local bees/,
+    );
+    assert.equal((await readBee(store, bee)).status, "running");
+    assert.equal((await readdir(join(store, "launch-reservations")).catch(() => [])).length, 0);
+  });
+});
+
 test("set-model refuses a live bee with no resumable session id unless --fresh", { skip: !tmuxAvailable() }, async () => {
   await withRig(async ({ store, socket }) => {
     const bee = "CO.live-no-session";
@@ -239,10 +265,20 @@ test("set-model refuses relaunch when pane teardown cannot prove the old process
 
     await assert.rejects(
       hive(store, socket, ["set-model", bee, "gpt-5.5"]),
-      /exact cleanup unconfirmed.*missing or mismatched birth fingerprint/,
+      /exact cleanup unconfirmed.*missing .*birth fingerprint/,
     );
 
-    assert.equal((await readBee(store, bee)).model, undefined, "selection stays aligned with the old runtime");
+    const fenced = await readBee(store, bee);
+    assert.equal(fenced.model, undefined, "selection stays aligned with the old runtime");
+    assert.equal(fenced.status, "kill_failed", "work is fenced before teardown starts");
+    const journalFiles = await readdir(join(store, "launch-reservations"));
+    assert.equal(journalFiles.length, 1);
+    const journal = JSON.parse(await readFile(join(store, "launch-reservations", journalFiles[0]!), "utf8")) as {
+      operation?: string;
+      phase?: string;
+    };
+    assert.equal(journal.operation, "set-model");
+    assert.equal(journal.phase, "stopping");
     assert.equal(await hasSession(target), false, "tmux removed the pane, but that alone did not authorize relaunch");
   });
 });

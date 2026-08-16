@@ -27,7 +27,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import { CodexBootProbeError, type CodexBootFailureCause } from "../../codexBoot.js";
-import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerInterruptResult, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "../types.js";
+import type { RunnerAdapter, RunnerEvent, RunnerInputAnswer, RunnerInputQuestion, RunnerInterruptResult, RunnerOpts, RunnerPreparedAnswer, RunnerSendOpts, RunnerSession, RunnerTier } from "../types.js";
 import { harnessAllowance } from "../harness.js";
 import { attachSessionPlumbing, spawnSessionChild, stopChildGroup } from "../sessionBase.js";
 import {
@@ -605,6 +605,8 @@ async function createLiveCodexHandshakeAttempt(params: {
   const child = await spawnSessionChild(params.command, params.args, {
     cwd: params.opts.cwd,
     env: params.env,
+    onChildSpawnPending: params.opts.onChildSpawnPending,
+    onChildSpawnFailure: params.opts.onChildSpawnFailure,
     onChildSpawn: params.opts.onChildSpawn,
   });
   forwardCodexStderr(child);
@@ -700,6 +702,8 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
   // in-flight requests reject before the exit event lands.
   const { events, ingestEvent, snapshot, hasExited, stop } = attachSessionPlumbing(bee, child, {
     onChildExit: () => peer.dispose(new Error("codex app-server exited")),
+    eventHost: opts.eventHost,
+    onEventPersistenceFailure: opts.onEventPersistenceFailure,
   });
 
   // Track whether the root turn is actually live. Retaining the last completed
@@ -731,6 +735,7 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     pid: child.pid as number,
     send,
     interrupt,
+    prepareAnswer,
     answer,
     events,
     snapshot,
@@ -806,13 +811,24 @@ export async function startCodexRunner(opts: RunnerOpts): Promise<RunnerSession>
     await startTurn(text, sendOpts?.mode === "next-tool");
   }
 
-  async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {
+  async function prepareAnswer(requestId: string, answerValue: RunnerInputAnswer): Promise<RunnerPreparedAnswer> {
     const pending = requestMethods.get(requestId);
     if (!pending) throw new Error(`hsr codex: no pending input for requestId ${requestId}`);
-    requestMethods.delete(requestId);
+    if (!peer.canRespond()) throw new Error("hsr codex: app-server stdin is not writable");
     const answerText = typeof answerValue === "string" ? answerValue : JSON.stringify(answerValue);
     const id: string | number = /^\d+$/.test(requestId) ? Number(requestId) : requestId;
-    peer.respond(id, encodeCodexApprovalResponse(pending.method, isApproval(answerText), answerText, pending.params));
+    const response = encodeCodexApprovalResponse(pending.method, isApproval(answerText), answerText, pending.params);
+    return {
+      async dispatch(): Promise<void> {
+        await peer.respond(id, response);
+        if (requestMethods.get(requestId) === pending) requestMethods.delete(requestId);
+      },
+    };
+  }
+
+  async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {
+    const prepared = await prepareAnswer(requestId, answerValue);
+    await prepared.dispatch();
   }
 
   async function interrupt(): Promise<RunnerInterruptResult> {

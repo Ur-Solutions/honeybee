@@ -37,8 +37,10 @@ function makeExecHook(opts: {
   remoteHasBundle?: boolean;
   remoteBundleHash?: string;
   handshakeVersion: string; // what `node <bundle> --version` prints
+  liveServe?: "absent" | "current" | "stale-upgradeable" | "stale-active" | "legacy";
   trace: Recorded[];
 }): SshExecHook {
+  let socketUp = opts.liveServe !== undefined && opts.liveServe !== "absent";
   return async (argv, input) => {
     const command = argv[argv.length - 1] ?? "";
     opts.trace.push({ command, ...(input !== undefined ? { input } : {}) });
@@ -57,6 +59,29 @@ function makeExecHook(opts: {
     }
     if (command.endsWith("--version") && command.includes(".mjs")) {
       return { stdout: `${opts.handshakeVersion}\n`, stderr: "", exitCode: 0 };
+    }
+    if (command.startsWith("test -S")) {
+      return { stdout: "", stderr: "", exitCode: socketUp ? 0 : 1 };
+    }
+    if (command.includes(" upgrade --socket ")) {
+      if (opts.liveServe === "current") return { stdout: "already-current\n", stderr: "", exitCode: 0 };
+      if (opts.liveServe === "stale-upgradeable") {
+        socketUp = false;
+        return { stdout: "upgraded\n", stderr: "", exitCode: 0 };
+      }
+      if (opts.liveServe === "stale-active") {
+        return { stdout: "", stderr: "upgrade refused while remote HSR work is active: busy-bee", exitCode: 1 };
+      }
+      return { stdout: "", stderr: "Method not found: prepareUpgrade", exitCode: 1 };
+    }
+    if (command.startsWith("setsid node")) {
+      socketUp = true;
+      return { stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (command.includes(" probe --socket ")) {
+      return socketUp
+        ? { stdout: `${opts.handshakeVersion}\n`, stderr: "", exitCode: 0 }
+        : { stdout: "", stderr: "no live socket", exitCode: 1 };
     }
     return { stdout: "", stderr: `unexpected command: ${command}`, exitCode: 1 };
   };
@@ -106,16 +131,23 @@ test("bootstrap: registers remote-hsr node and runs node-check → mkdir → cop
     assert.equal(loaded.runnerHostVersion, version);
     assert.deepEqual(loaded.capabilities, ["claude"]);
 
-    // Command sequence: node --version → mkdir → hash-check → copy → handshake.
+    // Command sequence includes exact live-authority start and digest probe
+    // before the NodeRecord is published.
     const kinds = trace.map((t) => {
       if (t.command === "node --version") return "node-check";
       if (t.command.startsWith("mkdir")) return "mkdir";
       if (t.command.startsWith("[ -f")) return "hash";
       if (t.command.startsWith("cat >")) return "copy";
       if (t.command.endsWith("--version")) return "handshake";
+      if (t.command.startsWith("test -S")) return "socket";
+      if (t.command.startsWith("setsid node")) return "serve";
+      if (t.command.includes(" probe --socket ")) return "live-handshake";
       return "other";
     });
-    assert.deepEqual(kinds, ["node-check", "mkdir", "hash", "copy", "handshake"]);
+    assert.deepEqual(kinds, [
+      "node-check", "mkdir", "hash", "copy", "handshake",
+      "socket", "socket", "serve", "socket", "live-handshake",
+    ]);
     // The copy carried the bundle bytes on stdin.
     const copy = trace.find((t) => t.command.startsWith("cat >"))!;
     assertAtomicCopyCommand(copy.command, version, sha256Hex(content));
@@ -131,7 +163,7 @@ test("bootstrap: idempotent re-run skips re-copy when the remote already has the
     const result = await bootstrapRunnerHost(
       { name: "loopunit2", endpoint: "me@localhost" },
       {
-        execHook: makeExecHook({ handshakeVersion: `runner-host ${version}`, remoteHasBundle: true, remoteBundleHash: sha256Hex(content), trace }),
+        execHook: makeExecHook({ handshakeVersion: `runner-host ${version}`, remoteHasBundle: true, remoteBundleHash: sha256Hex(content), liveServe: "current", trace }),
         ensureBundle,
         readBundle,
       },
@@ -140,6 +172,8 @@ test("bootstrap: idempotent re-run skips re-copy when the remote already has the
     assert.ok(!trace.some((t) => t.command.startsWith("cat >")), "no copy command should be issued");
     // Still handshakes.
     assert.ok(trace.some((t) => t.command.endsWith("--version") && t.command.includes(".mjs")));
+    assert.ok(trace.some((t) => t.command.includes(" upgrade --socket ")), "current serve is still digest-probed by the deployed client");
+    assert.ok(!trace.some((t) => t.command.startsWith("setsid node")), "current exact serve is not restarted");
   });
 });
 
@@ -166,6 +200,78 @@ test("bootstrap: re-deploys atomically when an existing remote bundle hash diffe
     const copy = trace.find((t) => t.command.startsWith("cat >"));
     assert.ok(copy, "copy command should be issued for a corrupt existing file");
     assertAtomicCopyCommand(copy.command, version, sha256Hex(content));
+  });
+});
+
+test("bootstrap: a quiescent same-protocol stale serve hands off and restarts at the exact new digest", async () => {
+  await withTempStore(async () => {
+    const version = "0.0.1+sha256.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const trace: Recorded[] = [];
+    const { ensureBundle, readBundle } = fakeBundle(version);
+    const result = await bootstrapRunnerHost(
+      { name: "upgrade-quiescent", endpoint: "me@localhost" },
+      {
+        execHook: makeExecHook({
+          handshakeVersion: `runner-host ${version}`,
+          liveServe: "stale-upgradeable",
+          trace,
+        }),
+        ensureBundle,
+        readBundle,
+      },
+    );
+    assert.equal(result.node.runnerHostVersion, version);
+    const upgradeIndex = trace.findIndex((item) => item.command.includes(" upgrade --socket "));
+    const startIndex = trace.findIndex((item) => item.command.startsWith("setsid node"));
+    const proofIndex = trace.findIndex((item) => item.command.includes(" probe --socket "));
+    assert.ok(upgradeIndex >= 0 && startIndex > upgradeIndex && proofIndex > startIndex);
+    assert.ok(trace[upgradeIndex]!.command.endsWith(`--target-version ${version}`));
+  });
+});
+
+test("bootstrap: stale serve with active work refuses without starting or publishing a new NodeRecord", async () => {
+  await withTempStore(async () => {
+    const version = "0.0.1+sha256.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const trace: Recorded[] = [];
+    const { ensureBundle, readBundle } = fakeBundle(version);
+    await assert.rejects(
+      bootstrapRunnerHost(
+        { name: "upgrade-busy", endpoint: "me@localhost" },
+        {
+          execHook: makeExecHook({
+            handshakeVersion: `runner-host ${version}`,
+            liveServe: "stale-active",
+            trace,
+          }),
+          ensureBundle,
+          readBundle,
+        },
+      ),
+      /live authority upgrade refused.*active.*busy-bee/s,
+    );
+    assert.equal(trace.some((item) => item.command.startsWith("setsid node")), false);
+    assert.equal(await loadNode("upgrade-busy"), null);
+  });
+});
+
+test("bootstrap: legacy live serve without quiescent handoff refuses rather than stealing its socket", async () => {
+  await withTempStore(async () => {
+    const version = "0.0.1+sha256.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const trace: Recorded[] = [];
+    const { ensureBundle, readBundle } = fakeBundle(version);
+    await assert.rejects(
+      bootstrapRunnerHost(
+        { name: "upgrade-legacy", endpoint: "me@localhost" },
+        {
+          execHook: makeExecHook({ handshakeVersion: `runner-host ${version}`, liveServe: "legacy", trace }),
+          ensureBundle,
+          readBundle,
+        },
+      ),
+      /live authority upgrade refused.*prepareUpgrade/s,
+    );
+    assert.equal(trace.some((item) => item.command.startsWith("setsid node")), false);
+    assert.equal(await loadNode("upgrade-legacy"), null);
   });
 });
 
@@ -205,11 +311,11 @@ test("bootstrap: a missing remote node runtime is a clear error", async () => {
   });
 });
 
-test("remoteHost.ts --version prints runner-host <version> and exits 0", async () => {
+test("remoteHost.ts --version is explicit development or staged content identity and exits 0", async () => {
   const { stdout } = await execFileAsync(
     process.execPath,
     ["--import", "tsx", "src/hsr/remoteHost.ts", "--version"],
     { cwd: process.cwd() },
   );
-  assert.match(stdout.trim(), /^runner-host 0\.0\.1\+[0-9a-f]{12}|^runner-host 0\.0\.1\+nogit$/);
+  assert.match(stdout.trim(), /^runner-host 0\.0\.1\+(?:development|sha256\.[a-f0-9]{64})$/);
 });

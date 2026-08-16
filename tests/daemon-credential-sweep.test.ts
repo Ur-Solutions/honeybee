@@ -33,6 +33,7 @@ import {
 import { createCredentialSyncController } from "../src/daemon/credentialSyncController.js";
 import type { ProcessBirthFingerprint, ProcessIdentityReader } from "../src/hsr/processIdentity.js";
 import type { SessionRecord } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 function account(id: string): AccountRecord {
   return {
@@ -136,6 +137,20 @@ test("credential sweep plan collapses 3k records to 19 canonical pairs and curre
   assert.equal(plan.skippedPairs, 2_982);
   assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.evidence.name, "CO.current");
   assert.equal(plan.pairs.find((pair) => pair.account.id === "codex-0")?.homePath, await canonicalActivationHomePath("/tmp/sweep-home-0"));
+});
+
+test("credential evidence prefers canonical active records over archived records despite stale scalars", async () => {
+  const acct = account("codex-lifecycle");
+  const home = "/tmp/credential-lifecycle";
+  const activeDone = record("CO.active-done", acct.id, home, "2026-07-01T00:00:01.000Z", "done");
+  activeDone.stateMachine = lifecycleCursor(activeDone.name, "active", activeDone.updatedAt);
+  const activeDead = record("CO.active-dead", acct.id, home, "2026-07-01T00:00:02.000Z", "dead");
+  activeDead.stateMachine = lifecycleCursor(activeDead.name, "active", activeDead.updatedAt);
+  const archivedRunning = record("CO.archived-running", acct.id, home, "2026-08-01T00:00:00.000Z", "running");
+  archivedRunning.stateMachine = lifecycleCursor(archivedRunning.name, "archived", archivedRunning.updatedAt);
+
+  const plan = await planCredentialSweep([activeDone, activeDead, archivedRunning], [acct]);
+  assert.equal(plan.pairs[0]?.evidence.name, activeDead.name, "newest canonical-active evidence wins");
 });
 
 test("credential sweep runs canonical accounts once and skips their dedicated session pairs", async () => {

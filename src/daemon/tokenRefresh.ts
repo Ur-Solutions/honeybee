@@ -28,7 +28,9 @@ import type { HsrObservation } from "../hsr/observe.js";
 import type { RemoteHsrSubstrate } from "../substrates/remote-hsr.js";
 import { remoteHsrSubstrateForNode } from "../substrates/index.js";
 import { authPolicyOf, loadNode as defaultLoadNode, LOCAL_NODE_NAME, type NodeRecord } from "../node.js";
-import { appendLedger as defaultAppendLedger, updateSession as defaultUpdateSession, type SessionRecord } from "../store.js";
+import { appendLedger as defaultAppendLedger, type SessionRecord } from "../store.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
+import { withRunnableSessionAdmission } from "../delivery.js";
 
 /** Default refresh window: re-deliver when the token has under this TTL remaining. */
 export const DEFAULT_TOKEN_REFRESH_WINDOW_MS = 60 * 60_000;
@@ -58,13 +60,19 @@ export type TokenRefresherDeps = {
   mint?: (account: AccountRecord, kind: string) => Promise<EphemeralCredential>;
   /** Build the remote-hsr substrate for a node (shares the mirror's per-node transport). */
   substrateForNode?: (node: NodeRecord) => RemoteHsrSubstrate;
-  /** Persist the new expiry back onto the SessionRecord. */
-  updateSession?: (name: string, patch: Partial<SessionRecord>) => Promise<SessionRecord | null>;
   /** Durable, secret-free audit line per refresh. */
   appendLedger?: (event: Record<string, unknown>) => Promise<void>;
   windowMs?: number;
   cooldownMs?: number;
   now?: () => number;
+  /** Lifecycle admission seam; production serializes refresh against stop. */
+  withAdmission?: <T>(
+    record: SessionRecord,
+    effect: (
+      current: SessionRecord,
+      commit: (patch: Partial<SessionRecord>) => Promise<SessionRecord | null>,
+    ) => Promise<T>,
+  ) => Promise<T>;
 };
 
 export type TokenRefresher = (
@@ -89,7 +97,7 @@ function latestAuthExpiredTs(observation: HsrObservation | undefined): number | 
 /** A record eligible for token refresh: a remote (non-local), account-bound, running codex bee. */
 function isRefreshCandidate(record: SessionRecord): boolean {
   if (record.agent !== REFRESHABLE_HARNESS) return false;
-  if (record.status !== "running") return false;
+  if (!isRunnableSessionRecord(record)) return false;
   if (!record.node || record.node === LOCAL_NODE_NAME) return false;
   if (!record.accountId) return false;
   return true;
@@ -106,11 +114,18 @@ export function createTokenRefresher(deps: TokenRefresherDeps = {}): TokenRefres
   const listAccounts = deps.listAccounts ?? defaultListAccounts;
   const mint = deps.mint ?? mintEphemeralCredential;
   const substrateForNode = deps.substrateForNode ?? remoteHsrSubstrateForNode;
-  const updateSession = deps.updateSession ?? defaultUpdateSession;
   const appendLedger = deps.appendLedger ?? defaultAppendLedger;
   const windowMs = deps.windowMs ?? DEFAULT_TOKEN_REFRESH_WINDOW_MS;
   const cooldownMs = deps.cooldownMs ?? DEFAULT_TOKEN_REFRESH_COOLDOWN_MS;
   const now = deps.now ?? (() => Date.now());
+  const withAdmission = deps.withAdmission ?? (<T>(
+    record: SessionRecord,
+    effect: (
+      current: SessionRecord,
+      commit: (patch: Partial<SessionRecord>) => Promise<SessionRecord | null>,
+    ) => Promise<T>,
+  ) => withRunnableSessionAdmission(record, (lifecycle, current) =>
+    effect(current, (patch) => lifecycle.commit(patch))));
 
   // Serialization state, keyed by bee name.
   const refreshing = new Set<string>();
@@ -181,20 +196,39 @@ export function createTokenRefresher(deps: TokenRefresherDeps = {}): TokenRefres
           continue;
         }
         const substrate = substrateForNode(node);
-        const res = await substrate.refreshCredsRemote({
-          bee,
-          creds: {
-            files: cred.files,
-            ...(cred.env ? { env: cred.env } : {}),
-          },
-        });
+        let res: Awaited<ReturnType<RemoteHsrSubstrate["refreshCredsRemote"]>>;
+        try {
+          res = await withAdmission(record, async (current, commit) => {
+            const refreshed = await substrate.refreshCredsRemote({
+              bee: current.name,
+              ...(current.remoteLaunchId ? { remoteLaunchId: current.remoteLaunchId } : {}),
+              ...(current.remoteIncarnation ? { remoteIncarnation: current.remoteIncarnation } : {}),
+              creds: {
+                files: cred.files,
+                ...(cred.env ? { env: cred.env } : {}),
+              },
+            });
+            if (!refreshed.ok && refreshed.stopUnconfirmed) {
+              const failedAt = new Date(now()).toISOString();
+              const persisted = await commit({
+                status: "kill_failed",
+                lastError: refreshed.error ?? "remote credential refresh stop unconfirmed",
+                updatedAt: failedAt,
+              });
+              if (!persisted) throw new Error(`could not persist stop doubt for ${current.name}`);
+            } else if (refreshed.ok && cred.expiresAt !== undefined) {
+              const persisted = await commit({ remoteTokenExpiresAt: cred.expiresAt });
+              if (!persisted) throw new Error(`could not persist refreshed credential expiry for ${current.name}`);
+            }
+            return refreshed;
+          });
+        } catch (error) {
+          outcomes.push({ bee, account: account.id, ok: false, trigger, error: messageOf(error) });
+          continue;
+        }
         if (!res.ok) {
           outcomes.push({ bee, account: account.id, ok: false, trigger, error: res.error ?? "remote refresh failed" });
           continue;
-        }
-        // Persist the new expiry so the next tick's proactive check keys off it.
-        if (cred.expiresAt !== undefined) {
-          await updateSession(bee, { remoteTokenExpiresAt: cred.expiresAt }).catch(() => undefined);
         }
         await appendLedger({
           type: "token.refresh",

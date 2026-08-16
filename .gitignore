@@ -3,5 +3,6 @@ dist/
 .test-dist/
 .DS_Store
 stress-reports/
+.local/
 
 .claude/worktrees

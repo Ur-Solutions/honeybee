@@ -27,6 +27,10 @@ import { killOrphanedChildGroup, reapDeadHosts } from "../src/hsr/observe.js";
 import { buildController, serve } from "../src/hsr/remoteHost.js";
 import { connectRpcClient } from "../src/hsr/rpc.js";
 import { ensureHsrRunDir, hsrMetaPath, hsrRunDir, readHsrMeta, writeHsrMeta } from "../src/hsr/runDir.js";
+import {
+  acknowledgeHsrEventIntegrityLoss,
+  readHsrEventIntegrityReceipt,
+} from "../src/hsr/eventIntegrity.js";
 import { hsrSubstrate, stopHsrIncarnation } from "../src/hsr/substrate.js";
 import { captureProcessBirthFingerprint, type ProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 
@@ -131,6 +135,13 @@ async function writeOrphanedMeta(bee: string, childPid: number, storeDir: string
   });
 }
 
+async function acknowledgeStoppedHistoryLoss(bee: string): Promise<void> {
+  const receipt = await readHsrEventIntegrityReceipt(bee);
+  assert.ok(receipt, `expected ${bee} to retain an event-integrity receipt`);
+  assert.equal(receipt.stopState, "confirmed", "controller child-group proof confirms the stopped runtime");
+  await acknowledgeHsrEventIntegrityLoss(bee, receipt.integrityId);
+}
+
 test("reapDeadHosts kills the orphaned harness child group and flips meta to exited", async () => {
   await withTempStore(async (dir) => {
     const bee = "orphanreap";
@@ -194,6 +205,18 @@ test("remoteHost.serve() startup is a non-event for an existing runner cursor", 
       assert.equal(isPidAlive(orphan.pid as number), true, "startup does not signal the runner group");
       const meta = await readHsrMeta(bee);
       assert.equal(meta?.status, "running", "startup does not stamp a terminal cursor");
+
+      // Cleanup follows the same explicit loss-acknowledgement boundary as an
+      // operator: an ungraceful running-host death is never tombstoned merely
+      // because the child was stopped successfully.
+      const client = await connectRpcClient(join(dir, "control.sock"));
+      try {
+        assert.equal(((await client.call("kill", { bee })) as { ok?: boolean }).ok, false);
+        await acknowledgeStoppedHistoryLoss(bee);
+        assert.equal(((await client.call("kill", { bee })) as { ok?: boolean }).ok, true);
+      } finally {
+        client.close();
+      }
     } finally {
       await server?.close();
       try {
@@ -205,7 +228,7 @@ test("remoteHost.serve() startup is a non-event for an existing runner cursor", 
   });
 });
 
-test("remote kill RPC signals the orphaned child group when the host is gone (and still removes the run dir)", async () => {
+test("remote kill stops an orphan but retains unclosed history until explicit loss acknowledgement", async () => {
   await withTempStore(async (dir) => {
     const bee = "killorphan";
     let orphan: ChildProcess | undefined;
@@ -218,13 +241,21 @@ test("remote kill RPC signals the orphaned child group when the host is gone (an
       const client = await connectRpcClient(join(dir, "control.sock"));
       try {
         const result = (await client.call("kill", { bee })) as { ok?: boolean };
-        assert.equal(result.ok, true);
+        assert.equal(result.ok, false, "unclosed source history blocks destructive tombstoning");
       } finally {
         client.close();
       }
 
       await waitFor(() => !isPidAlive(orphan!.pid as number), "kill stopped the orphaned harness child");
-      assert.equal(existsSync(hsrRunDir(bee)), false, "kill removed the run dir");
+      assert.equal(existsSync(hsrRunDir(bee)), true, "kill retains the run dir as manual history authority");
+      await acknowledgeStoppedHistoryLoss(bee);
+      const retry = await connectRpcClient(join(dir, "control.sock"));
+      try {
+        assert.equal(((await retry.call("kill", { bee })) as { ok?: boolean }).ok, true);
+      } finally {
+        retry.close();
+      }
+      assert.equal(existsSync(hsrRunDir(bee)), false, "acknowledged retry removes the quarantined active run dir");
     } finally {
       await server.close();
       try {
@@ -256,7 +287,7 @@ test("remote restart kill fails closed on corrupt metadata and preserves a live 
         assert.equal(existsSync(hsrRunDir(bee)), true, "run state remains the repair/retry handle");
         assert.equal(await readFile(hsrMetaPath(bee), "utf8"), corrupt);
       } finally {
-        await controller.close();
+        await assert.rejects(controller.close(), /left unconfirmed HSR runtimes/);
       }
     } finally {
       try {
@@ -297,7 +328,7 @@ test("remote restart kill distinguishes unreadable metadata from ENOENT and pres
         assert.equal(isPidAlive(orphan.pid as number), true);
         assert.equal(existsSync(hsrRunDir(bee)), true);
       } finally {
-        await controller.close();
+        await assert.rejects(controller.close(), /left unconfirmed HSR runtimes/);
       }
     } finally {
       try {
@@ -486,8 +517,18 @@ test("remote kill and observer startup never signal stale host/child numeric ide
 
     const controller = buildController({ processSignals: deps });
     const killResult = await controller.methods.kill!({ bee }, { connectionId: 1, close() {} });
-    assert.equal((killResult as { ok?: boolean }).ok, true);
+    assert.equal((killResult as { ok?: boolean }).ok, false, "unclosed history remains manual despite stale PID proof");
     assert.deepEqual(signals, []);
+    // The first census deliberately reports the recycled numeric group as
+    // occupied, so stop proof remains doubt. Once a later census proves that
+    // group absent, the controller may publish the manual history receipt —
+    // still without ever signalling the mismatched replacement identity.
+    deps.isProcessGroupAlive = () => false;
+    const stopped = await controller.methods.kill!({ bee }, { connectionId: 1, close() {} });
+    assert.equal((stopped as { ok?: boolean }).ok, false);
+    await acknowledgeStoppedHistoryLoss(bee);
+    const killRetry = await controller.methods.kill!({ bee }, { connectionId: 1, close() {} });
+    assert.equal((killRetry as { ok?: boolean }).ok, true);
     await controller.close();
 
     // Recreate the same stale record: serve startup is observation-only.
@@ -510,6 +551,14 @@ test("remote kill and observer startup never signal stale host/child numeric ide
       assert.deepEqual(signals, [], "observer startup never signals recycled identities");
       assert.equal((await readHsrMeta(bee))?.status, "running");
     } finally {
+      const cleanup = await connectRpcClient(join(dir, "reuse-control.sock"));
+      try {
+        assert.equal(((await cleanup.call("kill", { bee })) as { ok?: boolean }).ok, false);
+        await acknowledgeStoppedHistoryLoss(bee);
+        assert.equal(((await cleanup.call("kill", { bee })) as { ok?: boolean }).ok, true);
+      } finally {
+        cleanup.close();
+      }
       await server.close();
     }
   });

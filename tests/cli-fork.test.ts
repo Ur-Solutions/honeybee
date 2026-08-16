@@ -15,6 +15,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { after, test } from "node:test";
+import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
+import type { SessionRecord } from "../src/store.js";
 import { hasSession, setTmuxSocket, tmux } from "../src/substrates/local-tmux.js";
 
 const execFileAsync = promisify(execFile);
@@ -397,6 +399,120 @@ test("fork smoke: the spawned fork session is actually live", { timeout: 40_000 
   } finally {
     const recs = await listRecords(storeRoot);
     for (const r of recs) await tmux(["kill-session", "-t", `=${r.tmuxTarget}`], { reject: false });
+    await rm(storeRoot, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("fork source stop wins lifecycle admission before any target launch", { timeout: 40_000 }, async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "hive-fork-source-stop-"));
+  const cwd = await mkdtemp(join(tmpdir(), "hive-fork-cwd-"));
+  const env = { ...AGENT_CMD_ENV, HIVE_STORE_ROOT: storeRoot, TMUX_TMPDIR: process.env.TMUX_TMPDIR! };
+  const parentName = `forkp-stop-${process.pid}`;
+  const targetName = `forkc-stop-${process.pid}`;
+  const previousStoreRoot = process.env.HIVE_STORE_ROOT;
+  let forkPromise: ReturnType<typeof runCli> | undefined;
+  try {
+    const parent = await seedParent(storeRoot, parentName, cwd);
+    process.env.HIVE_STORE_ROOT = storeRoot;
+    await withSessionLifecycleTransaction(parent as unknown as SessionRecord, async (lifecycle) => {
+      // Let the child resolve a runnable source snapshot, then make stop intent
+      // win while the authoritative source lifecycle lock is still held. A
+      // snapshot-only fork would launch here; lifecycle admission must wait,
+      // refresh, and refuse without even reserving the target name.
+      forkPromise = runCli([
+        "fork",
+        parentName,
+        "--name",
+        targetName,
+        "--seed",
+        "none",
+        "--no-wait",
+      ], env);
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      await lifecycle.commit({ status: "kill_failed" });
+    });
+
+    assert.ok(forkPromise);
+    const fork = await forkPromise;
+    assert.notEqual(fork.code, 0, "stop intent refuses the fork");
+    assert.match(fork.stderr, /unresolved stop state/, fork.stderr);
+    assert.equal(await readRecord(storeRoot, targetName), null, "no child SessionRecord was published");
+    assert.equal(await hasSession(targetName), false, "no child runtime was launched");
+  } finally {
+    if (previousStoreRoot === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStoreRoot;
+    await tmux(["kill-session", "-t", `=${targetName}`], { reject: false });
+    await rm(storeRoot, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("reciprocal active-source names fail before taking nested lifecycle locks", { timeout: 20_000 }, async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "hive-fork-reciprocal-"));
+  const cwd = await mkdtemp(join(tmpdir(), "hive-fork-cwd-"));
+  const env = { ...AGENT_CMD_ENV, HIVE_STORE_ROOT: storeRoot, TMUX_TMPDIR: process.env.TMUX_TMPDIR! };
+  const left = `fork-recip-left-${process.pid}`;
+  const right = `fork-recip-right-${process.pid}`;
+  try {
+    await seedParent(storeRoot, left, cwd);
+    await seedParent(storeRoot, right, cwd);
+    const startedAt = Date.now();
+    const [leftResult, rightResult] = await Promise.all([
+      runCli(["fork", left, "--name", right, "--seed", "none", "--no-wait"], env),
+      runCli(["fork", right, "--name", left, "--seed", "none", "--no-wait"], env),
+    ]);
+    assert.notEqual(leftResult.code, 0);
+    assert.notEqual(rightResult.code, 0);
+    assert.match(leftResult.stderr, /session record already owns name/, leftResult.stderr);
+    assert.match(rightResult.stderr, /session record already owns name/, rightResult.stderr);
+    assert.ok(Date.now() - startedAt < 5_000, "invalid reciprocal forks fail fast instead of timing out on locks");
+    assert.equal((await listRecords(storeRoot)).length, 2, "neither invalid fork published a child record");
+  } finally {
+    await rm(storeRoot, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("remote-hsr fork refuses before target reservation or publication", { timeout: 20_000 }, async () => {
+  const storeRoot = await mkdtemp(join(tmpdir(), "hive-fork-remote-refusal-"));
+  const cwd = await mkdtemp(join(tmpdir(), "hive-fork-cwd-"));
+  const env = { ...AGENT_CMD_ENV, HIVE_STORE_ROOT: storeRoot, TMUX_TMPDIR: process.env.TMUX_TMPDIR! };
+  const parentName = `forkp-remote-refusal-${process.pid}`;
+  const targetName = `forkc-remote-refusal-${process.pid}`;
+  const nodeName = `remote-fork-${process.pid}`;
+  try {
+    await seedParent(storeRoot, parentName, cwd);
+    const now = new Date().toISOString();
+    await mkdir(join(storeRoot, "nodes"), { recursive: true });
+    await writeFile(join(storeRoot, "nodes", `${nodeName}.json`), `${JSON.stringify({
+      name: nodeName,
+      kind: "remote-hsr",
+      endpoint: "unix:///definitely-not-contacted.sock",
+      capabilities: ["claude"],
+      status: "online",
+      runnerHostVersion: "test",
+      createdAt: now,
+      updatedAt: now,
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    const fork = await runCli([
+      "fork",
+      parentName,
+      "--name",
+      targetName,
+      "--node",
+      nodeName,
+      "--seed",
+      "none",
+      "--no-wait",
+    ], env);
+    assert.notEqual(fork.code, 0);
+    assert.match(fork.stderr, /remote-hsr targets are not supported yet/, fork.stderr);
+    assert.equal(await readRecord(storeRoot, targetName), null, "no target SessionRecord was published");
+    const reservations = await readdir(join(storeRoot, "launch-reservations")).catch(() => []);
+    assert.deepEqual(reservations, [], "definitive pre-launch refusal leaves no name journal");
+  } finally {
     await rm(storeRoot, { recursive: true, force: true });
     await rm(cwd, { recursive: true, force: true });
   }

@@ -26,6 +26,15 @@ pass Slice B fixtures; only then is it stamped `v1` (plan §5.1).
   fixtures that must fail validation.
 - `digest.json` — the committed deterministic schema digest.
 
+The run-command schema is the forward-compatible validation vocabulary;
+`local-core-v1.commands` is the baseline client command set, and the selected
+harness's signed `node.describe.harnesses[].commands` can narrow it further.
+For example, `answer` and `checkpoint` remain schema-valid but are absent from
+both the baseline and node descriptor. `answer` needs a signed expected
+runner-host epoch; `checkpoint` has no runtime implementation. An older/direct
+client that still sends either receives `CAPABILITY_MISMATCH` before a durable
+operation or provider effect.
+
 ## Schema digest
 
 `schemaDigest` is `sha256:` over the canonical JSON (sorted keys) of

@@ -13,7 +13,7 @@
  * Node builtins only.
  */
 
-import type { RunnerEvent, RunnerInputAnswer, RunnerInterruptResult, RunnerOpts, RunnerSendOpts, RunnerSession, RunnerTier } from "./types.js";
+import type { RunnerEvent, RunnerInputAnswer, RunnerInterruptResult, RunnerOpts, RunnerPreparedAnswer, RunnerSendOpts, RunnerSession, RunnerTier } from "./types.js";
 import { attachSessionPlumbing, spawnSessionChild } from "./sessionBase.js";
 import { makeLineReader } from "./lineReader.js";
 
@@ -35,6 +35,8 @@ export type StreamRunnerConfig = {
   nativeSteering?: boolean;
   /** Optional: encode an answer to a needs_input requestId (permission/question). */
   encodeAnswer?(requestId: string, answer: string): string;
+  /** Forget provider request state only after the stdin write callback succeeds. */
+  commitAnswer?(requestId: string): void;
   /**
    * Optional: encode a TURN interrupt as a stdin line (e.g. claude's
    * stream-json `control_request {subtype:"interrupt"}`). When absent,
@@ -66,9 +68,14 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
   const child = await spawnSessionChild(config.command, config.args, {
     cwd: opts.cwd,
     env: opts.env,
+    onChildSpawnPending: opts.onChildSpawnPending,
+    onChildSpawnFailure: opts.onChildSpawnFailure,
     onChildSpawn: opts.onChildSpawn,
   });
-  const plumbing = attachSessionPlumbing(bee, child);
+  const plumbing = attachSessionPlumbing(bee, child, {
+    eventHost: opts.eventHost,
+    onEventPersistenceFailure: opts.onEventPersistenceFailure,
+  });
 
   const session: RunnerSession = {
     sessionId: opts.sessionId ?? "",
@@ -76,6 +83,7 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     pid: child.pid as number,
     send,
     interrupt,
+    prepareAnswer,
     answer,
     events: plumbing.events,
     snapshot: plumbing.snapshot,
@@ -124,8 +132,12 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     plumbing.ingestEvent({ type: "error", ts: Date.now(), message: line });
   };
 
-  child.stdout?.on("data", makeLineReader(handleStdoutLine));
-  child.stderr?.on("data", makeLineReader(handleStderrLine));
+  const stdoutReader = makeLineReader(handleStdoutLine);
+  const stderrReader = makeLineReader(handleStderrLine);
+  child.stdout?.on("data", stdoutReader);
+  child.stdout?.once("end", () => stdoutReader.end());
+  child.stderr?.on("data", stderrReader);
+  child.stderr?.once("end", () => stderrReader.end());
 
   function writableStdin(): NonNullable<typeof child.stdin> {
     const stdin = child.stdin;
@@ -189,16 +201,28 @@ export async function startStreamRunner(config: StreamRunnerConfig, opts: Runner
     await writeTurn(text);
   }
 
-  async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {
+  async function prepareAnswer(requestId: string, answerValue: RunnerInputAnswer): Promise<RunnerPreparedAnswer> {
     if (!config.encodeAnswer) throw new Error("answer not supported by this harness");
     const answerText = typeof answerValue === "string" ? answerValue : JSON.stringify(answerValue);
-    const stdin = child.stdin;
-    if (!stdin || stdin.destroyed || !stdin.writable) {
-      throw new Error("hsr stream: child stdin is not writable (session ended?)");
-    }
-    await new Promise<void>((resolve, reject) => {
-      stdin.write(config.encodeAnswer!(requestId, answerText), (err) => (err ? reject(err) : resolve()));
-    });
+    const stdin = writableStdin();
+    const encoded = config.encodeAnswer(requestId, answerText);
+    return {
+      async dispatch(): Promise<void> {
+        await new Promise<void>((resolve, reject) => {
+          try {
+            stdin.write(encoded, (err) => (err ? reject(err) : resolve()));
+          } catch (error) {
+            reject(error);
+          }
+        });
+        config.commitAnswer?.(requestId);
+      },
+    };
+  }
+
+  async function answer(requestId: string, answerValue: RunnerInputAnswer): Promise<void> {
+    const prepared = await prepareAnswer(requestId, answerValue);
+    await prepared.dispatch();
   }
 
   async function interrupt(): Promise<RunnerInterruptResult> {

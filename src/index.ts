@@ -18,3 +18,11 @@ export { parseBeeState, type BeeState } from "./state.js";
 export type { SessionRecord } from "./store.js";
 export type { SealRecord, SealStatus, SealType } from "./seal.js";
 export type { BeeContract } from "./contract.js";
+export type {
+  HsrAnswerControlParams,
+  HsrAnswerExpectedSource,
+  HsrAnswerHostIdentity,
+  HsrAnswerOperation,
+  HsrAnswerRpcParams,
+  HsrAnswerRpcResult,
+} from "./answerReceipt.js";

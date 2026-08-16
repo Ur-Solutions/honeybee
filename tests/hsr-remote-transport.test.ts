@@ -121,19 +121,43 @@ function serveUpExecHook(trace: string[]): SshExecHook {
     // resolveRemoteSocket expands `~/…` via the remote $HOME before probing.
     if (cmd.startsWith("printf")) return { stdout: "/home/me", stderr: "", exitCode: 0 };
     if (cmd.startsWith("test -S")) return { stdout: "", stderr: "", exitCode: 0 };
+    if (cmd.includes(" probe --socket ")) return { stdout: "runner-host 0.0.1+deadbeef1234\n", stderr: "", exitCode: 0 };
     return { stdout: "", stderr: "", exitCode: 0 };
   };
 }
 
 // --- ensureRemoteServe --------------------------------------------------------
 
-test("ensureRemoteServe: socket already present → single `test -S`, no serve start", async () => {
+test("ensureRemoteServe: an existing socket returns only after an exact digest-qualified probe", async () => {
   const trace: string[] = [];
   const { remoteSocket } = await ensureRemoteServe(makeNode(), { execHook: serveUpExecHook(trace) });
   // `~/…` is resolved to an absolute remote path (sshd does not expand `~` in a
   // `-L` forward target), so serve-bind and forward agree on the same socket.
   assert.equal(remoteSocket, "/home/me/.hive/runner-host/control.sock");
-  assert.deepEqual(trace, ['printf %s "$HOME"', "test -S /home/me/.hive/runner-host/control.sock"]);
+  assert.deepEqual(trace, [
+    'printf %s "$HOME"',
+    "test -S /home/me/.hive/runner-host/control.sock",
+    "node ~/.hive/runner-host/hive-runner-host-0.0.1+deadbeef1234.mjs probe --socket /home/me/.hive/runner-host/control.sock --expect-version 0.0.1+deadbeef1234",
+  ]);
+});
+
+test("ensureRemoteServe: a same-protocol socket with stale artifact bytes is refused for bootstrap", async () => {
+  const trace: string[] = [];
+  const execHook: SshExecHook = async (argv) => {
+    const cmd = argv.at(-1) ?? "";
+    trace.push(cmd);
+    if (cmd.startsWith("printf")) return { stdout: "/home/me", stderr: "", exitCode: 0 };
+    if (cmd.startsWith("test -S")) return { stdout: "", stderr: "", exitCode: 0 };
+    if (cmd.includes(" probe --socket ")) {
+      return { stdout: "", stderr: "live serve version mismatch: stale digest", exitCode: 1 };
+    }
+    return { stdout: "", stderr: `unexpected: ${cmd}`, exitCode: 1 };
+  };
+  await assert.rejects(
+    ensureRemoteServe(makeNode(), { execHook }),
+    /does not match registered version.*hive node bootstrap/s,
+  );
+  assert.equal(trace.some((cmd) => cmd.startsWith("setsid node")), false, "must not steal a stale live socket");
 });
 
 test("ensureRemoteServe: missing socket → starts detached setsid node serve, then polls test -S", async () => {
@@ -149,6 +173,9 @@ test("ensureRemoteServe: missing socket → starts detached setsid node serve, t
     if (cmd.startsWith("setsid node")) {
       socketUp = true; // the detached serve "comes up"
       return { stdout: "", stderr: "", exitCode: 0 };
+    }
+    if (cmd.includes(" probe --socket ")) {
+      return { stdout: "runner-host 0.0.1+deadbeef1234\n", stderr: "", exitCode: 0 };
     }
     return { stdout: "", stderr: `unexpected: ${cmd}`, exitCode: 1 };
   };

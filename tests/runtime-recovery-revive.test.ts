@@ -11,7 +11,7 @@ import {
   withHsrTurnDeliveryLock,
 } from "../src/hsr/pendingTurns.js";
 import { reviveHsrForAutomaticRecovery } from "../src/recovery/revive.js";
-import type { SessionRecord } from "../src/store.js";
+import { saveSession, type SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "hive-runtime-revive-"));
@@ -45,6 +45,7 @@ function record(bee: string): SessionRecord {
 test("automatic revive stages before ordinary stop clears pending turns, then restores exact ids", async () => {
   await withTempStore(async () => {
     const bee = "CO.auto-revive";
+    await saveSession(record(bee));
     const original = await withHsrTurnDeliveryLock(bee, () => enqueuePendingHsrTurn(bee, "resume exact work"));
     let sawStagedBeforeRevive = false;
     let drained: Awaited<ReturnType<typeof readPendingHsrTurns>> = [];

@@ -5,6 +5,7 @@ import { loadSession } from "../store.js";
 import { attachBeeToRun } from "../comb/attachment.js";
 import { loadTsModule } from "../tsLoader.js";
 import { flag, truthy, type Parsed } from "../parse.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
 import { boardView, cancelRunWithDisposition, entryNodeIds, listRuns, readRunEvents, requireRun } from "../comb/store.js";
 import { defineCombFromFile, defineCombVersion, listCombVersions, loadCombVersion } from "../comb/registry.js";
 import { asCombError, CombError } from "../comb/errors.js";
@@ -172,7 +173,7 @@ async function combRun(parsed: Parsed) {
   }
   const attachedRecord = attachedBee ? await loadSession(attachedBee) : null;
   if (attachedBee && !attachedRecord) throw new CombError("not_found", `bee not found: ${attachedBee}`);
-  if (attachedRecord && attachedRecord.status !== "running") {
+  if (attachedRecord && !isRunnableSessionRecord(attachedRecord)) {
     throw new CombError("invalid_argument", `bee ${attachedRecord.name} is terminal (${attachedRecord.status})`);
   }
   const entryNodeId = stringFlag(parsed, "entry");
