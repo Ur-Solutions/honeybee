@@ -170,6 +170,81 @@ export function computeSchemaDigest(contract: ExecutionContract): string {
   return canonicalDigest({ profile: contract.profile, states: contract.states, schemas });
 }
 
+/**
+ * Version of the deliberately narrower compatibility surface used during a
+ * coordinated Apiary/Honeybee rollout. Bump this before changing the
+ * projection below; an unknown version is never interpreted as compatible.
+ */
+export const EXECUTION_VALIDATION_SURFACE_VERSION = 1 as const;
+
+function requiredField(source: JsonObject, key: string, subject: string): JsonValue {
+  const value = source[key];
+  if (value === undefined) throw new Error(`${subject}.${key}: required by execution validation surface v1`);
+  return value;
+}
+
+/**
+ * Canonical v1 projection of every local-core value Honeybee and Apiary use
+ * to validate execution requests/responses. Capability advertisement and
+ * prose are intentionally excluded; schemas, method bindings, commands,
+ * events, errors, or state machines changing always changes this surface.
+ */
+export function executionValidationSurface(contract: ExecutionContract): JsonObject {
+  const profiles = asObject(requiredField(contract.profile, "profiles", "profile.json"), "profile.json#profiles");
+  const baseline = asObject(
+    requiredField(profiles, "local-core-v1", "profile.json#profiles"),
+    "profile.json#profiles.local-core-v1",
+  );
+  const schemas: JsonObject = {};
+  for (const name of [...contract.schemas.keys()].sort()) schemas[name] = contract.schemas.get(name)!;
+  return {
+    identity: {
+      contract: requiredField(contract.profile, "contract", "profile.json"),
+      contractVersion: requiredField(contract.profile, "contractVersion", "profile.json"),
+      protocolVersion: requiredField(contract.profile, "protocolVersion", "profile.json"),
+    },
+    baseline: {
+      methods: requiredField(baseline, "methods", "profile.json#profiles.local-core-v1"),
+      commands: requiredField(baseline, "commands", "profile.json#profiles.local-core-v1"),
+      profileGatedCommands: requiredField(
+        baseline,
+        "profileGatedCommands",
+        "profile.json#profiles.local-core-v1",
+      ),
+      eventTypes: requiredField(baseline, "eventTypes", "profile.json#profiles.local-core-v1"),
+      optionalEventTypes: requiredField(baseline, "optionalEventTypes", "profile.json#profiles.local-core-v1"),
+      errorCodes: requiredField(baseline, "errorCodes", "profile.json#profiles.local-core-v1"),
+    },
+    errorCodes: requiredField(contract.profile, "errorCodes", "profile.json"),
+    states: contract.states,
+    schemas,
+  };
+}
+
+/** Digest the canonical local-core validation surface for rollout fencing. */
+export function computeExecutionValidationSurfaceDigest(contract: ExecutionContract): string {
+  return canonicalDigest(executionValidationSurface(contract));
+}
+
+/** Features the baseline profile can advertise; malformed corpora fail closed. */
+export function executionBaselineFeatures(contract: ExecutionContract): string[] {
+  const profiles = asObject(requiredField(contract.profile, "profiles", "profile.json"), "profile.json#profiles");
+  const baseline = asObject(
+    requiredField(profiles, "local-core-v1", "profile.json#profiles"),
+    "profile.json#profiles.local-core-v1",
+  );
+  const features = requiredField(baseline, "features", "profile.json#profiles.local-core-v1");
+  if (
+    !Array.isArray(features) ||
+    features.length === 0 ||
+    features.some((feature) => typeof feature !== "string" || feature.length === 0) ||
+    new Set(features).size !== features.length
+  ) {
+    throw new Error("profile.json#profiles.local-core-v1.features: expected unique non-empty strings");
+  }
+  return [...features] as string[];
+}
+
 export type ValidationResult = { valid: boolean; errors: string[] };
 
 export type ExecutionValidator = {

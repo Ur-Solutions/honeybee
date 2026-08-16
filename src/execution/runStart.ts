@@ -8,6 +8,8 @@ import { canonicalDigest } from "../comb/canonical.js";
 import type { JsonValue } from "../comb/types.js";
 import type { ExecutionValidator, JsonObject } from "./contract.js";
 import { executionError } from "./errors.js";
+import { hasExactLocalGithubSessionCredentialLease } from "./localCredentials.js";
+import { executionReasoningArgs } from "./harnessPolicy.js";
 import type { ExecutionBindingRecord } from "./nodeState.js";
 import { bindingRefMatches } from "./nodeState.js";
 import { verifyCanonicalSignature, type SignatureVerifier } from "./signing.js";
@@ -69,6 +71,122 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
 
 function canonicalEquals(a: JsonValue, b: JsonValue): boolean {
   return canonicalDigest(a) === canonicalDigest(b);
+}
+
+/**
+ * The exact lease policy local-core-v1 can enforce today. Schema-valid policy
+ * is not automatically supported policy: accepting a CPU/memory limit without
+ * cgroups/rlimits, an allowlist without a network namespace, or a credential
+ * lease without its broker would turn a signed guarantee into decoration.
+ *
+ * Keep this deliberately equal to Apiary's current minting defaults. Stronger
+ * policy requires a named negotiated capability and a real enforcement seam;
+ * until then run.start refuses it before the durable reservation.
+ */
+export function assertSupportedExecutionLeasePolicy(lease: JsonObject): void {
+  if (!canonicalEquals((lease.resourceLimits ?? {}) as JsonValue, {})) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "resourceLimits are not enforceable by the native local-core-v1 runner; omit all resource limit fields",
+    );
+  }
+  if (!canonicalEquals(lease.networkPolicy as JsonValue, { mode: "inherit-node" })) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "only networkPolicy mode inherit-node (without an allow list) is supported by the native shared-network runner",
+    );
+  }
+  if (!canonicalEquals((lease.mutationAuthority ?? []) as JsonValue, [{ kind: "working-copy-write" }])) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "only the unrefined working-copy-write mutation grant is enforceable by the execution Cell sandbox",
+    );
+  }
+  if (Array.isArray(lease.materializationCredentialLeaseIds) && lease.materializationCredentialLeaseIds.length > 0) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "materialization credential leases require the unnegotiated credential-lease-v1 profile",
+    );
+  }
+  const runtimeCredentialLeaseIds = Array.isArray(lease.runtimeCredentialLeaseIds)
+    ? lease.runtimeCredentialLeaseIds.filter((value): value is string => typeof value === "string")
+    : [];
+  if (
+    runtimeCredentialLeaseIds.length > 0 &&
+    !hasExactLocalGithubSessionCredentialLease(String(lease.runId), runtimeCredentialLeaseIds)
+  ) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "runtime credential leases are unsupported except the exact Run-bound local-gh-session-v1 lease",
+    );
+  }
+}
+
+const SUPPORTED_EVIDENCE_KINDS = new Set(["logs", "diff", "environment-manifest", "transcript"]);
+
+/** Fail closed over schema-valid intent fields the local runner would ignore. */
+export function assertSupportedExecutionIntentPolicy(intent: JsonObject): void {
+  const harness = asObject(intent.harness);
+  if (harness?.versionRange !== undefined) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "harness versionRange is not negotiated or enforced by local-core-v1",
+    );
+  }
+  const rawConfig = harness?.config;
+  const config = asObject(rawConfig);
+  if (rawConfig !== undefined && !config) {
+    throw executionError("CAPABILITY_MISMATCH", "harness config must be an object for the local-core-v1 driver");
+  }
+  if (config) {
+    const supportedKeys = new Set(["brief", "account", "preamble", "kitProfile", "cellLayout", "reasoning"]);
+    const unknown = Object.keys(config).filter((key) => !supportedKeys.has(key));
+    if (unknown.length > 0) {
+      throw executionError(
+        "CAPABILITY_MISMATCH",
+        `harness config fields are not supported by local-core-v1: ${unknown.sort().join(", ")}`,
+      );
+    }
+    if (config.brief !== undefined && typeof config.brief !== "string") {
+      throw executionError("CAPABILITY_MISMATCH", "harness config.brief must be a string");
+    }
+    if (config.account !== undefined && (typeof config.account !== "string" || config.account.length === 0)) {
+      throw executionError("CAPABILITY_MISMATCH", "harness config.account must be a non-empty string");
+    }
+    if (config.preamble !== undefined && (typeof config.preamble !== "string" || config.preamble.trim().length === 0)) {
+      throw executionError("CAPABILITY_MISMATCH", "harness config.preamble must be a non-empty string");
+    }
+    if (config.kitProfile !== undefined && (typeof config.kitProfile !== "string" || config.kitProfile.trim().length === 0)) {
+      throw executionError("CAPABILITY_MISMATCH", "harness config.kitProfile must be a non-empty string");
+    }
+    if (config.cellLayout !== undefined && config.cellLayout !== "v1" && config.cellLayout !== "v2") {
+      throw executionError("CAPABILITY_MISMATCH", "harness config.cellLayout must be v1 or v2");
+    }
+    executionReasoningArgs(
+      typeof harness?.driverId === "string" ? harness.driverId : "",
+      typeof harness?.model === "string" ? harness.model : undefined,
+      config.reasoning,
+    );
+  }
+  if (!canonicalEquals((intent.budget ?? {}) as JsonValue, {})) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      "run budget limits are not enforced by local-core-v1; omit maxDurationSeconds, maxTokens, and maxCostUsd",
+    );
+  }
+  const evidenceContract = asObject(intent.evidenceContract);
+  const collect = Array.isArray(evidenceContract?.collect) ? evidenceContract.collect : [];
+  const unsupportedEvidence = collect.filter(
+    (kind): kind is string => typeof kind === "string" && !SUPPORTED_EVIDENCE_KINDS.has(kind),
+  );
+  if (evidenceContract?.delivery !== "local-manifest" || unsupportedEvidence.length > 0) {
+    throw executionError(
+      "CAPABILITY_MISMATCH",
+      `evidence contract is not collectable by local-core-v1${
+        unsupportedEvidence.length > 0 ? `: ${[...new Set(unsupportedEvidence)].sort().join(", ")}` : ""
+      }`,
+    );
+  }
 }
 
 export function validateRunStart(request: JsonValue, deps: RunStartValidationDeps): ValidatedRunStart {
@@ -171,6 +289,7 @@ export function validateRunStart(request: JsonValue, deps: RunStartValidationDep
   if (kitProfile !== undefined && (typeof kitProfile !== "string" || kitProfile.trim().length === 0)) {
     throw executionError("HARNESS_UNAVAILABLE", "harness config.kitProfile must be a non-empty string");
   }
+  assertSupportedExecutionIntentPolicy(intent);
 
   // 7. The intent cannot widen the lease: every required capability must be
   //    authorized by an EXACT canonical leased entry (a differing minVersion
@@ -209,6 +328,7 @@ export function validateRunStart(request: JsonValue, deps: RunStartValidationDep
   if (!canonicalEquals((intent.mutationAuthority ?? []) as JsonValue, (lease.mutationAuthority ?? []) as JsonValue)) {
     throw executionError("LEASE_DENIED", "intent mutation authority does not match the leased mutation authority");
   }
+  assertSupportedExecutionLeasePolicy(lease);
   if (!canonicalEquals(intent.evidenceContract as JsonValue, lease.evidenceContract as JsonValue)) {
     throw executionError("LEASE_DENIED", "intent evidence contract does not match the leased evidence contract");
   }

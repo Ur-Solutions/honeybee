@@ -140,3 +140,5 @@ export {
   recordAccountBootFailure,
   clearAccountBootFailure,
 } from "./accounts/bootHealth.js";
+
+export { accountCredentialUnavailableReason } from "./accounts/health.js";

@@ -13,7 +13,23 @@ import {
   parseOpenCodeStartupUrl,
   startOpenCodeRunner,
 } from "../src/hsr/adapters/opencode.js";
+import {
+  coordinateHsrAnswerOnHost,
+  createHsrAnswerOperation,
+  markHsrAnswerOperationSending,
+  offerHsrAnswerOperation,
+  readHsrAnswerReceipt,
+  type HsrAnswerHostIdentity,
+} from "../src/answerReceipt.js";
+import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import type { RunnerEvent, RunnerOpts, RunnerSession } from "../src/hsr/types.js";
+import {
+  ensureHsrRunDir,
+  hsrEventsPath,
+  sealHsrEventStreamClosure,
+  type HsrMeta,
+} from "../src/hsr/runDir.js";
+import type { SessionRecord } from "../src/store.js";
 
 const fixture = resolve("tests/fixtures/fake-opencode-server.mjs");
 
@@ -37,6 +53,7 @@ type FixtureState = {
 };
 
 type Rig = {
+  bee: string;
   session: RunnerSession;
   events: RunnerEvent[];
   url: string;
@@ -71,6 +88,8 @@ async function startRig(input: {
   sessionId?: string;
   cwd?: string;
   cellSandbox?: RunnerOpts['cellSandbox'];
+  eventHost?: HsrAnswerHostIdentity;
+  beforeProviderEvent?: (event: unknown) => Promise<void> | void;
 } = {}): Promise<Rig> {
   const root = await mkdtemp(join(tmpdir(), "hive-opencode-adapter-"));
   const cwd = input.cwd ?? root;
@@ -78,8 +97,9 @@ async function startRig(input: {
   const stopFile = join(root, "stopped.txt");
   const previousStore = process.env.HIVE_STORE_ROOT;
   process.env.HIVE_STORE_ROOT = join(root, "store");
+  const bee = `OP.test-${root.slice(-6)}`;
   const opts: RunnerOpts = {
-    bee: `OP.test-${root.slice(-6)}`,
+    bee,
     cwd,
     env: envRecord({
       FAKE_OPENCODE_URL_FILE: urlFile,
@@ -92,7 +112,12 @@ async function startRig(input: {
     ...(input.resume ? { resume: true } : {}),
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
     ...(input.cellSandbox ? { cellSandbox: input.cellSandbox } : {}),
+    ...(input.eventHost ? { eventHost: input.eventHost } : {}),
   };
+  // Runner sessions now persist every provider event before publishing it.
+  // Production runHsrHost creates this authority directory before adapter
+  // startup; the direct-adapter fixture must establish the same precondition.
+  await ensureHsrRunDir(opts.bee);
 
   let session: RunnerSession;
   try {
@@ -100,6 +125,7 @@ async function startRig(input: {
       startupTimeoutMs: 2_000,
       requestTimeoutMs: 2_000,
       reconnectBaseMs: 10,
+      beforeProviderEvent: input.beforeProviderEvent,
     });
   } catch (error) {
     if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
@@ -122,6 +148,7 @@ async function startRig(input: {
   }
 
   return {
+    bee,
     session,
     events,
     url,
@@ -301,7 +328,11 @@ test("startup uses random Basic auth, subscribes before prompt, filters sessions
     // close the newly released queued turn when session.idle follows it.
     await rig.emit({ type: "session.status", properties: { sessionID: rig.session.sessionId, status: { type: "idle" } } });
     await rig.emit({ type: "session.idle", properties: { sessionID: rig.session.sessionId } });
-    await waitFor(async () => promptRequests(await rig.state()).length === 2, "queued second prompt");
+    await waitFor(
+      async () => promptRequests(await rig.state()).length === 2
+        && rig.events.filter((event) => event.type === "turn_start").length === 2,
+      "queued second prompt and its durable turn boundary",
+    );
     const state = await rig.state();
     assert.equal(state.promptBeforeSubscription, false);
     const prompts = promptRequests(state);
@@ -449,6 +480,74 @@ test("permissions and native string[][] questions round-trip without flattening"
     await waitFor(() => rig.events.some((event) => event.type === "needs_input" && event.requestId === "que_2"), "rejectable question");
     await rig.session.answer("que_2", "reject");
     await waitFor(async () => (await rig.state()).requests.some((request) => request.path === "/question/que_2/reject"), "question rejection");
+  } finally {
+    await rig.cleanup();
+  }
+});
+
+test("lost OpenCode HTTP answer reply becomes durable ambiguity and is never written twice", async () => {
+  const rig = await startRig({ env: { FAKE_OPENCODE_DROP_ANSWER_REPLY: "1" } });
+  try {
+    await rig.emit({ type: "permission.asked", properties: {
+      id: "per_lost_reply",
+      sessionID: rig.session.sessionId,
+      permission: "bash",
+      patterns: ["npm test"],
+      metadata: {},
+      always: [],
+    } });
+    await waitFor(
+      () => rig.events.some((event) => event.type === "needs_input" && event.requestId === "per_lost_reply"),
+      "lost-reply permission input",
+    );
+    const source: SessionRecord = {
+      name: "opencode-answer-lost",
+      agent: "opencode",
+      cwd: rig.root,
+      command: "opencode",
+      tmuxTarget: "opencode-answer-lost",
+      createdAt: "2026-08-15T12:00:00.000Z",
+      updatedAt: "2026-08-15T12:00:00.000Z",
+      status: "running",
+      substrate: "hsr",
+      runtimeGeneration: 1,
+      id: "opencode-answer-lost-id",
+      uuid: "opencode-answer-lost-uuid",
+    };
+    const host: HsrAnswerHostIdentity = {
+      hostPid: process.pid,
+      startedAt: "2026-08-15T12:00:01.000Z",
+      hostFingerprint: { pgid: process.pid, startedAt: "opencode-test-host" },
+    };
+    const operation = createHsrAnswerOperation(source, "per_lost_reply", "yes", host);
+    await offerHsrAnswerOperation(source.name, operation);
+    await markHsrAnswerOperationSending(source.name, operation);
+    const first = await coordinateHsrAnswerOnHost({
+      bee: source.name,
+      operation,
+      host,
+      prepare: async () => {
+        const prepared = await rig.session.prepareAnswer(operation.requestId, "yes");
+        return () => prepared.dispatch();
+      },
+    });
+    assert.equal(first.status, "ambiguous");
+    assert.equal((await readHsrAnswerReceipt(source.name, operation))?.phase, "ambiguous");
+    const writesAfterFirst = (await rig.state()).requests.filter(
+      (request) => request.path === "/permission/per_lost_reply/reply",
+    ).length;
+    assert.equal(writesAfterFirst, 1);
+
+    const replay = await coordinateHsrAnswerOnHost({
+      bee: source.name,
+      operation,
+      host,
+      prepare: async () => { throw new Error("must not prepare a second HTTP write"); },
+    });
+    assert.equal(replay.status, "ambiguous");
+    assert.equal((await rig.state()).requests.filter(
+      (request) => request.path === "/permission/per_lost_reply/reply",
+    ).length, 1);
   } finally {
     await rig.cleanup();
   }
@@ -649,4 +748,101 @@ test("stop is idempotent and terminates the whole OpenCode process group", async
     }
   }, "descendant process exit");
   await rig.cleanup();
+});
+
+test("natural child close waits for an in-flight final SSE event before sealing exit", async () => {
+  let releaseTail!: () => void;
+  const tailRelease = new Promise<void>((resolveTail) => { releaseTail = resolveTail; });
+  let markTailEntered!: () => void;
+  const tailEntered = new Promise<void>((resolveTail) => { markTailEntered = resolveTail; });
+  const hostFingerprint = await captureProcessBirthFingerprint(process.pid);
+  assert.ok(hostFingerprint);
+  const eventHost: HsrAnswerHostIdentity = {
+    hostPid: process.pid,
+    startedAt: "2026-08-16T10:00:00.000Z",
+    hostFingerprint: hostFingerprint!,
+  };
+  const rig = await startRig({
+    eventHost,
+    beforeProviderEvent: async (value) => {
+      const event = value as { type?: unknown; properties?: { delta?: unknown } };
+      if (event.type !== "message.part.delta" || event.properties?.delta !== "final-tail") return;
+      markTailEntered();
+      await tailRelease;
+    },
+  });
+  try {
+    await rig.emit({
+      type: "message.updated",
+      properties: {
+        sessionID: rig.session.sessionId,
+        info: { id: "msg_terminal", sessionID: rig.session.sessionId, role: "assistant" },
+      },
+    });
+    await rig.emit({
+      type: "message.part.updated",
+      properties: {
+        sessionID: rig.session.sessionId,
+        part: {
+          id: "prt_terminal",
+          messageID: "msg_terminal",
+          sessionID: rig.session.sessionId,
+          type: "text",
+          text: "",
+        },
+      },
+    });
+    // Let the two setup frames reach the SSE consumer before pausing the final
+    // one. The test hook is inside the provider handler, after exact session
+    // filtering, so `tailEntered` proves the terminal frame is already parsed.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    const emittingTail = rig.emit({
+      type: "message.part.delta",
+      properties: {
+        sessionID: rig.session.sessionId,
+        messageID: "msg_terminal",
+        partID: "prt_terminal",
+        field: "text",
+        delta: "final-tail",
+      },
+    });
+    await tailEntered;
+    assert.equal(typeof rig.session.pid, "number");
+    process.kill(rig.session.pid!, "SIGTERM");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+    assert.equal(rig.events.some((event) => event.type === "exit"), false, "exit waits for the parsed SSE handler");
+    releaseTail();
+    await emittingTail;
+    await waitFor(() => rig.events.some((event) => event.type === "exit"), "terminal SSE drain and exit");
+
+    const tailIndex = rig.events.findIndex((event) => event.type === "text" && event.text === "final-tail");
+    const exitIndex = rig.events.findIndex((event) => event.type === "exit");
+    assert.ok(tailIndex >= 0);
+    assert.ok(exitIndex > tailIndex, "the final SSE event is published before terminal exit");
+    assert.equal(rig.events.slice(exitIndex + 1).length, 0, "nothing can land above terminal exit");
+
+    const durable = (await readFile(hsrEventsPath(rig.bee), "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as RunnerEvent);
+    const durableTail = durable.find((event) => event.type === "text" && event.text === "final-tail");
+    const durableExit = durable.find((event) => event.type === "exit");
+    assert.ok(durableTail?.seq && durableExit?.seq && durableTail.seq < durableExit.seq);
+    assert.equal(durable.at(-1)?.seq, durableExit?.seq);
+    const meta: HsrMeta = {
+      bee: rig.bee,
+      harness: "opencode",
+      tier: "server",
+      hostPid: eventHost.hostPid,
+      hostFingerprint: eventHost.hostFingerprint,
+      startedAt: eventHost.startedAt,
+      controlSocket: "",
+      status: "running",
+    };
+    const closure = await sealHsrEventStreamClosure(rig.bee, meta);
+    assert.equal(closure.lastSeq, durableExit?.seq, "terminal exit is the exact source high-water");
+  } finally {
+    releaseTail();
+    await rig.cleanup();
+  }
 });

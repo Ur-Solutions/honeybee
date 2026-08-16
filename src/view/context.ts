@@ -26,6 +26,7 @@ import { hsrObservations as hsrObservationsImpl, type HsrObservation } from "../
 import { listNodes as listNodesImpl, type NodeRecord } from "../node.js";
 import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
 import { liveTargetKey, parseBeeState, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
 import type { SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 
@@ -102,7 +103,7 @@ export async function capturePanesForRecords(records: SessionRecord[], liveTarge
  */
 function hsrCandidateNames(records: readonly SessionRecord[], remoteHsrNodes: ReadonlySet<string>): string[] {
   return records
-    .filter((record) => record.status !== "done" && (
+    .filter((record) => !isArchivedSessionLifecycle(record) && (
       record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
     ))
     .map((record) => record.name);

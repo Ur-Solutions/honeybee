@@ -76,7 +76,7 @@
           "responseSchema": "execution-response-envelope"
         }
       ],
-      "commands": ["send", "answer", "interrupt", "checkpoint"],
+      "commands": ["send", "interrupt"],
       "profileGatedCommands": { "refresh-credential": "credential-lease-v1" },
       "eventTypes": [
         "run.accepted",
@@ -110,7 +110,7 @@
         "artifact.finalized",
         "run.recovering"
       ],
-      "note": "Required eventTypes are exactly the families this runtime durably emits today. optionalEventTypes stay in the schema vocabulary (fixtures and run.events pages validate) but are not promised until the event-normalization bridge lands; needs_input.* is optional because needs_input.opened is not bridged yet, so the answer command is not advertised as deliverable.",
+      "note": "Required eventTypes are exactly the families this runtime durably emits today. optionalEventTypes and run-command schema variants stay in the validation vocabulary, but local-core-v1.commands lists only baseline commands clients may send; answer is excluded until its signed command carries an expected runner-host epoch, and checkpoint remains unsupported by the runtime.",
       "errorCodes": [
         "PROTOCOL_INCOMPATIBLE",
         "SCHEMA_UNSUPPORTED",

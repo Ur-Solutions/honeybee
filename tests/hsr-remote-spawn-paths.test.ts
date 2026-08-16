@@ -25,7 +25,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { test } from "node:test";
-import { serve, resolveRemoteSpawnCwd, resolveRemoteSpawnHome } from "../src/hsr/remoteHost.js";
+import { serve, resolveRemoteSpawnCwd, resolveRemoteSpawnHome, versionCore } from "../src/hsr/remoteHost.js";
 import { hsrRunDir } from "../src/hsr/runDir.js";
 import { createRemoteHsrSubstrate } from "../src/substrates/remote-hsr.js";
 import { clearSubstrateCache } from "../src/substrates/index.js";
@@ -111,7 +111,7 @@ function makeNode(overrides: Partial<NodeRecord> = {}): NodeRecord {
     kind: "remote-hsr",
     endpoint: "me@remote-host",
     capabilities: ["*"],
-    runnerHostVersion: "0.0.1+deadbeef1234",
+    runnerHostVersion: versionCore(),
     status: "unknown",
     createdAt: "2026-07-03T00:00:00.000Z",
     updatedAt: "2026-07-03T00:00:00.000Z",
@@ -212,9 +212,12 @@ test("remote HSR spawn: with NO client cwd/home, the remote derives cwd + home u
       assert.equal((await stat(join(hsrRunDir(bee), "home"))).mode & 0o777, 0o700, "derived home is 0700");
       assert.equal((await stat(derivedCred)).mode & 0o777, 0o600, "credential file is 0600");
 
-      // kill shreds the delivered credential and reclaims the run dir (cwd + home).
-      const kr = await sub.kill(bee);
-      assert.equal(kr.ok, true);
+      // Kill shreds the delivered credential after exact stop. The run dir is
+      // deliberately retained until this pre-admitted consumer acknowledges
+      // the terminal event suffix.
+      const kr = await sub.kill(bee, { remoteLaunchId: res.launchId, remoteIncarnation: res.incarnation });
+      assert.equal(kr.ok, false);
+      assert.equal(kr.incarnationStopped, true);
       await waitFor(async () => !(await fileExists(derivedCred)), "credential GONE after kill");
     } finally {
       await sub.close();
@@ -244,7 +247,7 @@ test("remote HSR spawn: a provisioned checkout cwd (a real remote path) is honor
       assert.equal(res.cwd, checkout, "the checkout cwd is honored verbatim");
       // The bee ran in the checkout, so the derived per-bee cwd was NEVER created.
       assert.equal(await fileExists(join(hsrRunDir(bee), "cwd")), false, "no derived cwd dir when a checkout is supplied");
-      await sub.kill(bee);
+      await sub.kill(bee, { remoteLaunchId: res.launchId, remoteIncarnation: res.incarnation });
     } finally {
       await sub.close();
       await server.close();
@@ -273,7 +276,7 @@ test("remote HSR spawn: a bare spawn (no creds) needs no client cwd/home and cre
       assert.equal(res.cwd, join(hsrRunDir(bee), "cwd"), "cwd derived even with no creds");
       await waitFor(() => fileExists(join(hsrRunDir(bee), "cwd")), "derived cwd created");
       assert.equal(await fileExists(join(hsrRunDir(bee), "home")), false, "no isolated home without delivered creds");
-      await sub.kill(bee);
+      await sub.kill(bee, { remoteLaunchId: res.launchId, remoteIncarnation: res.incarnation });
     } finally {
       await sub.close();
       await server.close();

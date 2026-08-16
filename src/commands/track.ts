@@ -1,10 +1,12 @@
 // `hive track` — reusable advisory work sequences attached to one live bee.
 import { deliverPromptText, ensureLive, resolveBeeInCurrentPane, resolveSession, stringFlag } from "../cli/shared.js";
+import { deliverSessionText, deliverSessionTextInAdmission, withRunnableSessionAdmission } from "../delivery.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { nextTurnPatch } from "../seal.js";
-import { updateSession, type SessionRecord } from "../store.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
+import type { SessionLifecycleTransaction } from "../lifecycle.js";
+import type { SessionRecord } from "../store.js";
 import {
   attachTrack,
   defineTrackFromFile,
@@ -156,16 +158,17 @@ async function trackAttach(parsed: Parsed): Promise<void> {
     throw new Error("Usage: hive track attach <track> <bee> [--version <n>] [--start-at <stepId>]");
   }
   const bee = await resolveSession(beeRef);
-  if (bee.status !== "running") throw new Error(`Bee ${bee.name} is terminal (${bee.status})`);
+  if (!isRunnableSessionRecord(bee)) throw new Error(`Bee ${bee.name} is terminal (${bee.status})`);
   await ensureLive(bee);
 
-  const attachment = await attachTrack(trackName, {
-    bee: bee.name,
-    ...(bee.id ? { beeId: bee.id } : {}),
-    ...(versionFlag(parsed) !== undefined ? { version: versionFlag(parsed) } : {}),
-    ...(stringFlag(parsed, ["start-at"]) ? { startAt: stringFlag(parsed, ["start-at"]) } : {}),
-    deliver: deliveryForBee(bee),
-  });
+  const attachment = await withRunnableSessionAdmission(bee, (lifecycle, admitted) =>
+    attachTrack(trackName, {
+      bee: admitted.name,
+      ...(admitted.id ? { beeId: admitted.id } : {}),
+      ...(versionFlag(parsed) !== undefined ? { version: versionFlag(parsed) } : {}),
+      ...(stringFlag(parsed, ["start-at"]) ? { startAt: stringFlag(parsed, ["start-at"]) } : {}),
+      deliver: deliveryForBeeInAdmission(lifecycle, admitted),
+    }), { operation: "hive track attach" });
 
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(attachment, null, 2));
@@ -187,7 +190,7 @@ async function trackQueue(parsed: Parsed): Promise<void> {
     throw new Error("Usage: hive track queue <track> <bee> [--version <n>] [--queued-by <who>]");
   }
   const bee = await resolveSession(beeRef);
-  const attachment = await queueTrack(trackName, bee.name, {
+  const attachment = await queueTrackForBee(trackName, bee, {
     ...(versionFlag(parsed) !== undefined ? { version: versionFlag(parsed) } : {}),
     queuedBy: stringFlag(parsed, ["queued-by"]) ?? process.env.HIVE_BEE ?? "operator",
   });
@@ -199,6 +202,16 @@ async function trackQueue(parsed: Parsed): Promise<void> {
   } else {
     console.log(`queued\t${entry.track}\t${attachment.bee}\t${attachment.queue.length}`);
   }
+}
+
+/** Lifecycle-linearized future-work enqueue; attachment locking stays inner. */
+export async function queueTrackForBee(
+  trackName: string,
+  bee: SessionRecord,
+  options: { version?: number; queuedBy: string; now?: () => Date },
+): Promise<TrackAttachment> {
+  return withRunnableSessionAdmission(bee, (_lifecycle, admitted) =>
+    queueTrack(trackName, admitted.name, options), { operation: "hive track queue" });
 }
 
 async function trackQueueList(parsed: Parsed): Promise<void> {
@@ -233,9 +246,17 @@ async function trackQueueList(parsed: Parsed): Promise<void> {
   ));
 }
 
-function deliveryForBee(bee: SessionRecord): TrackDelivery {
+function deliveryForBeeInAdmission(
+  lifecycle: SessionLifecycleTransaction,
+  bee: SessionRecord,
+): TrackDelivery {
+  let current = bee;
   return async (postscript) => {
-    await deliverTrackFollowUp(bee, postscript);
+    const delivered = await deliverSessionTextInAdmission(lifecycle, current, postscript, {
+      deliver: deliverPromptText,
+    });
+    current = delivered.record;
+    await writeHiveState(current, "working").catch(() => undefined);
   };
 }
 
@@ -256,17 +277,11 @@ export async function deliverTrackFollowUp(
   postscript: string,
   options: TrackFollowUpOptions = {},
 ): Promise<void> {
-  const turn = await nextTurnPatch(bee);
-  await (options.deliver ?? deliverPromptText)(bee, postscript);
-  const at = (options.now ?? (() => new Date()))().toISOString();
-  const persisted = await updateSession(bee.name, {
-    ...turn,
-    updatedAt: at,
-    status: "running",
-    lastPrompt: postscript,
-    lastPromptAt: at,
+  const delivered = await deliverSessionText(bee, postscript, {
+    deliver: options.deliver ?? deliverPromptText,
+    now: options.now,
   });
-  await (options.writeState ?? writeHiveState)(persisted ?? bee, "working");
+  await (options.writeState ?? writeHiveState)(delivered.record, "working").catch(() => undefined);
 }
 
 async function trackStatus(parsed: Parsed): Promise<void> {
@@ -284,11 +299,12 @@ async function trackDetach(parsed: Parsed): Promise<void> {
   const beeRef = parsed.args[1];
   if (!beeRef) throw new Error("Usage: hive track detach <bee> [--exception <why>] [--step <id>]");
   const bee = await resolveSession(beeRef);
-  const attachment = await detachTrack(bee.name, {
-    ...(stringFlag(parsed, ["exception"]) ? { exception: stringFlag(parsed, ["exception"]) } : {}),
-    ...(stringFlag(parsed, ["step"]) ? { stepId: stringFlag(parsed, ["step"]) } : {}),
-    deliver: deliveryForBee(bee),
-  });
+  const attachment = await withRunnableSessionAdmission(bee, (lifecycle, admitted) =>
+    detachTrack(admitted.name, {
+      ...(stringFlag(parsed, ["exception"]) ? { exception: stringFlag(parsed, ["exception"]) } : {}),
+      ...(stringFlag(parsed, ["step"]) ? { stepId: stringFlag(parsed, ["step"]) } : {}),
+      deliver: deliveryForBeeInAdmission(lifecycle, admitted),
+    }), { operation: "hive track detach" });
   const active = await loadTrackAttachment(bee.name);
   if (truthy(flag(parsed, "json"))) {
     console.log(JSON.stringify(attachment, null, 2));
@@ -311,14 +327,15 @@ async function trackStep(parsed: Parsed): Promise<void> {
   }
   const noteText = stringFlag(parsed, ["note"]);
   const bee = await requireSelf("track step");
-  const attachment = await updateTrackStep(
-    bee.name,
-    stepId,
-    action === "done" ? "done" : "skipped",
-    noteText,
-    () => new Date(),
-    { deliver: deliveryForBee(bee) },
-  );
+  const attachment = await withRunnableSessionAdmission(bee, (lifecycle, admitted) =>
+    updateTrackStep(
+      admitted.name,
+      stepId,
+      action === "done" ? "done" : "skipped",
+      noteText,
+      () => new Date(),
+      { deliver: deliveryForBeeInAdmission(lifecycle, admitted) },
+    ), { operation: "hive track step" });
   // Outcome-arm nodes intentionally do not appear in the legacy main-spine
   // `steps` projection, so fall back to their canonical v2 runtime node.
   const legacyStep = attachment.steps.find((candidate) => candidate.id === stepId);

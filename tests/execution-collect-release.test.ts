@@ -10,15 +10,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { computeSchemaDigest, createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
+import { computeSchemaDigest, createExecutionValidator, isTransitionAllowed, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { collectGitDiffMetadata, readEvidence } from "../src/execution/evidence.js";
+import { transactionalRetire } from "../src/kill.js";
 import { admitOperation, readOperation } from "../src/execution/opsStore.js";
 import { canonicalDigest } from "../src/comb/canonical.js";
 import { createRunOperations } from "../src/execution/operations.js";
-import { effectKeyHash, mutateReservation, readReservation, readRunEvents } from "../src/execution/runStore.js";
-import { storeSessionEvidenceSource } from "../src/execution/service.js";
+import { appendRunLossEpisodeEvents, appendRunTerminalEvents, effectKeyHash, mutateReservation, readReservation, readRunEvents } from "../src/execution/runStore.js";
+import { retireExecutionSessionRecord, storeSessionEvidenceSource } from "../src/execution/service.js";
 import { claimWorkingCopy, readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import type { JsonValue } from "../src/comb/types.js";
+import type { Substrate } from "../src/substrates/types.js";
+import { loadSession, transitionSession, updateSession } from "../src/store.js";
 import {
   beeNameForRun,
   buildOperationEnvelope,
@@ -68,11 +71,18 @@ function collectEnvelope(ctx: TestAuthority, effectKey = `${RUN_ID}/collect`, re
   return buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID }, requestId ? { requestId } : {});
 }
 
-async function startRun(opts: { control?: ReturnType<typeof fakeControl> } = {}) {
+async function startRun(opts: {
+  control?: ReturnType<typeof fakeControl>;
+  retireSession?: NonNullable<Parameters<typeof makeService>[0]>["retireSession"];
+} = {}) {
   const ctx = await installTestAuthority();
   const counting = countingLauncher();
   const control = opts.control ?? fakeControl();
-  const service = makeService({ launcher: counting.launcher, control: control.control });
+  const service = makeService({
+    launcher: counting.launcher,
+    control: control.control,
+    ...(opts.retireSession ? { retireSession: opts.retireSession } : {}),
+  });
   await service.runStart(buildRunStartEnvelope(ctx));
   return { ctx, counting, control, service };
 }
@@ -274,6 +284,7 @@ test("two service instances join one durable failed-to-collecting recovery attem
         binding: async () => ctx.binding,
         control: control.control,
         sessions: storeSessionEvidenceSource(),
+        retireSession: async () => ({ retired: true, detail: "test SessionRecord archived" }),
         settle: async (reservation: NonNullable<Awaited<ReturnType<typeof readReservation>>>) => ({ reservation, state: "running" }),
         origin: async () => ({ nodeId: ctx.nodeId }),
       };
@@ -360,6 +371,7 @@ test("run.collect holds working-copy ownership through its durable snapshot befo
         binding: async () => ctx.binding,
         control: control.control,
         sessions: storeSessionEvidenceSource(),
+        retireSession: async () => ({ retired: true, detail: "test SessionRecord archived" }),
         settle: async (reservation) => ({ reservation, state: "running" }),
         origin: async () => ({ nodeId: ctx.nodeId }),
         collectGitDiffMetadata: async (copy, generatedAt) => {
@@ -477,6 +489,7 @@ test("an admitted retain that loses to release is refused under the reservation 
       binding: async () => ctx.binding,
       control: control.control,
       sessions: storeSessionEvidenceSource(),
+      retireSession: async () => ({ retired: true, detail: "test SessionRecord archived" }),
       settle: async (reservation) => {
         reachedPause();
         await resume;
@@ -544,6 +557,148 @@ test("retain provenance recovers a crash after persistence but before the operat
     )) as JsonObject;
     assert.equal((replay.receipt as JsonObject).outcome, "replayed");
     assert.deepEqual(replay.result, { runId: RUN_ID, retainedUntil: retainUntil });
+  });
+});
+
+test("run.release archives the exact SessionRecord before freeing Cell occupancy", async () => {
+  await withTempStore(async () => {
+    let retirementObservedWhileOccupied = false;
+    const { ctx, service } = await startRun({
+      retireSession: async (reservation) => {
+        retirementObservedWhileOccupied =
+          (await readWorkingCopy("wc-0001"))?.occupancy?.claimedByRunId === RUN_ID;
+        const record = await loadSession(reservation.beeName);
+        assert.ok(record);
+        assert.equal(record.executionRunId, reservation.runId);
+        assert.equal(record.id, reservation.sessionRef);
+        const at = new Date().toISOString();
+        const eventId = `execution-release:${reservation.runId}:${at}`;
+        const transitioned = await transitionSession(record.name, {
+          eventId,
+          at,
+          type: "bee.archived",
+          cause: "retire",
+          evidence: { kind: "operator", actionId: eventId, observedAt: at, action: "retire" },
+          probe: {
+            kind: "probe",
+            probeId: `${eventId}:probe`,
+            observerId: "execution-release-test",
+            observedAt: at,
+            outcome: "dead",
+            target: { substrate: "hsr" },
+            detail: "exact execution harness stop confirmed",
+          },
+        });
+        return transitioned === null
+          ? { retired: false, detail: "SessionRecord vanished" }
+          : { retired: true, detail: "exact execution SessionRecord archived" };
+      },
+    });
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/honeybee-release-retirement",
+      snapshotDigest: SNAPSHOT_DIGEST,
+    });
+    await claimWorkingCopy("wc-0001", RUN_ID);
+
+    const response = (await service.runRelease(
+      buildOperationEnvelope(ctx, `${RUN_ID}/release-retire-session`, { runId: RUN_ID }),
+    )) as JsonObject;
+
+    assert.equal((response.result as JsonObject).environmentState, "released");
+    assert.equal(retirementObservedWhileOccupied, true, "retirement proof precedes occupancy release");
+    assert.equal((await loadSession(beeNameForRun(RUN_ID)))!.stateMachine?.lifecycle, "archived");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy, undefined);
+  });
+});
+
+test("run.release archives canonical-active SessionRecord despite stale top-level done", async () => {
+  await withTempStore(async () => {
+    const substrate = {
+      kind: "hsr",
+      kill: async () => ({ ok: true, stdout: "", stderr: "", exitCode: 0 }),
+      hasSession: async () => false,
+    } as unknown as Substrate;
+    const { ctx, service } = await startRun({
+      retireSession: (reservation) => retireExecutionSessionRecord(reservation, {
+        retire: (record) => transactionalRetire(record, {
+          substrate,
+          emitLedger: false,
+          pollIntervalMs: 0,
+          finalCredentialSync: async () => undefined,
+        }),
+      }),
+    });
+    const bee = beeNameForRun(RUN_ID);
+    const at = new Date().toISOString();
+    await transitionSession(bee, {
+      eventId: `mixed-lifecycle:${RUN_ID}`,
+      at,
+      type: "turn.started",
+      cause: "first-turn",
+      evidence: {
+        kind: "hook",
+        hookId: `mixed-lifecycle:${RUN_ID}:hook`,
+        observedAt: at,
+        hook: "turn-start",
+      },
+    });
+    await updateSession(bee, { status: "done", updatedAt: new Date().toISOString() });
+    const mixed = await loadSession(bee);
+    assert.equal(mixed?.status, "done");
+    assert.equal(mixed?.stateMachine?.lifecycle, "active");
+
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/honeybee-release-mixed-lifecycle",
+      snapshotDigest: SNAPSHOT_DIGEST,
+    });
+    await claimWorkingCopy("wc-0001", RUN_ID);
+
+    const response = (await service.runRelease(
+      buildOperationEnvelope(ctx, `${RUN_ID}/release-mixed-lifecycle`, { runId: RUN_ID }),
+    )) as JsonObject;
+
+    assert.equal((response.result as JsonObject).environmentState, "released");
+    assert.equal((await loadSession(bee))?.stateMachine?.lifecycle, "archived");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy, undefined);
+  });
+});
+
+test("run.release keeps every destructive step pending when SessionRecord retirement is unconfirmed", async () => {
+  await withTempStore(async () => {
+    let retirementConfirmed = false;
+    const retireSession = async () => retirementConfirmed
+      ? { retired: true, detail: "retry archived the exact SessionRecord" }
+      : { retired: false, detail: "session lifecycle store unavailable" };
+    const { ctx, service } = await startRun({
+      retireSession,
+    });
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/honeybee-release-retirement-fence",
+      snapshotDigest: SNAPSHOT_DIGEST,
+    });
+    await claimWorkingCopy("wc-0001", RUN_ID);
+    const effectKey = `${RUN_ID}/release-retirement-fence`;
+
+    const first = (await service.runRelease(
+      buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID }),
+    )) as JsonObject;
+    assert.equal((first.result as JsonObject).environmentState, "releasing");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+    assert.equal((await readReservation(RUN_ID))!.releasedAt, undefined);
+    assert.ok((await readOperation(RUN_ID, effectKey))!.releaseSteps!.every((step) => step.status === "pending"));
+
+    retirementConfirmed = true;
+    const restarted = makeService({ retireSession });
+    const retry = await restarted.reconcileInventory({ limit: 8 });
+    assert.ok(retry.outcomes.some((outcome) => outcome.runId === RUN_ID && outcome.action !== "error"));
+    assert.equal(((await readOperation(RUN_ID, effectKey))!.result as JsonObject).environmentState, "released");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy, undefined);
   });
 });
 
@@ -729,10 +884,11 @@ test("release keeps cleanup fenced when a terminal result races an unconfirmed o
       control.control.stop = async (beeName) => {
         if (!injectedTerminal) {
           injectedTerminal = true;
-          await mutateReservation(RUN_ID, (record) => ({
+          const terminal = await mutateReservation(RUN_ID, (record) => ({
             ...record,
             result: { outcome: "completed", finishedAt: new Date().toISOString(), harnessExitCode: 0 },
           }));
+          await appendRunTerminalEvents(terminal, "0.1", { nodeId: ctx.nodeId });
         }
         return baseStop(beeName);
       };
@@ -751,7 +907,15 @@ test("release keeps cleanup fenced when a terminal result races an unconfirmed o
       assert.equal(fenced.releasedAt, undefined);
       assert.equal(fenced.sealedAt, undefined);
       assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
-      assert.ok((await readRunEvents(RUN_ID)).some((event) => event.type === "run.lost"));
+      const fencedEvents = await readRunEvents(RUN_ID);
+      assert.ok(fencedEvents.some((event) => event.type === "run.lost"));
+      assert.ok(!fencedEvents.some((event) => event.type === "run.completed"), "premature terminal is retracted from the lost generation");
+      assert.equal((fencedEvents[0]!.payload as JsonObject).cursorResetThroughSeq, 6);
+      assert.deepEqual(
+        await appendRunTerminalEvents(fenced, "0.1", { nodeId: ctx.nodeId }),
+        [],
+        "terminal self-healing stays suppressed while the durable loss episode is active",
+      );
       assert.ok((await readOperation(RUN_ID, `${RUN_ID}/release-terminal-stop-race`))!.releaseSteps!.every(
         (step) => step.status === "pending",
       ));
@@ -773,8 +937,63 @@ test("release keeps cleanup fenced when a terminal result races an unconfirmed o
       assert.ok(recovered.releasedAt);
       assert.equal((await readWorkingCopy("wc-0001"))!.occupancy, undefined);
       const events = await readRunEvents(RUN_ID);
-      assert.ok(events.some((event) => event.type === "run.recovering"));
-      assert.ok(events.some((event) => event.type === "run.completed"));
+      const stateEvents = events.filter((event) => [
+        "run.accepted",
+        "environment.materializing",
+        "harness.starting",
+        "harness.running",
+        "run.lost",
+        "run.recovering",
+        "run.completed",
+        "run.failed",
+        "run.cancelled",
+      ].includes(event.type));
+      assert.deepEqual(stateEvents.map((event) => event.type), [
+        "run.accepted",
+        "environment.materializing",
+        "harness.starting",
+        "harness.running",
+        "run.lost",
+        "run.recovering",
+        "harness.running",
+        "run.completed",
+      ]);
+      const targetState: Record<string, string> = {
+        "environment.materializing": "materializing",
+        "harness.starting": "starting",
+        "harness.running": "running",
+        "run.lost": "lost",
+        "run.recovering": "recovering",
+        "run.completed": "completed",
+      };
+      let projected = "accepted";
+      for (const event of stateEvents.slice(1)) {
+        const target = targetState[event.type]!;
+        assert.ok(isTransitionAllowed(contract, "run", projected, target), `${projected} -> ${target} must be contract-legal`);
+        projected = target;
+      }
+      assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
+      await assert.rejects(
+        appendRunLossEpisodeEvents(
+          fenced,
+          "0.1",
+          [{
+            type: "run.lost",
+            payload: { lossEpisodeId: fenced.lossEpisodeId!, cause: "stale-retry" },
+            origin: { nodeId: ctx.nodeId },
+          }],
+          { onlyIfAbsentKeys: true },
+        ),
+        (error: { code?: string }) => error.code === "AUTHORITY_UNAVAILABLE",
+      );
+      assert.equal(
+        (await readRunEvents(RUN_ID)).filter((event) => event.type === "run.completed").length,
+        1,
+        "a stale loss publisher cannot retract the restored terminal generation",
+      );
+      const staleCursor = await service.runEvents({ protocolVersion: "0.1", runId: RUN_ID, afterSeq: 5 });
+      assert.ok("error" in staleCursor);
+      assert.equal(staleCursor.error.code, "CURSOR_EXPIRED");
     });
   });
 });

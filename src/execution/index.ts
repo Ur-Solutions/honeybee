@@ -4,9 +4,13 @@
 // conformance runner both repositories must pass with the same digest.
 export {
   EXECUTION_CONTRACT_SCHEMA_ID_BASE,
+  EXECUTION_VALIDATION_SURFACE_VERSION,
+  computeExecutionValidationSurfaceDigest,
   computeSchemaDigest,
   createExecutionValidator,
+  executionBaselineFeatures,
   executionContractRoot,
+  executionValidationSurface,
   isTransitionAllowed,
   loadExecutionContract,
   stateMachine,

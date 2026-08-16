@@ -121,8 +121,11 @@ export function hsrHarnessControl(options: HsrHarnessControlOptions = {}): Harne
       // blindly redeliver a protocol command later.
       await callControl(beeName, "send", { text, deliveryId }, options);
     },
-    async answer(beeName, inputRequestId, answer) {
-      await callControl(beeName, "answer", { requestId: inputRequestId, answer }, options);
+    async answer(_beeName, _inputRequestId, _answer) {
+      throw new HarnessDispatchError(
+        "failed",
+        "run.command answer is unavailable until the signed command carries an expected runner-host epoch",
+      );
     },
     async interrupt(beeName) {
       await callControl(beeName, "interrupt", undefined, options);

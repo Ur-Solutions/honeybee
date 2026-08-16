@@ -16,6 +16,9 @@ import {
   type SessionRecord,
 } from "../src/store.js";
 import {
+  isActiveSessionLifecycle,
+  isArchivedSessionLifecycle,
+  isRunnableSessionRecord,
   makeStateMachineCursor,
   reduceBeeTransition,
   type BeeStateMachineCursor,
@@ -30,6 +33,38 @@ import {
 import { projectBeeView } from "../src/view/project.js";
 
 const T0 = Date.parse("2026-08-11T19:00:00.000Z");
+
+test("lifecycle predicates make a canonical cursor outrank stale scalars in both directions", () => {
+  const active = { lifecycle: "active" as const };
+  const archived = { lifecycle: "archived" as const };
+
+  for (const status of ["done", "dead", "kill_failed", "running"]) {
+    assert.equal(isActiveSessionLifecycle({ status, stateMachine: active }), true, `active/${status}`);
+    assert.equal(isArchivedSessionLifecycle({ status, stateMachine: active }), false, `active/${status}`);
+    assert.equal(isActiveSessionLifecycle({ status, stateMachine: archived }), false, `archived/${status}`);
+    assert.equal(isArchivedSessionLifecycle({ status, stateMachine: archived }), true, `archived/${status}`);
+  }
+
+  assert.equal(isActiveSessionLifecycle({ status: "running" }), true);
+  assert.equal(isActiveSessionLifecycle({ status: "dead" }), false);
+  assert.equal(isArchivedSessionLifecycle({ status: "done" }), true);
+  assert.equal(isArchivedSessionLifecycle({ status: "running" }), false);
+});
+
+test("runnable-session admission keeps failed-stop doubt fenced from active lifecycle", () => {
+  const active = { lifecycle: "active" as const };
+  const archived = { lifecycle: "archived" as const };
+
+  for (const status of ["running", "done", "dead"]) {
+    assert.equal(isRunnableSessionRecord({ status, stateMachine: active }), true, `active/${status}`);
+  }
+  assert.equal(isRunnableSessionRecord({ status: "kill_failed", stateMachine: active }), false);
+  for (const status of ["running", "done", "dead", "kill_failed"]) {
+    assert.equal(isRunnableSessionRecord({ status, stateMachine: archived }), false, `archived/${status}`);
+  }
+  assert.equal(isRunnableSessionRecord({ status: "running" }), true, "legacy running remains runnable");
+  assert.equal(isRunnableSessionRecord({ status: "kill_failed" }), false, "legacy stop doubt remains fenced");
+});
 
 async function withTempStore(fn: (root: string) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "hive-bounded-state-"));
@@ -301,6 +336,18 @@ test("BeeView projects recovering, invisible parked, recovery failure, and obser
   const parkedView = viewFor(record({ lastPromptAt: at(1), stateMachine: parked }));
   assert.equal(parkedView.displayState, "ready");
   assert.equal(parkedView.latestRuntime.runtimeState, "parked");
+
+  const mixedVersionView = viewFor(record({
+    status: "done",
+    lastPromptAt: at(1),
+    stateMachine: parked,
+  }));
+  assert.equal(mixedVersionView.bee.lifecycleState, "active", "canonical active outranks a stale done scalar");
+  assert.equal(mixedVersionView.displayState, "ready");
+  assert.equal(mixedVersionView.interactionState, "idle");
+  assert.equal(mixedVersionView.latestRuntime.runtimeState, "parked");
+  assert.equal(mixedVersionView.latestRuntime.evidence.grade, "structured");
+  assert.match(mixedVersionView.latestRuntime.evidence.detail ?? "", /idle runtime parked/);
 
   const failedEvent = eventSet(12).find((event) => event.type === "recovery.failed")!;
   const failed = cursor(axes(recovering), failedEvent, recovering.revision);

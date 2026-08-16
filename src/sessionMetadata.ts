@@ -6,7 +6,9 @@ import { readHsrMeta } from "./hsr/runDir.js";
 import { writeHiveTitle } from "./hiveState.js";
 import { withFileLock } from "./lock.js";
 import { canWriteTitle } from "./naming.js";
+import { withSessionLifecycleTransactionIfPresent, type SessionLifecycleTransaction } from "./lifecycle.js";
 import { listSessions, loadSession, touchSession, type SessionRecord } from "./store.js";
+import { isArchivedSessionLifecycle } from "./stateMachine.js";
 import { isAnchoredTranscriptMatch, latestTranscript, type TranscriptFile, type TranscriptLookupOptions } from "./transcripts.js";
 import { samePath } from "./transcripts/util.js";
 
@@ -117,6 +119,44 @@ async function persistFields(
   options: PersistTranscriptMetadataOptions,
   allowMetadata: boolean,
 ): Promise<{ record: SessionRecord; titleChanged: boolean }> {
+  if (options.markRunning) {
+    const persisted = await withSessionLifecycleTransactionIfPresent(record, async (lifecycle) => {
+      const current = await lifecycle.refresh();
+      return persistFieldsWithLifecycle(lifecycle, current, tx, options, allowMetadata);
+    });
+    return persisted ?? { record, titleChanged: false };
+  }
+
+  const fields = transcriptMetadataFields(record, tx, options, allowMetadata);
+  if (Object.keys(fields).length === 0) return { record, titleChanged: false };
+  fields.updatedAt = new Date().toISOString();
+  const updated = await touchSession(record.name, fields);
+  return {
+    record: updated ?? { ...record, ...fields },
+    titleChanged: typeof fields.title === "string",
+  };
+}
+
+async function persistFieldsWithLifecycle(
+  lifecycle: SessionLifecycleTransaction,
+  record: SessionRecord,
+  tx: TranscriptFile,
+  options: PersistTranscriptMetadataOptions,
+  allowMetadata: boolean,
+): Promise<{ record: SessionRecord; titleChanged: boolean }> {
+  const fields = transcriptMetadataFields(record, tx, options, allowMetadata);
+  if (Object.keys(fields).length === 0) return { record, titleChanged: false };
+  fields.updatedAt = new Date().toISOString();
+  const updated = await lifecycle.commit(fields);
+  return { record: updated, titleChanged: typeof fields.title === "string" };
+}
+
+function transcriptMetadataFields(
+  record: SessionRecord,
+  tx: TranscriptFile,
+  options: PersistTranscriptMetadataOptions,
+  allowMetadata: boolean,
+): Partial<SessionRecord> {
   const fields: Partial<SessionRecord> = {};
 
   // Identity (path/session-id) and title are only ever adopted from a
@@ -144,16 +184,18 @@ async function persistFields(
       fields.providerTitleKind = incomingTitleKind;
     }
   }
-  if (options.markRunning && record.status !== "running") fields.status = "running";
-
-  if (Object.keys(fields).length === 0) return { record, titleChanged: false };
-
-  fields.updatedAt = new Date().toISOString();
-  const updated = await touchSession(record.name, fields);
-  return {
-    record: updated ?? { ...record, ...fields },
-    titleChanged: typeof fields.title === "string",
-  };
+  // `kill_failed` is current stop-doubt evidence, not a legacy lifecycle
+  // spelling. Transcript discovery must never erase it after a failed stop;
+  // only a later exact lifecycle operation may resolve that uncertainty.
+  if (
+    options.markRunning &&
+    !isArchivedSessionLifecycle(record) &&
+    record.status !== "running" &&
+    record.status !== "kill_failed"
+  ) {
+    fields.status = "running";
+  }
+  return fields;
 }
 
 type TranscriptOwnershipClaim = {

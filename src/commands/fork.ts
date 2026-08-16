@@ -9,17 +9,26 @@ import { modelArgsFor, pickForkSeed, type ForkSeedDecision, type ForkSeedInput, 
 import { copyThreadForFork, listTurnAnchors, locateThreadFile, parseAnchorFlag } from "../threadCopy.js";
 import { chooseFork, defaultForkForm, forkIntent, type ForkAccountOption } from "../forkTui.js";
 import { actionLine, bold, dim, isPretty, note, tildify } from "../format.js";
+import { withRunnableSessionAdmission } from "../delivery.js";
 import { writeSpawnOptions } from "../hiveState.js";
 import { adapterFor } from "../hsr/adapters/index.js";
 import { hsrSubstrate } from "../hsr/substrate.js";
 import { allocateBeeIdentity } from "../ids.js";
 import { LOCAL_NODE_NAME } from "../node.js";
+import { withBeeNameLaunchAdmission } from "../nameAdmission.js";
+import {
+  cleanupLaunchedTmuxIncarnation,
+  launchPublicationError,
+  rollbackFreshLaunchPublication,
+  type LaunchCleanupProof,
+} from "../launchPublication.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { acquireProSlot, deleteProSlot, listProRepoEntries, resolveProEntryForCwd, toProSlug, type ProSlotKind } from "../proProjects.js";
 import { listSeals, loadLatestSeal } from "../seal.js";
 import { resolveSelector } from "../selectors.js";
+import { isActiveSessionLifecycle } from "../stateMachine.js";
 import { planSpawnPreamble } from "../spawnPreamble.js";
-import { appendLedger, listSessions, safeName, saveSession, type SessionRecord } from "../store.js";
+import { appendLedger, listSessions, loadSession, safeName, saveSession, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateForRecord, type Substrate } from "../substrates/index.js";
 import { formatShellCommand } from "../tmux.js";
 import { randomUUID } from "node:crypto";
@@ -28,7 +37,8 @@ import { confirmPausedAccount, confirmSpawnReady, dangerousMode, deliverBrief, h
 import { cmdSend } from "../commands/messaging.js";
 import { maybeLinkHere, newBeeAccountRows, resolveAccountFlag, resolvePreambleFlags } from "../commands/spawn.js";
 import { spawnHsrHost, waitForHsrHost } from "../hsr/runnerHost.js";
-import { readHsrMetaStrict } from "../hsr/runDir.js";
+import { readHsrMetaStrict, removeConfirmedStoppedHsrRunDir } from "../hsr/runDir.js";
+import { stopHsrIncarnationByPid } from "../hsr/substrate.js";
 
 /**
  * RETIRED (APIA-85). `hive split` was the comb splitter: it created an adjacent
@@ -48,6 +58,19 @@ export async function cmdSplit(_parsed: Parsed): Promise<never> {
 
 export const FORK_SEED_MODES = new Set<SeedMode>(["resume", "seal", "summary", "log", "none"]);
 
+async function cleanupForkHsrIncarnation(bee: string, hostPid: number): Promise<LaunchCleanupProof> {
+  try {
+    const result = await stopHsrIncarnationByPid(bee, hostPid);
+    return {
+      stopped: result.ok,
+      detail: result.ok
+        ? "exact launched HSR incarnation stop confirmed"
+        : result.stderr || result.stdout || "exact HSR stop unconfirmed",
+    };
+  } catch (error) {
+    return { stopped: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 /**
  * Account gate for `hive fork` (session-fork-and-handoff epic, relaxing
@@ -239,6 +262,17 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     parsed.flags.set("substrate", "hsr");
   }
   const { useHsr, node } = await resolveSpawnSubstrate(parsed, targetTool);
+  // `remote-hsr` is not a tmux node: its Substrate.newSession deliberately
+  // refuses because only the tokenized remote spawn authority may create a
+  // runner. Fork has not yet implemented that publication protocol. Refuse
+  // here, before allocating a target identity or name reservation; entering
+  // the generic tmux branch would durably mark dispatch and then wedge a name
+  // even though no remote runtime was ever launched.
+  if (node?.kind === "remote-hsr") {
+    throw new Error(
+      "hive fork: remote-hsr targets are not supported yet; fork locally or choose an ssh-tmux node",
+    );
+  }
   const isRemote = node?.kind === "ssh-tmux";
   if (account && isRemote) throw new Error("--account forks are local-only (the vault never leaves this machine)");
 
@@ -317,6 +351,25 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
 
   const identity = await allocateBeeIdentity({ agent: spec.kind, requestedAgent: spec.requestedKind });
   const name = safeName(stringFlag(parsed, ["name"]) ?? identity.id);
+  if (name === source.name) {
+    throw new Error(`hive ${isHandoff ? "handoff" : "fork"}: target name must differ from source ${source.name}`);
+  }
+  // The authoritative target check remains inside withBeeNameLaunchAdmission.
+  // This fail-fast duplicate is a lock-order guard: without it reciprocal
+  // invalid forks A→B and B→A could each hold their source lifecycle lock while
+  // waiting on the other's target-name lock. A target that is itself a live
+  // source can never be a valid fresh fork name, so reject it before taking
+  // either source lock.
+  const existingTarget = await loadSession(name);
+  if (existingTarget && (
+    existingTarget.stateMachine !== undefined
+    || isActiveSessionLifecycle(existingTarget)
+    || existingTarget.status === "kill_failed"
+  )) {
+    throw new Error(
+      `session record already owns name ${name}; retire it or resolve its stop before launching a replacement`,
+    );
+  }
   stampBeeIdentityEnv(spec.env, {
     name,
     id: identity.id,
@@ -343,6 +396,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
   //    lineage + anti-cross-match fields. ANTI-CROSS-MATCH (§7.1): lastPromptAt
   //    set at creation; the fork gets its OWN provider session (a fresh pinned id
   //    under HSR, or a new tmux session), never the parent's transcript.
+  const launchTarget = () => withBeeNameLaunchAdmission(name, async (reservation) => {
   let record: SessionRecord;
   let substrate: Substrate;
   if (useHsr) {
@@ -365,6 +419,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     adoptInheritedHome(spec);
     const adapter = adapterFor(spec.kind);
     const runnerTier = adapter?.tier();
+    await reservation.markLaunchDispatch();
     const hostPid = await spawnHsrHost({
       bee: name,
       comb: name, // fork is its own comb (a fresh lineage root)
@@ -376,13 +431,8 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       ...(model ? { model } : {}),
       spec: { command: spec.command, args: spec.args, env: spec.env },
     });
-    const admittedMeta = await readHsrMetaStrict(name);
-    const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
-    if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
-      throw new Error(`HSR fork ${name} returned without complete process birth admission`);
-    }
     const command = shellCommand(spec);
-    record = {
+    const provisionalRecord: SessionRecord = {
       name,
       agent: spec.kind,
       cwd,
@@ -391,7 +441,6 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       tmuxTarget: name, // logical id — HSR has no tmux target
       substrate: "hsr",
       runnerPid: hostPid,
-      runnerFingerprint,
       ...(runnerTier ? { runnerTier } : {}),
       combId: name, // fork is its own comb
       forkedFromId: source.id ?? source.name,
@@ -413,9 +462,47 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(source.colony ? { colony: source.colony } : {}),
     };
+    let admittedMeta: Awaited<ReturnType<typeof readHsrMetaStrict>>;
+    try {
+      await reservation.recordHsrLaunch({ hostPid });
+      admittedMeta = await readHsrMetaStrict(name);
+    } catch (error) {
+      const rollback = await rollbackFreshLaunchPublication(reservation, provisionalRecord, {
+        context: `HSR fork runtime admission failed for ${name}`,
+        cleanup: () => cleanupForkHsrIncarnation(name, hostPid),
+        cleanupPrepublicationArtifacts: () => removeConfirmedStoppedHsrRunDir(name, hostPid),
+      });
+      throw launchPublicationError(error, rollback.cleanup, rollback.ownershipPersisted, rollback);
+    }
+    const runnerFingerprint = admittedMeta?.hostPid === hostPid ? admittedMeta.hostFingerprint : undefined;
+    if (!runnerFingerprint || (admittedMeta?.childAdmission !== "admitted" && admittedMeta?.childAdmission !== "none")) {
+      const error = new Error(`HSR fork ${name} returned without complete process birth admission`);
+      const rollback = await rollbackFreshLaunchPublication(reservation, provisionalRecord, {
+        context: `HSR fork birth admission was incomplete for ${name}`,
+        cleanup: () => cleanupForkHsrIncarnation(name, hostPid),
+        cleanupPrepublicationArtifacts: () => removeConfirmedStoppedHsrRunDir(name, hostPid, runnerFingerprint),
+      });
+      throw launchPublicationError(error, rollback.cleanup, rollback.ownershipPersisted, rollback);
+    }
+    record = { ...provisionalRecord, runnerFingerprint };
     substrate = hsrSubstrate();
-    await saveSession(record);
-    await writeSpawnOptions(record);
+    try {
+      await reservation.recordHsrLaunch({
+        hostPid,
+        hostFingerprint: runnerFingerprint,
+        childAdmission: admittedMeta!.childAdmission,
+      });
+      await saveSession(record);
+      await writeSpawnOptions(record);
+      await reservation.promotePublished(record);
+    } catch (error) {
+      const rollback = await rollbackFreshLaunchPublication(reservation, record, {
+        context: `HSR fork publication failed for ${name}`,
+        cleanup: () => cleanupForkHsrIncarnation(name, hostPid),
+        cleanupPrepublicationArtifacts: () => removeConfirmedStoppedHsrRunDir(name, hostPid, runnerFingerprint),
+      });
+      throw launchPublicationError(error, rollback.cleanup, rollback.ownershipPersisted, rollback);
+    }
     if (!(await waitForHsrHost(name, 5000))) {
       console.error(note(`hsr host for ${name} did not report live within 5s; the daemon will reconcile`));
     }
@@ -426,6 +513,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     const locationHint = isRemote && node ? ` on ${node.name}` : "";
     if (await substrate.hasSession(tmuxTarget)) throw new Error(`tmux session already exists${locationHint}: ${tmuxTarget}`);
 
+    await reservation.markLaunchDispatch();
     const launch = await substrate.newSession(tmuxTarget, cwd, {
       command: spec.command,
       args: spec.args,
@@ -463,9 +551,33 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
       ...(preamblePlan ? { preamble: preamblePlan.record } : {}),
       ...(source.colony ? { colony: source.colony } : {}),
     };
-    await saveSession(record);
-    await writeSpawnOptions(record);
+    try {
+      await reservation.recordTmuxLaunch({
+        substrate: substrate.kind === "ssh-tmux" ? "ssh-tmux" : "local-tmux",
+        target: tmuxTarget,
+        ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+        launch,
+      });
+      await saveSession(record);
+      await writeSpawnOptions(record);
+      await reservation.promotePublished(record);
+    } catch (error) {
+      const rollback = await rollbackFreshLaunchPublication(reservation, record, {
+        context: `tmux fork publication failed for ${name}`,
+        cleanup: () => cleanupLaunchedTmuxIncarnation(substrate, tmuxTarget, launch),
+      });
+      throw launchPublicationError(error, rollback.cleanup, rollback.ownershipPersisted, rollback);
+    }
   }
+  return { record, substrate };
+  }, { operation: isHandoff ? "handoff" : "fork" });
+  const launched = await withRunnableSessionAdmission(source, async (_sourceLifecycle, admittedSource) => {
+    if ((admittedSource.id ?? admittedSource.name) !== (source.id ?? source.name)) {
+      throw new Error(`hive ${isHandoff ? "handoff" : "fork"}: source identity changed before launch`);
+    }
+    return launchTarget();
+  }, { operation: isHandoff ? "hive handoff" : "hive fork" });
+  const { record, substrate } = launched;
 
   // 9. Ledger.
   await appendLedger({

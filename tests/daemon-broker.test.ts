@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { listMessages } from "../src/buz.js";
+import { mintCellBrokerCapability } from "../src/cellBrokerCapability.js";
 import {
   brokerFilesystemSpawnParsed,
   handleBrokerOperation,
@@ -13,9 +14,17 @@ import {
 import type { BrokerAcl } from "../src/daemon/brokerPolicy.js";
 import { capturePersistableProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
 import { writeHsrMeta } from "../src/hsr/runDir.js";
+import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
 import { listSeals } from "../src/seal.js";
+import { loadSession, updateSession } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
-async function seedSession(store: string, name: string, id = name): Promise<void> {
+async function seedSession(
+  store: string,
+  name: string,
+  id = name,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
   const sessions = join(store, "sessions");
   await mkdir(sessions, { recursive: true });
   const now = "2026-08-10T12:00:00.000Z";
@@ -29,7 +38,8 @@ async function seedSession(store: string, name: string, id = name): Promise<void
     substrate: "hsr",
     createdAt: now,
     updatedAt: now,
-    status: "dead",
+    status: "running",
+    ...overrides,
   }, null, 2)}\n`, { mode: 0o600 });
 }
 
@@ -136,6 +146,150 @@ test("broker handlers perform buz send/inbox, self-scoped state, and self seal",
   });
 });
 
+test("broker mutations reject a canonical-active kill_failed caller while diagnostics remain available", async () => {
+  await withStore(async (store) => {
+    const at = "2026-08-10T12:00:00.000Z";
+    await seedSession(store, "cell-stop-doubt", "CO.stop-doubt", {
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("cell-stop-doubt", "active", at),
+      lastError: "explicit stop could not be confirmed",
+    });
+    await seedSession(store, "cell-recipient", "CO.recipient");
+    const cwd = join(store, "allowed");
+    await mkdir(cwd);
+    let launches = 0;
+    const options = {
+      verifyCaller: verifiedTestCaller,
+      loadAcl: async (): Promise<BrokerAcl> => ({
+        "cell-stop-doubt": { "broker:spawn": [cwd] },
+      }),
+      spawnFilesystem: async () => {
+        launches += 1;
+        return { name: "must-not-launch" };
+      },
+    };
+
+    const buz = await handleBrokerOperation("broker:buz-send", {
+      callerBee: "cell-stop-doubt",
+      target: "cell-recipient",
+      tier: "queue",
+      body: "must not be accepted",
+    }, options);
+    assert.equal(buz.ok, false);
+    assert.match(buz.error ?? "", /unresolved stop state/);
+    assert.equal((await listMessages("cell-recipient", "queue")).length, 0);
+
+    const seal = await handleBrokerOperation("broker:seal", {
+      callerBee: "cell-stop-doubt",
+      artifact: { status: "done", summary: "must not seal", type: "implementation" },
+    }, options);
+    assert.equal(seal.ok, false);
+    assert.match(seal.error ?? "", /unresolved stop state/);
+    assert.equal((await listSeals("cell-stop-doubt")).length, 0);
+
+    const spawn = await handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-stop-doubt",
+      spawnArgs: { harness: "codex", cwd },
+    }, options);
+    assert.equal(spawn.ok, false);
+    assert.match(spawn.error ?? "", /unresolved stop state/);
+    assert.equal(launches, 0);
+
+    const inbox = await handleBrokerOperation("broker:buz-inbox", {
+      callerBee: "cell-stop-doubt",
+    }, options);
+    assert.equal(inbox.ok, true);
+    const state = await handleBrokerOperation("broker:state", {
+      callerBee: "cell-stop-doubt",
+      mode: "explain",
+    }, options);
+    assert.equal(state.ok, true);
+  });
+});
+
+test("broker:spawn holds caller admission through the irreversible child launch", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-linearized", "CO.linearized");
+    const cwd = join(store, "allowed");
+    await mkdir(cwd);
+    let releaseLaunch!: () => void;
+    let markLaunchEntered!: () => void;
+    const launchEntered = new Promise<void>((resolve) => { markLaunchEntered = resolve; });
+    const launchRelease = new Promise<void>((resolve) => { releaseLaunch = resolve; });
+    const options = {
+      verifyCaller: verifiedTestCaller,
+      loadAcl: async (): Promise<BrokerAcl> => ({
+        "cell-linearized": { "broker:spawn": [cwd] },
+      }),
+      spawnFilesystem: async () => {
+        markLaunchEntered();
+        await launchRelease;
+        return { name: "linearized-child", id: "CO.child" };
+      },
+    };
+    const spawn = handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-linearized",
+      spawnArgs: { harness: "codex", cwd },
+    }, options);
+    await launchEntered;
+    let stop: Promise<void> | undefined;
+    try {
+      const snapshot = await loadSession("cell-linearized");
+      assert.ok(snapshot);
+      let markStopEntered!: () => void;
+      const stopEntered = new Promise<void>((resolve) => { markStopEntered = resolve; });
+      stop = withSessionLifecycleTransaction(snapshot!, async (lifecycle) => {
+        markStopEntered();
+        await lifecycle.commit({ status: "kill_failed", lastError: "test stop doubt" });
+      });
+      const prematureStop = await Promise.race([
+        stopEntered.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+      ]);
+      assert.equal(prematureStop, false, "stop must wait until broker child launch settles");
+
+      releaseLaunch();
+      assert.equal((await spawn).ok, true);
+      await stop;
+      assert.equal((await loadSession("cell-linearized"))?.status, "kill_failed");
+    } finally {
+      // A failed timing assertion must not strand the broker launch under the
+      // lifecycle lock and hang the entire compiled suite for 120 seconds.
+      releaseLaunch();
+      await Promise.allSettled([spawn, ...(stop ? [stop] : [])]);
+    }
+  });
+});
+
+test("broker:spawn rejects a sanitized self-name before entering child name admission", async () => {
+  await withStore(async (store) => {
+    await seedSession(store, "cell-self-spawn", "CO.self-spawn");
+    const cwd = join(store, "allowed");
+    await mkdir(cwd);
+    let launches = 0;
+    const reply = await handleBrokerOperation("broker:spawn", {
+      callerBee: "cell-self-spawn",
+      spawnArgs: {
+        harness: "codex",
+        name: "cell/self-spawn",
+        cwd,
+      },
+    }, {
+      verifyCaller: verifiedTestCaller,
+      loadAcl: async (): Promise<BrokerAcl> => ({
+        "cell-self-spawn": { "broker:spawn": [cwd] },
+      }),
+      spawnFilesystem: async () => {
+        launches += 1;
+        return { name: "must-not-launch" };
+      },
+    });
+    assert.equal(reply.ok, false);
+    assert.match(reply.error ?? "", /cannot reuse the caller bee name/);
+    assert.equal(launches, 0);
+  });
+});
+
 test("broker handlers deny every cross-bee subject by default", async () => {
   await withStore(async (store) => {
     await seedSession(store, "cell-caller");
@@ -182,7 +336,10 @@ test("broker handler returns a flat denial for unknown operations", async () => 
 
 test("broker caller verification accepts a live birth-bound runner and denies a dead claim", async () => {
   await withStore(async (store) => {
-    await seedSession(store, "cell-caller");
+    const capability = mintCellBrokerCapability("cell-caller", 0);
+    await seedSession(store, "cell-caller", "cell-caller", {
+      cellBrokerCapabilityHash: capability.hash,
+    });
     const hostFingerprint = await capturePersistableProcessBirthFingerprint(process.pid);
     assert.ok(hostFingerprint, "the test process must have a persistable birth fingerprint");
     await writeHsrMeta("cell-caller", {
@@ -196,9 +353,14 @@ test("broker caller verification accepts a live birth-bound runner and denies a 
       status: "running",
     });
 
-    await assert.doesNotReject(verifyBrokerCallerClaim("cell-caller"));
+    await assert.doesNotReject(verifyBrokerCallerClaim("cell-caller", capability.token));
+    await assert.rejects(
+      verifyBrokerCallerClaim("cell-caller", mintCellBrokerCapability("cell-caller", 0).token),
+      /broker capability .* missing, stale, or invalid/,
+    );
     const live = await handleBrokerOperation("broker:buz-inbox", {
       callerBee: "cell-caller",
+      callerCapability: capability.token,
       target: "cell-caller",
     }, { loadAcl: loadDefaultAcl });
     assert.equal(live.ok, true);
@@ -215,6 +377,7 @@ test("broker caller verification accepts a live birth-bound runner and denies a 
     });
     const dead = await handleBrokerOperation("broker:buz-inbox", {
       callerBee: "cell-caller",
+      callerCapability: capability.token,
       target: "cell-caller",
     }, { loadAcl: loadDefaultAcl });
     assert.equal(dead.ok, false);
@@ -222,17 +385,75 @@ test("broker caller verification accepts a live birth-bound runner and denies a 
   });
 });
 
-test("HIVE_BROKER_VERIFY=0 restores v1 claimed-identity behavior", async () => {
+test("HIVE_BROKER_VERIFY=0 skips only liveness and never capability verification", async () => {
   await withStore(async (store) => {
-    await seedSession(store, "unverified-cell");
+    const capability = mintCellBrokerCapability("unverified-cell", 0);
+    await seedSession(store, "unverified-cell", "unverified-cell", {
+      cellBrokerCapabilityHash: capability.hash,
+    });
     const previous = process.env.HIVE_BROKER_VERIFY;
     process.env.HIVE_BROKER_VERIFY = "0";
     try {
       const reply = await handleBrokerOperation("broker:buz-inbox", {
         callerBee: "unverified-cell",
+        callerCapability: capability.token,
         target: "unverified-cell",
       }, { loadAcl: loadDefaultAcl });
       assert.equal(reply.ok, true);
+      const forged = await handleBrokerOperation("broker:buz-inbox", {
+        callerBee: "unverified-cell",
+        callerCapability: mintCellBrokerCapability("unverified-cell", 0).token,
+        target: "unverified-cell",
+      }, { loadAcl: loadDefaultAcl });
+      assert.equal(forged.ok, false);
+      assert.match(forged.error ?? "", /broker capability .* missing, stale, or invalid/);
+    } finally {
+      if (previous === undefined) delete process.env.HIVE_BROKER_VERIFY;
+      else process.env.HIVE_BROKER_VERIFY = previous;
+    }
+  });
+});
+
+test("every broker operation rejects a prior-generation capability before parsing or side effects", async () => {
+  await withStore(async () => {
+    const first = mintCellBrokerCapability("rotated-cell", 0);
+    await seedSession(process.env.HIVE_STORE_ROOT!, "rotated-cell", "CO.rotated", {
+      cellBrokerCapabilityHash: first.hash,
+    });
+    const second = mintCellBrokerCapability("rotated-cell", 1);
+    await updateSession("rotated-cell", {
+      runtimeGeneration: 1,
+      cellBrokerCapabilityHash: second.hash,
+    });
+    const previous = process.env.HIVE_BROKER_VERIFY;
+    process.env.HIVE_BROKER_VERIFY = "0";
+    try {
+      const cases: Array<[string, Record<string, unknown>]> = [
+        ["broker:buz-send", { target: "rotated-cell", tier: "queue", body: "forged" }],
+        ["broker:buz-inbox", { target: "rotated-cell" }],
+        ["broker:state", { target: "rotated-cell", mode: "explain" }],
+        ["broker:seal", { target: "rotated-cell", artifact: { status: "done", summary: "forged" } }],
+        ["broker:spawn", { spawnArgs: { harness: "codex", cwd: "/" } }],
+      ];
+      for (const [op, params] of cases) {
+        const reply = await handleBrokerOperation(op, {
+          callerBee: "rotated-cell",
+          callerCapability: first.token,
+          ...params,
+        }, { loadAcl: loadDefaultAcl });
+        assert.equal(reply.ok, false, op);
+        assert.match(reply.error ?? "", /broker capability .* missing, stale, or invalid/, op);
+      }
+      assert.equal((await listMessages("rotated-cell", "queue")).length, 0);
+      assert.equal((await listSeals("rotated-cell")).length, 0);
+
+      const current = await handleBrokerOperation("broker:state", {
+        callerBee: "rotated-cell",
+        callerCapability: second.token,
+        target: "rotated-cell",
+        mode: "explain",
+      }, { loadAcl: loadDefaultAcl });
+      assert.equal(current.ok, true);
     } finally {
       if (previous === undefined) delete process.env.HIVE_BROKER_VERIFY;
       else process.env.HIVE_BROKER_VERIFY = previous;

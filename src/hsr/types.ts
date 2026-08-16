@@ -1,3 +1,5 @@
+import type { HsrAnswerHostIdentity } from "../answerReceipt.js";
+
 /**
  * HSR — Hive Substrate Runner: runner contracts.
  *
@@ -45,6 +47,31 @@ export type RunnerInputQuestion = {
  */
 export type RunnerInputAnswer = string | string[][];
 
+/** Shared auth-failure classifier used by observation and compaction folds. */
+export function isRunnerAuthNeededMessage(message: string): boolean {
+  const m = message.toLowerCase();
+  if (m.includes("not logged in") && m.includes("/login")) return true;
+  if (m.includes("please log out and sign in again")) return true;
+  if (m.includes("please sign out and sign in again")) return true;
+  if (m.includes("access token") && m.includes("could not be refreshed")) return true;
+  if (m.includes("access token") && m.includes("couldn't be refreshed")) return true;
+  if (m.includes("access token") && m.includes("cannot be refreshed")) return true;
+  if ((m.includes("token") || m.includes("oauth")) && m.includes("revoked")) return true;
+  if (m.includes("401") && (m.includes("oauth") || m.includes("unauthorized") || m.includes("authentication"))) return true;
+  if ((m.includes("please log in") || m.includes("please login") || m.includes("sign in again")) && m.includes("auth")) return true;
+  if (m.startsWith("failed to authenticate")) return true;
+  return (
+    (m.includes("oauth") || m.includes("session"))
+    && m.includes("expired")
+    && (m.includes("could not be refreshed") || m.includes("couldn't be refreshed") || m.includes("cannot be refreshed"))
+  );
+}
+
+/** Validation-only answer preparation followed by one write-confirmed effect. */
+export type RunnerPreparedAnswer = {
+  dispatch(): Promise<void>;
+};
+
 /**
  * A structured event emitted by a running harness. Replaces screen-scraping:
  * these feed `deriveState`, needs-input detection, the usage sampler, and the
@@ -57,6 +84,32 @@ export type RunnerInputAnswer = string | string[][];
  * events and synthetic compaction checkpoints carry no seq.
  */
 export type RunnerEvent = (
+  | { type: "host_epoch"; ts: number; host: HsrAnswerHostIdentity }
+  | {
+      /**
+       * Local source compaction proof. `throughSeq` is the exact contiguous
+       * stamped prefix intentionally folded by the authority-held compactor;
+       * without it, a retained suffix starting above seq 1 is indistinguishable
+       * from deleted provider history.
+       */
+      type: "source_cursor_checkpoint";
+      ts: number;
+      throughSeq: number;
+    }
+  | {
+      /**
+       * Local mirror compaction proof. This seq-less checkpoint is written in
+       * the same atomic events.jsonl replacement that folds remote-origin
+       * events, so a daemon restart can distinguish intentional compaction from
+       * a deleted/corrupt local projection.
+       */
+      type: "remote_cursor_checkpoint";
+      ts: number;
+      throughRemoteSeq: number;
+      node: string;
+      remoteLaunchId: string;
+      remoteIncarnation: string;
+    }
   | { type: "turn_start"; ts: number; threadId?: string }
   | { type: "turn_end"; ts: number; threadId?: string }
   | { type: "text"; ts: number; text: string } // assistant output chunk (feeds ring buffer)
@@ -100,12 +153,10 @@ export type RunnerEvent = (
   // generic `error`). The daemon reacts by minting a fresh token and restarting
   // the runner with resume — mirrors how `exhausted` drives the autoswap edge.
   | { type: "auth_expired"; ts: number; detail?: string; requiresLogin?: boolean }
-  // Credential recovery marker: appended after `hive auth-resume` or daemon
-  // auto-recovery relaunches the runner. It un-sticks the
-  // auth-needed classification — a resumed bee sits idle, so WITHOUT this
-  // boundary the stale login-required `error` stays the tail's last turn and
-  // the daemon re-derives auth-needed forever (observed on CL.8d7,
-  // 2026-07-16). An auth error AFTER the marker (creds still bad) re-wins.
+  // Legacy credential recovery marker emitted by builds before runner-host
+  // epochs became authoritative. Current recovery relies on the successor's
+  // pre-adapter `host_epoch`; retaining this variant keeps old logs readable.
+  // Within a legacy epoch, an auth error AFTER the marker still re-wins.
   | {
       type: "auth_resume";
       ts: number;
@@ -133,7 +184,18 @@ export type RunnerEvent = (
     }
   | { type: "error"; ts: number; message: string }
   | { type: "exit"; ts: number; code: number | null; signal?: string }
-) & { seq?: number };
+) & {
+  seq?: number;
+  /**
+   * Origin sequence when an event is durably projected from a remote runner.
+   * The local mirror allocates its own `seq`; retaining this independent cursor
+   * makes replay idempotent across a crash between local append and cursor-file
+   * publication.
+   */
+  remoteSeq?: number;
+  /** Exact non-authorizing runner-host epoch that produced this event. */
+  host?: HsrAnswerHostIdentity;
+};
 
 /**
  * Everything an adapter needs to start a session. The caller (SubstrateHsr) has
@@ -180,6 +242,14 @@ export type RunnerOpts = {
    * returns a live session.
    */
   onChildSpawn?: (identity: { pid: number; pgid: number }) => Promise<void>;
+  /** Host-owned pre-spawn admission. `pending` must be durable before fork. */
+  onChildSpawnPending?: () => Promise<void>;
+  /** Host-owned proof that a failed OS spawn created no child. */
+  onChildSpawnFailure?: () => Promise<void>;
+  /** Internal host-owned event provenance; adapters must not source this. */
+  eventHost?: HsrAnswerHostIdentity;
+  /** Publish durable event-history doubt before a persistence error reaches the event iterator. */
+  onEventPersistenceFailure?: (event: RunnerEvent, error: unknown) => Promise<void>;
 };
 
 /**
@@ -211,6 +281,7 @@ export type RunnerSession = {
   pid?: number; // child pid (server tier: the shared server pid)
   send(text: string, opts?: RunnerSendOpts): Promise<void>;
   interrupt(): Promise<RunnerInterruptResult>;
+  prepareAnswer(requestId: string, answer: RunnerInputAnswer): Promise<RunnerPreparedAnswer>;
   answer(requestId: string, answer: RunnerInputAnswer): Promise<void>; // respond to a needs_input
   events: AsyncIterable<RunnerEvent>;
   snapshot(lines?: number): string; // rendered tail for Substrate.capture() compat

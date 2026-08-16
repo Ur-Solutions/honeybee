@@ -15,7 +15,8 @@ import {
   titleRank,
 } from "../src/naming.js";
 import { persistSessionTranscriptMetadata } from "../src/sessionMetadata.js";
-import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { loadSession, saveSession, transitionSession, type SessionRecord } from "../src/store.js";
+import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
 import type { TranscriptFile } from "../src/transcripts.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
@@ -404,6 +405,69 @@ test("persistSessionTranscriptMetadata: a weak match still honors markRunning", 
     assert.equal(stored?.status, "running");
     assert.equal(stored?.title, undefined);
     assert.equal(stored?.transcriptPath, undefined);
+  });
+});
+
+test("persistSessionTranscriptMetadata cannot mark a concurrently archived lifecycle running", async () => {
+  await withTempStore(async () => {
+    const stale = bee({ name: "CL.metadata-archive-race" });
+    await saveSession(stale);
+    await transitionSession(stale.name, {
+      type: "bee.archived",
+      eventId: "metadata-archive-race",
+      at: stale.updatedAt,
+      cause: "retire",
+      evidence: { kind: "operator", actionId: "metadata-archive-race", observedAt: stale.updatedAt, action: "retire" },
+      probe: {
+        kind: "probe",
+        probeId: "metadata-archive-race",
+        observerId: "naming-test",
+        observedAt: stale.updatedAt,
+        outcome: "dead",
+        target: { substrate: "local-tmux", tmuxTarget: stale.tmuxTarget },
+      },
+    });
+
+    await persistSessionTranscriptMetadata(
+      stale,
+      tx("Ignored title", ["mtime", "cwd"]),
+      { markRunning: true },
+    );
+    const stored = await loadSession(stale.name);
+    assert.equal(stored?.stateMachine?.lifecycle, "archived");
+    assert.equal(stored?.status, "done");
+  });
+});
+
+test("persistSessionTranscriptMetadata cannot erase concurrently committed failed-stop doubt", async () => {
+  await withTempStore(async () => {
+    const stale = bee({ name: "CL.metadata-kill-failed-race" });
+    await saveSession(stale);
+    const started = await transitionSession(stale.name, {
+      type: "turn.started",
+      eventId: "metadata-kill-failed-turn",
+      at: stale.updatedAt,
+      cause: "first-turn",
+      evidence: {
+        kind: "hook",
+        hookId: "metadata-kill-failed-turn",
+        observedAt: stale.updatedAt,
+        hook: "turn-start",
+      },
+    });
+    assert.ok(started);
+    await withSessionLifecycleTransaction(started.record, async (lifecycle) => {
+      await lifecycle.commit({ status: "kill_failed", lastError: "exact stop unconfirmed" });
+    });
+
+    await persistSessionTranscriptMetadata(
+      stale,
+      tx("Ignored title", ["mtime", "cwd"]),
+      { markRunning: true },
+    );
+    const stored = await loadSession(stale.name);
+    assert.equal(stored?.stateMachine?.lifecycle, "active");
+    assert.equal(stored?.status, "kill_failed");
   });
 });
 

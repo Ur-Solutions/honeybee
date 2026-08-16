@@ -37,7 +37,7 @@ async function seedSession(dir: string, name: string, overrides: Record<string, 
     tmuxTarget: `tg-${name}`,
     createdAt: "2026-05-28T00:00:00.000Z",
     updatedAt: "2026-05-28T00:00:00.000Z",
-    status: "dead",
+    status: "running",
     id: name,
     ...overrides,
   };
@@ -431,7 +431,8 @@ test("hive buz cancel refuses a message that is not in queue/", async () => {
 test("hive buz send --sender-human --tier interrupt is honored without recipient opt-in (human bypass)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-cli-"));
   try {
-    // A dead session: the interrupt paste fails, which downgrades to queue —
+    // A runnable record with no live tmux pane: the interrupt paste fails and
+    // downgrades to queue —
     // proving the POLICY no longer downgrades a human interrupt up front (the
     // old behavior downgraded before ever attempting the paste).
     await seedSession(dir, "CO.aaa");

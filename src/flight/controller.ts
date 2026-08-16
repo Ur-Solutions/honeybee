@@ -8,6 +8,8 @@
 import { createHash } from "node:crypto";
 import type { BeeState } from "../state.js";
 import type { SessionRecord } from "../store.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
+import { isLaunchOwnershipIndeterminate } from "../launchAmbiguity.js";
 import { planSlot, type SlotEvidence } from "./machine.js";
 import {
   SLOT_BOOTING_STATES,
@@ -58,6 +60,15 @@ export type FlightSweepDeps = {
    * crash-safe, not concurrency-safe. Absent (tests) → no locking.
    */
   withFlightLock?: <T>(flightId: string, fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Fresh source-Bee lifecycle admission for automatic replacement. The
+   * callback spans slot write-off, successor spawn, and publication. Absent is
+   * retained only for pure controller tests; production always supplies it.
+   */
+  withSourceBeeAdmission?: <T>(
+    source: SessionRecord,
+    fn: (current: SessionRecord) => Promise<T>,
+  ) => Promise<T>;
   /**
    * Best-effort retire of a live-but-written-off bee (wedged replacement) so
    * replaced attempts don't leak runner hosts/accounts. Absent → skipped.
@@ -208,7 +219,14 @@ async function sweepOneFlight(
   const queueBacked = counts !== null && counts.pending + counts.leased + counts.done + counts.failed > 0;
 
   const nudges: SlotRecord[] = [];
-  const spawnQueue: SlotRecord[] = [];
+  const spawnQueue: Array<{
+    slot: SlotRecord;
+    source?: SessionRecord;
+    applyPlan?: () => Promise<void>;
+    priorSlot?: SlotRecord;
+    retireBees: string[];
+  }> = [];
+  const ownershipHeldSlots = new Set<string>();
 
   const applied: SlotRecord[] = [];
   for (const slot of slots) {
@@ -223,6 +241,7 @@ async function sweepOneFlight(
       const orphan = recordsByName.get(slotBeeName(flight.id, slot.slotId, slot.generation, slot.attempt));
       if (orphan) {
         subject = { ...slot, beeName: orphan.name, ...(orphan.id ? { beeId: orphan.id } : {}) };
+        if (isRunnableSessionRecord(orphan)) delete subject.launchOwnership;
         adopted = true;
       }
     }
@@ -251,20 +270,22 @@ async function sweepOneFlight(
     // one poisoned packet must not kill lane capacity. The completed bee is
     // deliberately NOT retired: replace-before-collect leaves collection to
     // the manager at its leisure; retire after collecting.
-    if (queueBacked && planned.taskId && (planned.state === "done" || planned.state === "abandoned")) {
+    let recycle: {
+      bucket: "done" | "failed";
+      taskId: string;
+      generation: number;
+      beeName?: string;
+      sealFilename?: string;
+    } | undefined;
+    if (!plan.ownershipHeld && queueBacked && planned.taskId && (planned.state === "done" || planned.state === "abandoned")) {
       const bucket = planned.state === "done" ? "done" : "failed";
-      await deps.queue!.finish(flight.id, planned.taskId, bucket, bucket === "done"
-        ? { ...(planned.evidence.sealFilename ? { sealFilename: planned.evidence.sealFilename } : {}) }
-        : { reason: "attempts-exhausted" });
-      await deps.appendLedger({
-        type: `flight.task.${bucket}`,
-        flight: flight.id,
-        slot: slot.slotId,
-        task: planned.taskId,
+      recycle = {
+        bucket,
+        taskId: planned.taskId,
         generation: planned.generation,
-        ...(planned.beeName ? { bee: planned.beeName } : {}),
-        ...(planned.evidence.sealFilename ? { seal: planned.evidence.sealFilename } : {}),
-      });
+        ...(planned.beeName ? { beeName: planned.beeName } : {}),
+        ...(planned.evidence.sealFilename ? { sealFilename: planned.evidence.sealFilename } : {}),
+      };
       const recycleIso = new Date(deps.now()).toISOString();
       const recycled: SlotRecord = {
         ...planned,
@@ -287,37 +308,101 @@ async function sweepOneFlight(
       planned = recycled;
     }
 
-    if (plan.changed || adjusted || planned !== plan.slot) {
-      await deps.saveSlot(planned);
-      if (slot.state !== planned.state || adjusted || planned !== plan.slot) {
-        outcomes.push({
+    const applyPlan = async (): Promise<void> => {
+      if (recycle) {
+        await deps.queue!.finish(
+          flight.id,
+          recycle.taskId,
+          recycle.bucket,
+          recycle.bucket === "done"
+            ? { ...(recycle.sealFilename ? { sealFilename: recycle.sealFilename } : {}) }
+            : { reason: "attempts-exhausted" },
+        );
+        await deps.appendLedger({
+          type: `flight.task.${recycle.bucket}`,
           flight: flight.id,
           slot: slot.slotId,
-          action: "transition",
-          detail: `${slot.state}→${planned.state}${adopted ? " (adopted)" : ""}${revived ? " (revived)" : ""}${planned !== plan.slot ? " (recycled)" : ""}`,
+          task: recycle.taskId,
+          generation: recycle.generation,
+          ...(recycle.beeName ? { bee: recycle.beeName } : {}),
+          ...(recycle.sealFilename ? { seal: recycle.sealFilename } : {}),
         });
       }
-    }
-    for (const event of plan.events) {
-      await deps.appendLedger({ type: event.type, flight: flight.id, ...(event.data ?? {}) });
-    }
-    if (plan.wantsNudge && planned.beeName) nudges.push(planned);
-    if (planned.state === "vacant" && flight.status === "active") spawnQueue.push(planned);
-    // A wedged replacement writes off a bee that may still be alive (stuck
-    // boot) — retire it so replaced attempts don't leak hosts/accounts.
-    if (deps.retireBee) {
+      if (plan.changed || adjusted || planned !== plan.slot) {
+        await deps.saveSlot(planned);
+        if (slot.state !== planned.state || adjusted || planned !== plan.slot) {
+          outcomes.push({
+            flight: flight.id,
+            slot: slot.slotId,
+            action: "transition",
+            detail: `${slot.state}→${planned.state}${adopted ? " (adopted)" : ""}${revived ? " (revived)" : ""}${planned !== plan.slot ? " (recycled)" : ""}`,
+          });
+        }
+      }
       for (const event of plan.events) {
-        const bee = event.type === "flight.slot.wedged" && typeof event.data?.bee === "string" ? event.data.bee : undefined;
-        if (!bee) continue;
+        await deps.appendLedger({ type: event.type, flight: flight.id, ...(event.data ?? {}) });
+      }
+    };
+    if (plan.ownershipHeld) {
+      ownershipHeldSlots.add(slot.slotId);
+      outcomes.push({
+        flight: flight.id,
+        slot: slot.slotId,
+        action: "skipped",
+        detail: "ownership-held: stop-unconfirmed",
+      });
+    }
+    if (!plan.ownershipHeld && plan.wantsNudge && planned.beeName) nudges.push(planned);
+    const wantsSpawn = !plan.ownershipHeld && planned.state === "vacant" && flight.status === "active";
+    const retireBees = plan.events.flatMap((event) =>
+      event.type === "flight.slot.wedged" && typeof event.data?.bee === "string"
+        ? [event.data.bee]
+        : []);
+    // If a slot has a prior Bee, don't publish its write-off from frozen tick
+    // evidence. Defer every planning mutation until the spawn phase can hold a
+    // fresh lifecycle admission continuously through successor publication.
+    const deferForSourceAdmission = wantsSpawn && record !== undefined;
+    const deferForCleanup = retireBees.length > 0;
+    let planApplied = false;
+    if (!deferForSourceAdmission && !deferForCleanup) {
+      await applyPlan();
+      planApplied = true;
+    }
+    if (wantsSpawn) {
+      spawnQueue.push({
+        slot: planned,
+        ...(record ? { source: record } : {}),
+        ...(deferForSourceAdmission || deferForCleanup ? { applyPlan, priorSlot: slot } : {}),
+        retireBees,
+      });
+    } else if (deferForCleanup) {
+      // Draining/non-active flights still need exact cleanup before publishing
+      // a vacancy or terminalizing the flight. A failed stop leaves the
+      // original slot byte-for-byte authoritative.
+      let cleanupConfirmed = deps.retireBee !== undefined;
+      if (!deps.retireBee) {
+        outcomes.push({ flight: flight.id, slot: slot.slotId, action: "skipped", detail: "predecessor cleanup unavailable" });
+      } else for (const bee of retireBees) {
         try {
           await deps.retireBee(bee);
           outcomes.push({ flight: flight.id, slot: slot.slotId, action: "retire", detail: bee });
         } catch (error) {
-          outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: error instanceof Error ? error.message : String(error) });
+          cleanupConfirmed = false;
+          outcomes.push({
+            flight: flight.id,
+            slot: slot.slotId,
+            action: "error",
+            error: `predecessor cleanup unconfirmed for ${bee}: ${error instanceof Error ? error.message : String(error)}`,
+          });
+          break;
         }
       }
+      if (cleanupConfirmed) {
+        await applyPlan();
+        planApplied = true;
+      }
     }
-    applied.push(planned);
+    applied.push(planApplied ? planned : slot);
   }
 
   // Deterministic stall nudges. nudgedAt is stamped ONLY after the send
@@ -339,97 +424,209 @@ async function sweepOneFlight(
   // Vacancy fill under backpressure: never exceed maxConcurrentBoots
   // simultaneous provisioning/booting slots (mass-crash → no auth stampede).
   let booting = applied.filter((slot) => SLOT_BOOTING_STATES.includes(slot.state)).length;
-  for (const slot of spawnQueue) {
-    if (flight.status !== "active") break;
-    if (booting >= flight.replacement.maxConcurrentBoots) {
-      outcomes.push({ flight: flight.id, slot: slot.slotId, action: "spawn", detail: "deferred-backpressure" });
-      continue;
-    }
-    const mix = flight.target.mix.find((entry) => entry.key === slot.mixKey);
-    if (!mix) {
-      outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: `no mix entry for key ${slot.mixKey}` });
-      continue;
-    }
-
-    // Task binding (v1.1): a lane in a queue-backed flight works a PACKET.
-    // Order of precedence — the lease already bound to this slot (retry of an
-    // in-flight task, or a claim whose slot prepare was lost to a crash),
-    // else the oldest pending packet (claimed durably BEFORE the slot
-    // prepare, under the flight lock). No packet → the lane parks as drained
-    // until someone enqueues more work.
-    let task: FlightTaskPacket | null = null;
-    if (queueBacked) {
-      task = await deps.queue!.leasedForSlot(flight.id, slot.slotId);
-      if (!task) {
-        task = await deps.queue!.claimNext(flight.id, { slotId: slot.slotId, generation: slot.generation });
-        if (task) {
-          await deps.appendLedger({ type: "flight.task.claimed", flight: flight.id, slot: slot.slotId, task: task.taskId, generation: slot.generation });
+  for (const candidate of spawnQueue) {
+    const slot = candidate.slot;
+    let predecessorCleanupConfirmed = true;
+    if (candidate.retireBees.length > 0) {
+      if (!deps.retireBee) {
+        predecessorCleanupConfirmed = false;
+        outcomes.push({
+          flight: flight.id,
+          slot: slot.slotId,
+          action: "skipped",
+          detail: "predecessor cleanup unavailable",
+        });
+      } else {
+        for (const bee of candidate.retireBees) {
+          try {
+            await deps.retireBee(bee);
+            outcomes.push({ flight: flight.id, slot: slot.slotId, action: "retire", detail: bee });
+          } catch (error) {
+            predecessorCleanupConfirmed = false;
+            outcomes.push({
+              flight: flight.id,
+              slot: slot.slotId,
+              action: "error",
+              error: `predecessor cleanup unconfirmed for ${bee}: ${error instanceof Error ? error.message : String(error)}`,
+            });
+            break;
+          }
         }
       }
-      if (!task) {
-        const drainedIso = new Date(deps.now()).toISOString();
-        const drained: SlotRecord = { ...slot, state: "drained", since: drainedIso };
-        delete drained.taskId;
-        await deps.saveSlot(drained);
-        await deps.appendLedger({ type: "flight.slot.drained", flight: flight.id, slot: slot.slotId, mixKey: slot.mixKey });
-        const index = applied.findIndex((entry) => entry.slotId === slot.slotId);
-        if (index >= 0) applied[index] = drained;
-        outcomes.push({ flight: flight.id, slot: slot.slotId, action: "transition", detail: "vacant→drained" });
-        continue;
-      }
     }
+    if (!predecessorCleanupConfirmed) continue;
+    const execute = async (): Promise<void> => {
+      if (candidate.applyPlan) {
+        await candidate.applyPlan();
+        const index = applied.findIndex((entry) => entry.slotId === slot.slotId);
+        if (index >= 0) applied[index] = slot;
+        if (
+          candidate.priorSlot &&
+          SLOT_BOOTING_STATES.includes(candidate.priorSlot.state) &&
+          !SLOT_BOOTING_STATES.includes(slot.state)
+        ) {
+          booting = Math.max(0, booting - 1);
+        }
+      }
+      if (flight.status !== "active") return;
+      if (booting >= flight.replacement.maxConcurrentBoots) {
+        outcomes.push({ flight: flight.id, slot: slot.slotId, action: "spawn", detail: "deferred-backpressure" });
+        return;
+      }
+      const mix = flight.target.mix.find((entry) => entry.key === slot.mixKey);
+      if (!mix) {
+        outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: `no mix entry for key ${slot.mixKey}` });
+        return;
+      }
 
-    // PREPARE: durably claim the attempt before any side effect.
-    const nowIso = new Date(deps.now()).toISOString();
-    const prepared: SlotRecord = {
-      ...slot,
-      ...(task ? { taskId: task.taskId } : {}),
-      attempt: slot.attempt + 1,
-      state: "provisioning",
-      since: nowIso,
-      attemptStartedAt: nowIso,
-      idempotencyKey: slotIdempotencyKey(flight.id, slot.slotId, slot.generation, slot.attempt + 1),
-      evidence: {},
-      history: slot.history,
-    };
-    delete prepared.beeName;
-    delete prepared.beeId;
-    delete prepared.nudgedAt;
-    await deps.saveSlot(prepared);
-    await deps.appendLedger({ type: "flight.slot.provisioning", flight: flight.id, slot: slot.slotId, generation: prepared.generation, attempt: prepared.attempt, mixKey: slot.mixKey, ...(task ? { task: task.taskId } : {}) });
-    booting += 1;
-    // EXECUTE + CONFIRM.
-    try {
-      const spawned = await deps.spawnSlot(flight, prepared, mix, task ?? undefined);
-      const confirmed: SlotRecord = {
+      // Task binding (v1.1): a lane in a queue-backed flight works a PACKET.
+      // Order of precedence — the lease already bound to this slot (retry of an
+      // in-flight task, or a claim whose slot prepare was lost to a crash),
+      // else the oldest pending packet (claimed durably BEFORE the slot
+      // prepare, under the flight lock). No packet → the lane parks as drained
+      // until someone enqueues more work.
+      let task: FlightTaskPacket | null = null;
+      if (queueBacked) {
+        task = await deps.queue!.leasedForSlot(flight.id, slot.slotId);
+        if (!task) {
+          task = await deps.queue!.claimNext(flight.id, { slotId: slot.slotId, generation: slot.generation });
+          if (task) {
+            await deps.appendLedger({ type: "flight.task.claimed", flight: flight.id, slot: slot.slotId, task: task.taskId, generation: slot.generation });
+          }
+        }
+        if (!task) {
+          const drainedIso = new Date(deps.now()).toISOString();
+          const drained: SlotRecord = { ...slot, state: "drained", since: drainedIso };
+          delete drained.taskId;
+          await deps.saveSlot(drained);
+          await deps.appendLedger({ type: "flight.slot.drained", flight: flight.id, slot: slot.slotId, mixKey: slot.mixKey });
+          const index = applied.findIndex((entry) => entry.slotId === slot.slotId);
+          if (index >= 0) applied[index] = drained;
+          outcomes.push({ flight: flight.id, slot: slot.slotId, action: "transition", detail: "vacant→drained" });
+          return;
+        }
+      }
+
+      // PREPARE: durably claim the attempt before any side effect.
+      const nowIso = new Date(deps.now()).toISOString();
+      const prepared: SlotRecord = {
+        ...slot,
+        ...(task ? { taskId: task.taskId } : {}),
+        attempt: slot.attempt + 1,
+        state: "provisioning",
+        since: nowIso,
+        attemptStartedAt: nowIso,
+        idempotencyKey: slotIdempotencyKey(flight.id, slot.slotId, slot.generation, slot.attempt + 1),
+        evidence: {},
+        history: slot.history,
+      };
+      delete prepared.beeName;
+      delete prepared.beeId;
+      delete prepared.nudgedAt;
+      await deps.saveSlot(prepared);
+      await deps.appendLedger({ type: "flight.slot.provisioning", flight: flight.id, slot: slot.slotId, generation: prepared.generation, attempt: prepared.attempt, mixKey: slot.mixKey, ...(task ? { task: task.taskId } : {}) });
+      booting += 1;
+      const dispatching: SlotRecord = {
         ...prepared,
+        launchOwnership: { status: "dispatching", at: new Date(deps.now()).toISOString() },
+      };
+      // Persist before entering spawnSlot: a coordinator crash from this point
+      // may have crossed the detached-host fork even if no SessionRecord exists.
+      await deps.saveSlot(dispatching);
+      // EXECUTE. Only errors thrown by the spawn primitive may prove a
+      // pre-launch failure. Once it returns, the deterministic Bee is
+      // published; a later slot/ledger write failure must leave this exact
+      // provisioning attempt for crash adoption, never vacate it.
+      let spawned: { beeName: string; beeId?: string };
+      try {
+        spawned = await deps.spawnSlot(flight, dispatching, mix, task ?? undefined);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isLaunchOwnershipIndeterminate(error)) {
+          const held: SlotRecord = {
+            ...dispatching,
+            launchOwnership: {
+              status: "indeterminate",
+              at: new Date(deps.now()).toISOString(),
+              error: message,
+            },
+            history: [
+              ...dispatching.history,
+              { attempt: dispatching.attempt, outcome: "spawn-indeterminate", at: new Date(deps.now()).toISOString() },
+            ],
+          };
+          await deps.saveSlot(held);
+          await deps.appendLedger({
+            type: "flight.slot.spawn_indeterminate",
+            flight: flight.id,
+            slot: slot.slotId,
+            attempt: dispatching.attempt,
+            error: message,
+          });
+          outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: message });
+          return;
+        }
+        // The attempt stays consumed (idempotency) — record the failure and let
+        // the next sweep decide vacant-vs-abandoned via the machine.
+        const failed: SlotRecord = {
+          ...dispatching,
+          state: dispatching.attempt >= flight.contract.maxAttemptsPerSlot ? "abandoned" : "vacant",
+          since: new Date(deps.now()).toISOString(),
+          history: [...dispatching.history, { attempt: dispatching.attempt, outcome: "spawn-failed", at: new Date(deps.now()).toISOString() }],
+        };
+        delete failed.launchOwnership;
+        delete failed.attemptStartedAt;
+        await deps.saveSlot(failed);
+        await deps.appendLedger({ type: "flight.slot.spawn_failed", flight: flight.id, slot: slot.slotId, attempt: dispatching.attempt, error: message });
+        if (failed.state === "abandoned") {
+          await deps.appendLedger({ type: "flight.mix.violation", flight: flight.id, slot: slot.slotId, mixKey: slot.mixKey, attempts: dispatching.attempt });
+        }
+        booting -= 1;
+        outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: message });
+        return;
+      }
+
+      // CONFIRM. If this write fails, `prepared` remains the durable claim and
+      // the next sweep adopts `slotBeeName(...)` from the SessionRecord.
+      const confirmed: SlotRecord = {
+        ...dispatching,
         beeName: spawned.beeName,
         ...(spawned.beeId ? { beeId: spawned.beeId } : {}),
         state: "booting",
         since: new Date(deps.now()).toISOString(),
       };
+      delete confirmed.launchOwnership;
       await deps.saveSlot(confirmed);
-      await deps.appendLedger({ type: "flight.slot.booting", flight: flight.id, slot: slot.slotId, attempt: confirmed.attempt, bee: spawned.beeName });
-      outcomes.push({ flight: flight.id, slot: slot.slotId, action: "spawn", detail: spawned.beeName });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // The attempt stays consumed (idempotency) — record the failure and let
-      // the next sweep decide vacant-vs-abandoned via the machine.
-      const failed: SlotRecord = {
-        ...prepared,
-        state: prepared.attempt >= flight.contract.maxAttemptsPerSlot ? "abandoned" : "vacant",
-        since: new Date(deps.now()).toISOString(),
-        history: [...prepared.history, { attempt: prepared.attempt, outcome: "spawn-failed", at: new Date(deps.now()).toISOString() }],
-      };
-      delete failed.attemptStartedAt;
-      await deps.saveSlot(failed);
-      await deps.appendLedger({ type: "flight.slot.spawn_failed", flight: flight.id, slot: slot.slotId, attempt: prepared.attempt, error: message });
-      if (failed.state === "abandoned") {
-        await deps.appendLedger({ type: "flight.mix.violation", flight: flight.id, slot: slot.slotId, mixKey: slot.mixKey, attempts: prepared.attempt });
+      try {
+        await deps.appendLedger({ type: "flight.slot.booting", flight: flight.id, slot: slot.slotId, attempt: confirmed.attempt, bee: spawned.beeName });
+      } catch (error) {
+        outcomes.push({
+          flight: flight.id,
+          slot: slot.slotId,
+          action: "error",
+          error: `spawn confirmed but booting ledger failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        return;
       }
-      booting -= 1;
-      outcomes.push({ flight: flight.id, slot: slot.slotId, action: "error", error: message });
+      outcomes.push({ flight: flight.id, slot: slot.slotId, action: "spawn", detail: spawned.beeName });
+    };
+
+    try {
+      if (candidate.source && deps.withSourceBeeAdmission) {
+        await deps.withSourceBeeAdmission(candidate.source, async () => execute());
+      } else {
+        await execute();
+      }
+    } catch (error) {
+      outcomes.push({
+        flight: flight.id,
+        slot: slot.slotId,
+        action: "skipped",
+        detail: "source lifecycle admission refused",
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
+
   }
 
   // Flight completion: the FULL declared slot set finished → close + one
@@ -445,7 +642,8 @@ async function sweepOneFlight(
   const finalCounts = queueBacked ? await deps.queue!.counts(flight.id) : null;
   const queueOpen = flight.status === "active" && finalCounts !== null && finalCounts.pending + finalCounts.leased > 0;
   const terminalUnderStatus = (slot: SlotRecord) =>
-    SLOT_COMPLETION_STATES.includes(slot.state) || (flight.status === "draining" && slot.state === "vacant");
+    !ownershipHeldSlots.has(slot.slotId) &&
+    (SLOT_COMPLETION_STATES.includes(slot.state) || (flight.status === "draining" && slot.state === "vacant"));
   if (finalSlots.length >= flight.target.slots && finalSlots.every(terminalUnderStatus) && !queueOpen) {
     const done = finalSlots.filter((slot) => slot.state === "done").length;
     const closed: FlightRecord = { ...flight, status: "closed", updatedAt: new Date(deps.now()).toISOString() };

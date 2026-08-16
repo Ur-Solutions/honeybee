@@ -27,10 +27,9 @@ export const ADVERTISED_HARNESSES = ["claude", "codex", "opencode", "grok", "kim
 
 /**
  * run.command variants the HSR control socket actually delivers (H3).
- * `answer` is NOT here: needs_input.opened is not bridged into the protocol
- * event stream yet, so an open input request is unobservable from protocol
- * data and an advertised answer command could never be driven honestly. The
- * legacy session/UI answer path is unaffected.
+ * `answer` is NOT here: run.command v1 carries no expected host epoch, so a
+ * delayed answer could bind a reused request id after provider restart. The
+ * aggregate session/UI path carries exact source + host and remains supported.
  */
 export const SUPPORTED_COMMANDS = ["send", "interrupt"] as const;
 
@@ -69,16 +68,24 @@ export type HarnessProbe = (kind: string) => Promise<{
   installHint?: string;
 }>;
 
+export type ProbeHarnessDependencies = {
+  assertExecutable?: typeof assertExecutableAvailable;
+  probeContainment?: typeof probeCellSandbox;
+};
+
 /** Default probe: the driver's resolved executable is runnable on this node. */
-export async function probeHarness(kind: string): Promise<{
+export async function probeHarness(kind: string, deps: ProbeHarnessDependencies = {}): Promise<{
   status: "ready" | "absent";
   command?: string;
   installHint?: string;
 }> {
   try {
-    const spec = resolveAgent(kind);
-    await assertExecutableAvailable(spec.command);
-    const containment = probeCellSandbox();
+    // Probe the same built-in implementation run.start will launch. Ordinary
+    // HIVE/AP/config wrappers and kind aliases remain valid for ordinary HSR,
+    // but cannot make execution advertise a command protocolLaunch bypasses.
+    const spec = resolveAgent(kind, [], { protocolLaunch: true });
+    await (deps.assertExecutable ?? assertExecutableAvailable)(spec.command);
+    const containment = (deps.probeContainment ?? probeCellSandbox)();
     if (containment.status !== "ready") return containment;
     return { status: "ready", command: spec.command };
   } catch {
@@ -117,7 +124,7 @@ export async function buildNodeDescriptor(deps: NodeDescriptorDeps): Promise<Jso
       runnerTier: "hsr",
       // H3: exactly the effect-keyed commands the HSR control socket truly
       // delivers. checkpoint is NOT advertised (no driver support), answer is
-      // NOT advertised (needs_input.opened is not bridged), and delivery is
+      // NOT advertised (v1 has no expected host epoch), and delivery is
       // honestly at-most-once: crash windows become durable `indeterminate`
       // command results and are never blindly redelivered.
       commands: [...SUPPORTED_COMMANDS],

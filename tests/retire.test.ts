@@ -6,8 +6,14 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { activationHomeOwnerPath } from "../src/accounts.js";
-import { ensureHsrRunDir, hsrEventsPath, hsrMetaPath, hsrRingPath } from "../src/hsr/runDir.js";
-import { purgeSessionData, transactionalKill, transactionalRetire } from "../src/kill.js";
+import { compactRetiredHsrEvents } from "../src/commands/observe.js";
+import {
+  persistHsrEventIntegrityFailure,
+  readHsrEventIntegrityReceipt,
+  recordHsrEventIntegrityStop,
+} from "../src/hsr/eventIntegrity.js";
+import { appendHsrEvent, ensureHsrRunDir, hsrEventsPath, hsrMetaPath, hsrRingPath } from "../src/hsr/runDir.js";
+import { purgeSessionData, retireSessionByNameExactly, transactionalKill, transactionalRetire } from "../src/kill.js";
 import { recordSeal, sealsRoot, validateSealArtifact } from "../src/seal.js";
 import { deriveState } from "../src/state.js";
 import { ledgerPath, listSessions, loadSession, saveSession, type SessionRecord } from "../src/store.js";
@@ -56,6 +62,20 @@ function fakeSubstrate(overrides: Partial<Substrate>): Substrate {
   } as Substrate;
 }
 
+async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await stat(path);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${path}`);
+}
+
 test("transactionalRetire archives the record instead of deleting it", async () => {
   await withTempStore(async () => {
     const record = { ...seed({ name: "retire-me", tmuxTarget: "retire-me", lastError: "stale kill error" }), substrate: "hsr" as const };
@@ -85,6 +105,102 @@ test("transactionalRetire archives the record instead of deleting it", async () 
     assert.match(await readFile(hsrEventsPath(record.name), "utf8"), /history/, "retire keeps HSR history");
     const [sealFile] = await readdir(join(sealsRoot(), record.name));
     assert.match(await readFile(join(sealsRoot(), record.name, sealFile!), "utf8"), /keep me/);
+  });
+});
+
+test("transactionalRetire never releases ownership when event-integrity doubt lands during teardown", async () => {
+  await withTempStore(async () => {
+    const host = {
+      hostPid: 7411,
+      startedAt: "2026-08-15T22:40:00.000Z",
+      hostFingerprint: { pgid: 7411, startedAt: "retire-integrity-host-birth" },
+    };
+    const record: SessionRecord = {
+      ...seed({ name: "retire-event-integrity", tmuxTarget: "retire-event-integrity" }),
+      substrate: "hsr",
+      runnerPid: host.hostPid,
+      runnerFingerprint: host.hostFingerprint,
+      runtimeGeneration: 1,
+    };
+    await saveSession(record);
+
+    const outcome = await transactionalRetire(record, {
+      substrate: fakeSubstrate({}),
+      pollIntervalMs: 0,
+      emitLedger: false,
+      afterTeardown: async () => {
+        await persistHsrEventIntegrityFailure({
+          bee: record.name,
+          host,
+          deliveryIds: [],
+          reason: "provider event outcome became unknown while retire stopped the host",
+        });
+      },
+    });
+
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.equal(outcome.stillRunning, false, "process stop may be proven while event ownership remains unresolved");
+      assert.match(outcome.lastError, /unresolved HSR event history/);
+    }
+    const stored = await loadSession(record.name);
+    assert.equal(stored?.status, "kill_failed");
+    assert.notEqual(stored?.stateMachine?.lifecycle, "archived", "automatic cleanup cannot publish archive/release");
+    assert.equal(stored?.eventIntegrityDoubt?.integrityId, (await readHsrEventIntegrityReceipt(record.name))?.integrityId);
+  });
+});
+
+test("transactionalRetire strictly stops a live host with preexisting event-integrity doubt but never archives it", async () => {
+  await withTempStore(async () => {
+    const host = {
+      hostPid: 7412,
+      startedAt: "2026-08-15T22:45:00.000Z",
+      hostFingerprint: { pgid: 7412, startedAt: "retire-preexisting-integrity-host" },
+    };
+    const record: SessionRecord = {
+      ...seed({ name: "retire-preexisting-integrity", tmuxTarget: "retire-preexisting-integrity" }),
+      substrate: "hsr",
+      runnerPid: host.hostPid,
+      runnerFingerprint: host.hostFingerprint,
+      runtimeGeneration: 1,
+    };
+    await saveSession(record);
+    const receipt = await persistHsrEventIntegrityFailure({
+      bee: record.name,
+      host,
+      deliveryIds: [],
+      reason: "provider output is missing before explicit retire",
+    });
+    let live = true;
+    let stops = 0;
+
+    const outcome = await transactionalRetire(record, {
+      substrate: fakeSubstrate({
+        hasSession: async () => live,
+        kill: async () => {
+          stops += 1;
+          live = false;
+          await recordHsrEventIntegrityStop(
+            record.name,
+            receipt.integrityId,
+            host,
+            "confirmed",
+            "fixture exact host and child-group stop proof",
+          );
+          return killOk();
+        },
+      }),
+      pollIntervalMs: 0,
+      emitLedger: false,
+    });
+
+    assert.equal(stops, 1, "preexisting doubt does not skip strict teardown");
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) assert.equal(outcome.stillRunning, false);
+    assert.equal((await readHsrEventIntegrityReceipt(record.name))?.stopState, "confirmed");
+    const canonical = await loadSession(record.name);
+    assert.equal(canonical?.status, "kill_failed");
+    assert.notEqual(canonical?.stateMachine?.lifecycle, "archived");
   });
 });
 
@@ -120,6 +236,73 @@ test("hive retire --compact compacts HSR events but preserves metadata, seals, m
     assert.equal(await readFile(hsrRingPath(record.name), "utf8"), "rendered tail\n");
     assert.ok((await readFile(hsrEventsPath(record.name), "utf8")).split("\n").filter(Boolean).length <= 401);
     assert.ok((await readdir(join(sealsRoot(), record.name))).length > 0);
+  });
+});
+
+test("retire compaction holds the cross-process lifecycle lock until its snapshot replacement completes", async () => {
+  await withTempStore(async (dir) => {
+    const record = {
+      ...seed({ name: "compact-revive-race", tmuxTarget: "compact-revive-race" }),
+      substrate: "hsr" as const,
+      runtimeGeneration: 4,
+    };
+    await saveSession(record);
+    await ensureHsrRunDir(record.name);
+    await appendHsrEvent(record.name, { type: "text", ts: 1, text: "predecessor-one" });
+    await appendHsrEvent(record.name, { type: "text", ts: 2, text: "predecessor-two" });
+    assert.equal((await transactionalRetire(record, {
+      substrate: fakeSubstrate({}),
+      pollIntervalMs: 0,
+      emitLedger: false,
+    })).ok, true);
+
+    let snapshotReadyResolve!: () => void;
+    const snapshotReady = new Promise<void>((resolve) => { snapshotReadyResolve = resolve; });
+    let releaseSnapshotResolve!: () => void;
+    const releaseSnapshot = new Promise<void>((resolve) => { releaseSnapshotResolve = resolve; });
+    const compacting = compactRetiredHsrEvents(record, {
+      keepLines: 1,
+      targetBytes: 64,
+      afterSnapshotRead: async () => {
+        snapshotReadyResolve();
+        await releaseSnapshot;
+      },
+    });
+    await snapshotReady;
+
+    const attemptedPath = join(dir, "successor-attempted");
+    const acquiredPath = join(dir, "successor-acquired");
+    const successor = execFileAsync(process.execPath, ["tests/fixtures/retire-compact-successor.mjs"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HIVE_STORE_ROOT: dir,
+        HIVE_TEST_COMPACT_BEE: record.name,
+        HIVE_TEST_COMPACT_ATTEMPTED: attemptedPath,
+        HIVE_TEST_COMPACT_ACQUIRED: acquiredPath,
+      },
+    });
+    await waitForPath(attemptedPath);
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    await assert.rejects(
+      stat(acquiredPath),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+      "a successor process must not acquire lifecycle admission while compaction owns its snapshot",
+    );
+
+    releaseSnapshotResolve();
+    await Promise.all([compacting, successor]);
+    await stat(acquiredPath);
+    const lines = (await readFile(hsrEventsPath(record.name), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { text?: string });
+    assert.equal(
+      lines.filter((event) => event.text === "successor-first-event").length,
+      1,
+      "the successor's first detached-host event lands after compaction and survives exactly once",
+    );
+    assert.equal((await loadSession(record.name))?.runtimeGeneration, 5);
   });
 });
 
@@ -685,6 +868,41 @@ test("an archived (retired) record derives archived even without a live session"
   const retired = seed({ name: "filed", tmuxTarget: "filed", status: "done" });
   const derived = deriveState(retired, { liveTargets: new Set<string>() });
   assert.equal(derived.state, "done");
+});
+
+test("strict retire-by-name refuses archived and recordless bees with surviving event-history authority", async () => {
+  await withTempStore(async () => {
+    for (const shape of ["archived", "recordless"] as const) {
+      const bee = `retire-by-name-${shape}`;
+      if (shape === "archived") {
+        await saveSession({
+          ...seed({ name: bee, tmuxTarget: bee, status: "done" }),
+          substrate: "hsr",
+        });
+      }
+      await persistHsrEventIntegrityFailure({
+        bee,
+        host: {
+          hostPid: shape === "archived" ? 2_147_100_001 : 2_147_100_002,
+          startedAt: `2026-08-15T23:2${shape === "archived" ? "0" : "1"}:00.000Z`,
+          hostFingerprint: {
+            pgid: shape === "archived" ? 2_147_100_001 : 2_147_100_002,
+            startedAt: `retire-by-name-${shape}-host`,
+          },
+        },
+        deliveryIds: [],
+        reason: `${shape} provider history remains unresolved`,
+      });
+
+      await assert.rejects(
+        retireSessionByNameExactly(bee, "scheduler cleanup"),
+        /unresolved HSR event history/,
+      );
+      assert.equal((await readHsrEventIntegrityReceipt(bee))?.phase, "unresolved");
+      if (shape === "archived") assert.equal((await loadSession(bee))?.status, "done");
+      else assert.equal(await loadSession(bee), null);
+    }
+  });
 });
 
 test("an hsr record that is not live derives crashed when still marked running", () => {

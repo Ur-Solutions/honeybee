@@ -19,7 +19,13 @@
 import { createHash } from "node:crypto";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import type { BeeState } from "../state.js";
+import {
+  parseHsrAnswerHostIdentity,
+  sameHsrAnswerHostIdentity,
+  type HsrAnswerHostIdentity,
+} from "../answerReceipt.js";
 import { defaultIsPidAlive as isPidAlive } from "../fsx.js";
+import { withSessionLifecycleLock } from "../lifecycle.js";
 import {
   HSR_EVENTS_MAX_BYTES,
   hsrEventsPath,
@@ -32,6 +38,10 @@ import {
   type HsrMeta,
 } from "./runDir.js";
 import {
+  assertHsrSourceEventLogIntegrity,
+  HsrSourceEventIntegrityError,
+} from "./eventIntegrity.js";
+import {
   inspectProcessGroupBirth,
   inspectProcessBirth,
   readProcessBirthFingerprint,
@@ -40,7 +50,7 @@ import {
   type ProcessIdentityReader,
   type ProcessIdentityVerdict,
 } from "./processIdentity.js";
-import type { RunnerEvent } from "./types.js";
+import { isRunnerAuthNeededMessage, type RunnerEvent } from "./types.js";
 
 const DEFAULT_HSR_DISCOVERY_CONCURRENCY = 64;
 const DEFAULT_HSR_OBSERVATION_CONCURRENCY = 32;
@@ -254,6 +264,12 @@ async function readTailText(path: string, maxBytes: number): Promise<string | nu
  */
 export type HsrObservation = {
   live: boolean;
+  /** Per-Bee authority/read failure. Consumers must treat this row as unknown. */
+  unavailable?: {
+    kind: "integrity" | "busy" | "storage";
+    detail: string;
+    integrityId?: string;
+  };
   state?: BeeState;
   snapshot: string;
   /** Latest genuine runner-event progress observed in events.jsonl. */
@@ -304,6 +320,76 @@ export type HsrEventDerivationOptions = {
   /** Provider root thread id from meta.json; scoped lifecycle events from other threads are ignored. */
   rootThreadId?: string;
 };
+
+function eventHost(event: RunnerEvent): HsrAnswerHostIdentity | undefined {
+  if (!("host" in event) || event.host === undefined) return undefined;
+  try {
+    return parseHsrAnswerHostIdentity(event.host);
+  } catch {
+    return undefined;
+  }
+}
+
+function latestStampedHost(events: RunnerEvent[]): HsrAnswerHostIdentity | undefined {
+  // A host_epoch is durably appended before its adapter can emit. Prefer that
+  // explicit boundary; fall back to the latest stamped event for logs written
+  // during a rolling upgrade where the marker itself was unavailable.
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type !== "host_epoch") continue;
+    const host = eventHost(event);
+    if (host) return host;
+  }
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const host = eventHost(events[index]!);
+    if (host) return host;
+  }
+  return undefined;
+}
+
+export type HsrCurrentEventEpoch = {
+  host?: HsrAnswerHostIdentity;
+  events: RunnerEvent[];
+};
+
+/**
+ * Select events owned by one exact runner-host epoch. Local callers supply the
+ * host from meta.json. Remote mirrors recover it from the durable host_epoch
+ * marker. Hostless legacy events are accepted only on a local same-clock run
+ * and only at/after that host's startedAt boundary; mirrors fail closed until
+ * exact stamped provenance arrives.
+ */
+export function currentHsrEventEpoch(
+  events: RunnerEvent[],
+  expectedHost?: HsrAnswerHostIdentity,
+): HsrCurrentEventEpoch {
+  const host = expectedHost ?? latestStampedHost(events);
+  if (!host) return { events: [] };
+  const startedAt = Date.parse(host.startedAt);
+  const allowLegacyTimestampBoundary = expectedHost !== undefined && Number.isFinite(startedAt);
+  let markerIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type !== "host_epoch") continue;
+    const stamped = eventHost(event);
+    if (stamped && sameHsrAnswerHostIdentity(stamped, host)) {
+      markerIndex = index;
+      break;
+    }
+  }
+  return {
+    host,
+    events: events.filter((event, index) => {
+      const stamped = eventHost(event);
+      if (stamped) return sameHsrAnswerHostIdentity(stamped, host);
+      if ("host" in event && event.host !== undefined) return false;
+      // Once the durable boundary exists, file order is stronger than a
+      // provider-supplied wall clock for rolling-upgrade hostless events.
+      if (markerIndex >= 0) return index > markerIndex;
+      return allowLegacyTimestampBoundary && Number.isFinite(event.ts) && event.ts >= startedAt;
+    }),
+  };
+}
 
 function lifecycleThreadId(event: RunnerEvent): string | undefined {
   if ((event.type !== "turn_start" && event.type !== "turn_end") || !("threadId" in event)) return undefined;
@@ -387,10 +473,10 @@ export function structuredStateFromEvents(
   // A login-required auth failure is sticky for the turn it happened in. It is
   // intentionally separate from `auth_expired`: remote ephemeral-token bees can
   // recover that automatically, while this one requires a human login. The
-  // `auth_resume` marker (written after credential-aware capture/revive)
-  // bounds the stickiness: a resumed bee sits idle without starting a new
-  // turn, so the stale error must not keep re-deriving auth-needed. An auth
-  // error AFTER the marker (the resumed runner failed again) still wins.
+  // Legacy `auth_resume` markers bound this stickiness within pre-epoch logs.
+  // Current relaunches instead publish `host_epoch` before adapter start, and
+  // currentHsrEventEpoch removes every predecessor fact before this derivation.
+  // An auth error AFTER either boundary still wins.
   if (lastAuthNeeded >= 0 && lastAuthNeeded >= lastStart && lastAuthNeeded > lastAuthResume) {
     return "auth-needed";
   }
@@ -481,34 +567,7 @@ export function hsrActivityFromEvents(
 }
 
 export function isAuthNeededMessage(message: string): boolean {
-  const m = message.toLowerCase();
-  if (m.includes("not logged in") && m.includes("/login")) return true;
-  if (m.includes("please log out and sign in again")) return true;
-  if (m.includes("please sign out and sign in again")) return true;
-  if (m.includes("access token") && m.includes("could not be refreshed")) return true;
-  if (m.includes("access token") && m.includes("couldn't be refreshed")) return true;
-  if (m.includes("access token") && m.includes("cannot be refreshed")) return true;
-  // Anthropic's revocation shape ("401 OAuth access token has been revoked",
-  // 2026-08-08 incident) previously fell through to a generic error, so the
-  // bee never showed auth-needed and nothing reached account health.
-  if ((m.includes("token") || m.includes("oauth")) && m.includes("revoked")) return true;
-  if (m.includes("401") && (m.includes("oauth") || m.includes("unauthorized") || m.includes("authentication"))) return true;
-  if ((m.includes("please log in") || m.includes("please login") || m.includes("sign in again")) && m.includes("auth")) return true;
-  // "Failed to authenticate: OAuth session expired and could not be refreshed"
-  // (2026-08-10 incident, CL.6139) has no "access token" wording, so it fell
-  // through every rule above — no auth_expired event, no needs-auth request,
-  // and daemon authRecovery never fired. The claude adapter prefixes its own
-  // auth failures with "Failed to authenticate", so match that prefix, plus
-  // the session-expired refresh-failure shape on its own.
-  if (m.startsWith("failed to authenticate")) return true;
-  if (
-    (m.includes("oauth") || m.includes("session")) &&
-    m.includes("expired") &&
-    (m.includes("could not be refreshed") || m.includes("couldn't be refreshed") || m.includes("cannot be refreshed"))
-  ) {
-    return true;
-  }
-  return false;
+  return isRunnerAuthNeededMessage(message);
 }
 
 /**
@@ -540,14 +599,46 @@ export async function readEventTail(bee: string): Promise<RunnerEvent[]> {
   return raw === null ? [] : parseRunnerEvents(raw);
 }
 
-async function readEventSnapshot(bee: string, rootThreadId?: string): Promise<HsrEventSnapshot> {
-  const events = await readEventTail(bee);
+/** Current-host lifecycle slice, including for a dead host whose exact meta remains. */
+export async function readCurrentHsrEventTail(bee: string): Promise<RunnerEvent[]> {
+  const [retainedEvents, meta] = await Promise.all([readEventTail(bee), readHsrMeta(bee)]);
+  if (!meta) return [];
+  const host = meta.hostFingerprint ? {
+    hostPid: meta.hostPid,
+    startedAt: meta.startedAt,
+    hostFingerprint: meta.hostFingerprint,
+  } : undefined;
+  const epoch = currentHsrEventEpoch(retainedEvents, host);
+  if (!meta.mirrorOfNode && !host && !epoch.host) return retainedEvents;
+  return epoch.events;
+}
+
+function eventSnapshotFromRetainedEvents(
+  retainedEvents: RunnerEvent[],
+  rootThreadId?: string,
+  host?: HsrAnswerHostIdentity,
+  allowUnboundLegacy = false,
+): HsrEventSnapshot {
+  const derivedEpoch = currentHsrEventEpoch(retainedEvents, host);
+  const epoch = allowUnboundLegacy && !host && !derivedEpoch.host
+    ? { events: retainedEvents }
+    : derivedEpoch;
+  const pending = pendingNeedsInputFromEvents(epoch.events, { rootThreadId });
+  const cumulativeUsage = hsrUsageObservationFromEvents(retainedEvents);
+  const currentUsage = hsrUsageObservationFromEvents(epoch.events);
   return {
-    events,
-    tailEvents: events,
-    activity: hsrActivityFromEvents(events, { rootThreadId }),
-    usage: hsrUsageObservationFromEvents(events),
-    pendingNeedsInput: pendingNeedsInputFromEvents(events, { rootThreadId }),
+    // Current-lifecycle consumers (state, auth, recovery, BeeView, pending
+    // routing) must never see retained predecessor-host authority.
+    events: epoch.events,
+    tailEvents: epoch.events,
+    activity: hsrActivityFromEvents(epoch.events, { rootThreadId }),
+    // Token totals are session-history cumulative. Exhaustion is an active
+    // host signal and therefore comes only from the current epoch.
+    usage: {
+      totals: cumulativeUsage.totals,
+      ...(currentUsage.latestExhausted ? { latestExhausted: currentUsage.latestExhausted } : {}),
+    },
+    pendingNeedsInput: pending && epoch.host ? { ...pending, host: epoch.host } : pending,
   };
 }
 
@@ -560,7 +651,9 @@ async function readEventSnapshot(bee: string, rootThreadId?: string): Promise<Hs
  * only: stale ring/events cannot affect state, usage, or needs-input routing,
  * so rereading them every tick is pure waste. For live hosts, ring and event
  * reads run concurrently and a requested event snapshot is reused for state.
- * Never throws: a bad bee yields `{ live: false, snapshot: "" }`.
+ * Never throws: a bad bee yields an unavailable row. Source event facts are
+ * always returned from the same strict event-authority snapshot that admitted
+ * them; callers must not treat `unavailable` as an idle/dead observation.
  */
 export async function hsrObservations(options: HsrObservationOptions = {}): Promise<Map<string, HsrObservation>> {
   const observations = new Map<string, HsrObservation>();
@@ -569,7 +662,20 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
     : [...new Set(options.bees)].sort();
   const rows = await mapWithConcurrency(bees, observationConcurrency(options.concurrency), async (bee) => {
     try {
-      const meta = await readHsrMeta(bee);
+      const admitted = await withSessionLifecycleLock(bee, async () => {
+        const current = await readHsrMetaStrict(bee);
+        let sourceEvents: RunnerEvent[] | undefined;
+        if (current && !current.mirrorOfNode) {
+          sourceEvents = await assertHsrSourceEventLogIntegrity({
+            bee,
+            meta: current,
+            operation: "HSR observation",
+            includeEvents: true,
+          });
+        }
+        return { meta: current, sourceEvents };
+      });
+      const { meta, sourceEvents } = admitted;
       if (!meta) return undefined;
       const live = isMetaLive(meta);
       const mirrorOf = meta?.mirrorOfNode;
@@ -582,11 +688,16 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
       }
 
       const rootThreadId = meta?.sessionId;
+      const host = meta.hostFingerprint ? {
+        hostPid: meta.hostPid,
+        startedAt: meta.startedAt,
+        hostFingerprint: meta.hostFingerprint,
+      } : undefined;
       if (options.includeEvents) {
-        const [snapshot, eventSnapshot] = await Promise.all([
-          hsrSnapshot(bee),
-          readEventSnapshot(bee, rootThreadId),
-        ]);
+        const retainedEvents = sourceEvents ?? await readEventTail(bee);
+        const snapshotPromise = hsrSnapshot(bee);
+        const eventSnapshot = eventSnapshotFromRetainedEvents(retainedEvents, rootThreadId, host, !meta.mirrorOfNode);
+        const snapshot = await snapshotPromise;
         const state = structuredStateFromRunDir(meta, eventSnapshot.tailEvents);
         return [bee, {
           live: true,
@@ -598,12 +709,16 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
         }] as const;
       }
 
-      const [snapshot, events] = await Promise.all([
+      const [snapshot, retainedEvents] = await Promise.all([
         hsrSnapshot(bee),
-        readEventTail(bee),
+        sourceEvents ? Promise.resolve(sourceEvents) : readEventTail(bee),
       ]);
-      const state = structuredStateFromRunDir(meta, events);
-      const activity = hsrActivityFromEvents(events, { rootThreadId });
+      const derivedEpoch = currentHsrEventEpoch(retainedEvents, host);
+      const epoch = !meta.mirrorOfNode && !host && !derivedEpoch.host
+        ? { events: retainedEvents }
+        : derivedEpoch;
+      const state = structuredStateFromRunDir(meta, epoch.events);
+      const activity = hsrActivityFromEvents(epoch.events, { rootThreadId });
       return [bee, {
         live,
         snapshot,
@@ -611,8 +726,16 @@ export async function hsrObservations(options: HsrObservationOptions = {}): Prom
         ...(activity ? { activity } : {}),
         ...(mirrorOf ? { mirrorOf } : {}),
       }] as const;
-    } catch {
-      return [bee, { live: false, snapshot: "" }] as const;
+    } catch (error) {
+      return [bee, {
+        live: false,
+        snapshot: "",
+        unavailable: error instanceof HsrSourceEventIntegrityError
+          ? { kind: "integrity" as const, detail: error.message, integrityId: error.integrityId }
+          : (error as { code?: unknown }).code === "HIVE_HSR_EVENT_LOG_BUSY"
+            ? { kind: "busy" as const, detail: error instanceof Error ? error.message : String(error) }
+            : { kind: "storage" as const, detail: error instanceof Error ? error.message : String(error) },
+      }] as const;
     }
   });
   for (const row of rows) {
@@ -639,6 +762,8 @@ export type PendingNeedsInput = {
   questions?: Extract<RunnerEvent, { type: "needs_input" }>["questions"];
   multiSelect?: boolean;
   input?: unknown;
+  /** Exact non-authorizing runner epoch that emitted this request. */
+  host?: HsrAnswerHostIdentity;
 };
 
 export function pendingNeedsInputFromEvents(
@@ -679,7 +804,22 @@ export function pendingNeedsInputFromEvents(
 export async function pendingNeedsInput(bee: string): Promise<PendingNeedsInput | null> {
   const meta = await readHsrMeta(bee);
   if (!isMetaLive(meta)) return null;
-  return pendingNeedsInputFromEvents(await readEventTail(bee), { rootThreadId: meta?.sessionId });
+  const host = meta?.hostFingerprint ? {
+    hostPid: meta.hostPid,
+    startedAt: meta.startedAt,
+    hostFingerprint: meta.hostFingerprint,
+  } : undefined;
+  const retainedEvents = await readEventTail(bee);
+  const derivedEpoch = currentHsrEventEpoch(retainedEvents, host);
+  const epoch = !meta?.mirrorOfNode && !host && !derivedEpoch.host
+    ? { events: retainedEvents }
+    : derivedEpoch;
+  const pending = pendingNeedsInputFromEvents(epoch.events, { rootThreadId: meta?.sessionId });
+  if (!pending || !epoch.host) return pending;
+  return {
+    ...pending,
+    host: epoch.host,
+  };
 }
 
 /**
@@ -739,7 +879,23 @@ export async function hsrUsageObservation(bee: string): Promise<HsrUsageObservat
   } catch {
     return { totals: null };
   }
-  return hsrUsageObservationFromEvents(parseRunnerEvents(raw));
+  const retainedEvents = parseRunnerEvents(raw);
+  const cumulative = hsrUsageObservationFromEvents(retainedEvents);
+  const meta = await readHsrMeta(bee).catch(() => null);
+  const host = meta?.hostFingerprint ? {
+    hostPid: meta.hostPid,
+    startedAt: meta.startedAt,
+    hostFingerprint: meta.hostFingerprint,
+  } : undefined;
+  const derivedEpoch = currentHsrEventEpoch(retainedEvents, host);
+  const currentEvents = !meta?.mirrorOfNode && !host && !derivedEpoch.host
+    ? retainedEvents
+    : derivedEpoch.events;
+  const current = hsrUsageObservationFromEvents(currentEvents);
+  return {
+    totals: cumulative.totals,
+    ...(current.latestExhausted ? { latestExhausted: current.latestExhausted } : {}),
+  };
 }
 
 // Escalation grace for orphaned harness child groups (SIGTERM → SIGKILL),
@@ -849,7 +1005,25 @@ export async function ensureOrphanedChildGroupStopped(
   deps: HsrProcessSignalDependencies = {},
 ): Promise<boolean> {
   const before = await inspectHsrChildProcess(meta, deps);
-  if (before === "absent" || before === "gone" || before === "mismatch") return true;
+  if (before === "absent") return true;
+  if (before === "gone" || before === "mismatch") {
+    // A detached process-group leader may exit while descendants keep the
+    // recorded PGID alive. Leader death (or PID reuse) therefore proves only
+    // that we must not signal through that numeric identity; it does not prove
+    // that the whole owned group is gone. Require a separate non-destructive
+    // group census before publishing a confirmed stop.
+    const pgid = meta?.childPgid ?? meta?.childPid ?? 0;
+    if (!Number.isSafeInteger(pgid) || pgid <= 0) return false;
+    try {
+      if (deps.readProcessGroupPresence) {
+        return (await deps.readProcessGroupPresence(pgid)) === "absent";
+      }
+      if (deps.isProcessGroupAlive) return !deps.isProcessGroupAlive(pgid);
+      return (await readProcessGroupPresence(pgid)) === "absent";
+    } catch {
+      return false;
+    }
+  }
   // Pre-fingerprint Honeybee persisted the detached child PID/PGID but no OS
   // birth token. Never signal such a recyclable numeric identity. An already
   // finalized legacy host can still be reconciled safely when two independent,
@@ -885,6 +1059,29 @@ export async function ensureOrphanedChildGroupStopped(
   // original descendants, but it can no longer be revalidated before another
   // signal. Preserve unconfirmed state instead of risking a recycled PGID.
   return false;
+}
+
+/**
+ * Positive no-descendant proof used with a durable terminal event-stream seal.
+ * Unlike `ensureOrphanedChildGroupStopped`, this never signals: a group that
+ * still exists after the host's terminal event is ambiguity, not clean exit.
+ */
+export async function proveHsrChildGroupAbsent(
+  meta: HsrMeta,
+  deps: HsrProcessSignalDependencies = {},
+): Promise<boolean> {
+  if (meta.childAdmission === "none") return true;
+  if (meta.childAdmission !== "admitted" || !meta.childPid || !meta.childPgid || !meta.childFingerprint) {
+    return false;
+  }
+  const leader = await inspectHsrChildProcess(meta, deps);
+  if (leader === "unverifiable" || leader === "match") return false;
+  if (leader === "mismatch") return true;
+  try {
+    return await (deps.readProcessGroupPresence ?? readProcessGroupPresence)(meta.childPgid) === "absent";
+  } catch {
+    return false;
+  }
 }
 
 /**

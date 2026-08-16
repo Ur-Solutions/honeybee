@@ -377,7 +377,7 @@ test("concurrent queued wakes launch one replacement and publish one steer edge"
     assert.deepEqual(new Set(wakes.map((item) => item.runtimeGeneration)), new Set([2]));
     const final = (await loadSession(initial.name))!;
     assert.equal(final.stateMachine?.work, "working");
-    assert.equal(final.stateMachine?.revision, 2);
+    assert.equal(final.stateMachine?.revision, 3, "parking, exact revival, and the one steer edge are all durable");
   });
 });
 

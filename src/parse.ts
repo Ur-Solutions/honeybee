@@ -54,6 +54,7 @@ export const BOOLEAN_FLAGS = new Set([
   "list",
   "live",
   "new-client",
+  "new",
   "now",
   "open",
   "popup",

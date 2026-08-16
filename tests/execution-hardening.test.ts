@@ -19,7 +19,7 @@ import {
   writeEffectIndex,
 } from "../src/execution/runStore.js";
 import { claimWorkingCopy, readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
-import { loadSession, saveSession } from "../src/store.js";
+import { loadSession, saveSession, updateSession } from "../src/store.js";
 import type { SessionEvidenceSource } from "../src/execution/service.js";
 import {
   beeNameForRun,
@@ -127,6 +127,74 @@ test("event self-healing: state written without its lifecycle events re-derives 
     for (const expected of ["environment.sealed", "environment.released", "command.accepted", "command.dispatching", "command.completed"]) {
       assert.ok(types.includes(expected), `missing healed event ${expected}`);
     }
+  });
+});
+
+test("run.events polling is projection-only and never retries stop, retirement, or release", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    let clock = new Date("2026-08-05T10:30:00Z");
+    const expiresAt = "2026-08-05T11:00:00Z";
+    const control = fakeControl({ stopResult: { stopped: true, detail: "stop would mutate lifecycle" } });
+    let retirementCalls = 0;
+    const service = makeService({
+      launcher: countingLauncher().launcher,
+      control: control.control,
+      now: () => clock,
+      retireSession: async () => {
+        retirementCalls += 1;
+        return { retired: true, detail: "retirement would mutate lifecycle" };
+      },
+    });
+    await service.runStart(buildRunStartEnvelope(ctx, { expiresAt }));
+    await registerWorkingCopy({
+      workingCopyId: "wc-0001",
+      productId: "prod-honeycomb-app",
+      path: "/tmp/honeybee-event-observer",
+      snapshotDigest: SNAPSHOT_DIGEST,
+    });
+    await claimWorkingCopy("wc-0001", RUN_ID);
+
+    const effectKey = `${RUN_ID}/release-observer-regression`;
+    const releaseEnvelope = buildOperationEnvelope(ctx, effectKey, { runId: RUN_ID });
+    await admitOperation({
+      runId: RUN_ID,
+      method: "run.release",
+      effectKey,
+      requestDigest: String(releaseEnvelope.requestDigest),
+      protocolVersion: "0.1",
+      schemaDigest: service.schemaDigest,
+      init: {
+        releaseSteps: [
+          { step: "harness-stop", status: "pending" },
+          { step: "occupancy-release", status: "pending" },
+          { step: "environment-seal", status: "pending" },
+          { step: "environment-release", status: "pending" },
+        ],
+      },
+    });
+    const eventsBefore = await readRunEvents(RUN_ID);
+    const reservationBefore = (await readReservation(RUN_ID))!;
+
+    // Lease expiry is a lifecycle obligation, but event observation is not
+    // its retry clock. The daemon inventory/run.get will own that progression.
+    clock = new Date("2026-08-05T12:00:00Z");
+    let afterSeq = 0;
+    for (let index = 0; index < 12; index += 1) {
+      const page = await service.runEvents({ protocolVersion: "0.1", runId: RUN_ID, afterSeq });
+      assert.ok("result" in page);
+      afterSeq = Number(page.result.nextAfterSeq);
+    }
+
+    assert.equal(control.calls.filter((call) => call.method === "stop").length, 0);
+    assert.equal(retirementCalls, 0);
+    assert.deepEqual(await readRunEvents(RUN_ID), eventsBefore, "polling appends no repair/lifecycle events");
+    const reservationAfter = (await readReservation(RUN_ID))!;
+    assert.deepEqual(reservationAfter, reservationBefore, "polling mutates no reservation state");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+    const release = (await readOperation(RUN_ID, effectKey))!;
+    assert.equal(release.result, undefined);
+    assert.ok(release.releaseSteps?.every((step) => step.status === "pending"));
   });
 });
 
@@ -258,6 +326,24 @@ test("lease expiry stops ongoing execution: confirmed stop -> cancelled(lease_ex
   });
 });
 
+test("cancellation cannot treat a legacy kill_failed SessionRecord as exit proof", async () => {
+  await withTempStore(async () => {
+    const control = fakeControl({ stopResult: { stopped: false, detail: "exact stop unconfirmed" } });
+    const { ctx, service } = await startRunning({ control });
+    const bee = beeNameForRun(RUN_ID);
+    await updateSession(bee, { status: "kill_failed", lastError: "escaped process may remain" });
+
+    const response = (await service.runCancel(
+      buildOperationEnvelope(ctx, `${RUN_ID}/cancel/stop-doubt`, { runId: RUN_ID, reason: "operator stop" }),
+    )) as JsonObject;
+    assert.deepEqual(response.result, { runId: RUN_ID, state: "lost" });
+    const reservation = (await readReservation(RUN_ID))!;
+    assert.equal(reservation.result, undefined, "uncertain ownership cannot terminalize the Run");
+    assert.ok(reservation.indeterminateAt);
+    assert.ok((await readRunEvents(RUN_ID)).some((event) => event.type === "run.lost"));
+  });
+});
+
 test("stop retries on every reconcile pass: a transient first failure never strands a live harness behind a lost marker", async () => {
   await withTempStore(async () => {
     const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
@@ -372,6 +458,7 @@ test("cancel during launch with an unconfirmable stop projects lost, then conver
     // Session outcome later proves exit: reconciliation converges to cancelled.
     const bee = beeNameForRun(RUN_ID);
     await saveSession({ ...(await loadSession(bee))!, status: "done" });
+    control.behavior.stopResult = { stopped: true, detail: "later exact absence proof" };
     const settledProjection = ((await service.runGet({ protocolVersion: "0.1", runId: RUN_ID })) as { result: JsonObject }).result;
     assert.equal(settledProjection.state, "cancelled");
     assert.equal((await readReservation(RUN_ID))!.indeterminateAt, undefined, "doubt resolved");
@@ -471,13 +558,13 @@ test("release during an in-flight launch fences all cleanup; reconciliation comp
   });
 });
 
-test("requested evidence kinds this node cannot collect yield a typed partial failure, never a silent complete", async () => {
+test("requested evidence kinds this node cannot collect are refused before work starts", async () => {
   await withTempStore(async () => {
     const ctx = await installTestAuthority();
-    const control = fakeControl();
-    const service = makeService({ control: control.control });
+    const counting = countingLauncher();
+    const service = makeService({ launcher: counting.launcher });
     const evidenceContract = { collect: ["logs", "media", "tests"], delivery: "local-manifest" };
-    await service.runStart(
+    const response = (await service.runStart(
       buildRunStartEnvelope(ctx, {
         mutateIntent: (intent) => {
           intent.evidenceContract = structuredClone(evidenceContract);
@@ -486,27 +573,10 @@ test("requested evidence kinds this node cannot collect yield a typed partial fa
           lease.evidenceContract = structuredClone(evidenceContract);
         },
       }),
-    );
-    const response = (await service.runCollect(buildOperationEnvelope(ctx, `${RUN_ID}/collect`, { runId: RUN_ID }))) as JsonObject;
-    const manifest = response.result as JsonObject;
-    assert.equal(manifest.state, "failed", "unsupported kinds cannot silently complete");
-    // The supported portion was still collected (typed partial).
-    assert.ok((manifest.entries as JsonObject[]).some((entry) => entry.kind === "log"));
-    const record = (await readOperation(RUN_ID, `${RUN_ID}/collect`))!;
-    assert.match(record.cause!, /media, tests|tests, media/);
-    assert.equal(record.collectionFailure, "unrecoverable");
-    assert.ok(!(await readRunEvents(RUN_ID)).some((event) => event.type === "collection.completed"));
-
-    // Unsupported/unrecoverable collection failures remain terminal across
-    // replay and restart; only failures explicitly classified retryable may
-    // re-enter under the same stable effect.
-    const restarted = makeService({ control: fakeControl().control });
-    const replay = (await restarted.runCollect(
-      buildOperationEnvelope(ctx, `${RUN_ID}/collect`, { runId: RUN_ID }, { requestId: "req-unsupported-replay" }),
     )) as JsonObject;
-    assert.equal((replay.receipt as JsonObject).outcome, "replayed");
-    assert.equal((replay.result as JsonObject).state, "failed");
-    assert.equal((replay.receipt as JsonObject).resultVersion, (response.receipt as JsonObject).resultVersion);
-    assert.equal((await readOperation(RUN_ID, `${RUN_ID}/collect`))!.collectionFailure, "unrecoverable");
+    assert.equal((response.error as JsonObject).code, "CAPABILITY_MISMATCH");
+    assert.match(String((response.error as JsonObject).message), /evidence/i);
+    assert.equal(await readReservation(RUN_ID), null, "unsupported guarantees create no Run reservation");
+    assert.equal(counting.calls.length, 0, "unsupported guarantees launch no work");
   });
 });

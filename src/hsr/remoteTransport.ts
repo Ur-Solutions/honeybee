@@ -30,7 +30,7 @@ import { mkdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { storeRoot } from "../fsx.js";
 import type { NodeRecord } from "../node.js";
-import { remoteBundlePath } from "./bootstrap.js";
+import { DEFAULT_REMOTE_RUNNER_HOST_SOCKET, remoteBundlePath } from "./bootstrap.js";
 import { connectRpcClient, type RpcClient } from "./rpc.js";
 import { defaultSshExecHook, DEFAULT_SSH_EXEC_TIMEOUT_MS, type SshExecHook } from "./sshExec.js";
 
@@ -42,7 +42,7 @@ export type { SshExecHook };
 // --- shared defaults ----------------------------------------------------------
 
 /** Default runner-host control socket path on the remote (tilde-expanded remote-side). */
-export const DEFAULT_REMOTE_SOCKET = "~/.hive/runner-host/control.sock";
+export const DEFAULT_REMOTE_SOCKET = DEFAULT_REMOTE_RUNNER_HOST_SOCKET;
 
 const DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = Math.ceil(DEFAULT_SSH_EXEC_TIMEOUT_MS / 1000);
 
@@ -204,10 +204,10 @@ export type EnsureServeOptions = RemoteTransportDeps & {
 };
 
 /**
- * Ensure the remote runner-host serve socket exists. Idempotent: if
- * `test -S <remoteSock>` already succeeds, returns immediately; otherwise starts
- * the bundle detached (`setsid node <bundle> serve --socket <sock> &`) and polls
- * `test -S` until the socket appears (bounded) or throws.
+ * Ensure the exact NodeRecord runner-host serve exists. A socket alone is not
+ * authority proof: every existing or newly started serve must answer the staged
+ * bundle's digest-qualified probe before this function returns. Stale live
+ * serves fail closed with an actionable bootstrap/upgrade error.
  */
 export async function ensureRemoteServe(
   node: NodeRecord,
@@ -229,10 +229,31 @@ export async function ensureRemoteServe(
   // Expand once via the remote `$HOME` ("$HOME" is safe to double-quote; `~` is
   // not, as it would not expand inside quotes) so serve-bind and forward agree.
   const remoteSocket = await resolveRemoteSocket(runRemote, opts.remoteSocket ?? DEFAULT_REMOTE_SOCKET);
+  const exactProbeCommand = `node ${bundle} probe --socket ${remoteSocket} --expect-version ${version}`;
+
+  const proveExactServe = async (): Promise<void> => {
+    const exact = await runRemote(exactProbeCommand);
+    if (exact.exitCode !== 0) {
+      throw new Error(
+        `remoteTransport: live runner-host on ${node.endpoint} does not match registered version ${version}; `
+        + `run \`hive node bootstrap ${node.name}\` to quiescently upgrade it `
+        + `(exit ${exact.exitCode}: ${exact.stderr.trim() || exact.stdout.trim() || "no output"})`,
+      );
+    }
+  };
 
   // Already up?
   const probe = await runRemote(`test -S ${remoteSocket}`);
-  if (probe.exitCode === 0) return { remoteSocket };
+  if (probe.exitCode === 0) {
+    await proveExactServe();
+    return { remoteSocket };
+  }
+  if (probe.exitCode !== 1) {
+    throw new Error(
+      `remoteTransport: could not prove whether remote serve socket ${remoteSocket} exists on ${node.endpoint} `
+      + `(exit ${probe.exitCode}: ${probe.stderr.trim() || probe.stdout.trim() || "no output"})`,
+    );
+  }
 
   // Start detached so it outlives this ssh connection. setsid detaches from the
   // controlling terminal; redirect all fds and background so ssh returns at once.
@@ -248,7 +269,16 @@ export async function ensureRemoteServe(
   // Poll until the socket materializes.
   for (let i = 0; i < attempts; i++) {
     const check = await runRemote(`test -S ${remoteSocket}`);
-    if (check.exitCode === 0) return { remoteSocket };
+    if (check.exitCode === 0) {
+      await proveExactServe();
+      return { remoteSocket };
+    }
+    if (check.exitCode !== 1) {
+      throw new Error(
+        `remoteTransport: remote serve socket poll failed on ${node.endpoint} `
+        + `(exit ${check.exitCode}: ${check.stderr.trim() || check.stdout.trim() || "no output"})`,
+      );
+    }
     await sleep(intervalMs);
   }
   throw new Error(

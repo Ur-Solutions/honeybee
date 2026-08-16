@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { deliverTrackFollowUp, renderTrackStatus } from "../src/commands/track.js";
+import { deliverTrackFollowUp, queueTrackForBee, renderTrackStatus } from "../src/commands/track.js";
+import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
 import { recordSeal, validateSealArtifact } from "../src/seal.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
 import { listActiveSessions, loadSession, saveSession, updateSession, type SessionRecord } from "../src/store.js";
@@ -185,6 +186,48 @@ test("track attachment rolls back when standing-postscript delivery fails", asyn
   });
 });
 
+test("track queue loses to fresh lifecycle stop doubt with zero queue and ledger writes", async () => {
+  await withStore(async (store) => {
+    const active = await defineValue(store, {
+      name: "queue-admission-active",
+      items: [{ type: "action", id: "active", name: "Active" }],
+    }, "queue-admission-active.json");
+    const future = await defineValue(store, {
+      name: "queue-admission-future",
+      items: [{ type: "action", id: "future", name: "Future" }],
+    }, "queue-admission-future.json");
+    const bee: SessionRecord = {
+      name: "CO.queue-kill-wins",
+      id: "CO.queue-kill-wins",
+      agent: "stub",
+      cwd: store,
+      command: "stub",
+      tmuxTarget: "CO.queue-kill-wins",
+      createdAt: "2026-08-15T10:00:00.000Z",
+      updatedAt: "2026-08-15T10:00:00.000Z",
+      status: "running",
+    };
+    await saveSession(bee);
+    await attachTrack(active.name, { bee: bee.name, beeId: bee.id });
+    const snapshot = (await loadSession(bee.name))!;
+    await withSessionLifecycleTransaction(snapshot, (lifecycle) => lifecycle.commit({
+      status: "kill_failed",
+      lastError: "queue race stop ownership unresolved",
+      updatedAt: "2026-08-15T10:00:01.000Z",
+    }));
+
+    await assert.rejects(
+      queueTrackForBee(future.name, snapshot, { queuedBy: "race-test" }),
+      /unresolved stop state/,
+    );
+
+    assert.deepEqual((await loadTrackAttachment(bee.name))?.queue, []);
+    const ledger = await readFile(join(store, "ledger.jsonl"), "utf8");
+    assert.doesNotMatch(ledger, /"type":"track\.queue"/);
+    assert.equal((await loadSession(bee.name))?.lastError, "queue race stop ownership unresolved");
+  });
+});
+
 test("track follow-up retires the completed-turn boundary and re-enters the active index", async () => {
   await withStore(async (store) => {
     const record: SessionRecord = {
@@ -236,6 +279,30 @@ test("track follow-up retires the completed-turn boundary and re-enters the acti
     );
     assert.equal((await loadSession(record.name))?.lastObservedState, "done", "failed delivery preserves the completed boundary");
     assert.deepEqual((await listActiveSessions()).map((candidate) => candidate.name), [record.name]);
+  });
+});
+
+test("track follow-up hive-state mirror failure after acceptance is repair-only", async () => {
+  await withStore(async (store) => {
+    const record: SessionRecord = {
+      name: "CO.track-mirror-fault",
+      id: "CO.track-mirror-fault",
+      agent: "codex",
+      cwd: store,
+      command: "codex",
+      tmuxTarget: "CO.track-mirror-fault",
+      createdAt: "2026-08-15T16:10:00.000Z",
+      updatedAt: "2026-08-15T16:10:00.000Z",
+      status: "running",
+    };
+    await saveSession(record);
+    let deliveries = 0;
+    await deliverTrackFollowUp(record, "track exactly once", {
+      deliver: async () => { deliveries += 1; },
+      writeState: async () => { throw new Error("injected track mirror failure"); },
+    });
+    assert.equal(deliveries, 1);
+    assert.equal((await loadSession(record.name))?.lastPrompt, "track exactly once");
   });
 });
 

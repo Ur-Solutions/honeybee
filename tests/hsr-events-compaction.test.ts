@@ -98,16 +98,16 @@ test("compactHsrEvents folds dropped usage/exhausted into checkpoints, keeps the
     await compactHsrEvents(bee, { keepLines: 4, targetBytes: 10_000 });
 
     const lines = await readLines(bee);
-    // usage checkpoint + exhausted checkpoint + text stub (the dropped prefix
-    // held assistant text but no turn markers) + the 4 kept tail lines.
-    assert.equal(lines.length, 7);
+    // usage checkpoint + current-authority exhausted checkpoint + the 4 kept
+    // tail lines. Exhaustion is already a state marker, so a synthetic text
+    // stub must not be reordered beside it and change authority semantics.
+    assert.equal(lines.length, 6);
     assert.deepEqual(JSON.parse(lines[0]!), {
       type: "usage", ts: 2, inputTokens: 150, outputTokens: 15, totalTokens: 187,
       cacheReadTokens: 12, cacheWriteTokens: 2, reasoningTokens: 8, cost: 0.375,
     });
     assert.deepEqual(JSON.parse(lines[1]!), { type: "exhausted", ts: 3, resetHint: "R1" });
-    assert.deepEqual(JSON.parse(lines[2]!), { type: "text", ts: 11, text: "…" });
-    assert.deepEqual(lines.slice(3), before.slice(-4), "kept tail must be preserved verbatim");
+    assert.deepEqual(lines.slice(2), before.slice(-4), "kept tail must be preserved verbatim");
 
     // The cumulative usage observation is EXACTLY what it was pre-compaction.
     const usage = await hsrUsageObservation(bee);
@@ -283,6 +283,33 @@ test("compaction preserves in-flight turn markers and unresolved needs_input (HI
     await compactHsrEvents(idle, { keepLines: 10, targetBytes: 10_000 });
     assert.equal((await hsrObservations()).get(idle)?.state, "idle_with_output", "finished turn must stay idle after compaction");
     assert.equal(await pendingNeedsInput(idle), null, "a resolved needs_input must not resurface after compaction");
+
+    // 4. A tool emitted after a provider's premature turn_end keeps the Cell
+    // active even when both facts fall into the folded prefix.
+    const toolActive = "compact-tool-after-end";
+    await writeEvents(toolActive, [
+      { type: "turn_start", ts: 1 },
+      { type: "turn_end", ts: 2 },
+      { type: "tool_use", ts: 3, tool: "Bash" },
+      ...Array.from({ length: 50 }, (_, i): RunnerEvent => ({ type: "usage", ts: 4 + i, inputTokens: 1 })),
+    ]);
+    await writeHsrMeta(toolActive, liveMeta(toolActive));
+    await compactHsrEvents(toolActive, { keepLines: 10, targetBytes: 10_000 });
+    assert.equal((await hsrObservations()).get(toolActive)?.state, "active", "post-end tool activity must survive compaction");
+
+    // 5. Auth loss and its later legacy recovery boundary are both state
+    // authority. Keeping only the error would falsely re-fence a recovered run.
+    const authResumed = "compact-auth-resume";
+    await writeEvents(authResumed, [
+      { type: "turn_start", ts: 1 },
+      { type: "error", ts: 2, message: "Not logged in; run /login" },
+      { type: "auth_resume", ts: 3, source: "human-login" },
+      { type: "turn_end", ts: 4 },
+      ...Array.from({ length: 50 }, (_, i): RunnerEvent => ({ type: "usage", ts: 5 + i, inputTokens: 1 })),
+    ]);
+    await writeHsrMeta(authResumed, liveMeta(authResumed));
+    await compactHsrEvents(authResumed, { keepLines: 10, targetBytes: 10_000 });
+    assert.equal((await hsrObservations()).get(authResumed)?.state, "idle_with_output", "auth recovery ordering must survive compaction");
   });
 });
 

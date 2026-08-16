@@ -17,11 +17,13 @@ export type ProbeEvidence = {
   observedAt: string;
   outcome: "alive" | "dead" | "unreachable";
   target: {
-    substrate: "local-tmux" | "hsr";
+    substrate: "local-tmux" | "hsr" | "remote-hsr";
     node?: string;
     tmuxTarget?: string;
     agentPaneId?: string;
     runnerPid?: number;
+    remoteLaunchId?: string;
+    remoteIncarnation?: string;
   };
   detail?: string;
 };
@@ -113,6 +115,53 @@ export type BeeStateMachineCursor = {
   /** Carries the proof for the cursor even after ledger rotation. */
   lastTransition: BeeTransitionReceipt;
 };
+
+/**
+ * One canonical retirement predicate for every Honeybee control/read path.
+ * Once a proof-carrying cursor exists its lifecycle axis outranks stale
+ * mixed-version scalars in both directions. Legacy `status:done` remains the
+ * archive spelling only when no canonical cursor exists.
+ */
+export function isArchivedSessionLifecycle(record: {
+  status: string;
+  stateMachine?: Pick<BeeStateMachineCursor, "lifecycle">;
+}): boolean {
+  return record.stateMachine !== undefined
+    ? record.stateMachine.lifecycle === "archived"
+    : record.status === "done";
+}
+
+/**
+ * Canonical-active eligibility with an exact legacy fallback. Once a bounded
+ * cursor exists its lifecycle axis wins in both directions; cursor-less
+ * records retain the historical `status:running` gate.
+ */
+export function isActiveSessionLifecycle(record: {
+  status: string;
+  stateMachine?: Pick<BeeStateMachineCursor, "lifecycle">;
+}): boolean {
+  return record.stateMachine !== undefined
+    ? record.stateMachine.lifecycle === "active"
+    : record.status === "running";
+}
+
+/**
+ * Whether a session may accept newly launched, recovered, or adopted work.
+ * Lifecycle remains cursor-first, but `kill_failed` is an independent durable
+ * stop-doubt fence: until teardown is resolved, no second runtime may be
+ * started or attached to the same record.
+ */
+export function isRunnableSessionRecord(record: {
+  status: string;
+  stateMachine?: Pick<BeeStateMachineCursor, "lifecycle">;
+  deliveryStopDoubt?: unknown;
+  eventIntegrityDoubt?: unknown;
+}): boolean {
+  return isActiveSessionLifecycle(record)
+    && record.status !== "kill_failed"
+    && record.deliveryStopDoubt === undefined
+    && record.eventIntegrityDoubt === undefined;
+}
 
 type EventBase = { eventId: string; at: string };
 
@@ -228,9 +277,16 @@ export function isProbeEvidence(value: unknown): value is ProbeEvidence {
   if (!isRecord(value) || value.kind !== "probe") return false;
   if (!isNonEmptyString(value.probeId) || !isNonEmptyString(value.observerId) || !isIsoTimestamp(value.observedAt)) return false;
   if (value.outcome !== "alive" && value.outcome !== "dead" && value.outcome !== "unreachable") return false;
-  if (!isRecord(value.target) || (value.target.substrate !== "local-tmux" && value.target.substrate !== "hsr")) return false;
+  if (
+    !isRecord(value.target)
+    || (
+      value.target.substrate !== "local-tmux"
+      && value.target.substrate !== "hsr"
+      && value.target.substrate !== "remote-hsr"
+    )
+  ) return false;
   if (value.target.runnerPid !== undefined && (!Number.isSafeInteger(value.target.runnerPid) || Number(value.target.runnerPid) <= 0)) return false;
-  for (const key of ["node", "tmuxTarget", "agentPaneId"] as const) {
+  for (const key of ["node", "tmuxTarget", "agentPaneId", "remoteLaunchId", "remoteIncarnation"] as const) {
     if (value.target[key] !== undefined && !isNonEmptyString(value.target[key])) return false;
   }
   return value.detail === undefined || typeof value.detail === "string";
@@ -416,6 +472,8 @@ export function reduceBeeTransition(current: StateMachineSeed, event: BeeTransit
         // runtime availability. The suspended work/request axis is unchanged.
         if (current.runtime === "parked" && current.work === "needs-you" && event.resume === "needs-you") {
           to = { ...current, runtime: "live", work: "needs-you" };
+        } else if (current.runtime === "parked" && current.work === "done" && event.resume === "done") {
+          to = { ...current, runtime: "live", work: "done" };
         }
         break;
     }

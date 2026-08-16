@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { startTurnRunner, type TurnRunnerConfig } from "../src/hsr/turnRunner.js";
+import { ensureHsrRunDir } from "../src/hsr/runDir.js";
 import type { RunnerEvent, RunnerOpts, RunnerSession } from "../src/hsr/types.js";
 
 // Reads the prompt from stdin, then emits init + assistant (echoing prompt and
@@ -47,6 +48,63 @@ process.stdin.on("end", () => {
       setTimeout(() => {}, 2_500);
     }, 250);
   }, 50);
+});
+`;
+
+// The per-turn process exits immediately after handing its stdout fd to a
+// short-lived descendant. Node emits ChildProcess `exit` for the parent first,
+// then the descendant writes the final (unterminated) provider frame, EOFs the
+// shared pipe, and only then allows ChildProcess `close`.
+const EXIT_BEFORE_STDIO_CLOSE_SCRIPT = `
+const { spawn } = require("node:child_process");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const frame = Buffer.from(JSON.stringify({ type: "late-result", text: "tail-after-exit" })).toString("base64");
+  const tail = spawn(process.execPath, [
+    "-e",
+    "setTimeout(() => process.stdout.write(Buffer.from(process.argv[1], 'base64')), 150)",
+    frame,
+  ], { stdio: ["ignore", 1, "ignore"] });
+  tail.unref();
+});
+`;
+
+// The parent emits an exact turn_end, then exits while a tracked detached tool
+// keeps the inherited stdout write end open indefinitely. Waiting for the
+// ChildProcess `close` event would wedge the turn queue forever even though the
+// provider protocol has already supplied its terminal boundary.
+const INHERITED_STDOUT_AFTER_TURN_END_SCRIPT = `
+const { spawn } = require("node:child_process");
+const { appendFileSync } = require("node:fs");
+const pidFile = process.argv[1];
+const line = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: ["ignore", 1, "ignore"],
+  });
+  descendant.unref();
+  appendFileSync(pidFile, String(descendant.pid) + "\\n");
+  line({ type: "tool" });
+  // Give event-driven process ownership its bounded post-tool census before
+  // the parent exits and loses the ancestry link.
+  setTimeout(() => line({ type: "result" }), 350);
+});
+`;
+
+const INHERITED_STDOUT_WITHOUT_TURN_END_SCRIPT = `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const pidFile = process.argv[1];
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: ["ignore", 1, "ignore"],
+  });
+  descendant.unref();
+  writeFileSync(pidFile, String(descendant.pid));
 });
 `;
 
@@ -126,10 +184,15 @@ async function waitFor(check: () => boolean | Promise<boolean>, label: string): 
   throw new Error(`timed out waiting for ${label}`);
 }
 
+async function startTestTurnRunner(config: TurnRunnerConfig, opts: RunnerOpts): Promise<RunnerSession> {
+  await ensureHsrRunDir(opts.bee);
+  return startTurnRunner(config, opts);
+}
+
 test("turn runner: learns the session id on turn 1 and resumes it on turn 2", async () => {
   await withTempStore(async () => {
     const opts: RunnerOpts = { bee: "turn-bee", cwd: process.cwd(), env: { ...process.env } as Record<string, string>, runDir: "unused" };
-    const session = await startTurnRunner(stubConfig(), opts);
+    const session = await startTestTurnRunner(stubConfig(), opts);
     try {
       assert.equal(session.tier, "turn");
       assert.equal(session.sessionId, "", "fresh session has no provider id yet");
@@ -156,6 +219,55 @@ test("turn runner: learns the session id on turn 1 and resumes it on turn 2", as
   });
 });
 
+test("turn runner: every per-turn fork publishes pending before admitting the new child", async () => {
+  await withTempStore(async () => {
+    const phases: string[] = [];
+    const admissions = [0, 1].map(() => {
+      let entered!: (identity: { pid: number; pgid: number }) => void;
+      let release!: () => void;
+      return {
+        entered: new Promise<{ pid: number; pgid: number }>((resolve) => { entered = resolve; }),
+        release: new Promise<void>((resolve) => { release = resolve; }),
+        noteEntered: entered,
+        admit: release,
+      };
+    });
+    let admissionIndex = 0;
+    const opts: RunnerOpts = {
+      bee: "turn-bee-child-admission",
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      runDir: "unused",
+      onChildSpawnPending: async () => { phases.push("pending"); },
+      onChildSpawn: async (identity) => {
+        const admission = admissions[admissionIndex++]!;
+        admission.noteEntered(identity);
+        await admission.release;
+        phases.push("admitted");
+      },
+      onChildSpawnFailure: async () => { phases.push("none"); },
+    };
+    const session = await startTestTurnRunner(stubConfig(), opts);
+    try {
+      await session.send("first");
+      const first = await admissions[0]!.entered;
+      assert.deepEqual(phases, ["pending"], "the first detached child exists while durable admission remains pending");
+      assert.equal(isPidAlive(first.pid), true);
+      admissions[0]!.admit();
+      await collectTurns(session, 1);
+      await session.send("second");
+      const second = await admissions[1]!.entered;
+      assert.deepEqual(phases, ["pending", "admitted", "pending"], "the prior child locator is cleared before the second fork is admitted");
+      assert.equal(isPidAlive(second.pid), true);
+      admissions[1]!.admit();
+      await collectTurns(session, 1);
+      assert.deepEqual(phases, ["pending", "admitted", "pending", "admitted"]);
+    } finally {
+      await session.stop();
+    }
+  });
+});
+
 test("turn runner: an explicit resume seeds the session id for the first turn", async () => {
   await withTempStore(async () => {
     const opts: RunnerOpts = {
@@ -166,7 +278,7 @@ test("turn runner: an explicit resume seeds the session id for the first turn", 
       resume: true,
       sessionId: "chat-preexisting",
     };
-    const session = await startTurnRunner(stubConfig(), opts);
+    const session = await startTestTurnRunner(stubConfig(), opts);
     try {
       await session.send("resumed prompt");
       const events = await collectTurns(session, 1);
@@ -181,7 +293,7 @@ test("turn runner: an explicit resume seeds the session id for the first turn", 
 test("turn runner: stop emits the terminal exit event and ends the stream; send then throws", async () => {
   await withTempStore(async () => {
     const opts: RunnerOpts = { bee: "turn-bee-stop", cwd: process.cwd(), env: { ...process.env } as Record<string, string>, runDir: "unused" };
-    const session = await startTurnRunner(stubConfig(), opts);
+    const session = await startTestTurnRunner(stubConfig(), opts);
     const seen: RunnerEvent[] = [];
     const pump = (async () => {
       for await (const event of session.events) seen.push(event);
@@ -200,7 +312,7 @@ test("turn runner: a crashing turn surfaces an error and still closes the turn b
       baseArgs: ["-e", "process.exit(3)", "--"],
     };
     const opts: RunnerOpts = { bee: "turn-bee-crash", cwd: process.cwd(), env: { ...process.env } as Record<string, string>, runDir: "unused" };
-    const session = await startTurnRunner(config, opts);
+    const session = await startTestTurnRunner(config, opts);
     try {
       await session.send("doomed");
       const events = await collectTurns(session, 1);
@@ -208,6 +320,132 @@ test("turn runner: a crashing turn surfaces an error and still closes the turn b
       assert.equal(events.at(-1)?.type, "turn_end", "the bracket closes even without a result line");
     } finally {
       await session.stop();
+    }
+  });
+});
+
+test("turn runner: child exit cannot overtake delayed final stdout and EOF", async () => {
+  await withTempStore(async () => {
+    const config: TurnRunnerConfig = {
+      ...stubConfig(),
+      baseArgs: ["-e", EXIT_BEFORE_STDIO_CLOSE_SCRIPT, "--"],
+      parseLine: (line) => {
+        const parsed = JSON.parse(line) as { type?: string; text?: string };
+        if (parsed.type !== "late-result") return [];
+        return [
+          { type: "text", ts: Date.now(), text: parsed.text ?? "" },
+          { type: "turn_end", ts: Date.now() },
+        ];
+      },
+      sessionIdFromEvent: undefined,
+    };
+    const opts: RunnerOpts = {
+      bee: "turn-bee-exit-before-close",
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      runDir: "unused",
+    };
+    const session = await startTestTurnRunner(config, opts);
+    try {
+      await session.send("drain the final pipe frame");
+      const events = await collectTurns(session, 1);
+      assert.deepEqual(
+        events.map((event) => event.type),
+        ["turn_start", "text", "turn_end"],
+        "the real final frame, not a premature synthetic turn_end, closes the turn",
+      );
+      assert.equal((events[1] as Extract<RunnerEvent, { type: "text" }>).text, "tail-after-exit");
+    } finally {
+      await session.stop();
+    }
+  });
+});
+
+test("turn runner: exact turn_end advances past an inherited stdout pipe and session stop reaps descendants", async () => {
+  await withTempStore(async (dir) => {
+    const pidFile = join(dir, "inherited-stdout-descendants.pid");
+    const config: TurnRunnerConfig = {
+      ...stubConfig(),
+      baseArgs: ["-e", INHERITED_STDOUT_AFTER_TURN_END_SCRIPT, pidFile, "--"],
+      parseLine: (line) => {
+        const parsed = JSON.parse(line) as { type?: string };
+        if (parsed.type === "tool") return [{ type: "tool_use", ts: Date.now(), tool: "preview" }];
+        if (parsed.type === "result") return [{ type: "turn_end", ts: Date.now() }];
+        return [];
+      },
+      sessionIdFromEvent: undefined,
+    };
+    const session = await startTestTurnRunner(config, {
+      bee: "turn-bee-inherited-stdout",
+      cwd: dir,
+      env: { ...process.env } as Record<string, string>,
+      runDir: "unused",
+    });
+    let descendantPids: number[] = [];
+    try {
+      await session.send("first preview");
+      await session.send("second preview");
+      const events = await collectTurns(session, 2, 5_000);
+      assert.equal(events.filter((event) => event.type === "turn_end").length, 2);
+      descendantPids = (await readFile(pidFile, "utf8"))
+        .trim()
+        .split("\n")
+        .map(Number);
+      assert.equal(descendantPids.length, 2, "the second turn started without waiting for the first inherited pipe EOF");
+      assert.equal(descendantPids.every(isPidAlive), true, "tool descendants remain owned but alive between turns");
+      await session.stop();
+      await waitFor(() => descendantPids.every((pid) => !isPidAlive(pid)), "inherited-pipe descendants to stop with session");
+    } finally {
+      await session.stop().catch(() => undefined);
+      for (const pid of descendantPids) {
+        if (!isPidAlive(pid)) continue;
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+  });
+});
+
+test("turn runner: exited child without turn_end or pipe EOF fails within a bound", async () => {
+  await withTempStore(async (dir) => {
+    const pidFile = join(dir, "unterminated-inherited-stdout.pid");
+    const config: TurnRunnerConfig = {
+      ...stubConfig(),
+      baseArgs: ["-e", INHERITED_STDOUT_WITHOUT_TURN_END_SCRIPT, pidFile, "--"],
+      parseLine: () => [],
+      sessionIdFromEvent: undefined,
+      pipeDrainTimeoutMs: 100,
+    };
+    const session = await startTestTurnRunner(config, {
+      bee: "turn-bee-unverified-pipe",
+      cwd: dir,
+      env: { ...process.env } as Record<string, string>,
+      runDir: "unused",
+    });
+    let descendantPid: number | undefined;
+    try {
+      const consume = (async () => {
+        for await (const _event of session.events) {
+          // consume until the bounded integrity failure rejects the iterator
+        }
+      })();
+      await session.send("no terminal boundary");
+      await assert.rejects(consume, /without a terminal turn boundary or verified pipe EOF/);
+      descendantPid = Number(await readFile(pidFile, "utf8"));
+      assert.equal(isPidAlive(descendantPid), true);
+      await session.stop();
+    } finally {
+      await session.stop().catch(() => undefined);
+      if (descendantPid && isPidAlive(descendantPid)) {
+        try {
+          process.kill(-descendantPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
     }
   });
 });
@@ -231,7 +469,7 @@ test("turn runner: detached tool process survives its turn and dies with the ses
       env: { ...process.env } as Record<string, string>,
       runDir: "unused",
     };
-    const session = await startTurnRunner(config, opts);
+    const session = await startTestTurnRunner(config, opts);
     let backgroundPid: number | undefined;
     try {
       await session.send("start preview");

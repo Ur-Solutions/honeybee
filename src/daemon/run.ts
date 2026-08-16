@@ -23,6 +23,7 @@ import {
 import { logTickResult, tick, type TickResult } from "./tick.js";
 import { defaultTickTimeouts, envMs, toError, withTimeout } from "./timeouts.js";
 import { buildDefaultDeps } from "./wiring.js";
+import { createProductionExecutionServiceProvider } from "../execution/production.js";
 import {
   handleVerifiedBootRuntimeDeath,
   handleVerifiedBootRuntimeLive,
@@ -135,7 +136,11 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   let exitCode = 0;
 
   const tickFn = options.tickImpl ?? tick;
-  const deps = buildDefaultDeps();
+  // One coordinator instance owns both RPC continuations and periodic durable
+  // inventory recovery. Their in-process single-flight maps therefore agree;
+  // the persisted owner tokens/file locks remain the cross-process fence.
+  const executionService = createProductionExecutionServiceProvider();
+  const deps = buildDefaultDeps({ executionService });
 
   const requestShutdown = (reason: string, code: number) => {
     if (stopping) return;
@@ -195,7 +200,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
   // a socket failure must NOT prevent the daemon from running.
   let hsrControl: HsrControlServer | null = null;
   try {
-    hsrControl = await startHsrControlServer();
+    hsrControl = await startHsrControlServer({ executionService });
     await appendDaemonLog({ level: "info", msg: "hsr.control.start", path: hsrControl.path });
   } catch (error) {
     await appendDaemonLog({ level: "warn", msg: "hsr.control.start.failed", error: error instanceof Error ? error.message : String(error) });
@@ -548,6 +553,7 @@ export async function runDaemon(options: RunDaemonOptions = {}): Promise<void> {
     // single-flight controller retains a non-isolated late promise until it
     // settles, but shutdown never waits indefinitely for it.
     await deps.syncChains?.close?.().catch(() => undefined);
+    await deps.reconcileExecutions?.close().catch(() => undefined);
     await Promise.race([chainSyncLoop, new Promise((resolve) => setTimeout(resolve, 500))]);
     if (sentinel) {
       try {

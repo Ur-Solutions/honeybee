@@ -45,6 +45,16 @@ function stringEnv(extra: Record<string, string> = {}): Record<string, string> {
   };
 }
 
+async function waitForFileText(path: string, expected: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const contents = await readFile(path, "utf8").catch(() => "");
+    if (contents.includes(expected)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`timed out waiting for ${JSON.stringify(expected)} in ${path}`);
+}
+
 /** Strip the ts field so event shapes assert deterministically. */
 function stripTs(events: RunnerEvent[]): unknown[] {
   return events.map((e) => {
@@ -384,6 +394,59 @@ test("codex app-server handshake acknowledges initialize before thread/start", a
     if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previousStore;
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex keeps pending input through pre-write failure and deletes only after the write callback", async () => {
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  const roots: string[] = [];
+  const sessions: Array<Awaited<ReturnType<typeof startCodexRunner>>> = [];
+  const startAsked = async (suffix: string) => {
+    const root = await mkdtemp(join(tmpdir(), `honeybee-hsr-codex-answer-${suffix}-`));
+    roots.push(root);
+    process.env.HIVE_STORE_ROOT = root;
+    const bee = `CO.codex-answer-${suffix}`;
+    const logPath = join(root, "rpc.jsonl");
+    await ensureHsrRunDir(bee);
+    const session = await startCodexRunner({
+      bee,
+      cwd: root,
+      env: stringEnv({ CODEX_APP_SERVER_STUB_LOG: logPath, CODEX_APP_SERVER_STUB_ASK: "1" }),
+      runDir: join(root, "hsr", bee),
+      command: appServerFixture,
+    });
+    sessions.push(session);
+    const iterator = session.events[Symbol.asyncIterator]();
+    const event = await iterator.next();
+    assert.equal(event.value?.type, "needs_input");
+    assert.equal(event.value?.type === "needs_input" ? event.value.requestId : undefined, "approval-stub");
+    return { session, logPath };
+  };
+
+  try {
+    const healthy = await startAsked("success");
+    const prepared = await healthy.session.prepareAnswer("approval-stub", "yes");
+    await prepared.dispatch();
+    await waitForFileText(healthy.logPath, '"id":"approval-stub","result"');
+    await assert.rejects(
+      healthy.session.prepareAnswer("approval-stub", "yes"),
+      /no pending input/,
+      "callback-confirmed write removes the pending request",
+    );
+
+    const failed = await startAsked("prewrite-failure");
+    await failed.session.stop();
+    await assert.rejects(failed.session.prepareAnswer("approval-stub", "yes"), /stdin is not writable/);
+    await assert.rejects(
+      failed.session.prepareAnswer("approval-stub", "yes"),
+      /stdin is not writable/,
+      "pre-write transport refusal must retain the pending request",
+    );
+  } finally {
+    for (const session of sessions) await session.stop().catch(() => undefined);
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    for (const root of roots) await rm(root, { recursive: true, force: true });
   }
 });
 

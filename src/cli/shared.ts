@@ -3,6 +3,7 @@
 // brief delivery, and per-bee state-context building. No command handlers live
 // here — those are in src/commands/*.ts; this module holds only the pieces they
 // share so cli.ts stays a thin dispatcher.
+import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -12,23 +13,26 @@ import { parseAge } from "../clean.js";
 import { loadColony } from "../colony.js";
 import { mapWithConcurrency } from "../concurrency.js";
 import { beeConfig, briefFooter, spawnDefaultSubstrate } from "../config.js";
+import { deliverSessionText } from "../delivery.js";
 import { autoAliasForcesYolo, bootMsForAgent } from "../drivers.js";
 import { actionLine, bold, cyan, dim, formatRelativeTime, green, isPretty, note, red, tildify, yellow } from "../format.js";
 import { writeHiveState } from "../hiveState.js";
 import { hsrObservations, type HsrObservation } from "../hsr/observe.js";
-import { enqueueTurnForBootingHsrHost } from "../hsr/pendingTurns.js";
+import { enqueueTurnForBootingHsrHost, readPendingHsrTurn } from "../hsr/pendingTurns.js";
 import { matchesSessionReference } from "../ids.js";
 import { LOCAL_NODE_NAME, loadNode, loadNodeSync, supportsCapability, type NodeRecord } from "../node.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
+import { prependPreamble } from "../preamble.js";
 import { AgentReadinessError, waitForAgentReady } from "../readiness.js";
-import { nextTurnPatch, sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
+import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
 import { ensureSessionLive } from "../sessionLiveness.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../state.js";
 import { assembleStateContext } from "../view/context.js";
 import { consumePreambleForDelivery } from "../spawnPreamble.js";
-import { appendLedger, flushPaneStampRepairs, listSessions, loadSession, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, flushPaneStampRepairs, listSessions, loadSession, type SessionRecord } from "../store.js";
 import { listPanesBySession } from "../substrates/local-tmux.js";
 import { localSubstrate, substrateFor, substrateForRecord } from "../substrates/index.js";
+import type { SendTextOptions } from "../substrates/types.js";
 import { generateSwarmId, validSwarmId } from "../swarm.js";
 import { tmux } from "../tmux.js";
 
@@ -107,42 +111,19 @@ export async function deliverBrief(parsed: Parsed, record: SessionRecord, briefT
       console.error(actionLine("warn", "force", [`readiness timeout for ${bold(record.name)}, briefing anyway`]));
     }
   }
-  // Snapshot the completed-turn boundary before delivery, then persist it only
-  // after delivery succeeds. This reactivates a sealed/done warm runtime in the
-  // operational index without letting a failed brief retire its old seal.
-  const turn = await nextTurnPatch(record);
   const delivered = augmentBrief(parsed, briefText);
-  await deliverPromptText(record, delivered);
-  await writeHiveState(record, "working");
-  const now = new Date().toISOString();
-  const persisted = await updateSession(record.name, {
-    ...turn,
-    updatedAt: now,
-    status: "running",
-    brief: briefText,
-    briefedAt: now,
-    lastPrompt: delivered,
-    lastPromptAt: now,
+  const result = await deliverSessionText(record, delivered, {
+    deliver: deliverPromptText,
+    metadata: (at) => ({ brief: briefText, briefedAt: at }),
   });
-  if (!persisted) {
-    // The record vanished mid-brief (concurrent kill/clean). The text was
-    // already delivered to the pane, but nothing recorded it — say so instead
-    // of silently returning an in-memory merge that looks persisted.
-    console.error(note(`warn ${record.name}: session record disappeared while briefing; brief delivered but not recorded`));
-  }
-  const updated: SessionRecord = persisted ?? {
-    ...record,
-    updatedAt: now,
-    status: "running",
-    brief: briefText,
-    briefedAt: now,
-    lastPrompt: delivered,
-    lastPromptAt: now,
-  };
-  await appendLedger({ type: "brief", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, chars: delivered.length, briefChars: briefText.length });
+  // Provider handoff + SessionRecord metadata above are authoritative. These
+  // mirrors/audit rows are repair-only after acceptance and must never make a
+  // caller retry the brief under a fresh delivery id.
+  await writeHiveState(result.record, "working").catch(() => undefined);
+  await appendLedger({ type: "brief", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, chars: delivered.length, briefChars: briefText.length }).catch(() => undefined);
   if (isPretty()) console.log(actionLine("ok", "brief", [bold(record.name), `${briefText.length} chars`]));
   else console.log(`briefed\t${record.name}\t${briefText.length} chars`);
-  return updated;
+  return result.record;
 }
 
 
@@ -204,15 +185,44 @@ export async function retryWhileHsrHostBoots<T>(
 }
 
 /** Send a prompt, tolerating a detached HSR host's bounded startup window. */
-export async function deliverPromptText(record: SessionRecord, promptText: string): Promise<void> {
+export async function deliverPromptText(
+  record: SessionRecord,
+  promptText: string,
+  options: SendTextOptions = {},
+): Promise<void> {
   // The one choke point every "hand this bee some text" path funnels through
   // (brief, `hive x`/`run`, the HSR spawn prompt, the flight sweep). A
   // message-channel preamble is prepended HERE, exactly once, so callers keep
   // persisting the operator's own text in brief/lastPrompt and no path can
   // forget to inject. No-op for claude/grok, whose preamble rode argv.
-  const prompt = await consumePreambleForDelivery(record, promptText);
   const substrate = substrateFor(record);
-  const attempt = () => substrate.sendText(record.tmuxTarget, prompt, record.agentPaneId);
+  // Allocate once outside the boot retry loop. A lost local/remote HSR reply
+  // must retry the same durable intent, never manufacture another provider
+  // turn merely because the control socket was still starting.
+  const deliveryId = options.deliveryId ?? randomUUID();
+  let prompt: string;
+  if (substrate.kind === "hsr" && options.deliveryId) {
+    const existing = await readPendingHsrTurn(record.tmuxTarget, deliveryId);
+    const preambleReplay = record.preamble?.channel === "message"
+      ? prependPreamble(promptText, record.preamble.text)
+      : promptText;
+    // consumePreamble marks the SessionRecord before transport. If a process
+    // then crashes before its binding commit, an exact effect replay sees the
+    // flag already set. Reuse the already-journaled composed bytes so the same
+    // delivery id remains a receipt lookup; different caller text still fails
+    // the substrate's identity check.
+    prompt = existing && (existing.text === promptText || existing.text === preambleReplay)
+      ? existing.text
+      : await consumePreambleForDelivery(record, promptText);
+  } else {
+    prompt = await consumePreambleForDelivery(record, promptText);
+  }
+  const attempt = () => substrate.sendText(record.tmuxTarget, prompt, record.agentPaneId, {
+    ...options,
+    deliveryId,
+    ...(record.remoteLaunchId ? { remoteLaunchId: record.remoteLaunchId } : {}),
+    ...(record.remoteIncarnation ? { remoteIncarnation: record.remoteIncarnation } : {}),
+  });
   if (substrate.kind !== "hsr" && substrate.kind !== "remote-hsr") {
     await attempt();
     return;
@@ -223,7 +233,14 @@ export async function deliverPromptText(record: SessionRecord, promptText: strin
   // return instead of polling the boot. (remote-hsr keeps the retry loop:
   // runnerPid there is a pid on the remote node, unverifiable here.)
   if (substrate.kind === "hsr" && record.runnerPid !== undefined) {
-    if (await enqueueTurnForBootingHsrHost(record.tmuxTarget, record.runnerPid, prompt, record.runnerFingerprint)) return;
+    if (await enqueueTurnForBootingHsrHost(
+      record.tmuxTarget,
+      record.runnerPid,
+      prompt,
+      record.runnerFingerprint,
+      undefined,
+      { deliveryId, mode: options.mode === "next-tool" ? "next-tool" : "turn" },
+    )) return;
   }
   await retryWhileHsrHostBoots(attempt, {
     onRetry: () => {
@@ -254,14 +271,12 @@ export async function deliverPromptText(record: SessionRecord, promptText: strin
  * the queue is not usable, so spawn+prompt stays atomic across host boot.
  */
 export async function deliverHsrPrompt(record: SessionRecord, prompt: string): Promise<SessionRecord> {
-  await deliverPromptText(record, prompt);
-  await writeHiveState(record, "working");
-  const now = new Date().toISOString();
-  const persisted = await updateSession(record.name, { updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now });
-  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length });
+  const delivered = await deliverSessionText(record, prompt, { deliver: deliverPromptText });
+  await writeHiveState(delivered.record, "working").catch(() => undefined);
+  await appendLedger({ type: "prompt.run", session: record.name, agent: record.agent, node: record.node ?? LOCAL_NODE_NAME, cwd: record.cwd, chars: prompt.length }).catch(() => undefined);
   if (isPretty()) console.log(actionLine("ok", "send", [bold(record.name), `${prompt.length} chars`]));
   else console.log(`sent\t${record.name}\t${prompt.length} chars`);
-  return persisted ?? { ...record, updatedAt: now, status: "running", lastPrompt: prompt, lastPromptAt: now };
+  return delivered.record;
 }
 
 

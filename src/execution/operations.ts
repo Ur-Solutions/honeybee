@@ -41,6 +41,7 @@ import {
   type ReleaseStepId,
 } from "./opsStore.js";
 import {
+  appendRunLossEpisodeEvents,
   appendRunEvents,
   appendRunTerminalEvents,
   commitRunTerminalResult,
@@ -50,9 +51,11 @@ import {
   lossEpisodePayload,
   mutateReservation,
   readReservation,
+  type RunEventInput,
   type RunReservation,
 } from "./runStore.js";
 import type { SignatureVerifier } from "./signing.js";
+import type { ExecutionRuntimeSettlement } from "./runtimeSettlement.js";
 import {
   readWorkingCopy,
   releaseWorkingCopy,
@@ -69,6 +72,11 @@ export type SessionEvidenceReader = {
   evidence(beeName: string): Promise<{ sessionExists: boolean; stampedRunId?: string }>;
 };
 
+export type ExecutionSessionRetirementResult = {
+  retired: boolean;
+  detail: string;
+};
+
 export type RunOperationsDeps = {
   contract: ExecutionContract;
   validator: ExecutionValidator;
@@ -79,6 +87,13 @@ export type RunOperationsDeps = {
   verifySignature?: SignatureVerifier;
   control: HarnessControl;
   sessions: SessionEvidenceReader;
+  /** Archive only the exact SessionRecord owned by this Run after stop proof. */
+  retireSession: (reservation: RunReservation) => Promise<ExecutionSessionRetirementResult>;
+  /** Pre-signal canonical fence, exact clean stop, and generation archive. */
+  stopAndRetireSession?: (
+    reservation: RunReservation,
+    context: string,
+  ) => Promise<ExecutionRuntimeSettlement>;
   /** Injectable only to place deterministic tests at the post-ownership read barrier. */
   collectGitDiffMetadata?: typeof collectGitDiffMetadata;
   /** Bounded durable continuation lease; production defaults to 15 seconds. */
@@ -118,6 +133,12 @@ function asObject(value: JsonValue | undefined): JsonObject | undefined {
 
 export function createRunOperations(deps: RunOperationsDeps): RunOperations {
   const { protocolVersion, schemaDigest, now } = deps;
+  const stopAndRetireSession = deps.stopAndRetireSession ?? (async () => ({
+    settled: false as const,
+    detail: "no pre-signal canonical execution stop protocol is configured",
+    cleanup: { stopped: false, detail: "stop was not dispatched" },
+    stopDoubtPersisted: false,
+  }));
   const collectWorkingCopyDiff = deps.collectGitDiffMetadata ?? collectGitDiffMetadata;
   const appendEvents = deps.operationPersistence?.appendRunEvents ?? appendRunEvents;
   const persistOperationResult = deps.operationPersistence?.setOperationResult ?? setOperationResult;
@@ -671,6 +692,9 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
       const { validated, reservation, state } = await prepare(request, "run-command-body", "run.command");
       const command = asObject(validated.body.command) ?? {};
       const kind = String(command.kind ?? "");
+      const unsupportedAnswerCause = kind === "answer"
+        ? `driver ${driverIdOf(reservation)} does not deliver run.command answer on this node (expected runner-host epoch is absent from v1)`
+        : undefined;
       const { record, created } = await admitOperation({
         runId: validated.runId,
         method: "run.command",
@@ -691,14 +715,14 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             throw executionError("CAPABILITY_MISMATCH", `driver ${driverIdOf(reservation)} does not support checkpoint on this node`);
           }
           if (kind === "answer") {
-            // needs_input.opened is not bridged into the protocol event
-            // stream, so an open input request is unobservable from protocol
-            // data: answer is not deliverable here (node.describe does not
-            // advertise it). The legacy session/UI answer path is unaffected;
-            // the dispatch machinery below stays for when the bridge lands.
+            // The v1 command carries only inputRequestId, not the runner-host
+            // epoch that authored the intent. A provider restart can reuse r1,
+            // so consulting current pending state would rebind stale authority.
+            // Refuse inside admission before any operation receipt or provider
+            // effect. Aggregate HSR/API answers carry exact source + host.
             throw executionError(
               "CAPABILITY_MISMATCH",
-              `driver ${driverIdOf(reservation)} does not deliver answer on this node yet (needs_input.opened is not bridged)`,
+              unsupportedAnswerCause!,
             );
           }
           assertLeaseNotExpired(reservation, now());
@@ -734,6 +758,27 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
         },
       });
       let current = record;
+      if (unsupportedAnswerCause && current.commandState === "accepted") {
+        // Mixed-version/crash compatibility: an older binary may have durably
+        // admitted an answer then died before dispatch. admitOperation guards
+        // run only for a NEW record, so fence that accepted residue here before
+        // dispatchCommand can claim it. A concurrent old binary that already
+        // crossed to dispatching is not rewritten as definite failure.
+        current = await persistOperationResult(
+          validated.runId,
+          validated.effectKey,
+          { commandState: "failed", cause: unsupportedAnswerCause },
+          { commandState: "failed", cause: unsupportedAnswerCause, operationAttempt: undefined },
+          (candidate) => candidate.commandState === "accepted",
+        );
+      }
+      if (
+        unsupportedAnswerCause
+        && current.commandState === "failed"
+        && current.cause === unsupportedAnswerCause
+      ) {
+        throw executionError("CAPABILITY_MISMATCH", unsupportedAnswerCause);
+      }
       if (created || current.commandState === "accepted") {
         // New effect, or an admitted effect whose dispatch never began
         // (crash between admission and `dispatching`): safe to continue.
@@ -817,12 +862,23 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
           } else if (!reservation.result) {
             // running (or lost): stop only the session provably bound to THIS
             // run, only over its control socket — never a kill -9.
-            let stopConfirmed = true;
-            let stopDetail: string | undefined;
+            // Absence of a SessionRecord is deliberately NOT exit proof. A
+            // coordinator can die after the non-deduplicating launcher side
+            // effect but before publishing that record; treating absence as
+            // down would free occupancy under a hidden live harness.
+            let stopConfirmed = false;
+            let stopDetail = "no durable session evidence proves the activated runtime is down";
             if (await sessionIsOurs(reservation)) {
-              const stop = await deps.control.stop(reservation.beeName);
-              stopDetail = stop.detail;
-              stopConfirmed = stop.stopped;
+              try {
+                const stop = await stopAndRetireSession(
+                  reservation,
+                  "run.cancel is stopping its exact execution runtime",
+                );
+                stopDetail = stop.detail;
+                stopConfirmed = stop.settled;
+              } catch (error) {
+                stopDetail = error instanceof Error ? error.message : String(error);
+              }
             }
             if (!stopConfirmed) {
               // The owned harness may still be alive: never project terminal
@@ -834,8 +890,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               if (reservation.result) {
                 state = reservation.result.outcome;
               } else {
-                await appendEvents(
-                  validated.runId,
+                await appendRunLossEpisodeEvents(
+                  reservation,
                   protocolVersion,
                   [
                     {
@@ -864,7 +920,7 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               reservation = await commitRunTerminalResult(
                 validated.runId,
                 { outcome: "cancelled", cause: reason ?? "cancel_requested" },
-                { now, clearIndeterminate: true },
+                { now, clearIndeterminate: true, launchOccupancyCleanupProof: "runtime-down" },
               );
               await appendRunTerminalEvents(reservation, protocolVersion, await deps.origin());
               state = reservation.result?.outcome ?? "cancelled";
@@ -1338,11 +1394,12 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
             // not deliver a duplicate stop. completed/failed results do not
             // carry this liveness guarantee and must still probe an owned host.
             const stopAlreadyProven = terminal && reservation.result?.outcome === "cancelled";
-            if (!terminal && (settled.state === "accepted" || settled.state === "starting") && !ours) {
-              // A launch may still be CREATING the process: "no live harness"
-              // would be a guess, and releasing occupancy under a nascent
-              // harness could free a tree it is about to mutate.
-              await annotatePending("launch unresolved and no provable session yet");
+            if (!terminal && !ours) {
+              // Any nonterminal Run may still own an unpublished runtime. In
+              // particular, `lost` after launch activation means the
+              // coordinator died in the fork -> SessionRecord crash window.
+              // Absence is never a process-exit proof for destructive cleanup.
+              await annotatePending("run is nonterminal and no durable session evidence proves its runtime is down");
               break;
             }
             let detail = stopAlreadyProven
@@ -1351,10 +1408,15 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 ? "run terminal; no owned harness remains"
                 : "no live harness";
             let stopConfirmed = true;
+            let sessionArchived = false;
             if (ours && !stopAlreadyProven) {
-              const stop = await deps.control.stop(reservation.beeName);
+              const stop = await stopAndRetireSession(
+                reservation,
+                "run.release is stopping its exact execution runtime",
+              );
               detail = stop.detail;
-              stopConfirmed = stop.stopped;
+              stopConfirmed = stop.settled;
+              sessionArchived = stop.settled;
             }
             if (!stopConfirmed) {
               // A terminal computation result says nothing about whether the
@@ -1364,8 +1426,8 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               reservation = await mutateReservation(runId, (record) =>
                 enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
               );
-              await appendEvents(
-                runId,
+              await appendRunLossEpisodeEvents(
+                reservation,
                 protocolVersion,
                 [{
                   type: "run.lost",
@@ -1377,10 +1439,53 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
               await annotatePending(detail);
               break;
             }
+            // Apiary's physical Cell fence reads the durable SessionRecord
+            // lifecycle; Honeybee's private stop verdict is not visible
+            // there. Archive this exact execution generation before the
+            // harness-stop step can settle, otherwise a clean release remains
+            // indistinguishable from deleting beneath a live agent.
+            let retirement: ExecutionSessionRetirementResult = sessionArchived
+              ? { retired: true, detail: "exact stop protocol archived the SessionRecord" }
+              : { retired: false, detail: "SessionRecord archive has not been attempted" };
+            if (!sessionArchived) {
+              try {
+                retirement = await deps.retireSession(reservation);
+              } catch (error) {
+                retirement = {
+                  retired: false,
+                  detail: error instanceof Error ? error.message : String(error),
+                };
+              }
+            }
+            if (!retirement.retired) {
+              reservation = await mutateReservation(runId, (record) =>
+                enterLossEpisode(record, "release_stop_unconfirmed", now().toISOString()),
+              );
+              await appendRunLossEpisodeEvents(
+                reservation,
+                protocolVersion,
+                [{
+                  type: "run.lost",
+                  payload: lossEpisodePayload(reservation, {
+                    cause: "release_stop_unconfirmed",
+                    detail: `runtime stopped but SessionRecord retirement is unconfirmed: ${retirement.detail}`,
+                  }),
+                  origin: await deps.origin(),
+                }],
+                { onlyIfAbsentKeys: true },
+              );
+              await annotatePending(`SessionRecord retirement unconfirmed: ${retirement.detail}`);
+              break;
+            }
+            detail = `${detail}; ${retirement.detail}`;
             // Stop confirmed (or no session belonging to this Run remains):
             // resolve any earlier liveness doubt. The terminal helper preserves
             // an already-committed result while clearing only the loss episode.
             if (reservation.indeterminateCause === "release_stop_unconfirmed") {
+              const lossEpisodeId = reservation.lossEpisodeId;
+              if (!lossEpisodeId) {
+                throw executionError("AUTHORITY_UNAVAILABLE", `run ${runId} release loss has no durable episode identity`);
+              }
               await appendEvents(
                 runId,
                 protocolVersion,
@@ -1391,6 +1496,37 @@ export function createRunOperations(deps: RunOperationsDeps): RunOperations {
                 }],
                 { onlyIfAbsentKeys: true },
               );
+              // completed is not a legal direct successor of recovering. A
+              // completion that won before stop doubt is a delayed receipt for
+              // a runtime that did run and has now exited, so publish the
+              // episode-keyed recovered-running bridge before restoring its
+              // immutable terminal winner. Failed/cancelled may terminate
+              // directly from recovering, but still publish the exit proof.
+              const recoveryReceipts: RunEventInput[] = [];
+              if (reservation.result?.outcome === "completed") {
+                if (!reservation.sessionRef) {
+                  throw executionError(
+                    "AUTHORITY_UNAVAILABLE",
+                    `run ${runId} completed release recovery has no canonical session reference`,
+                  );
+                }
+                recoveryReceipts.push({
+                  type: "harness.running",
+                  payload: { sessionRef: reservation.sessionRef, recovered: true, lossEpisodeId },
+                  origin: await deps.origin({ driverId: driverIdOf(reservation) }),
+                });
+              }
+              recoveryReceipts.push({
+                type: "harness.exited",
+                payload: {
+                  lossEpisodeId,
+                  ...(reservation.result?.harnessExitCode !== undefined
+                    ? { exitCode: reservation.result.harnessExitCode }
+                    : {}),
+                },
+                origin: await deps.origin({ driverId: driverIdOf(reservation) }),
+              });
+              await appendEvents(runId, protocolVersion, recoveryReceipts, { onlyIfAbsentKeys: true });
             }
             reservation = await commitRunTerminalResult(
               runId,

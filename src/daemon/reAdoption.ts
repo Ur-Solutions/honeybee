@@ -21,7 +21,12 @@ import {
   markSessionVerified,
   type SessionRecord,
 } from "../store.js";
-import type { ObserverOfflineMarker, ProbeEvidence, UnverifiedCursorMarker } from "../stateMachine.js";
+import {
+  isArchivedSessionLifecycle,
+  type ObserverOfflineMarker,
+  type ProbeEvidence,
+  type UnverifiedCursorMarker,
+} from "../stateMachine.js";
 import { mapWithConcurrency } from "./concurrency.js";
 
 export type HsrControlProbe =
@@ -133,12 +138,12 @@ export type BootReAdoptionLifecycleOptions = HsrReAdoptionDependencies & {
 
 /** Records whose runtime cursor still matters. Archived records never adopt. */
 export function isHsrReAdoptionCandidate(record: SessionRecord): boolean {
-  return record.substrate === "hsr" && record.status !== "done" && record.stateMachine?.lifecycle !== "archived";
+  return record.substrate === "hsr" && !isArchivedSessionLifecycle(record);
 }
 
 /** Every active lifecycle cursor becomes uncertain when its observer exits. */
 export function isObserverCursorCandidate(record: SessionRecord): boolean {
-  return record.status !== "done" && record.stateMachine?.lifecycle !== "archived";
+  return !isArchivedSessionLifecycle(record);
 }
 
 /**

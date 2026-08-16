@@ -8,6 +8,12 @@ import { grokAdapter } from "./hsr/adapters/grok.js";
 import { kimiAdapter, normalizeKimiModel } from "./hsr/adapters/kimi.js";
 import { openCodeAdapter } from "./hsr/adapters/opencode.js";
 import type { PreambleChannel } from "./preamble.js";
+import {
+  allDriverIdentityEnvKeys,
+  driverIdentityEnvKeysForAgent,
+} from "./driverIdentityEnv.js";
+
+export { driverIdentityEnvKeysForAgent } from "./driverIdentityEnv.js";
 
 /**
  * IdentityRecipe describes how a provider's login materializes on disk so the
@@ -390,19 +396,19 @@ export function homeEnvForAgent(kind: string): string | undefined {
 }
 
 /**
+ * Identity-bearing environment keys for exactly one driver. Execution Cells
+ * use this narrower form at the process boundary: a signed account selection
+ * may inject the selected provider's home/token variables, but it must never
+ * inherit another provider's identity or an arbitrary gateway variable.
+ */
+/**
  * Env keys whose ownership follows a driver home/account identity. Callers and
  * operator gateways must never override these: doing so can relocate a
  * credential file or replace a per-account token while the SessionRecord still
  * claims the original account/home.
  */
 export function driverIdentityEnvKeys(): string[] {
-  const keys = new Set<string>();
-  for (const driver of Object.values(AGENT_DRIVERS)) {
-    if (driver.homeEnv) keys.add(driver.homeEnv);
-    for (const key of Object.keys(driver.identity?.extraEnv ?? {})) keys.add(key);
-    for (const key of driver.identity?.secretEnvKeys ?? []) keys.add(key);
-  }
-  return [...keys].sort();
+  return allDriverIdentityEnvKeys();
 }
 
 export function hasTranscriptProvider(kind: string): boolean {

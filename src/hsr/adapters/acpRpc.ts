@@ -47,7 +47,8 @@ export type AcpRpcPeer = {
   onNotification(method: string, handler: (params: unknown) => void): () => void;
   onNotificationCatchAll(handler: (method: string, params: unknown) => void): void;
   onServerRequest(handler: (method: string, id: AcpRpcId, params: unknown) => void): void;
-  respond(id: AcpRpcId, result: unknown): void;
+  canRespond(): boolean;
+  respond(id: AcpRpcId, result: unknown): Promise<void>;
   respondError(id: AcpRpcId, code: number, message: string): void;
   dispose(error?: Error): void;
 };
@@ -67,6 +68,19 @@ export function createAcpRpcPeer(stdin: Writable, stdout: Readable): AcpRpcPeer 
     } catch {
       // Closing pipes can throw EPIPE synchronously. Child exit settles callers.
     }
+  };
+
+  const writeConfirmed = (value: unknown): Promise<void> => {
+    if (disposed || !stdin.writable || stdin.destroyed || stdin.writableEnded) {
+      return Promise.reject(new Error("ACP response failed: child stdin is not writable"));
+    }
+    return new Promise<void>((resolve, reject) => {
+      try {
+        stdin.write(`${JSON.stringify(value)}\n`, (error) => error ? reject(error) : resolve());
+      } catch (error) {
+        reject(error);
+      }
+    });
   };
 
   function respondError(id: AcpRpcId, code: number, message: string): void {
@@ -136,10 +150,14 @@ export function createAcpRpcPeer(stdin: Writable, stdout: Readable): AcpRpcPeer 
     }
   };
 
-  stdout.on("data", makeLineReader(handleLine));
+  const lineReader = makeLineReader(handleLine);
+  stdout.on("data", lineReader);
   stdin.on("error", (error) => dispose(error));
   stdout.on("error", (error) => dispose(error));
-  stdout.on("end", () => dispose(new Error("ACP peer stdout ended")));
+  stdout.on("end", () => {
+    lineReader.end();
+    dispose(new Error("ACP peer stdout ended"));
+  });
 
   return {
     request(method, params, opts): Promise<unknown> {
@@ -177,8 +195,11 @@ export function createAcpRpcPeer(stdin: Writable, stdout: Readable): AcpRpcPeer 
     onServerRequest(handler): void {
       serverRequestHandler = handler;
     },
-    respond(id, result): void {
-      write({ jsonrpc: "2.0", id, result: result === undefined ? null : result });
+    canRespond(): boolean {
+      return !disposed && stdin.writable && !stdin.destroyed && !stdin.writableEnded;
+    },
+    respond(id, result): Promise<void> {
+      return writeConfirmed({ jsonrpc: "2.0", id, result: result === undefined ? null : result });
     },
     respondError,
     dispose,

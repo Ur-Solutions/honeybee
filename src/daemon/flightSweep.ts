@@ -4,15 +4,21 @@
 // the tick's already-observed records/states — the sweep itself derives
 // nothing from panes or transcripts.
 import { join } from "node:path";
+import { withSessionLifecycleTransaction } from "../lifecycle.js";
+import {
+  assertNoCanonicalHsrEventIntegrityDoubt,
+  assertNoUnresolvedHsrEventIntegrity,
+} from "../hsr/eventIntegrity.js";
 import { scanLatestSeal } from "../seal.js";
 import { sendBuzMessage } from "../buz/send.js";
-import { transactionalRetire } from "../kill.js";
+import { retireSessionByNameExactly } from "../kill.js";
 import { withFileLock } from "../lock.js";
 import { sweepFlights, stallNudgeText, type BeeActivitySignal, type FlightSweepDeps, type FlightSweepOutcome } from "../flight/controller.js";
 import { spawnSlotBee } from "../flight/spawnSlotBee.js";
 import { claimNextTask, finishTask, flightDir, leasedTaskForSlot, listFlights, listSlots, loadFlight, saveFlight, saveSlot, taskCounts } from "../flight/store.js";
 import { type SlotSealObservation } from "../flight/types.js";
 import type { BeeState } from "../state.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
 import { appendLedger, loadSession, type SessionRecord } from "../store.js";
 
 export type FlightSweeper = (
@@ -24,6 +30,25 @@ export type FlightSweeper = (
 export type FlightSweeperOptions = {
   detached?: boolean;
 };
+
+/** Exact source gate shared by the production sweeper and integrity tests. */
+export async function withFlightAutomaticSourceAdmission<T>(
+  source: SessionRecord,
+  fn: (current: SessionRecord) => Promise<T>,
+): Promise<T> {
+  return withSessionLifecycleTransaction(source, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    assertNoCanonicalHsrEventIntegrityDoubt(current, "flight automatic replacement");
+    await assertNoUnresolvedHsrEventIntegrity(current.name, "flight automatic replacement");
+    // A completed archive is exact predecessor-stop proof and may authorize a
+    // different slot generation only when no event-history authority remains.
+    // A runnable or failed-stop predecessor still owns the lane too.
+    if (current.status === "kill_failed" || isRunnableSessionRecord(current)) {
+      throw new Error(`flight automatic replacement: ${current.name} still owns its slot`);
+    }
+    return fn(current);
+  });
+}
 
 export async function latestSealForCurrentIncarnation(beeName: string): Promise<SlotSealObservation | null> {
   const record = await loadSession(beeName);
@@ -69,11 +94,8 @@ export function createFlightSweeper(overrides: Partial<FlightSweepDeps> = {}, op
     // holder's lock expires but a live slow sweep is never stolen.
     withFlightLock: (flightId, fn) =>
       withFileLock(join(flightDir(flightId), ".sweep.lock"), fn, { timeoutMs: 5_000, staleMs: 10 * 60_000 }),
-    retireBee: async (beeName) => {
-      const record = await loadSession(beeName);
-      if (!record || record.status !== "running") return;
-      await transactionalRetire(record);
-    },
+    withSourceBeeAdmission: withFlightAutomaticSourceAdmission,
+    retireBee: (beeName) => retireSessionByNameExactly(beeName, "flight automatic cleanup"),
     queue: {
       counts: taskCounts,
       claimNext: claimNextTask,

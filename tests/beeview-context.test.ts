@@ -6,6 +6,7 @@ import type { NodeRecord } from "../src/node.js";
 import { deriveState, liveTargetKey, type BeeState } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
 import { assembleStateContext, type StateContextAssemblyDeps } from "../src/view/context.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const NOW = Date.parse("2026-07-28T12:00:00.000Z");
 
@@ -195,6 +196,45 @@ test("a failed HSR observation batch marks hsrUnavailable rather than deriving f
   );
   assert.equal(emptyContext.hsrUnavailable.size, 0);
   assert.equal(deriveState(record, emptyContext).state, "crashed", "genuinely gone run dir derives crashed");
+});
+
+test("HSR observation candidates obey canonical lifecycle over stale status scalars", async () => {
+  const canonicalActive = bee({
+    name: "canonical-active-stale-done",
+    tmuxTarget: "canonical-active-stale-done",
+    substrate: "hsr",
+    status: "done",
+    stateMachine: lifecycleCursor("canonical-active-stale-done", "active", "2026-07-28T11:30:00.000Z"),
+  });
+  const canonicalArchived = bee({
+    name: "canonical-archived-stale-running",
+    tmuxTarget: "canonical-archived-stale-running",
+    substrate: "hsr",
+    status: "running",
+    stateMachine: lifecycleCursor("canonical-archived-stale-running", "archived", "2026-07-28T11:30:00.000Z"),
+  });
+  let requested: string[] = [];
+  const records = [canonicalActive, canonicalArchived];
+  const context = await assembleStateContext(
+    records,
+    { liveTargets: new Set(), unreachableNodes: new Set() },
+    {
+      deps: {
+        ...assemblerDeps({ records }),
+        hsrObservations: async ({ bees }) => {
+          requested = [...(bees ?? [])];
+          return new Map(requested.map((name) => [
+            name,
+            { live: true, state: "active" as const, snapshot: `${name} output` },
+          ]));
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(requested, [canonicalActive.name]);
+  assert.equal(context.hsrLive.has(canonicalActive.name), true);
+  assert.equal(context.hsrLive.has(canonicalArchived.name), false);
 });
 
 // ---------------------------------------------------------------------------

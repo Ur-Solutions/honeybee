@@ -125,7 +125,11 @@ export function deriveOpenRequests(sources: OpenRequestSources): BeeViewRequest[
   //    it, so closure is inherent in re-derivation. Live fallback only: a
   //    store record under the same id (any status) wins.
   const pending = eventSnapshot?.pendingNeedsInput ?? null;
-  if (pending && !storedIds.has(needsInputRequestId(record.name, pending))) {
+  // A remote mirror without its exact runner epoch cannot derive the same
+  // durable id as the authority. Rely on the store record populated by the
+  // token-qualified request sweep instead of fabricating a requestId-only row.
+  const pendingHasExactIdentity = !!pending && (record.substrate === "hsr" || !!pending.host);
+  if (pending && pendingHasExactIdentity && !storedIds.has(needsInputRequestId(record.name, pending))) {
     const openedAt = isoFromEpochMs(pending.ts);
     requests.push({
       id: needsInputRequestId(record.name, pending),

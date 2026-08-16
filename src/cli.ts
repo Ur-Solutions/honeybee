@@ -21,6 +21,7 @@ import { cmdFlow, runFlowExec } from "./commands/flow.js";
 import { cmdComb, COMB_HELP, runCombSweepExec } from "./commands/comb.js";
 import { cmdFork, cmdForkLaunch, cmdSplit } from "./commands/fork.js";
 import { cmdHandoff } from "./commands/handoff.js";
+import { cmdHsrReconcile } from "./commands/hsr.js";
 import { cmdFrame } from "./commands/frame.js";
 import { cmdGateways } from "./commands/gateways.js";
 import { cmdHere, cmdSpawnPicker } from "./commands/here.js";
@@ -102,6 +103,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
       break;
     case "answer":
       await cmdAnswer(parsed);
+      break;
+    case "hsr-reconcile":
+      await cmdHsrReconcile(parsed);
       break;
     case "tail":
     case "cat":

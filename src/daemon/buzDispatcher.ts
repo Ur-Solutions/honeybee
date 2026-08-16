@@ -23,11 +23,14 @@
 import { readdir } from "node:fs/promises";
 import {
   beeMailboxDir,
+  clearMessageRecovery,
   listMessages,
   processQueueForBee,
   type DrainResult,
 } from "../buz.js";
+import { withRunnableSessionAdmission } from "../delivery.js";
 import type { BeeState } from "../state.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
 import type { SessionRecord } from "../store.js";
 import { substrateFor, type Substrate } from "../substrates/index.js";
 import { envConcurrency, mapWithConcurrency } from "./concurrency.js";
@@ -340,9 +343,10 @@ export async function findStaleBuzQueues(
 }
 
 function buzRecipientIsSendable(record: SessionRecord): boolean {
-  // A live kill_failed runtime can still be working or idle: the failed stop
-  // is diagnostic, not proof of death. The liveness check happens below.
-  return record.status !== "done";
+  // `kill_failed` carries unresolved explicit stop intent. Exact observation
+  // may continue elsewhere, but queue draining is new work admission and must
+  // remain fenced regardless of apparent liveness.
+  return isRunnableSessionRecord(record);
 }
 
 /**
@@ -379,7 +383,7 @@ export async function selectBuzDispatchTriggers(
     if (current === "idle_with_output" || current === "ready") action = "drain";
     // A seal ends work but does not archive the Bee. Its process may be hot or
     // cold, so the dispatcher probes before choosing drain/wake.
-    else if (current === "done" || current === "kill_failed") action = "ensure";
+    else if (current === "done") action = "ensure";
     if (!action) continue;
     candidates.push({ record, action, ...(transition ? { transition } : {}) });
   }
@@ -421,20 +425,25 @@ export async function dispatchBuzDrains(
   return mapWithConcurrency(triggers, drainConcurrency, async (trigger) => {
     const { record } = trigger;
     try {
-      const substrate = resolveSubstrate(record);
-      if (trigger.action === "ensure" && !(await substrate.hasSession(record.tmuxTarget))) {
-        return {
-          recipient: record.name,
-          result: { delivered: [], quarantined: [], errors: [] },
-        };
-      }
-      const result = await drain(record, {
-        transport: { substrate, tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId },
-        stopOnFirstFailure: true,
-        // One message per idle observation: the delivered message starts a new
-        // turn; the rest of the queue waits for the next idle_with_output tick.
-        deliverLimit: 1,
+      const result = await withRunnableSessionAdmission(record, async (_lifecycle, current) => {
+        const substrate = resolveSubstrate(current);
+        if (trigger.action === "ensure" && !(await substrate.hasSession(current.tmuxTarget))) {
+          return { delivered: [], quarantined: [], errors: [] };
+        }
+        return drain(current, {
+          transport: { substrate, tmuxTarget: current.tmuxTarget, agentPaneId: current.agentPaneId },
+          stopOnFirstFailure: true,
+          deferRecoveryClear: true,
+          // One message per idle observation: the delivered message starts a new
+          // turn; the rest of the queue waits for the next idle_with_output tick.
+          deliverLimit: 1,
+        });
       });
+      // Recovery settlement acquires lifecycle itself, so do it only after the
+      // admission lock above has released.
+      for (const messageId of result.delivered) {
+        await clearMessageRecovery(record.name, messageId, { resolveRequestBy: "buz-delivery" }).catch(() => undefined);
+      }
       return { recipient: record.name, result };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

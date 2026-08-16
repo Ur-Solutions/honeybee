@@ -1,15 +1,16 @@
 import { LifecycleConflictError, withSessionLifecycleTransaction } from "../lifecycle.js";
 import { messageDeliveryRequestId } from "../requests/keys.js";
-import { openRequest, resolveRequest } from "../requests/store.js";
+import { openRequest, readBeeRequests, resolveRequest } from "../requests/store.js";
 import { loadSession, type SessionRecord } from "../store.js";
+import { listMessages } from "./storage.js";
 
 export type MessageUndeliverableReason =
   | "missing-cwd"
   | "missing-provider-session"
   | "wake-retry-exhausted"
-  | "recovery-request-expired"
   | "queued-message-missing"
-  | "archive-unresolved";
+  | "archive-unresolved"
+  | "delivery-ambiguous";
 
 function undeliverableQuestion(record: SessionRecord, reason: MessageUndeliverableReason): string {
   switch (reason) {
@@ -17,12 +18,12 @@ function undeliverableQuestion(record: SessionRecord, reason: MessageUndeliverab
       return `Message is queued, but the working directory is unavailable: ${record.cwd}. Restore or recreate the working copy, then retry delivery.`;
     case "missing-provider-session":
       return "Message is queued, but this bee has no recorded provider session to resume. Choose an exact session id or revive it fresh, then retry delivery.";
-    case "recovery-request-expired":
-      return "Message is queued, but its recovery request is too old to auto-revive after a daemon restart. Confirm the bee should be resumed, then retry delivery.";
     case "queued-message-missing":
       return "The accepted message can no longer be found in the delivery queue. Inspect buz history before retrying it.";
     case "archive-unresolved":
       return "Message is queued, but the bee's archive request is unresolved and its runtime is no longer live. Resolve the stop state before retrying delivery.";
+    case "delivery-ambiguous":
+      return "Message crossed provider dispatch on a prior host, but acceptance or completion cannot be proven. Reconcile the provider conversation before choosing whether to redrive or file this message.";
     case "wake-retry-exhausted":
       return "Message is queued, but automatic runtime recovery failed repeatedly. Inspect daemon recovery logs, repair the runtime, then retry delivery.";
   }
@@ -115,13 +116,39 @@ export async function clearMessageRecovery(
     return await withSessionLifecycleTransaction(record, async (lifecycle) => {
       const current = await lifecycle.refresh();
       if (current.recoveryMessageId !== messageId || !current.recoveryRequestedAt) return false;
-      await lifecycle.commit({
-        recoveryRequestedAt: undefined,
-        recoveryMessageId: undefined,
-        recoveryAttemptCount: undefined,
-        recoveryNextAttemptAt: undefined,
-        updatedAt: new Date().toISOString(),
-      });
+
+      // The record stores one recovery cursor, not the complete delivery
+      // backlog. The queue is the durable authority. When the cursor settles,
+      // promote the oldest queued message that is not already parked behind a
+      // manual-action request. Without this promotion, accepting A then B and
+      // cancelling/delivering B could clear the scalar and strand A forever.
+      const [queued, requests] = await Promise.all([
+        listMessages(bee, "queue"),
+        readBeeRequests(bee),
+      ]);
+      const openRequestIds = new Set(
+        requests.filter((request) => request.status === "open").map((request) => request.id),
+      );
+      const promoted = queued
+        .filter((entry) => entry.message.id !== messageId
+          && !openRequestIds.has(messageDeliveryRequestId(bee, entry.message.id)))
+        .at(-1)?.message;
+      const updatedAt = new Date().toISOString();
+      await lifecycle.commit(promoted
+        ? {
+            recoveryRequestedAt: updatedAt,
+            recoveryMessageId: promoted.id,
+            recoveryAttemptCount: 0,
+            recoveryNextAttemptAt: undefined,
+            updatedAt,
+          }
+        : {
+            recoveryRequestedAt: undefined,
+            recoveryMessageId: undefined,
+            recoveryAttemptCount: undefined,
+            recoveryNextAttemptAt: undefined,
+            updatedAt,
+          });
       return true;
     });
   } catch {

@@ -16,14 +16,16 @@
 //   lane. The synthetic packet never enters the queue buckets: the
 //   controller's queue.finish is a no-op for it by design.
 // - `release` returns the lane to the flight's pool (generation bump →
-//   vacant) and best-effort retires the leased bee; the comb engine collects
-//   evidence BEFORE releasing.
+//   vacant) only after exact retirement of the leased bee; the comb engine
+//   collects evidence BEFORE releasing.
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
+import { isLaunchOwnershipIndeterminate } from "../launchAmbiguity.js";
 import { withFileLock } from "../lock.js";
-import { transactionalRetire } from "../kill.js";
+import { retireSessionByNameExactly } from "../kill.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
 import { appendLedger, loadSession, safeName, type SessionRecord } from "../store.js";
 import { spawnSlotBee } from "./spawnSlotBee.js";
 import { flightDir, listSlots, loadFlight, saveSlot } from "./store.js";
@@ -177,11 +179,7 @@ export function createFlightCapacityProvider(overrides: Partial<FlightCapacityDe
       withFileLock(join(flightDir(flightId), ".sweep.lock"), fn, { timeoutMs: 5_000, staleMs: 10 * 60_000 }),
     spawnSlot: spawnSlotBee,
     loadSession,
-    retireBee: async (beeName) => {
-      const record = await loadSession(beeName);
-      if (!record || record.status !== "running") return;
-      await transactionalRetire(record);
-    },
+    retireBee: (beeName) => retireSessionByNameExactly(beeName, "flight capacity release"),
     listFlightIds: async () => {
       const { listFlights } = await import("./store.js");
       return (await listFlights()).map((flight) => flight.id);
@@ -286,11 +284,39 @@ export function createFlightCapacityProvider(overrides: Partial<FlightCapacityDe
       const expectedName = slotBeeName(request.flightId, claimed.slotId, claimed.generation, claimed.attempt);
       const orphan = await deps.loadSession(expectedName);
       let spawned: { beeName: string; beeId?: string };
-      if (orphan && orphan.status === "running") {
+      if (orphan && isRunnableSessionRecord(orphan)) {
         spawned = { beeName: orphan.name, ...(orphan.id ? { beeId: orphan.id } : {}) };
       } else {
+        if (orphan) {
+          const message = `deterministic slot bee ${orphan.name} is non-runnable (${orphan.status}); ownership retained`;
+          const held: SlotRecord = {
+            ...claimed,
+            launchOwnership: {
+              status: "indeterminate",
+              at: new Date(deps.now()).toISOString(),
+              error: message,
+            },
+          };
+          await deps.saveSlot(held);
+          await writeLease({ ...lease, lastError: message });
+          return { kind: "unavailable", retryAfterMs: RETRY_SPAWN_FAILED_MS };
+        }
+        if (claimed.launchOwnership) {
+          await writeLease({
+            ...lease,
+            lastError: claimed.launchOwnership.status === "indeterminate"
+              ? claimed.launchOwnership.error
+              : "slot launch dispatch is unresolved",
+          });
+          return { kind: "unavailable", retryAfterMs: RETRY_SPAWN_FAILED_MS };
+        }
         const mix = flight.target.mix.find((entry) => entry.key === claimed!.mixKey);
         if (!mix) return { kind: "unavailable", retryAfterMs: RETRY_INACTIVE_MS };
+        claimed = {
+          ...claimed,
+          launchOwnership: { status: "dispatching", at: new Date(deps.now()).toISOString() },
+        };
+        await deps.saveSlot(claimed);
         try {
           // EXECUTE — the synthetic packet carries the comb's brief; the slot
           // already carries the comb taskId/attempt, so the contract
@@ -301,12 +327,38 @@ export function createFlightCapacityProvider(overrides: Partial<FlightCapacityDe
             enqueuedAt: nowIso,
           });
         } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (isLaunchOwnershipIndeterminate(error)) {
+            const held: SlotRecord = {
+              ...claimed,
+              launchOwnership: {
+                status: "indeterminate",
+                at: new Date(deps.now()).toISOString(),
+                error: message,
+              },
+              history: [
+                ...claimed.history,
+                { attempt: claimed.attempt, generation: claimed.generation, outcome: "comb-lease-spawn-indeterminate", at: new Date(deps.now()).toISOString() },
+              ],
+            };
+            await deps.saveSlot(held);
+            await writeLease({ ...lease, lastError: message });
+            await deps.appendLedger({
+              type: "flight.lease.spawn_indeterminate",
+              flight: request.flightId,
+              slot: claimed.slotId,
+              lease: lease.leaseId,
+              error: message,
+            });
+            return { kind: "unavailable", retryAfterMs: RETRY_SPAWN_FAILED_MS };
+          }
           // The lane must not stay bound to a spawn that never happened: clear
           // the binding so neither the sweeper nor a re-acquire trips on it.
           const restored: SlotRecord = { ...claimed, state: "vacant", since: new Date(deps.now()).toISOString() };
           delete restored.taskId;
           delete restored.idempotencyKey;
           delete restored.attemptStartedAt;
+          delete restored.launchOwnership;
           restored.history = [...claimed.history, { attempt: claimed.attempt, generation: claimed.generation, outcome: "comb-lease-spawn-failed", at: new Date(deps.now()).toISOString() }];
           await deps.saveSlot(restored);
           await writeLease({ ...lease, lastError: error instanceof Error ? error.message : String(error) });
@@ -323,6 +375,7 @@ export function createFlightCapacityProvider(overrides: Partial<FlightCapacityDe
         state: "booting",
         since: new Date(deps.now()).toISOString(),
       };
+      delete confirmed.launchOwnership;
       await deps.saveSlot(confirmed);
       await writeLease({ ...lease, status: "acquired", beeName: spawned.beeName, ...(spawned.beeId ? { beeId: spawned.beeId } : {}) });
       await deps.appendLedger({
@@ -357,6 +410,36 @@ export function createFlightCapacityProvider(overrides: Partial<FlightCapacityDe
       const nowIso = new Date(deps.now()).toISOString();
       const slots = await deps.listSlots(lease.flightId);
       const slot = slots.find((entry) => entry.slotId === lease.slotId);
+      // Exact predecessor cleanup is the release commit point. Never vacate a
+      // lane or release its lease while an escaped worker may still own it.
+      if (lease.beeName) {
+        try {
+          if (!deps.retireBee) throw new Error("exact predecessor cleanup is unavailable");
+          await deps.retireBee(lease.beeName);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (slot && slot.generation === lease.generation && (slot.idempotencyKey === lease.idempotencyKey || slot.taskId === lease.taskId)) {
+            await deps.saveSlot({
+              ...slot,
+              launchOwnership: {
+                status: "indeterminate",
+                at: nowIso,
+                error: `lease release cleanup unconfirmed for ${lease.beeName}: ${message}`,
+              },
+            });
+          }
+          await writeLease({ ...lease, lastError: message });
+          await deps.appendLedger({
+            type: "flight.lease.release_cleanup_unconfirmed",
+            flight: lease.flightId,
+            slot: lease.slotId,
+            lease: lease.leaseId,
+            bee: lease.beeName,
+            error: message,
+          });
+          throw error;
+        }
+      }
       // Recycle only if the lane is still bound to THIS lease — the sweeper
       // may already have recycled it (seal-driven done on a queue-backed
       // flight), in which case the lane moved on and we only file the lease.
@@ -379,14 +462,10 @@ export function createFlightCapacityProvider(overrides: Partial<FlightCapacityDe
         delete recycled.nudgedAt;
         delete recycled.attemptStartedAt;
         delete recycled.idempotencyKey;
+        delete recycled.launchOwnership;
         await deps.saveSlot(recycled);
       }
-      // The engine collects evidence BEFORE releasing; the leased bee is done
-      // serving and is retired so leases never leak hosts/accounts.
-      if (lease.beeName && deps.retireBee) {
-        await deps.retireBee(lease.beeName).catch(() => undefined);
-      }
-      await writeLease({ ...lease, status: "released", releasedAt: nowIso, releaseReason: reason });
+      await writeLease({ ...lease, status: "released", releasedAt: nowIso, releaseReason: reason, lastError: undefined });
       await deps.appendLedger({
         type: "flight.lease.released",
         flight: lease.flightId,

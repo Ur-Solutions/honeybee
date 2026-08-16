@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { DEFAULT_BUZ_TIER, type BuzSendResult } from "./buz.js";
+import {
+  CELL_BROKER_CAPABILITY_ENV,
+  CELL_BROKER_CAPABILITY_VERSION,
+  isCellBrokerCapabilityToken,
+} from "./cellBrokerCapability.js";
 import { stringFlag } from "./cli/shared.js";
 import { printBuzListing, printBuzSendResult, type BuzListEntry } from "./commands/buz.js";
 import { printSealResult } from "./commands/messaging.js";
@@ -39,7 +44,22 @@ function callingBee(): string {
   return bee;
 }
 
+function callingCapability(): string {
+  const token = process.env[CELL_BROKER_CAPABILITY_ENV];
+  if (!isCellBrokerCapabilityToken(token)) {
+    deny(`${CELL_BROKER_CAPABILITY_ENV} is missing or malformed; revive this Cell with the current Honeybee runtime`);
+  }
+  return token;
+}
+
 function controlSocketPath(): string {
+  const explicit = process.env.HIVE_CELL_BROKER_SOCKET;
+  if (explicit !== undefined) {
+    if (!isAbsolute(explicit) || explicit.includes("\0")) {
+      deny("HIVE_CELL_BROKER_SOCKET must be an absolute local socket path");
+    }
+    return explicit;
+  }
   return join(daemonRoot(), "hsr-control.sock");
 }
 
@@ -53,9 +73,10 @@ function asBrokerReply(value: unknown): BrokerReply {
 async function callCellBroker(
   op: string,
   params: Record<string, unknown>,
-  requiredBrokerVersion = 1,
+  requiredBrokerVersion = CELL_BROKER_CAPABILITY_VERSION,
 ): Promise<BrokerReply> {
   const callerBee = callingBee();
+  const callerCapability = callingCapability();
   let client: RpcClient | undefined;
   try {
     client = await connectRpcClient(controlSocketPath());
@@ -67,7 +88,7 @@ async function callCellBroker(
       const alternative = requiredBrokerVersion >= 2 ? `; ${CELL_SPAWN_ALTERNATIVE}` : "";
       deny(`the running daemon does not advertise broker:${requiredBrokerVersion}; deploy a broker-capable daemon${alternative}`);
     }
-    const reply = asBrokerReply(await client.call(op, { ...params, callerBee }));
+    const reply = asBrokerReply(await client.call(op, { ...params, callerBee, callerCapability }));
     if (!reply.ok) deny(reply.error || `${op} was refused without a reason`);
     return reply;
   } catch (error) {
@@ -145,7 +166,7 @@ async function brokerSpawn(parsed: Parsed): Promise<void> {
       ...(account ? { account } : {}),
       ...(prompt ? { prompt } : {}),
     },
-  }, 2);
+  }, CELL_BROKER_CAPABILITY_VERSION);
   if (typeof reply.bee !== "string" || typeof reply.name !== "string") {
     deny("daemon returned a malformed broker:spawn result");
   }
@@ -161,7 +182,7 @@ function usageState(): never {
 async function brokerBuzSend(parsed: Parsed): Promise<void> {
   const target = parsed.args[1];
   if (!target) {
-    throw new Error(`Usage: hive buz send <selector> [--sender <bee>] [--tier <interrupt|next-tool|queue|passive>] -p <body> (default tier: ${DEFAULT_BUZ_TIER})`);
+    throw new Error(`Usage: hive buz send <selector> [--sender <bee>] [--tier <interrupt|next-tool|queue|passive>] [--message-id <uuidv7>|--new] -p <body> (default tier: ${DEFAULT_BUZ_TIER})`);
   }
   if (flag(parsed, "sender-human") !== undefined) {
     deny("a Cell bee cannot claim a human sender; buz-send must act as HIVE_BEE_NAME");
@@ -172,10 +193,15 @@ async function brokerBuzSend(parsed: Parsed): Promise<void> {
   const body = stringFlag(parsed, ["prompt", "p"]) ?? "";
   if (body.length === 0) throw new Error("buz: --prompt|-p body is required");
   const subject = typeof flag(parsed, "subject") === "string" ? String(flag(parsed, "subject")) : undefined;
+  const messageId = typeof flag(parsed, "message-id") === "string" ? String(flag(parsed, "message-id")) : undefined;
+  const forceNewIntent = truthy(flag(parsed, "new"));
+  if (messageId && forceNewIntent) deny("--message-id and --new are mutually exclusive");
   const reply = await callCellBroker("broker:buz-send", {
     target,
     tier,
     body,
+    ...(messageId ? { messageId } : {}),
+    ...(forceNewIntent ? { forceNewIntent: true } : {}),
     ...(typeof senderFlag === "string" ? { senderBee: senderFlag } : {}),
     ...(subject ? { subject } : {}),
   });

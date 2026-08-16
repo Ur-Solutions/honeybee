@@ -4,12 +4,13 @@ import { deadSessionAge, deadSessionRecords, idleAgeSource, idleOlderThanMillis,
 import { chooseCleanTargets, type CleanTuiCleanOutcome, type CleanTuiItem } from "../cleanTui.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note, tildify, truncate } from "../format.js";
 import { highlightUniqueSessionReference } from "../ids.js";
-import { purgeSessionData, transactionalKill } from "../kill.js";
+import { transactionalCleanSession, type TransactionalCleanOptions } from "../kill.js";
 import { LOCAL_NODE_NAME, listNodes } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
 import { resolveSessionTranscript } from "../sessionMetadata.js";
 import { cleanStatePriority, deriveState, isTerminalState, liveTargetKey, type BeeState, type DerivedState } from "../state.js";
-import { flushPaneStampRepairs, listSessions, safeName, type SessionRecord } from "../store.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import { flushPaneStampRepairs, listSessions, loadSession, safeName, type SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 import { listPanesBySession } from "../substrates/local-tmux.js";
 import { tmux } from "../tmux.js";
@@ -50,7 +51,7 @@ export async function cmdCleanDead(parsed: Parsed) {
   // A filed (done) bee is filed, not dead — `clean` must never reap it (PRD
   // §13); only an explicit `hive kill` deletes a filed bee. Exclude it at the
   // source so neither the dead-sweep nor the pane-dead loop below can touch it.
-  const records = allRecords.filter((r) => r.status !== "done");
+  const records = allRecords.filter((record) => !isArchivedSessionLifecycle(record));
   const probe = await liveTargetsAcrossNodes(nodes);
   // Records on an unreachable node are NOT dead — we genuinely don't know their state.
   // Treat them as live so we don't sweep their metadata while their node is down.
@@ -129,14 +130,19 @@ export async function cmdCleanDead(parsed: Parsed) {
     return;
   }
 
+  let failed = 0;
   for (const record of dead) {
-    // Selection happened before the lifecycle lock. Re-check the authoritative
-    // record under that lock so an accept op that won the race cannot lose its
-    // queued message and session metadata to this stale dead snapshot.
-    if (!await purgeSessionData(record, { preserveRecoveryRequest: true })) continue;
+    const result = await cleanSessionExactly(record, "removed stale");
+    if (result.kind === "protected") continue;
+    if (result.kind === "failed") {
+      failed += 1;
+      printCleanFailure(record, result.detail);
+      continue;
+    }
     if (isPretty()) console.log(actionLine("ok", "clean", [bold(record.name), record.agent, dim(tildify(record.cwd))]));
     else console.log(`cleaned\t${record.name}`);
   }
+  if (failed > 0) process.exitCode = 1;
 }
 
 
@@ -183,10 +189,18 @@ export async function cmdCleanCrashed(parsed: Parsed) {
     return;
   }
 
+  let failed = 0;
   for (const candidate of crashed) {
-    await purgeSessionData(candidate.record);
-    printCleanSuccess(candidate.record, "removed crashed");
+    const result = await cleanSessionExactly(candidate.record, "removed crashed");
+    if (result.kind === "protected") continue;
+    if (result.kind === "failed") {
+      failed += 1;
+      printCleanFailure(candidate.record, result.detail);
+      continue;
+    }
+    printCleanSuccess(candidate.record, result.detail);
   }
+  if (failed > 0) process.exitCode = 1;
 }
 
 
@@ -313,7 +327,7 @@ export async function collectCleanCandidates(): Promise<{ records: SessionRecord
   // A filed (done) bee derives to the "done" terminal state but must NOT
   // be offered as an idle/dead clean candidate (PRD §13) — exclude it up front so
   // `clean --idle`/interactive never lists it.
-  const records = allRecords.filter((r) => r.status !== "done");
+  const records = allRecords.filter((record) => !isArchivedSessionLifecycle(record));
   const probe = await liveTargetsAcrossNodes(nodes);
   // A record whose node is no longer registered was never probed; treat it as
   // unreachable (not dead) so clean paths refuse to sweep a possibly-live bee.
@@ -360,6 +374,8 @@ export function cleanDisabledReason(state: BeeState): string | undefined {
       return "queued";
     case "booting":
       return "booting";
+    case "kill_failed":
+      return "stop unconfirmed";
     case "node_unreachable":
       return "offline";
     default:
@@ -490,13 +506,77 @@ export async function cleanCandidatesForTui(candidates: CleanCandidate[]): Promi
 
 export async function cleanCandidate(candidate: CleanCandidate): Promise<CleanTuiCleanOutcome> {
   const record = candidate.record;
-  if (candidate.mode === "delete") {
-    await purgeSessionData(record);
-    return { name: record.name, ok: true, detail: "removed stale" };
+  if (candidate.mode === "disabled") {
+    return {
+      name: record.name,
+      ok: false,
+      detail: `disabled: ${candidate.disabledReason ?? candidate.state}`,
+    };
   }
-  const outcome = await transactionalKill(record);
-  if (!outcome.ok) return { name: record.name, ok: false, detail: outcome.lastError };
-  return { name: record.name, ok: true, detail: outcome.alreadyGone ? "gone" : "killed" };
+  const result = await cleanSessionExactly(
+    record,
+    candidate.mode === "delete" ? "removed stale" : { alreadyGone: "gone", stopped: "killed" },
+  );
+  return {
+    name: record.name,
+    ok: result.kind === "cleaned",
+    detail: result.detail,
+  };
+}
+
+
+type ExactCleanResult =
+  | { kind: "cleaned"; detail: string }
+  | { kind: "protected"; detail: string }
+  | { kind: "failed"; detail: string };
+
+
+/**
+ * Exact-stop choke shared by every clean mode. A stale/dead projection is
+ * selection evidence only: HSR host absence, tmux target absence, or a
+ * crashed BeeView does not prove the detached launcher/child group exited.
+ * The lifecycle transaction therefore revalidates all preservation facts and
+ * drives the substrate's birth-qualified cleanup before deleting artifacts.
+ */
+export async function cleanSessionExactly(
+  record: SessionRecord,
+  successDetail: string | { alreadyGone: string; stopped: string },
+  options: TransactionalCleanOptions = {},
+): Promise<ExactCleanResult> {
+  const outcome = await transactionalCleanSession(record, {
+    ...options,
+    preserveArchived: true,
+    preserveKillFailed: true,
+    preserveRecoveryRequest: true,
+  });
+  if (outcome === null) {
+    const current = await loadSession(record.name);
+    const detail = current?.status === "kill_failed"
+      ? "preserved stop doubt"
+      : current && isArchivedSessionLifecycle(current)
+        ? "preserved filed"
+        : current?.recoveryRequestedAt
+          ? "preserved runtime recovery"
+          : "preserved protected lifecycle";
+    return { kind: "protected", detail };
+  }
+  if (!outcome.ok) return { kind: "failed", detail: outcome.lastError };
+  const detail = typeof successDetail === "string"
+    ? successDetail
+    : outcome.alreadyGone
+      ? successDetail.alreadyGone
+      : successDetail.stopped;
+  return { kind: "cleaned", detail };
+}
+
+
+function printCleanFailure(record: SessionRecord, detail: string): void {
+  if (isPretty()) {
+    console.log(actionLine("warn", "clean", [bold(record.name), dim(detail)]));
+    console.error(note(`bee may still be running; retry: hive kill ${record.name}`));
+  } else {
+    console.log(`clean_failed\t${record.name}\t${detail}`);
+  }
 }
 
 

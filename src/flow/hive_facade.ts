@@ -19,13 +19,15 @@ import {
   type BuzTier,
   DEFAULT_BUZ_TIER,
   listMessages,
-  sendBuzMessage,
+  sendBuzMessageInAdmission,
 } from "../buz.js";
+import { deliverSessionText, withRunnableSessionAdmission } from "../delivery.js";
 import { transactionalRetire } from "../kill.js";
 import { LOCAL_NODE_NAME, loadNodeSync, type NodeRecord } from "../node.js";
-import { loadLatestSeal, nextTurnPatch, recordSeal, type SealArtifact, type SealRecord } from "../seal.js";
+import { loadLatestSeal, type SealArtifact, type SealRecord } from "../seal.js";
+import { recordRunnableSessionSeal } from "../sealAdmission.js";
 import { resolveSelector } from "../selectors.js";
-import { appendLedger, loadSession, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, loadSession, type SessionRecord } from "../store.js";
 import { substrateFor, substrateForRecord } from "../substrates/index.js";
 import { agentDefaultsToYolo, spawnBeeForFlow, type SpawnBeeOptions } from "../agents.js";
 import { resolveSpawnSpec } from "../spawnResolve.js";
@@ -50,6 +52,9 @@ export type HiveFacadeOptions = {
    * Defaults to `flow:<flowName>:run:<runId>` so the cohort is addressable.
    */
   defaultSwarmId?: string;
+  /** @internal deterministic post-acceptance fault seams. */
+  deliverSessionText?: typeof deliverSessionText;
+  appendLedger?: typeof appendLedger;
 };
 
 export type FacadeWaitOptions = {
@@ -83,6 +88,8 @@ export class HiveFacade {
   readonly cleanup: "keep" | "kill-on-end";
   readonly defaultSwarmId: string;
   private readonly signal: AbortSignal | undefined;
+  private readonly deliverText: typeof deliverSessionText;
+  private readonly writeLedger: typeof appendLedger;
   /** Bees the facade has spawned during this run — used for killAll. */
   private readonly spawned: SessionRecord[] = [];
 
@@ -92,6 +99,8 @@ export class HiveFacade {
     this.cleanup = options.cleanup ?? "keep";
     this.signal = options.signal;
     this.defaultSwarmId = options.defaultSwarmId ?? `flow:${options.flowName}:run:${options.runId}`;
+    this.deliverText = options.deliverSessionText ?? deliverSessionText;
+    this.writeLedger = options.appendLedger ?? appendLedger;
   }
 
   /** Names of every bee spawned during this run. Useful for callers. */
@@ -151,14 +160,14 @@ export class HiveFacade {
     };
     if (record.node) handle.node = record.node;
 
-    await appendLedger({
+    await this.writeLedger({
       type: "flow.spawn",
       flowName: this.flowName,
       runId: this.runId,
       session: record.name,
       agent: record.agent,
       node: record.node ?? LOCAL_NODE_NAME,
-    });
+    }).catch(() => undefined);
 
     return handle;
   }
@@ -168,41 +177,29 @@ export class HiveFacade {
   async send(target: BeeRef, text: string): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
-    const turn = await nextTurnPatch(record);
-    await substrateFor(record).sendText(record.tmuxTarget, text, record.agentPaneId);
-    const now = new Date().toISOString();
-    await updateSession(record.name, { ...turn, updatedAt: now, status: "running", lastPrompt: text, lastPromptAt: now });
-    await appendLedger({
+    await this.deliverText(record, text);
+    await this.writeLedger({
       type: "flow.send",
       flowName: this.flowName,
       runId: this.runId,
       session: record.name,
       chars: text.length,
-    });
+    }).catch(() => undefined);
   }
 
   async brief(target: BeeRef, text: string): Promise<void> {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
-    const turn = await nextTurnPatch(record);
-    await substrateFor(record).sendText(record.tmuxTarget, text, record.agentPaneId);
-    const now = new Date().toISOString();
-    await updateSession(record.name, {
-      ...turn,
-      updatedAt: now,
-      status: "running",
-      brief: text,
-      briefedAt: now,
-      lastPrompt: text,
-      lastPromptAt: now,
+    await this.deliverText(record, text, {
+      metadata: (at) => ({ brief: text, briefedAt: at }),
     });
-    await appendLedger({
+    await this.writeLedger({
       type: "flow.brief",
       flowName: this.flowName,
       runId: this.runId,
       session: record.name,
       chars: text.length,
-    });
+    }).catch(() => undefined);
   }
 
   /** ---------------------- wait / waitForSeal ---------------------- */
@@ -268,7 +265,7 @@ export class HiveFacade {
     const { readFile } = await import("node:fs/promises");
     const raw = await readFile(artifactPath, "utf8");
     const parsed = JSON.parse(raw) as SealArtifact;
-    const stored = await recordSeal(record.name, parsed);
+    const stored = await recordRunnableSessionSeal(record, parsed);
     return stored;
   }
 
@@ -296,17 +293,19 @@ export class HiveFacade {
     this.assertNotAborted();
     const record = await this.resolveRecord(target);
     const tier: BuzTier = options.tier ?? DEFAULT_BUZ_TIER;
-    const transport = tier === "interrupt" || tier === "next-tool"
-      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
-      : undefined;
-    await sendBuzMessage({
-      recipient: record,
-      sender: options.sender,
-      tier,
-      body,
-      ...(options.subject ? { subject: options.subject } : {}),
-      ...(transport ? { transport } : {}),
-      ...(record.node ? { node: record.node } : {}),
+    await withRunnableSessionAdmission(record, async (lifecycle, current) => {
+      const transport = tier === "interrupt" || tier === "next-tool"
+        ? { substrate: substrateFor(current), tmuxTarget: current.tmuxTarget, agentPaneId: current.agentPaneId }
+        : undefined;
+      await sendBuzMessageInAdmission({
+        recipient: current,
+        sender: options.sender,
+        tier,
+        body,
+        ...(options.subject ? { subject: options.subject } : {}),
+        ...(transport ? { transport } : {}),
+        ...(current.node ? { node: current.node } : {}),
+      }, { lifecycle });
     });
   }
 

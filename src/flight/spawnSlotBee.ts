@@ -4,6 +4,7 @@
 // same HSR substrate, same contract postscript, same deterministic name the
 // crash-adoption paths re-derive.
 import { deliverPromptText } from "../cli/shared.js";
+import { deliverSessionText } from "../delivery.js";
 import { resolveAccountFlag, spawnBee } from "../commands/spawn.js";
 import { appendLedger } from "../store.js";
 import { slotBeeName, slotContractTaskId, type FlightMixEntry, type FlightRecord, type FlightTaskPacket, type SlotRecord } from "./types.js";
@@ -48,7 +49,10 @@ export async function spawnSlotBee(
   });
   if (record.brief) {
     try {
-      await deliverPromptText(record, record.brief);
+      await deliverSessionText(record, record.brief, {
+        deliver: deliverPromptText,
+        deliveryId: `flight:${flight.id}:${slot.slotId}:${slot.generation}:${slot.attempt}:brief`,
+      });
     } catch (error) {
       await appendLedger({
         type: "flight.slot.brief_failed",

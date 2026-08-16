@@ -1,6 +1,8 @@
 import { deliverPromptText } from "../cli/shared.js";
 import { withContractPostscript } from "../contract.js";
-import { loadSession, touchSession, type SessionRecord } from "../store.js";
+import { deliverSessionTextInAdmission, withRunnableSessionAdmission } from "../delivery.js";
+import { isRunnableSessionRecord } from "../stateMachine.js";
+import { loadSession, type SessionRecord } from "../store.js";
 import { canonicalDigest } from "./canonical.js";
 import { CombError } from "./errors.js";
 import { activateAgent, effectBaseKey } from "./machine.js";
@@ -28,12 +30,18 @@ export async function attachBeeToRun(options: {
   entryNodeId?: string;
   brief?: string;
   deliver?: boolean;
+  /** Transport override for deterministic admission tests. */
+  deliverText?: typeof deliverPromptText;
   now?: () => number;
+  /** Deterministic race seam: invoked after snapshots, before lifecycle admission. */
+  beforeSessionAdmission?: () => Promise<void>;
+  /** Deterministic race seam: invoked after lifecycle admission, before the run lock. */
+  beforeRunMutation?: () => Promise<void>;
 }): Promise<AttachRunResult> {
   const nowFn = options.now ?? Date.now;
   const session = await loadSession(options.beeName);
   if (!session) throw new CombError("not_found", `bee not found: ${options.beeName}`);
-  if (session.status !== "running") {
+  if (!isRunnableSessionRecord(session)) {
     throw new CombError("invalid_argument", `bee ${session.name} is terminal (${session.status})`);
   }
   const run = await requireRun(options.runId);
@@ -86,133 +94,183 @@ export async function attachBeeToRun(options: {
   const requestDigest = canonicalDigest(adoptionRequest as unknown as JsonValue);
   const startedAt = new Date(nowFn()).toISOString();
 
-  await mutateRun(run.id, (record) => {
-    const current = record.activations[activation.id];
-    if (!current) throw new CombError("corrupt_state", `activation disappeared: ${activation.id}`);
-    const existing = record.effects[effectKey];
-    if (existing && existing.requestDigest !== requestDigest) {
-      throw new CombError("version_conflict", `adoption effect ${effectKey} has a different request digest`);
-    }
-    if (!existing) {
-      const effect: EffectRecord = {
-        key: effectKey,
-        scope: { kind: "activation", activation: current.address },
-        kind: "agent-adopt",
-        semanticId,
-        semanticDigest,
-        fenceEpoch: 0,
-        status: "prepared",
-        preparedAt: startedAt,
-        externalRef: session.name,
-        requestDigest,
-        request: adoptionRequest as unknown as JsonValue,
-        verificationEvidenceIds: [],
-      };
-      record.effects[effectKey] = effect;
-      current.effectKeys.push(effectKey);
-      recordRunEvent(record, "comb.effect.prepared", current.address, {
-        effectKey,
-        kind: "agent-adopt",
-      });
-    }
-    const effect = record.effects[effectKey]!;
-    if (effect.status === "confirmed") return;
-    if (effect.status !== "prepared" && effect.status !== "executing") {
-      throw new CombError("version_conflict", `adoption effect ${effectKey} is ${effect.status}`);
-    }
-    effect.status = "executing";
-    effect.executeStartedAt ??= startedAt;
-    activateAgent(record, current, effect.executeStartedAt);
-  });
-
-  const exactBinding = session.combActivations?.find(
-    (candidate) =>
-      candidate.runId === run.id &&
-      candidate.nodeId === activation.address.nodeId &&
-      candidate.attempt === activation.address.attempt &&
-      candidate.itemIndex === activation.address.itemIndex &&
-      candidate.trackDigest === trackDigest,
-  );
-  const binding = {
-    runId: run.id,
-    nodeId: activation.address.nodeId,
-    attempt: activation.address.attempt,
-    itemIndex: activation.address.itemIndex,
-    taskId: activation.taskId,
-    status: "current" as const,
-    attachedAt: exactBinding?.attachedAt ?? startedAt,
-    trackDigest,
-    ...(exactBinding?.deliveredAt ? { deliveredAt: exactBinding.deliveredAt } : {}),
-  };
-  let updated = await touchSession(session.name, {
-    contract,
-    brief: fullBrief,
-    combActivations: [
-      ...(session.combActivations ?? [])
-        .filter(
-          (candidate) =>
-            !(
-              candidate.runId === run.id &&
-              candidate.nodeId === activation.address.nodeId &&
-              candidate.attempt === activation.address.attempt &&
-              candidate.itemIndex === activation.address.itemIndex
-            ),
-        )
-        .map((candidate) =>
-          candidate.status === "current" &&
+  await options.beforeSessionAdmission?.();
+  await withRunnableSessionAdmission(session, async (lifecycle, admitted) => {
+    let effectStarted = false;
+    const bindingPatch = (current: SessionRecord, deliveredAt?: string): Partial<SessionRecord> => {
+      const exact = current.combActivations?.find(
+        (candidate) =>
           candidate.runId === run.id &&
-          candidate.nodeId === activation.address.nodeId
-            ? { ...candidate, status: "historical" as const, endedAt: startedAt }
-            : candidate
-        ),
-      binding,
-    ],
-  });
-  if (!updated) throw new CombError("external_dependency", `bee ${session.name} disappeared during adoption`);
-  if (options.deliver !== false && !exactBinding?.deliveredAt) {
-    await deliverPromptText(updated, fullBrief);
-    const deliveredAt = new Date(nowFn()).toISOString();
-    updated = await touchSession(updated.name, {
-      combActivations: updated.combActivations?.map((candidate) =>
-        candidate.runId === run.id &&
-        candidate.nodeId === activation.address.nodeId &&
-        candidate.attempt === activation.address.attempt &&
-        candidate.itemIndex === activation.address.itemIndex
-          ? { ...candidate, deliveredAt }
-          : candidate
-      ),
-    }) ?? updated;
-  }
-
-  await mutateRun(run.id, (record) => {
-    const effect = record.effects[effectKey];
-    const current = record.activations[activation.id];
-    if (!effect || !current) throw new CombError("corrupt_state", "adoption state disappeared before confirm");
-    if (effect.status === "confirmed") return;
-    if (effect.status !== "executing") {
-      throw new CombError("version_conflict", `adoption effect ${effectKey} is ${effect.status}`);
-    }
-    const confirmedAt = new Date(nowFn()).toISOString();
-    effect.status = "confirmed";
-    effect.confirmedAt = confirmedAt;
-    effect.externalRef = session.name;
-    effect.result = {
-      bee: session.name,
-      beeId: session.id ?? null,
-      trackDigest,
+          candidate.nodeId === activation.address.nodeId &&
+          candidate.attempt === activation.address.attempt &&
+          candidate.itemIndex === activation.address.itemIndex &&
+          candidate.trackDigest === trackDigest,
+      );
+      const deliveryAt = deliveredAt ?? exact?.deliveredAt;
+      const binding = {
+        runId: run.id,
+        nodeId: activation.address.nodeId,
+        attempt: activation.address.attempt,
+        itemIndex: activation.address.itemIndex,
+        taskId: activation.taskId,
+        status: "current" as const,
+        attachedAt: exact?.attachedAt ?? startedAt,
+        trackDigest,
+        ...(deliveryAt ? { deliveredAt: deliveryAt } : {}),
+      };
+      return {
+        contract,
+        brief: fullBrief,
+        combActivations: [
+          ...(current.combActivations ?? [])
+            .filter(
+              (candidate) =>
+                !(
+                  candidate.runId === run.id &&
+                  candidate.nodeId === activation.address.nodeId &&
+                  candidate.attempt === activation.address.attempt &&
+                  candidate.itemIndex === activation.address.itemIndex
+                ),
+            )
+            .map((candidate) =>
+              candidate.status === "current" &&
+              candidate.runId === run.id &&
+              candidate.nodeId === activation.address.nodeId
+                ? { ...candidate, status: "historical" as const, endedAt: startedAt }
+                : candidate
+            ),
+          binding,
+        ],
+      };
     };
-    if (!current.beeHandles.some((handle) => handle.name === session.name)) {
-      current.beeHandles.push({
-        name: session.name,
-        ...(session.id ? { id: session.id } : {}),
-        source: "adopted",
+
+    try {
+      await options.beforeRunMutation?.();
+      await mutateRun(run.id, (record) => {
+        if (record.status !== "active" || record.cancellation) {
+          throw new CombError("version_conflict", `comb run ${record.id} is no longer active`);
+        }
+        if (
+          record.snapshotRevision !== run.snapshotRevision ||
+          record.currentSnapshot.definitionDigest !== run.currentSnapshot.definitionDigest
+        ) {
+          throw new CombError("version_conflict", `comb run ${record.id} changed before attachment`);
+        }
+        const current = currentEntryActivation(record, entryId);
+        if (current.id !== activation.id) {
+          throw new CombError(
+            "version_conflict",
+            `entry activation changed from ${activation.id} to ${current.id} before attachment`,
+          );
+        }
+        const existing = record.effects[effectKey];
+        if (existing && existing.requestDigest !== requestDigest) {
+          throw new CombError("version_conflict", `adoption effect ${effectKey} has a different request digest`);
+        }
+        if (!existing) {
+          const effect: EffectRecord = {
+            key: effectKey,
+            scope: { kind: "activation", activation: current.address },
+            kind: "agent-adopt",
+            semanticId,
+            semanticDigest,
+            fenceEpoch: 0,
+            status: "prepared",
+            preparedAt: startedAt,
+            externalRef: admitted.name,
+            requestDigest,
+            request: adoptionRequest as unknown as JsonValue,
+            verificationEvidenceIds: [],
+          };
+          record.effects[effectKey] = effect;
+          current.effectKeys.push(effectKey);
+          recordRunEvent(record, "comb.effect.prepared", current.address, {
+            effectKey,
+            kind: "agent-adopt",
+          });
+        }
+        const effect = record.effects[effectKey]!;
+        if (effect.status === "confirmed") return;
+        if (effect.status !== "prepared" && effect.status !== "executing") {
+          throw new CombError("version_conflict", `adoption effect ${effectKey} is ${effect.status}`);
+        }
+        effect.status = "executing";
+        effect.executeStartedAt ??= startedAt;
+        activateAgent(record, current, effect.executeStartedAt);
+        effectStarted = true;
       });
+
+      const exactBinding = admitted.combActivations?.find(
+        (candidate) =>
+          candidate.runId === run.id &&
+          candidate.nodeId === activation.address.nodeId &&
+          candidate.attempt === activation.address.attempt &&
+          candidate.itemIndex === activation.address.itemIndex &&
+          candidate.trackDigest === trackDigest,
+      );
+      let updated: SessionRecord;
+      if (options.deliver !== false && !exactBinding?.deliveredAt) {
+        updated = (await deliverSessionTextInAdmission(lifecycle, admitted, fullBrief, {
+          deliver: options.deliverText ?? deliverPromptText,
+          deliveryId: `comb:${effectKey}`,
+          now: () => new Date(nowFn()),
+          metadata: (deliveredAt, current) => bindingPatch(current, deliveredAt),
+        })).record;
+      } else {
+        updated = await lifecycle.commit(bindingPatch(admitted));
+      }
+
+      await mutateRun(run.id, (record) => {
+        const effect = record.effects[effectKey];
+        const current = record.activations[activation.id];
+        if (!effect || !current) throw new CombError("corrupt_state", "adoption state disappeared before confirm");
+        if (effect.status === "confirmed") return;
+        if (effect.status !== "executing") {
+          throw new CombError("version_conflict", `adoption effect ${effectKey} is ${effect.status}`);
+        }
+        const confirmedAt = new Date(nowFn()).toISOString();
+        effect.status = "confirmed";
+        effect.confirmedAt = confirmedAt;
+        effect.externalRef = admitted.name;
+        effect.result = {
+          bee: admitted.name,
+          beeId: updated.id ?? null,
+          trackDigest,
+        };
+        if (!current.beeHandles.some((handle) => handle.name === admitted.name)) {
+          current.beeHandles.push({
+            name: admitted.name,
+            ...(updated.id ? { id: updated.id } : {}),
+            source: "adopted",
+          });
+        }
+        recordRunEvent(record, "comb.effect.confirmed", current.address, {
+          effectKey,
+          externalRef: admitted.name,
+        });
+      });
+    } catch (error) {
+      if (effectStarted) {
+        const message = error instanceof Error ? error.message : String(error);
+        await mutateRun(run.id, (record) => {
+          const effect = record.effects[effectKey];
+          const current = record.activations[activation.id];
+          if (!effect || !current || effect.status !== "executing") return;
+          // Transport rejection is not proof that the Bee did not accept the
+          // brief, and a following binding commit can fail after transport.
+          // Hold the exact activation for manual reconciliation; never turn
+          // either ambiguity into a retry on a different Bee.
+          effect.status = "ambiguous";
+          effect.error = message;
+          recordRunEvent(record, "comb.effect.failed", current.address, {
+            effectKey,
+            outcome: "ambiguous-adoption",
+          });
+        }).catch(() => undefined);
+      }
+      throw error;
     }
-    recordRunEvent(record, "comb.effect.confirmed", current.address, {
-      effectKey,
-      externalRef: session.name,
-    });
-  });
+  }, { operation: "hive comb attach" });
   return {
     run: boardView(await requireRun(run.id)),
     activationId: activation.id,

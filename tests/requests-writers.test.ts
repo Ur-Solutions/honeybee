@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { cmdAnswer } from "../src/commands/messaging.js";
+import { createRequestReconciler } from "../src/daemon/requestSweep.js";
 import { resolveAuthRequestsAfterResume } from "../src/commands/migrate.js";
 import { runHsrHost, type HsrHostHandle } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { hsrObservations, pendingNeedsInput } from "../src/hsr/observe.js";
-import { hsrRunDir } from "../src/hsr/runDir.js";
+import { hsrEventsPath, hsrRunDir } from "../src/hsr/runDir.js";
+import { readHsrEventIntegrityReceipt } from "../src/hsr/eventIntegrity.js";
 import { transactionalKill, transactionalRetire } from "../src/kill.js";
 import type { Parsed } from "../src/parse.js";
 import { authRequestId, needsInputRequestId, stopFailedRequestId } from "../src/requests/keys.js";
@@ -168,6 +170,115 @@ test("cmdAnswer attributes the resolution to the calling bee via HIVE_BEE", asyn
     } finally {
       if (previousHiveBee === undefined) delete process.env.HIVE_BEE;
       else process.env.HIVE_BEE = previousHiveBee;
+      await handle?.stop().catch(() => undefined);
+    }
+  });
+});
+
+test("cmdAnswer detects a holed local source log before offering or sending a provider answer", async () => {
+  await withTempStore(async () => {
+    const bee = "answer-source-history-hole";
+    const opts: RunnerOpts = {
+      bee,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+      runDir: hsrRunDir(bee),
+    };
+    const handle = await runHsrHost({ bee, adapter: stubAdapter, opts });
+    const { connectRpcClient } = await import("../src/hsr/rpc.js");
+    const client = await connectRpcClient(handle.controlSocket);
+    let answered = 0;
+    client.on("event", (value) => {
+      const event = value as { type?: unknown; text?: unknown };
+      if (event.type === "text" && typeof event.text === "string" && event.text.startsWith("answered:")) answered += 1;
+    });
+    try {
+      await client.call("send", { text: "ask me" });
+      await waitFor(async () => (await pendingNeedsInput(bee)) !== null, "pending answer before corruption");
+      await saveSession(record(bee, { substrate: "hsr", runtimeGeneration: 1 }));
+      const lines = (await readFile(hsrEventsPath(bee), "utf8")).split("\n").filter(Boolean);
+      const events = lines.map((line) => JSON.parse(line) as { seq?: number; type?: string });
+      const internal = events.find((event, index) => index > 0 && index < events.length - 1 && event.seq !== undefined);
+      assert.ok(internal?.seq);
+      await writeFile(
+        hsrEventsPath(bee),
+        `${lines.filter((line) => (JSON.parse(line) as { seq?: number }).seq !== internal!.seq).join("\n")}\n`,
+        { mode: 0o600 },
+      );
+
+      await assert.rejects(cmdAnswer(parsed(["answer", bee, "yes"])), /unresolved HSR event history/);
+      assert.equal(answered, 0, "strict source admission rejects before provider answer I/O");
+      assert.equal((await readHsrEventIntegrityReceipt(bee))?.phase, "unresolved");
+      await handle.done;
+    } finally {
+      client.close();
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+test("host refresh reuses r1 without reopening or resolving the predecessor request", async () => {
+  await withTempStore(async () => {
+    const previousHiveBee = process.env.HIVE_BEE;
+    delete process.env.HIVE_BEE;
+    const bee = "answer-host-refresh";
+    const current = record(bee, { substrate: "hsr", runtimeGeneration: 4 });
+    await saveSession(current);
+    const opts: RunnerOpts = {
+      bee,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+      runDir: hsrRunDir(bee),
+    };
+    const reconcile = createRequestReconciler();
+    let handle: HsrHostHandle | undefined;
+    const openFromCurrentObservation = async () => reconcile({
+      records: [current],
+      currentStates: new Map(),
+      hsrObservations: await hsrObservations({ bees: [bee], includeEvents: true }),
+      hsrUnavailable: new Set(),
+    });
+    try {
+      handle = await runHsrHost({ bee, adapter: stubAdapter, opts });
+      let client = await (await import("../src/hsr/rpc.js")).connectRpcClient(handle.controlSocket);
+      try {
+        await client.call("send", { text: "ask first" });
+      } finally {
+        client.close();
+      }
+      await waitFor(async () => (await pendingNeedsInput(bee))?.question === "proceed?", "first host pending r1");
+      const firstPending = (await pendingNeedsInput(bee))!;
+      const firstId = needsInputRequestId(bee, firstPending);
+      assert.deepEqual((await openFromCurrentObservation()).map((row) => row.action), ["open"]);
+      await cmdAnswer(parsed(["answer", bee, "yes"]));
+      assert.equal((await readBeeRequests(bee)).find((row) => row.id === firstId)?.status, "resolved");
+
+      await handle.stop();
+      handle = await runHsrHost({ bee, adapter: stubAdapter, opts });
+      assert.equal(await pendingNeedsInput(bee), null, "old r1 is absent before the refreshed host asks");
+      client = await (await import("../src/hsr/rpc.js")).connectRpcClient(handle.controlSocket);
+      try {
+        await client.call("send", { text: "ask different" });
+      } finally {
+        client.close();
+      }
+      await waitFor(async () => (await pendingNeedsInput(bee))?.question === "different prompt?", "refreshed host pending r1");
+      const secondPending = (await pendingNeedsInput(bee))!;
+      assert.equal(secondPending.requestId, "r1");
+      const secondId = needsInputRequestId(bee, secondPending);
+      assert.notEqual(secondId, firstId, "request identity includes the exact host epoch");
+      assert.deepEqual((await openFromCurrentObservation()).map((row) => row.action), ["open"]);
+      let stored = await readBeeRequests(bee);
+      assert.equal(stored.find((row) => row.id === firstId)?.status, "resolved", "closed A stays closed");
+      assert.equal(stored.find((row) => row.id === secondId)?.status, "open", "B opens independently");
+      assert.equal(stored.find((row) => row.id === secondId)?.question, "different prompt?");
+
+      await cmdAnswer(parsed(["answer", bee, "yes"]));
+      stored = await readBeeRequests(bee);
+      assert.equal(stored.find((row) => row.id === firstId)?.status, "resolved");
+      assert.equal(stored.find((row) => row.id === secondId)?.status, "resolved", "answer closes only B's exact request");
+    } finally {
+      if (previousHiveBee !== undefined) process.env.HIVE_BEE = previousHiveBee;
       await handle?.stop().catch(() => undefined);
     }
   });

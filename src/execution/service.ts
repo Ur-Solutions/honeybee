@@ -13,6 +13,9 @@ import type { JsonValue } from "../comb/types.js";
 import { machineId } from "../fsx.js";
 import { captureProcessBirthFingerprint, inspectProcessBirth } from "../hsr/processIdentity.js";
 import type { SpawnedRuntimeHandle } from "../spawnRuntime.js";
+import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import type { SessionRecord } from "../store.js";
+import type { KillOutcome } from "../kill.js";
 import {
   computeSchemaDigest,
   createExecutionValidator,
@@ -41,6 +44,7 @@ import {
   admitRunStart,
   activateRunLaunchAttempt,
   acceptedCursorResetThroughSeq,
+  appendRunLossEpisodeEvents,
   appendRunEvents,
   appendRunTerminalEvents,
   claimRunLaunchAttempt,
@@ -49,12 +53,15 @@ import {
   commitRunLaunchStarted,
   commitRunTerminalResult,
   enterLossEpisode,
+  ensureRunReservationIndexed,
   ensureRunAcceptedFirst,
+  listRunReservationInventory,
   lossEpisodePayload,
   launchAttemptOwns,
   mutateReservation,
   readReservation,
   readRunEvents,
+  reconcileRunLaunchOccupancyCleanup,
   type LaunchEvidence,
   type RunEnvironmentFacts,
   type RunEventInput,
@@ -65,8 +72,18 @@ import {
 } from "./runStore.js";
 import { assertLeaseWindow, validateRunStart } from "./runStart.js";
 import { hsrHarnessControl, type HarnessControl } from "./harnessControl.js";
-import { createRunOperations, type RunOperations } from "./operations.js";
+import {
+  createRunOperations,
+  type ExecutionSessionRetirementResult,
+  type RunOperations,
+} from "./operations.js";
 import type { SignatureVerifier } from "./signing.js";
+import {
+  stopAndRetireExecutionSession,
+  stopAndSettleExecutionRuntime,
+  type ExecutionRuntimeOwner,
+  type ExecutionRuntimeSettlement,
+} from "./runtimeSettlement.js";
 
 /* ---------------------------------------------------------------- */
 /* Injected seams                                                    */
@@ -97,9 +114,12 @@ export type RunLaunchResult = {
 /**
  * Materialize the leased placement and start the harness for one reserved
  * Run. Must be path-free at the boundary: placement identity arrives as the
- * intent's placement/working-copy reference, never as a caller cwd. Throws
- * ExecutionProtocolError (MATERIALIZATION_FAILED / HARNESS_UNAVAILABLE / ...)
- * on typed refusals.
+ * intent's placement/working-copy reference, never as a caller cwd. A normal
+ * ExecutionProtocolError is also a positive assertion that no launched
+ * runtime remains; a failure after a side effect whose cleanup is unconfirmed
+ * MUST throw IndeterminateExecutionError. Unknown exceptions are treated as
+ * indeterminate by the coordinator. This distinction fences working-copy
+ * occupancy from a possibly-live harness.
  */
 export type RunLauncher = (request: RunLaunchRequest) => Promise<RunLaunchResult>;
 
@@ -117,6 +137,13 @@ export type ExecutionServiceOptions = {
   control?: HarnessControl;
   /** Strict stop for a spawn-known runtime; missing HSR meta is unconfirmed. */
   stopKnownExecution?: (beeName: string) => Promise<{ stopped: boolean; detail: string }>;
+  /** Exact SessionRecord archival after a release stop proof. */
+  retireSession?: (reservation: RunReservation) => Promise<ExecutionSessionRetirementResult>;
+  /** @internal complete pre-fence -> clean stop -> exact archive seam. */
+  stopAndRetireSession?: (
+    reservation: RunReservation,
+    context: string,
+  ) => Promise<ExecutionRuntimeSettlement>;
   harnessProbe?: HarnessProbe;
   verifySignature?: SignatureVerifier;
   now?: () => Date;
@@ -129,6 +156,8 @@ export type ExecutionServiceOptions = {
   afterLaunchClaim?: (reservation: RunReservation, attemptId: string) => void | Promise<void>;
   /** Test seam for a transient launch-lifecycle event-store rejection. */
   appendLaunchEvents?: typeof appendRunEvents;
+  /** Deterministic crash seam after exact runtime stop dispatch, before purge. */
+  afterRuntimeStopDispatch?: () => void | Promise<void>;
   /** @deprecated Elapsed time no longer grants launch authority. */
   launchGraceMs?: number;
 };
@@ -138,6 +167,21 @@ export type ExecutionServiceOptions = {
 /* ---------------------------------------------------------------- */
 
 export type NonEffectResult = { result: JsonObject } | { error: ExecutionErrorWire };
+
+export type ExecutionInventoryOutcome = {
+  runId?: string;
+  directory: string;
+  action: "stable" | "reconciled" | "resumed" | "deferred" | "error";
+  phase?: RunReservation["phase"];
+  detail?: string;
+  error?: string;
+};
+
+export type ExecutionInventoryPage = {
+  outcomes: ExecutionInventoryOutcome[];
+  /** Directory cursor for the next bounded page; null means wrap to head. */
+  nextAfterDirectory: string | null;
+};
 
 export type ExecutionService = {
   contract: ExecutionContract;
@@ -154,6 +198,8 @@ export type ExecutionService = {
   runCollect(request: JsonValue): Promise<JsonObject>;
   runRetain(request: JsonValue): Promise<JsonObject>;
   runRelease(request: JsonValue): Promise<JsonObject>;
+  /** Node-owned, bounded reconciliation over durable Run reservations. */
+  reconcileInventory(options?: { afterDirectory?: string; limit?: number }): Promise<ExecutionInventoryPage>;
 };
 
 /**
@@ -177,6 +223,49 @@ export async function inspectRunLaunchOwner(
   return "unverifiable";
 }
 
+/**
+ * Convert an exact run.release stop proof into the durable Honeybee lifecycle
+ * fact consumed by Apiary's Cell occupancy fence. transactionalRetire repeats
+ * the birth-safe substrate check under the session lifecycle generation lock;
+ * a replacement or mismatched record is never archived on the old Run's word.
+ */
+export async function retireExecutionSessionRecord(
+  reservation: RunReservation,
+  options: {
+    /** @internal exact teardown seam for lifecycle/ordering tests. */
+    retire?: (record: SessionRecord) => Promise<KillOutcome>;
+  } = {},
+): Promise<ExecutionSessionRetirementResult> {
+  const { loadSession } = await import("../store.js");
+  const record = await loadSession(reservation.beeName);
+  if (!record) {
+    return { retired: true, detail: "no SessionRecord remains" };
+  }
+  if (record.executionRunId !== reservation.runId) {
+    return {
+      retired: false,
+      detail: `SessionRecord belongs to ${record.executionRunId ?? "no execution Run"}`,
+    };
+  }
+  if (reservation.sessionRef !== undefined && record.id !== reservation.sessionRef) {
+    return {
+      retired: false,
+      detail: `SessionRecord identity ${record.id ?? "missing"} does not match ${reservation.sessionRef}`,
+    };
+  }
+  if (isArchivedSessionLifecycle(record)) {
+    return { retired: true, detail: "exact execution SessionRecord already archived" };
+  }
+  const retire = options.retire ?? (await import("../kill.js")).transactionalRetire;
+  const outcome = await retire(record);
+  return outcome.ok
+    ? { retired: true, detail: "exact execution SessionRecord archived" }
+    : {
+        retired: false,
+        detail: outcome.lastError ?? "exact SessionRecord retirement remained unconfirmed",
+      };
+}
+
 export function createExecutionService(options: ExecutionServiceOptions): ExecutionService {
   const contract = loadExecutionContract();
   const validator = createExecutionValidator(contract);
@@ -189,6 +278,21 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     const result = await (await import("../hsr/substrate.js")).stopKnownHsrExecution(beeName);
     return { stopped: result.ok, detail: result.ok ? "HSR stop confirmed" : result.stderr || "HSR stop unconfirmed" };
   });
+  const retireSession = options.retireSession ?? retireExecutionSessionRecord;
+  const stopAndRetireSession = options.stopAndRetireSession ?? (async (
+    reservation: RunReservation,
+    context: string,
+  ) => stopAndRetireExecutionSession(
+    {
+      runId: reservation.runId,
+      beeName: reservation.beeName,
+      ...(reservation.sessionRef ? { sessionRef: reservation.sessionRef } : {}),
+    },
+    context,
+    ...(options.afterRuntimeStopDispatch
+      ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
+      : []),
+  ));
   const inFlight = new Map<string, Promise<void>>();
   let launchOwnerPromise: Promise<RunLaunchOwner> | undefined;
   const launchOwner = (): Promise<RunLaunchOwner> => (launchOwnerPromise ??= (async () => {
@@ -235,6 +339,10 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     "readiness_evidence_missing",
     "session_ref_missing",
     "environment_receipt_missing",
+    "launcher_outcome_indeterminate",
+    "spawn_cleanup_unconfirmed",
+    "launch_commit_cleanup_unconfirmed",
+    "start_outcome_indeterminate",
     "readiness_stop_unconfirmed",
     "cancel_stop_unconfirmed",
     "release_stop_unconfirmed",
@@ -258,8 +366,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           enterLossEpisode(record, reservation.indeterminateCause!, reservation.indeterminateAt!),
         );
     const eventOrigin = await origin();
-    await appendRunEvents(
-      reservation.runId,
+    await appendRunLossEpisodeEvents(
+      durable,
       protocolVersion,
       [
         {
@@ -280,9 +388,9 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
 
   /**
    * Publish the observable end of one liveness-loss episode before its durable
-   * marker is cleared. This is intentionally separate from terminal append:
-   * an already-published terminal member may precede a later stop doubt, and
-   * appendRunTerminalEvents must not place an exit precursor after it.
+   * marker is cleared. A terminal member that raced ahead of the loss is
+   * removed by appendRunLossEpisodeEvents' cursor-reset generation and restored
+   * only after this contract-legal recovery/exit receipt stream is durable.
    */
   async function publishLossRecoveryExit(
     reservation: RunReservation,
@@ -291,6 +399,22 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
   ): Promise<RunReservation | null> {
     const recovering = await beginLostRecovery(reservation, verified);
     if (!recovering?.lossEpisodeId) return null;
+    if (recovering.result?.outcome === "completed") {
+      if (
+        recovering.phase !== "started" ||
+        !recovering.environment ||
+        !recovering.sessionRef
+      ) {
+        throw executionError(
+          "AUTHORITY_UNAVAILABLE",
+          `run ${recovering.runId} completed recovery lacks its canonical started receipts`,
+        );
+      }
+      // The contract has no recovering -> completed edge. This is a delayed,
+      // episode-keyed receipt for the runtime whose identity and later exit are
+      // now proven, so recovering -> running -> completed remains truthful.
+      await ensureStartedReceipts(recovering, recovering.lossEpisodeId);
+    }
     await appendRunEvents(
       recovering.runId,
       protocolVersion,
@@ -416,8 +540,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         now().toISOString(),
       ),
     );
-    await appendRunEvents(
-      runId,
+    await appendRunLossEpisodeEvents(
+      lost,
       protocolVersion,
       [{
         type: "run.lost",
@@ -433,26 +557,36 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
 
   async function cleanupUncommittedLaunch(
     result: RunLaunchResult,
+    owner: ExecutionRuntimeOwner,
     cause: string,
     indeterminateCause = "launch_commit_cleanup_unconfirmed",
   ): Promise<void> {
-    let stopped = false;
+    let settled = false;
     let detail = "launcher returned no exact runtime cleanup handle";
+    let stopDoubtPersisted = false;
     if (result.runtime) {
-      try {
-        const cleanup = await result.runtime.stop();
-        stopped = cleanup.stopped;
-        detail = cleanup.detail;
-      } catch (error) {
-        detail = error instanceof Error ? error.message : String(error);
-      }
+      const canonical = await stopAndSettleExecutionRuntime(
+        owner,
+        result.runtime,
+        cause,
+        ...(options.afterRuntimeStopDispatch
+          ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
+          : []),
+      );
+      settled = canonical.settled;
+      detail = canonical.detail;
+      if (!canonical.settled) stopDoubtPersisted = canonical.stopDoubtPersisted;
     }
-    if (!stopped) {
+    if (!settled) {
       throw indeterminateExecutionError(
         "HARNESS_UNAVAILABLE",
         `launched runtime could not commit ${cause} and exact cleanup was unconfirmed`,
         indeterminateCause,
-        { detail, ...(result.runtime ? { runtime: result.runtime.identity } : {}) },
+        {
+          detail,
+          ...(result.runtime ? { runtime: result.runtime.identity } : {}),
+          stopDoubtPersisted,
+        },
       );
     }
   }
@@ -483,7 +617,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         const failed = await commitRunTerminalResult(
           fresh.runId,
           { outcome: "failed", cause: "lease_expired", failureCause },
-          { now, canCommit: (record) => launchAttemptOwns(record, attemptId) },
+          {
+            now,
+            canCommit: (record) => launchAttemptOwns(record, attemptId),
+            launchOccupancyCleanupProof: "launcher-not-invoked",
+          },
         );
         await appendRunTerminalEvents(failed, protocolVersion, await origin());
         return;
@@ -492,7 +630,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         const cancelled = await commitRunTerminalResult(
           fresh.runId,
           { outcome: "cancelled", cause: "cancel_requested" },
-          { now, canCommit: (record) => launchAttemptOwns(record, attemptId) },
+          {
+            now,
+            canCommit: (record) => launchAttemptOwns(record, attemptId),
+            launchOccupancyCleanupProof: "launcher-not-invoked",
+          },
         );
         await appendRunTerminalEvents(cancelled, protocolVersion, await origin());
         return;
@@ -522,7 +664,11 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           ? await commitRunTerminalResult(
               runId,
               { outcome: "cancelled", cause: "cancel_requested" },
-              { now, canCommit: (record) => launchAttemptOwns(record, attemptId) && record.cancel !== undefined },
+              {
+                now,
+                canCommit: (record) => launchAttemptOwns(record, attemptId) && record.cancel !== undefined,
+                launchOccupancyCleanupProof: "launcher-not-invoked",
+              },
             )
           : blocked;
         if (settled.result) await appendRunTerminalEvents(settled, protocolVersion, await origin());
@@ -530,6 +676,9 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       }
       fresh = activation.reservation;
 
+      let launchedResult: RunLaunchResult | undefined;
+      let runtimeCleanupConfirmed = false;
+      let readinessCommitted = false;
       try {
         const launched = options.launcher({
           runId,
@@ -539,8 +688,15 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           ...(spawnedById ? { spawnedById } : {}),
         });
         const result = await launched;
+        launchedResult = result;
         if (!result.sessionRef) {
-          await cleanupUncommittedLaunch(result, "without a canonical session reference", "session_ref_missing");
+          await cleanupUncommittedLaunch(
+            result,
+            { runId, beeName: fresh.beeName },
+            "without a canonical session reference",
+            "session_ref_missing",
+          );
+          runtimeCleanupConfirmed = true;
           throw executionError("HARNESS_UNAVAILABLE", "harness reached readiness without a canonical session reference; exact cleanup confirmed");
         }
         const started = await commitRunLaunchStarted(
@@ -555,19 +711,32 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           // tear down only the concrete incarnation returned by this attempt.
           await cleanupUncommittedLaunch(
             result,
+            { runId, beeName: fresh.beeName },
             "because launch ownership was lost",
             started.reservation.cancel ? "cancel_stop_unconfirmed" : "launch_commit_cleanup_unconfirmed",
           );
+          runtimeCleanupConfirmed = true;
           const settled = started.reservation.cancel && !started.reservation.result
             ? await commitRunTerminalResult(
                 runId,
                 { outcome: "cancelled", cause: "cancel_requested" },
-                { now, canCommit: (record) => launchAttemptOwns(record, attemptId) && record.cancel !== undefined },
+                {
+                  now,
+                  canCommit: (record) => launchAttemptOwns(record, attemptId) && record.cancel !== undefined,
+                  launchOccupancyCleanupProof: "runtime-down",
+                },
               )
-            : started.reservation;
+            : started.reservation.result
+              ? await commitRunTerminalResult(
+                  runId,
+                  started.reservation.result,
+                  { now, launchOccupancyCleanupProof: "runtime-down" },
+                )
+              : started.reservation;
           await appendRunTerminalEvents(settled, protocolVersion, await origin());
           return;
         }
+        readinessCommitted = true;
         await appendRunEvents(
           runId,
           protocolVersion,
@@ -597,11 +766,24 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             // Prefer the launcher-returned incarnation handle while it is
             // available. The bound control path remains the compatibility
             // fallback for injected launchers that predate exact handles.
-            const stop = result.runtime
-              ? await result.runtime.stop()
-              : await control.stop(fresh.beeName);
-            stopConfirmed = stop.stopped;
-            detail = stop.detail;
+            if (result.runtime) {
+              const canonical = await stopAndSettleExecutionRuntime(
+                { runId, beeName: fresh.beeName },
+                result.runtime,
+                "cancel won after execution runtime publication",
+                ...(options.afterRuntimeStopDispatch
+                  ? [{ afterStopDispatch: options.afterRuntimeStopDispatch }]
+                  : []),
+              );
+              stopConfirmed = canonical.settled;
+              detail = canonical.detail;
+            } else {
+              // A legacy/injected launcher without an incarnation handle
+              // cannot birth-qualify the canonical row before signalling it.
+              // Keep the Run lost + occupied for reconciliation instead of
+              // reviving the stop-before-fence crash window.
+              detail = "launcher returned no exact runtime handle; no unfenced cancel stop was dispatched";
+            }
           } catch (error) {
             detail = error instanceof Error ? error.message : String(error);
           }
@@ -621,8 +803,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
                 : record,
             );
             if (unresolved.indeterminateCause === "cancel_stop_unconfirmed") {
-              await appendRunEvents(
-                runId,
+              await appendRunLossEpisodeEvents(
+                unresolved,
                 protocolVersion,
                 [{
                   type: "run.lost",
@@ -640,11 +822,57 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           await markLaunchLost(runId, error, wire);
           return;
         }
+        // Once started is durable, downstream receipt publication is
+        // self-healed by the reconcile call that follows this continuation.
+        // It must not be mistaken for a launch failure or trigger occupancy
+        // compensation for a genuinely running environment.
+        if (readinessCommitted) return;
+
+        // A coordinator/store failure can occur after the launcher returned
+        // but before its started CAS became durable. The normal launcher-error
+        // contract no longer covers that window, so stop the exact returned
+        // incarnation here. Only a confirmed stop can become terminal proof.
+        if (launchedResult && !runtimeCleanupConfirmed) {
+          try {
+            await cleanupUncommittedLaunch(
+              launchedResult,
+              { runId, beeName: fresh.beeName },
+              "after coordinator persistence failed before readiness commit",
+              "launch_commit_cleanup_unconfirmed",
+            );
+            runtimeCleanupConfirmed = true;
+          } catch (cleanupError) {
+            if (cleanupError instanceof IndeterminateExecutionError) {
+              await markLaunchLost(runId, cleanupError);
+              return;
+            }
+            throw cleanupError;
+          }
+        }
+        if (!(error instanceof ExecutionProtocolError) && !runtimeCleanupConfirmed) {
+          await markLaunchLost(
+            runId,
+            indeterminateExecutionError(
+              "AUTHORITY_UNAVAILABLE",
+              wire.message,
+              "launcher_outcome_indeterminate",
+              wire.details,
+            ),
+            wire,
+          );
+          return;
+        }
         const cause = `${wire.code}: ${wire.message}`;
         const failed = await commitRunTerminalResult(
           runId,
           { outcome: "failed", cause, failureCause: cause },
-          { now, canCommit: (record) => launchAttemptOwns(record, attemptId) },
+          {
+            now,
+            canCommit: (record) => launchAttemptOwns(record, attemptId),
+            launchOccupancyCleanupProof: runtimeCleanupConfirmed
+              ? "runtime-down"
+              : "launcher-definite-failure",
+          },
         );
         await appendRunTerminalEvents(failed, protocolVersion, await origin());
       }
@@ -676,17 +904,19 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
    * Reconcile a reservation with the durable session evidence: repair the
    * started-receipt-lost crash window, mark indeterminate outcomes lost, and
    * fold a finished harness into terminal state + events. Idempotent; called
-   * from run.start replays, run.get, and run.events.
+   * from run.start replays, run.get, mutations, and the node inventory. Event
+   * observation is deliberately excluded: high-frequency polling is a read,
+   * never a lifecycle retry clock.
    */
   async function reconcile(reservation: RunReservation): Promise<RunReservation> {
     await ensureAcceptedReceipt(reservation);
-    const launchEvidence = await options.sessions.evidence(reservation.beeName);
-    const classification = classifyLaunch(reservation, launchEvidence, {
-      inFlight: inFlight.has(reservation.runId),
+    let current = await reconcileRunLaunchOccupancyCleanup(reservation, { now });
+    const launchEvidence = await options.sessions.evidence(current.beeName);
+    const classification = classifyLaunch(current, launchEvidence, {
+      inFlight: inFlight.has(current.runId),
       nowMs: now().getTime(),
       ...(options.launchGraceMs !== undefined ? { graceMs: options.launchGraceMs } : {}),
     });
-    let current = reservation;
     if (classification === "started-receipt-lost") {
       // The process started durably but the receipt path crashed. Binding to
       // the provisional xr-* lookup name would leak the wrong public identity;
@@ -696,8 +926,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           record.result ? record : enterLossEpisode(record, "session_ref_missing", now().toISOString()),
         );
         if (!current.result) {
-          await appendRunEvents(
-            current.runId,
+          await appendRunLossEpisodeEvents(
+            current,
             protocolVersion,
             [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "session_ref_missing" }), origin: await origin() }],
             { onlyIfAbsentKeys: true },
@@ -718,8 +948,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
               : enterLossEpisode({ ...record, sessionRef: launchEvidence.sessionRef }, "environment_receipt_missing", now().toISOString()),
           );
           if (!current.result) {
-            await appendRunEvents(
-              current.runId,
+            await appendRunLossEpisodeEvents(
+              current,
               protocolVersion,
               [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "environment_receipt_missing" }), origin: await origin() }],
               { onlyIfAbsentKeys: true },
@@ -750,8 +980,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
           record.result ? record : enterLossEpisode(record, "readiness_evidence_missing", now().toISOString()),
         );
         if (!current.result) {
-          await appendRunEvents(
-            current.runId,
+          await appendRunLossEpisodeEvents(
+            current,
             protocolVersion,
             [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "readiness_evidence_missing" }), origin: await origin() }],
             { onlyIfAbsentKeys: true },
@@ -765,7 +995,12 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         current = await commitRunTerminalResult(
           current.runId,
           { outcome: "failed", cause, failureCause: cause },
-          { now, clearIndeterminate: true, canCommit: (record) => record.phase === "launching" },
+          {
+            now,
+            clearIndeterminate: true,
+            canCommit: (record) => record.phase === "launching",
+            launchOccupancyCleanupProof: "runtime-down",
+          },
         );
         await appendRunTerminalEvents(current, protocolVersion, await origin());
       }
@@ -774,14 +1009,17 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         current = await mutateReservation(current.runId, (record) =>
           record.result ? record : enterLossEpisode(record, "start_outcome_indeterminate", now().toISOString()),
         );
-        if (!current.result) {
-          await appendRunEvents(
-            current.runId,
-            protocolVersion,
-            [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: "start_outcome_indeterminate" }), origin: await origin() }],
-            { onlyIfAbsentKeys: true },
-          );
-        }
+      }
+      // The launch-claim CAS can persist loss before this separate event-log
+      // write. Always repair the observable edge from the durable episode;
+      // episode-key deduplication keeps ordinary reconciliation idempotent.
+      if (!current.result && current.indeterminateAt && current.indeterminateCause) {
+        await appendRunLossEpisodeEvents(
+          current,
+          protocolVersion,
+          [{ type: "run.lost", payload: lossEpisodePayload(current, { cause: current.indeterminateCause }), origin: await origin() }],
+          { onlyIfAbsentKeys: true },
+        );
       }
 
       // A readiness timeout whose first stop was unconfirmed remains lost,
@@ -790,10 +1028,13 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       // outcome evidence proves the process is down.
       if (current.indeterminateCause === "readiness_stop_unconfirmed") {
         const outcome = await options.sessions.outcome(current.beeName);
-        let stopConfirmed = Boolean(outcome && !outcome.live);
-        if (outcome?.live) {
+        let stopConfirmed = false;
+        if (outcome) {
           try {
-            stopConfirmed = (await stopKnownExecution(current.beeName)).stopped;
+            stopConfirmed = (await stopAndRetireSession(
+              current,
+              "reconcile readiness-timeout execution runtime",
+            )).settled;
           } catch {
             stopConfirmed = false;
           }
@@ -808,6 +1049,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
               now,
               clearIndeterminate: true,
               canCommit: (record) => record.indeterminateCause === "readiness_stop_unconfirmed",
+              launchOccupancyCleanupProof: "runtime-down",
             },
           );
           await appendRunTerminalEvents(current, protocolVersion, await origin());
@@ -835,21 +1077,22 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       }
     }
     await ensureStartedReceipts(current);
-    if (
-      current.phase === "launching" &&
-      current.cancel &&
-      !current.result &&
-      current.indeterminateCause === "cancel_stop_unconfirmed"
-    ) {
-      // The launcher lost its started CAS to cancellation and its first exact
-      // stop was unconfirmed. A later proven process exit (or strict stop of
-      // the still-bound HSR execution) is enough to resolve cancellation; no
-      // second launch is ever admitted while this owner token remains.
-      const outcome = await options.sessions.outcome(current.beeName);
-      let stopConfirmed = Boolean(outcome && !outcome.live);
-      if (outcome?.live) {
+    if (current.phase === "launching" && current.cancel && !current.result && current.indeterminateAt) {
+      // Cancellation of any activated, indeterminate launch is reconciled
+      // only from positive evidence. The coordinator may have died after fork
+      // and before SessionRecord publication, so an absent record is not
+      // evidence that no runtime exists.
+      const evidence = await options.sessions.evidence(current.beeName);
+      const ours = evidence.sessionExists &&
+        (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
+      const outcome = ours ? await options.sessions.outcome(current.beeName) : null;
+      let stopConfirmed = false;
+      if (ours && outcome) {
         try {
-          stopConfirmed = (await stopKnownExecution(current.beeName)).stopped;
+          stopConfirmed = (await stopAndRetireSession(
+            current,
+            "reconcile cancelled indeterminate launch",
+          )).settled;
         } catch {
           stopConfirmed = false;
         }
@@ -864,6 +1107,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
             now,
             clearIndeterminate: true,
             canCommit: (record) => !!attemptId && launchAttemptOwns(record, attemptId) && record.cancel !== undefined,
+            launchOccupancyCleanupProof: "runtime-down",
           },
         );
         await appendRunTerminalEvents(current, protocolVersion, await origin());
@@ -900,12 +1144,17 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       if (!current.result || terminalCancelStopDoubt) {
         const evidence = await options.sessions.evidence(current.beeName);
         const ours = evidence.sessionExists && (evidence.stampedRunId === undefined || evidence.stampedRunId === current.runId);
-        let stopConfirmed = true;
-        let detail = "no live harness";
+        let stopConfirmed = false;
+        let detail = "no durable session evidence proves the activated runtime is down";
         if (ours) {
           try {
-            const stop = await control.stop(current.beeName);
-            stopConfirmed = stop.stopped;
+            const stop = await stopAndRetireSession(
+              current,
+              current.cancel?.reason === "lease_expired"
+                ? "reconcile expired execution lease"
+                : "reconcile cancelled execution runtime",
+            );
+            stopConfirmed = stop.settled;
             detail = stop.detail;
           } catch (error) {
             stopConfirmed = false;
@@ -937,8 +1186,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
               : record,
           );
           if (current.indeterminateCause === "cancel_stop_unconfirmed") {
-            await appendRunEvents(
-              current.runId,
+            await appendRunLossEpisodeEvents(
+              current,
               protocolVersion,
               [{
                 type: "run.lost",
@@ -965,7 +1214,12 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         current = await commitRunTerminalResult(
           current.runId,
           { outcome: "cancelled", cause: "cancel_requested" },
-          { now, clearIndeterminate: true, canCommit: (record) => record.phase !== "started" },
+          {
+            now,
+            clearIndeterminate: true,
+            canCommit: (record) => record.phase !== "started",
+            launchOccupancyCleanupProof: "launcher-not-invoked",
+          },
         );
         await appendRunTerminalEvents(current, protocolVersion, await origin());
       }
@@ -1016,7 +1270,9 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     // Self-heal missing lifecycle events: a crash can land between a durable
     // state write and its event append, and replays deliberately skip side
     // effects — so every read re-derives the events its state implies.
-    if (current.result) await appendRunTerminalEvents(current, protocolVersion, await origin());
+    if (current.result && !current.indeterminateAt) {
+      await appendRunTerminalEvents(current, protocolVersion, await origin());
+    }
     const repairs: RunEventInput[] = [];
     if (current.sealedAt && current.environment) {
       repairs.push({
@@ -1102,6 +1358,8 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     ...(options.verifySignature ? { verifySignature: options.verifySignature } : {}),
     control,
     sessions: options.sessions,
+    retireSession,
+    stopAndRetireSession,
     settle: async (reservation) => {
       const settled = await reconcile(reservation);
       return { reservation: settled, state: deriveState(settled, inFlight.has(settled.runId)).state };
@@ -1179,6 +1437,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
         jobId: String(validated.intent.jobId),
         leaseId: String(validated.lease.leaseId),
         leaseExpiresAt: String(validated.lease.expiresAt),
+        lease: validated.lease,
         capabilityLeaseId: String(validated.authority.capabilityLeaseId),
         intent: validated.intent,
         ...(initiator ? { initiator } : {}),
@@ -1195,8 +1454,10 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
       }
       // Identical retry: replay the original receipt. The atomic durable claim
       // decides whether this process may continue the effect: reserved records
-      // are claimable; a launching record is claimable only after its exact
-      // owner is proven dead and positive launch evidence is absent.
+      // are claimable; a preparing attempt is claimable only after its exact
+      // owner is proven dead and positive launch evidence is absent. An
+      // activated attempt can only recover from positive evidence, never by
+      // repeating its non-idempotent launcher.
       let current = await reconcile(reservation);
       current = await continueLaunch(current, validated.lease);
       current = await reconcile((await readReservation(current.runId))!);
@@ -1233,8 +1494,12 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
 
   async function runEvents(request: JsonValue): Promise<NonEffectResult> {
     try {
-      const reservation = await reconcile(await loadReservationFor(request, "run-events-request"));
-      await ops.reconcileOperations(reservation.runId);
+      // Projection-only by contract. Apiary polls this endpoint at a much
+      // higher cadence than lifecycle backoff; coupling observation to
+      // reconcile/operation progression caused every poll to retry stop,
+      // retirement, and release effects. Full repair belongs to run.get,
+      // mutation entrypoints, and the node-owned durable inventory lane.
+      const reservation = await loadReservationFor(request, "run-events-request");
       const doc = request as JsonObject;
       const afterSeq = Number(doc.afterSeq ?? 0);
       const all = await readRunEvents(reservation.runId);
@@ -1304,6 +1569,84 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     }
   }
 
+  /**
+   * Reconcile a bounded durable inventory page without a client connection.
+   * Only the two states that positively prove the launcher was never invoked
+   * may resume (`reserved`, or a `preparing` attempt). Activated, legacy-stage,
+   * and indeterminate launches are observation-only and can recover solely
+   * from positive session evidence inside reconcile().
+   */
+  async function reconcileInventory(options: {
+    afterDirectory?: string;
+    limit?: number;
+  } = {}): Promise<ExecutionInventoryPage> {
+    const page = await listRunReservationInventory(options);
+    const outcomes: ExecutionInventoryOutcome[] = [];
+    for (const entry of page.entries) {
+      if ("error" in entry) {
+        outcomes.push({ directory: entry.directory, action: "error", error: entry.error });
+        continue;
+      }
+      const before = entry.reservation;
+      try {
+        let current = await reconcile(await ensureRunReservationIndexed(before));
+        let resumed = false;
+        let deferredDetail: string | undefined;
+        const launcherProvablyNotInvoked =
+          !current.result &&
+          !current.indeterminateAt &&
+          (current.phase === "reserved" ||
+            (current.phase === "launching" && current.launchAttempt?.stage === "preparing"));
+        if (launcherProvablyNotInvoked) {
+          if (current.lease) {
+            resumed = true;
+            current = await continueLaunch(current, current.lease);
+            const durable = await readReservation(current.runId);
+            if (durable) current = await reconcile(durable);
+          } else {
+            deferredDetail = "legacy reservation has no durable validated lease; identical run.start replay required";
+          }
+        } else if (
+          !current.result &&
+          !current.indeterminateAt &&
+          current.phase === "launching" &&
+          current.launchAttempt?.stage === "launching" &&
+          current.lease
+        ) {
+          // Let the durable owner-death claim path record an honest lost
+          // episode. continueLaunch cannot invoke an activated attempt: its
+          // only resumable disposition is stage=preparing.
+          current = await continueLaunch(current, current.lease);
+          const durable = await readReservation(current.runId);
+          if (durable) current = await reconcile(durable);
+        }
+        await ops.reconcileOperations(current.runId);
+        const latest = (await readReservation(current.runId)) ?? current;
+        outcomes.push({
+          runId: latest.runId,
+          directory: entry.directory,
+          action: deferredDetail
+            ? "deferred"
+            : resumed
+              ? "resumed"
+              : JSON.stringify(latest) === JSON.stringify(before)
+                ? "stable"
+                : "reconciled",
+          phase: latest.phase,
+          ...(deferredDetail ? { detail: deferredDetail } : {}),
+        });
+      } catch (error) {
+        outcomes.push({
+          runId: before.runId,
+          directory: entry.directory,
+          action: "error",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return { outcomes, nextAfterDirectory: page.nextAfterDirectory };
+  }
+
   return {
     contract,
     validator,
@@ -1319,6 +1662,7 @@ export function createExecutionService(options: ExecutionServiceOptions): Execut
     runCollect: ops.runCollect,
     runRetain: ops.runRetain,
     runRelease: ops.runRelease,
+    reconcileInventory,
   };
 }
 
@@ -1362,7 +1706,22 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
         import("../hsr/runDir.js"),
         import("../hsr/observe.js"),
       ]);
-      const meta = await readHsrMeta(beeName);
+      const [record, meta] = await Promise.all([loadSession(beeName), readHsrMeta(beeName)]);
+
+      // The durable SessionRecord owns lifecycle and unresolved-stop intent.
+      // HSR meta is process evidence only and must never override an archive,
+      // an exact stop-doubt fence, or a legacy terminal fact.
+      if (record?.stateMachine !== undefined && isArchivedSessionLifecycle(record)) {
+        return { live: false, exitCode: null };
+      }
+      if (record?.status === "kill_failed") return null;
+      if (
+        record?.stateMachine === undefined
+        && (record?.status === "dead" || record?.status === "done")
+      ) {
+        return { live: false, exitCode: null };
+      }
+
       if (meta) {
         if (meta.status === "exited") return { live: false, exitCode: meta.exitCode ?? null };
         if (!meta.mirrorOfNode) {
@@ -1372,11 +1731,20 @@ export function storeSessionEvidenceSource(): SessionEvidenceSource {
         }
         return { live: true };
       }
-      const record = await loadSession(beeName);
       if (!record) return null;
-      // A record-only HSR session proves identity/ownership, not process
-      // liveness. Its host meta may be delayed; wait for it (or a later record
-      // terminal state) instead of treating the label "running" as proof.
+      if (record.stateMachine !== undefined) {
+        // A canonical-active record-only HSR session proves identity and
+        // ownership, not process liveness. Its host meta may be delayed, so a
+        // stale scalar must never turn it into positive or negative proof.
+        if (record.substrate === "hsr") return null;
+        return record.stateMachine.runtime === "live" || record.stateMachine.runtime === "recovering"
+          ? { live: true }
+          : { live: false, exitCode: null };
+      }
+      // Cursor-less records retain the exact legacy contract: running HSR is
+      // identity-only/unknown, while a durable non-running scalar is the old
+      // terminal evidence used to resolve pre-cursor loss episodes. The
+      // kill_failed exception was fenced before process-meta inspection.
       if (record.substrate === "hsr" && record.status === "running") return null;
       return record.status === "running" ? { live: true } : { live: false, exitCode: null };
     },

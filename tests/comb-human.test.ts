@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { attachBeeToRun } from "../src/comb/attachment.js";
 import { canonicalDigest } from "../src/comb/canonical.js";
 import {
+  AgentActivationAmbiguousError,
   sweepCombs,
   type AgentAdoptRequest,
   type CombSweepDeps,
 } from "../src/comb/controller.js";
+import { SpawnAfterForkError } from "../src/spawnRuntime.js";
+import { adoptCombAgent, createCombSweeper } from "../src/daemon/combSweep.js";
+import { withSessionLifecycleTransaction } from "../src/lifecycle.js";
 import {
   ForumCommandError,
   type ForumPacketEffectRequest,
@@ -31,7 +35,9 @@ import type {
   RunRecord,
 } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
+import type { BeeState } from "../src/state.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-comb-human-"));
@@ -101,6 +107,12 @@ function session(dir: string): SessionRecord {
     updatedAt: "2026-07-28T12:00:00.000Z",
     status: "running",
   };
+}
+
+async function writeMixedVersionSession(dir: string, record: SessionRecord): Promise<void> {
+  const sessions = join(dir, "sessions");
+  await mkdir(sessions, { recursive: true });
+  await writeFile(join(sessions, `${record.name}.json`), `${JSON.stringify(record, null, 2)}\n`);
 }
 
 function seal(
@@ -1580,6 +1592,358 @@ test("a quarantined malformed packet does not block another human run's valid ve
   });
 });
 
+test("comb attachment uses canonical lifecycle over stale mixed-version status", async () => {
+  await withTempStore(async (dir) => {
+    const at = "2026-07-28T12:00:00.000Z";
+    const active: SessionRecord = {
+      ...session(dir),
+      name: "canonical-active-attachment",
+      tmuxTarget: "canonical-active-attachment",
+      status: "done",
+      stateMachine: lifecycleCursor("canonical-active-attachment", "active", at),
+    };
+    await writeMixedVersionSession(dir, active);
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "canonical-lifecycle-attachment",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: active.name, entryNodeId: "work" },
+      now: at,
+      policies: { retireAgentsOnTerminal: false },
+    });
+
+    const attached = await attachBeeToRun({
+      runId: created.id,
+      beeName: active.name,
+      deliver: false,
+      now: () => Date.parse("2026-07-28T12:00:01.000Z"),
+    });
+    assert.equal(attached.bee, active.name, "canonical active outranks stale done");
+
+    const archived: SessionRecord = {
+      ...session(dir),
+      name: "canonical-archived-attachment",
+      tmuxTarget: "canonical-archived-attachment",
+      status: "running",
+      stateMachine: lifecycleCursor("canonical-archived-attachment", "archived", at),
+    };
+    await writeMixedVersionSession(dir, archived);
+    await assert.rejects(
+      () => attachBeeToRun({ runId: created.id, beeName: archived.name, deliver: false }),
+      /terminal/,
+      "canonical archive outranks stale running",
+    );
+
+    const stopDoubt: SessionRecord = {
+      ...session(dir),
+      name: "canonical-active-kill-failed-attachment",
+      tmuxTarget: "canonical-active-kill-failed-attachment",
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("canonical-active-kill-failed-attachment", "active", at),
+    };
+    await writeMixedVersionSession(dir, stopDoubt);
+    await assert.rejects(
+      () => attachBeeToRun({ runId: created.id, beeName: stopDoubt.name, deliver: false }),
+      /terminal/,
+      "failed-stop doubt must fence attachment even while lifecycle remains active",
+    );
+  });
+});
+
+test("comb holds a past-stall activation while its bee has unresolved stop ownership", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "stop-doubt-hold",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [{ id: "retry-work", from: "work", to: "work", kind: "retry", on: "failed" }],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: {
+        stallMs: 1_000,
+        retryBackoffMs: 0,
+        retireAgentsOnTerminal: false,
+      },
+    });
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    let spawnCalls = 0;
+    let spawnedName = "";
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => {
+        spawnCalls += 1;
+        spawnedName = request.name;
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    const stopDoubt: SessionRecord = {
+      ...session(dir),
+      name: spawnedName,
+      tmuxTarget: spawnedName,
+      status: "kill_failed",
+      stateMachine: lifecycleCursor(spawnedName, "active", "2026-07-28T12:00:02.000Z"),
+    };
+    now = Date.parse("2026-07-28T12:01:00.000Z");
+
+    await sweepCombs(deps, [stopDoubt], new Map());
+
+    const run = (await loadRun(created.id))!;
+    const activation = current(run, "work");
+    assert.equal(activation.address.attempt, 1);
+    assert.equal(activation.status, "active");
+    assert.equal(activation.failure, undefined);
+    assert.equal(Object.values(run.activations).length, 1, "stop doubt must not create a retry attempt");
+    assert.equal(Object.values(run.effects).length, 1, "stop doubt must not prepare a second effect");
+    assert.equal(spawnCalls, 1, "stop doubt must not spawn a replacement worker");
+  });
+});
+
+test("comb automatic retry loses to kill_failed after its tick snapshot without retry metadata or spawn", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "automatic-retry-kill-wins",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [{ id: "retry-work", from: "work", to: "work", kind: "retry", on: "failed" }],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
+    });
+    let now = Date.parse("2026-07-28T12:00:01.000Z");
+    let spawnCalls = 0;
+    let spawnedName = "";
+    let admissions = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => {
+        spawnCalls += 1;
+        spawnedName = request.name;
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      withAgentSourceAdmission: async (sources, _fn) => {
+        admissions += 1;
+        assert.deepEqual(sources.map((source) => source.name), [spawnedName]);
+        throw new Error("comb automatic retry: source became kill_failed after snapshot");
+      },
+      now: () => now,
+    };
+
+    await sweepCombs(deps, [], new Map());
+    const before = (await loadRun(created.id))!;
+    assert.equal(current(before, "work").status, "active");
+    now = Date.parse("2026-07-28T12:00:10.000Z");
+    const frozenTerminal = {
+      ...session(dir),
+      name: spawnedName,
+      tmuxTarget: spawnedName,
+      status: "dead" as const,
+    };
+    const outcomes = await sweepCombs(
+      deps,
+      [frozenTerminal],
+      new Map([[spawnedName, "dead" as BeeState]]),
+    );
+
+    const after = (await loadRun(created.id))!;
+    const activation = current(after, "work");
+    assert.equal(admissions, 1);
+    assert.equal(spawnCalls, 1, "the successor is never launched");
+    assert.equal(activation.address.attempt, 1);
+    assert.equal(activation.status, "active");
+    assert.equal(activation.failure, undefined, "stale ownership is never marked retryable");
+    assert.equal(Object.values(after.activations).length, 1);
+    assert.equal(Object.values(after.effects).length, 1);
+    assert.ok(outcomes.some((outcome) =>
+      outcome.action === "error" && outcome.error?.includes("became kill_failed")));
+  });
+});
+
+test("default Comb admission rejects revived or still-live sources behind frozen terminal/stall evidence", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "automatic-retry-live-source-fence",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [{ id: "retry-work", from: "work", to: "work", kind: "retry", on: "failed" }],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retryBackoffMs: 0, stallMs: 1_000, retireAgentsOnTerminal: false },
+    });
+    let now = Date.parse("2026-07-28T12:00:00.000Z");
+    let spawns = 0;
+    let spawnedName = "";
+    const sweeper = createCombSweeper({
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => {
+        spawns += 1;
+        spawnedName = request.name;
+        return { name: request.name };
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      listHumanPackets: async () => [],
+      now: () => now,
+    }, { detached: false });
+    await sweeper([], new Map());
+
+    const canonical: SessionRecord = {
+      name: spawnedName,
+      agent: "codex",
+      cwd: dir,
+      command: "codex",
+      tmuxTarget: spawnedName,
+      substrate: "hsr",
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:02.000Z",
+      status: "running",
+      runtimeGeneration: 2,
+    };
+    await saveSession(canonical);
+    const frozenDead = { ...canonical, status: "dead" as const };
+    now += 10_000;
+
+    const terminal = await sweeper([frozenDead], new Map([[spawnedName, "dead" as BeeState]]));
+    const stalled = await sweeper([canonical], new Map([[spawnedName, "idle_with_output" as BeeState]]));
+    assert.equal(spawns, 1, "neither stale death nor a live stall launches a successor");
+    assert.ok([...terminal, ...stalled].some((outcome) =>
+      outcome.action === "error" && outcome.error?.includes("still owns runnable")));
+    const run = (await loadRun(created.id))!;
+    assert.equal(current(run, "work").address.attempt, 1);
+    assert.equal(current(run, "work").status, "active");
+    assert.equal(Object.values(run.effects).length, 1);
+  });
+});
+
+test("comb holds an indeterminate launch and never starts a second activation", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "ambiguous-agent-launch",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [{ id: "retry-work", from: "work", to: "work", kind: "retry", on: "failed" }],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
+    });
+    let spawns = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async () => {
+        spawns += 1;
+        throw new SpawnAfterForkError(
+          "runtime-publish",
+          {
+            identity: { kind: "hsr", beeName: "escaped-comb-bee", hostPid: 4242 },
+            stop: async () => ({ stopped: false, detail: "still live" }),
+          },
+          { stopped: false, detail: "exact host absence unconfirmed" },
+          new Error("publication failed"),
+        );
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      now: () => Date.parse("2026-07-28T12:00:01.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    await sweepCombs(deps, [], new Map());
+
+    const run = (await loadRun(created.id))!;
+    const activation = current(run, "work");
+    assert.equal(spawns, 1, "an unresolved launch is never followed by another spawn");
+    assert.equal(activation.address.attempt, 1);
+    assert.equal(activation.status, "active");
+    assert.equal(Object.values(run.effects)[0]?.status, "ambiguous");
+  });
+});
+
+test("comb preserves a published bee when binding or delivery fails", async () => {
+  await withTempStore(async (dir) => {
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "published-before-binding",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [{ id: "retry-work", from: "work", to: "work", kind: "retry", on: "failed" }],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retryBackoffMs: 0, stallMs: 0, retireAgentsOnTerminal: false },
+    });
+    let spawns = 0;
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async (request) => {
+        spawns += 1;
+        throw new AgentActivationAmbiguousError(
+          { name: request.name, id: "published-id" },
+          new Error("brief delivery outcome unknown"),
+        );
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      now: () => Date.parse("2026-07-28T12:10:00.000Z"),
+    };
+
+    await sweepCombs(deps, [], new Map());
+    await sweepCombs(deps, [], new Map());
+
+    const run = (await loadRun(created.id))!;
+    const activation = current(run, "work");
+    assert.equal(spawns, 1);
+    assert.equal(Object.values(run.effects)[0]?.status, "ambiguous");
+    assert.equal(activation.beeHandles[0]?.id, "published-id", "the live Bee remains tracked");
+    assert.equal(activation.status, "active", "ambiguous delivery never becomes retryable failure");
+  });
+});
+
 test("comb run attachment durably adopts the bee before evidence can count", async () => {
   await withTempStore(async (dir) => {
     const bee = session(dir);
@@ -1644,8 +2008,192 @@ test("comb run attachment durably adopts the bee before evidence can count", asy
     }, [bee], new Map());
     const recovered = (await loadRun(run.id))!;
     assert.equal(recovered.status, "active");
-    assert.equal(Object.values(recovered.effects)[0]?.status, "confirmed");
-    assert.equal(current(recovered, "work").beeHandles[0]?.name, bee.name);
-    assert.equal(recoveries, 1);
+    assert.equal(Object.values(recovered.effects)[0]?.status, "ambiguous");
+    assert.equal(current(recovered, "work").beeHandles.length, 0);
+    assert.equal(recoveries, 0, "restart never repeats an adoption delivery without a receipt");
+  });
+});
+
+test("comb attachment loses to cancellation before its under-lock run mutation", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    await saveSession(bee);
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "attach-cancel-race",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: bee.name, entryNodeId: "work" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+
+    await assert.rejects(
+      () => attachBeeToRun({
+        runId: created.id,
+        beeName: bee.name,
+        deliver: false,
+        beforeRunMutation: async () => {
+          await cancelRun(created.id, {
+            reason: "operator cancellation won",
+            requestedBy: "race-test",
+            now: "2026-07-28T12:00:01.000Z",
+          });
+        },
+      }),
+      /no longer active/,
+    );
+
+    const run = (await loadRun(created.id))!;
+    const storedBee = (await loadSession(bee.name))!;
+    assert.equal(run.status, "cancelled");
+    assert.equal(Object.keys(run.effects).length, 0, "refused attachment creates no latent effect");
+    assert.equal(current(run, "work").status, "pending");
+    assert.equal(storedBee.combActivations, undefined, "refused attachment creates no binding");
+    assert.equal(storedBee.brief, undefined, "refused attachment creates no delivery metadata");
+  });
+});
+
+test("direct Comb attachment loses to a kill after its snapshot with zero delivery or binding", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    await saveSession(bee);
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "direct-attach-kill-race",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: bee.name, entryNodeId: "work" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retireAgentsOnTerminal: false },
+    });
+    let deliveries = 0;
+
+    await assert.rejects(
+      () => attachBeeToRun({
+        runId: created.id,
+        beeName: bee.name,
+        deliverText: async () => {
+          deliveries += 1;
+        },
+        beforeSessionAdmission: async () => {
+          await withSessionLifecycleTransaction(bee, async (lifecycle) => {
+            await lifecycle.commit({ status: "kill_failed", lastError: "operator stop won" });
+          });
+        },
+      }),
+      /unresolved stop state/,
+    );
+
+    const run = (await loadRun(created.id))!;
+    const storedBee = (await loadSession(bee.name))!;
+    assert.equal(deliveries, 0);
+    assert.equal(Object.keys(run.effects).length, 0);
+    assert.equal(storedBee.combActivations, undefined);
+    assert.equal(storedBee.brief, undefined);
+    assert.equal(storedBee.status, "kill_failed");
+  });
+});
+
+test("direct Comb attachment holds an ambiguous delivery instead of creating a retry", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    await saveSession(bee);
+    const created = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "direct-attach-delivery-ambiguity",
+        input: { kind: "informal", description: "none" },
+        nodes: [agentNode("work")],
+        edges: [{ id: "retry-work", from: "work", to: "work", kind: "retry", on: "failed" }],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "attached", beeName: bee.name, entryNodeId: "work" },
+      now: "2026-07-28T12:00:00.000Z",
+      policies: { retryBackoffMs: 0, retireAgentsOnTerminal: false },
+    });
+
+    await assert.rejects(
+      () => attachBeeToRun({
+        runId: created.id,
+        beeName: bee.name,
+        deliverText: async () => {
+          throw new Error("transport reply lost after acceptance");
+        },
+      }),
+      /transport reply lost/,
+    );
+
+    const deps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async () => {
+        throw new Error("must not spawn");
+      },
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      now: () => Date.parse("2026-07-28T12:10:00.000Z"),
+    };
+    await sweepCombs(deps, [bee], new Map());
+
+    const run = (await loadRun(created.id))!;
+    assert.equal(Object.values(run.effects)[0]?.status, "ambiguous");
+    assert.equal(current(run, "work").status, "active");
+    assert.equal(Object.values(run.activations).length, 1, "no retry activation is created");
+    assert.equal((await loadSession(bee.name))?.combActivations, undefined);
+  });
+});
+
+test("daemon Comb adoption loses to a kill before admission with no latent delivery", async () => {
+  await withTempStore(async (dir) => {
+    const bee = session(dir);
+    await saveSession(bee);
+    let deliveries = 0;
+    const request: AgentAdoptRequest = {
+      runId: "CR.daemon-kill-race",
+      activation: { runId: "CR.daemon-kill-race", nodeId: "work", attempt: 1, itemIndex: 0 },
+      name: bee.name,
+      agent: "codex",
+      substrate: "hsr",
+      cwd: dir,
+      brief: "must not be delivered",
+      taskId: "CR.daemon-kill-race/work/1/0",
+      attempt: 1,
+      trackDigest: canonicalDigest("must not be delivered"),
+    };
+
+    await assert.rejects(
+      () => adoptCombAgent(request, {
+        beforeSessionAdmission: async () => {
+          await withSessionLifecycleTransaction(bee, async (lifecycle) => {
+            await lifecycle.commit({ status: "kill_failed", lastError: "daemon lost to stop" });
+          });
+        },
+        deliver: async () => {
+          deliveries += 1;
+        },
+      }),
+      /unresolved stop state/,
+    );
+
+    const storedBee = (await loadSession(bee.name))!;
+    assert.equal(deliveries, 0);
+    assert.equal(storedBee.combActivations, undefined);
+    assert.equal(storedBee.brief, undefined);
+    assert.equal(storedBee.status, "kill_failed");
   });
 });

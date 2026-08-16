@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
+import { localGithubSessionCredentialLeaseId } from "../src/execution/localCredentials.js";
 import {
   consumeHsrRunPayload,
   hsrStartupFailureForPayload,
@@ -240,6 +241,67 @@ test("parent spawn failure removes an unconsumed payload and redacts its content
   } finally {
     if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
     else process.env.HIVE_STORE_ROOT = previous;
+    await rm(store, { recursive: true, force: true });
+  }
+});
+
+test("execution parent strips arbitrary env before writing the handoff or forking the runner", async () => {
+  const store = await mkdtemp(join(tmpdir(), "hive-hsr-cell-env-store-"));
+  const previousStore = process.env.HIVE_STORE_ROOT;
+  const previousAws = process.env.AWS_SECRET_ACCESS_KEY;
+  const previousNodeOptions = process.env.NODE_OPTIONS;
+  process.env.HIVE_STORE_ROOT = store;
+  process.env.AWS_SECRET_ACCESS_KEY = "ambient-aws-secret";
+  process.env.NODE_OPTIONS = "--require=/tmp/ambient-hook.cjs";
+  const runId = "run-cell-env-handoff";
+  let written: HsrRunPayload | undefined;
+  let hostEnv: NodeJS.ProcessEnv | undefined;
+  try {
+    await assert.rejects(
+      spawnHsrHost({
+        bee: "cell-env-handoff",
+        kind: "claude",
+        cwd: process.cwd(),
+        filesystemWriteScope: "cwd",
+        executionRunId: runId,
+        runtimeCredentialLeaseIds: [localGithubSessionCredentialLeaseId(runId)],
+        accountId: "acct-claude-1",
+        spec: {
+          command: "claude",
+          args: [],
+          env: {
+            CLAUDE_CONFIG_DIR: join(store, "accounts", "claude-1"),
+            GH_TOKEN: "unleased-explicit-gh",
+            AWS_ACCESS_KEY_ID: "gateway-aws-id",
+            RANDOM_GATEWAY_SECRET: "gateway-secret",
+          },
+        },
+      }, {
+        resolveEntry: async () => ({ path: "/unused/runner-entry.js", mode: "dedicated" }),
+        spawn: ((_command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) => {
+          const payloadPath = args.at(-1)!;
+          written = JSON.parse(readFileSync(payloadPath, "utf8")) as HsrRunPayload;
+          hostEnv = options.env;
+          throw new Error("injected spawn stop");
+        }) as unknown as typeof import("node:child_process").spawn,
+      }),
+      /injected spawn stop/,
+    );
+    assert.deepEqual(written?.spec.env, { CLAUDE_CONFIG_DIR: join(store, "accounts", "claude-1") });
+    assert.equal(written?.runtimeCredentialLeaseIds?.[0], localGithubSessionCredentialLeaseId(runId));
+    assert.equal(hostEnv?.HIVE_STORE_ROOT, store, "the runner host keeps its exact control-plane root");
+    for (const forbidden of ["AWS_SECRET_ACCESS_KEY", "NODE_OPTIONS", "GH_TOKEN", "RANDOM_GATEWAY_SECRET"]) {
+      assert.equal(forbidden in (hostEnv ?? {}), false, `${forbidden} is absent from the detached host env`);
+    }
+    const serialized = JSON.stringify(written);
+    assert.doesNotMatch(serialized, /ambient-aws-secret|ambient-hook|unleased-explicit-gh|gateway-aws-id|gateway-secret/);
+  } finally {
+    if (previousStore === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previousStore;
+    if (previousAws === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = previousAws;
+    if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previousNodeOptions;
     await rm(store, { recursive: true, force: true });
   }
 });

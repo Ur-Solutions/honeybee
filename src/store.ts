@@ -16,6 +16,7 @@ import type { ProcessBirthFingerprint } from "./hsr/processIdentity.js";
 import {
   IllegalBeeTransitionError,
   isBeeStateMachineCursor,
+  isArchivedSessionLifecycle,
   isProbeEvidence,
   isUnverifiedCursorMarker,
   makeStateMachineCursor,
@@ -41,6 +42,40 @@ export type TaskSupplyConfig = {
   feeds?: number;
   /** Breaker tripped; cleared only by `hive task supply <bee> --on`. */
   paused?: boolean;
+};
+
+export type DeliveryStopDoubt = {
+  version: 1;
+  deliveryId: string;
+  contentDigest: string;
+  source: {
+    createdAt: string;
+    runtimeGeneration: number;
+    id?: string;
+    uuid?: string;
+  };
+  createdAt: string;
+  fenceError: string;
+};
+
+/**
+ * Canonical projection of a purge-surviving HSR event-integrity receipt.
+ * The source is the exact provider-host birth (and remote generation, when
+ * applicable), while the marker itself fences the Bee name until an operator
+ * explicitly acknowledges the corresponding outside-store receipt.
+ */
+export type HsrEventIntegrityDoubt = {
+  version: 1;
+  integrityId: string;
+  source: {
+    hostPid: number;
+    startedAt: string;
+    hostFingerprint?: ProcessBirthFingerprint;
+    remoteLaunchId?: string;
+    remoteIncarnation?: string;
+  };
+  createdAt: string;
+  fenceError: string;
 };
 
 export type SessionRecord = {
@@ -146,6 +181,10 @@ export type SessionRecord = {
   updatedAt: string;
   status: "running" | "dead" | "kill_failed" | "done";
   lastError?: string;
+  /** Exact provider-delivery doubt retained when every sidecar write failed. */
+  deliveryStopDoubt?: DeliveryStopDoubt;
+  /** Independent event-history loss fence; cleared only by exact HSR reconcile. */
+  eventIntegrityDoubt?: HsrEventIntegrityDoubt;
   notes?: string;
   id?: string;
   prefix?: string;
@@ -167,6 +206,11 @@ export type SessionRecord = {
   sealHighWaterFilename?: string;
   /** Monotonic relaunch counter; initial spawn is generation zero. */
   runtimeGeneration?: number;
+  /**
+   * SHA-256 verifier for this exact Cell runtime's broker capability. The
+   * plaintext capability is never persisted in the SessionRecord.
+   */
+  cellBrokerCapabilityHash?: string;
   title?: string;
   /** Who set `title`: user beats auto beats provider (see naming.ts). */
   titleSource?: "user" | "auto" | "provider";
@@ -188,6 +232,10 @@ export type SessionRecord = {
   brief?: string;
   briefedAt?: string;
   node?: string;
+  /** Client-generated idempotency key for the authoritative remote-HSR launch. */
+  remoteLaunchId?: string;
+  /** Remote-issued immutable logical runtime generation for stale-controller fencing. */
+  remoteIncarnation?: string;
   /** Substrate hosting this bee. Absent = local-tmux (back-compat). "hsr" = pane-less Hive Substrate Runner. */
   substrate?: "local-tmux" | "hsr";
   /** HSR: runner process pid (structured-tier child or server). */
@@ -219,7 +267,7 @@ export type SessionRecord = {
    * fabricating lifecycle status or an observed runtime state.
    */
   recoveryRequestedAt?: string;
-  /** Exact queued buz message whose delivery owns the recovery obligation. */
+  /** Exact queued buz message currently at the head of the recovery obligation. */
   recoveryMessageId?: string;
   /** Persisted wake failures so daemon restarts cannot reset the retry cap. */
   recoveryAttemptCount?: number;
@@ -234,6 +282,13 @@ export type SessionRecord = {
    * indeterminate) without ever counting processes.
    */
   executionRunId?: string;
+  /**
+   * Signed execution-lease runtime credential identifiers retained so an HSR
+   * revive cannot silently gain, lose, or substitute credential authority.
+   * Values are non-secret; the runner resolves material only after validating
+   * the exact Run-bound policy.
+   */
+  executionRuntimeCredentialLeaseIds?: string[];
   /**
    * Extra sandbox write roots granted at spawn (`hive spawn --sandbox-write`,
    * Apiary Cell Layout v2 wrappers). Persisted so relaunches (revive/swap)
@@ -319,13 +374,12 @@ export function isActiveSessionRecord(
   // Once the bounded cursor exists its lifecycle axis is authoritative. In
   // particular, an archived cursor must never remain in the probe set merely
   // because a mixed-version reader still sees the legacy status spelling.
-  if (record.stateMachine?.lifecycle === "archived") return false;
+  if (isArchivedSessionLifecycle(record)) return false;
   if (record.stateMachine?.lifecycle === "active") return true;
   // kill_failed means teardown could not prove the runtime stopped. Keep it in
   // the daemon work set until an operator retries/repairs it. Likewise a
   // provider/runtime `error` observation can recover on a later tick. Neither
   // contributes an account commitment (limits/commitments owns that policy).
-  if (record.status === "done") return false;
   if (record.recoveryRequestedAt) return true;
   if (record.status !== "running" && record.status !== "kill_failed") return false;
   return true;
@@ -1053,8 +1107,9 @@ const TOUCH_HEARTBEAT_MS = 60_000;
 
 /** Whether a record still benefits from a persisted observation freshness lease. */
 export function shouldPersistObservationHeartbeat(
-  record: Pick<SessionRecord, "status">,
+  record: Pick<SessionRecord, "status" | "stateMachine">,
 ): boolean {
+  if (record.stateMachine !== undefined) return !isArchivedSessionLifecycle(record);
   return record.status !== "done" && record.status !== "dead";
 }
 
@@ -1899,15 +1954,103 @@ function validateStrictSessionRecord(value: unknown, path: string): void {
   if (object.agentPaneId !== undefined && (typeof object.agentPaneId !== "string" || object.agentPaneId.length === 0)) {
     throw new Error(`Invalid session record ${path}: agentPaneId must be a non-empty string when present`);
   }
+  if (object.deliveryStopDoubt !== undefined && !normalizeDeliveryStopDoubt(object.deliveryStopDoubt)) {
+    throw new Error(`Invalid session record ${path}: malformed deliveryStopDoubt`);
+  }
+  if (object.eventIntegrityDoubt !== undefined && !normalizeHsrEventIntegrityDoubt(object.eventIntegrityDoubt)) {
+    throw new Error(`Invalid session record ${path}: malformed eventIntegrityDoubt`);
+  }
 }
 
-const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "lastObservedState", "lastObservedStateAt", "recoveryRequestedAt", "recoveryMessageId", "recoveryNextAttemptAt", "runId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
+function normalizeDeliveryStopDoubt(value: unknown): DeliveryStopDoubt | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const marker = value as Record<string, unknown>;
+  const source = marker.source;
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const identity = source as Record<string, unknown>;
+  if (
+    marker.version !== 1 ||
+    typeof marker.deliveryId !== "string" || marker.deliveryId.length === 0 ||
+    typeof marker.contentDigest !== "string" || !/^[a-f0-9]{64}$/.test(marker.contentDigest) ||
+    typeof marker.createdAt !== "string" || !Number.isFinite(Date.parse(marker.createdAt)) ||
+    typeof marker.fenceError !== "string" || marker.fenceError.length === 0 ||
+    typeof identity.createdAt !== "string" || !Number.isFinite(Date.parse(identity.createdAt)) ||
+    !Number.isSafeInteger(identity.runtimeGeneration) || (identity.runtimeGeneration as number) < 0 ||
+    (identity.id !== undefined && typeof identity.id !== "string") ||
+    (identity.uuid !== undefined && typeof identity.uuid !== "string")
+  ) return null;
+  return {
+    version: 1,
+    deliveryId: marker.deliveryId,
+    contentDigest: marker.contentDigest,
+    source: {
+      createdAt: identity.createdAt,
+      runtimeGeneration: identity.runtimeGeneration as number,
+      ...(typeof identity.id === "string" ? { id: identity.id } : {}),
+      ...(typeof identity.uuid === "string" ? { uuid: identity.uuid } : {}),
+    },
+    createdAt: marker.createdAt,
+    fenceError: marker.fenceError,
+  };
+}
+
+function normalizeEventIntegrityFingerprint(value: unknown): ProcessBirthFingerprint | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const fingerprint = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(fingerprint.pgid) || Number(fingerprint.pgid) <= 0) return null;
+  if (typeof fingerprint.startedAt !== "string" || fingerprint.startedAt.length === 0) return null;
+  return { pgid: Number(fingerprint.pgid), startedAt: fingerprint.startedAt };
+}
+
+function normalizeHsrEventIntegrityDoubt(value: unknown): HsrEventIntegrityDoubt | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const marker = value as Record<string, unknown>;
+  const source = marker.source;
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const identity = source as Record<string, unknown>;
+  const remoteLaunchId = identity.remoteLaunchId;
+  const remoteIncarnation = identity.remoteIncarnation;
+  const hasRemote = remoteLaunchId !== undefined || remoteIncarnation !== undefined;
+  if (
+    marker.version !== 1
+    || typeof marker.integrityId !== "string" || marker.integrityId.length === 0
+    || typeof marker.createdAt !== "string" || !Number.isFinite(Date.parse(marker.createdAt))
+    || typeof marker.fenceError !== "string" || marker.fenceError.length === 0
+    || !Number.isSafeInteger(identity.hostPid) || (identity.hostPid as number) <= 0
+    || typeof identity.startedAt !== "string" || !Number.isFinite(Date.parse(identity.startedAt))
+    || (identity.hostFingerprint !== undefined && !normalizeEventIntegrityFingerprint(identity.hostFingerprint))
+    || (hasRemote && (
+      typeof remoteLaunchId !== "string" || remoteLaunchId.length === 0
+      || typeof remoteIncarnation !== "string" || remoteIncarnation.length === 0
+    ))
+  ) return null;
+  return {
+    version: 1,
+    integrityId: marker.integrityId,
+    source: {
+      hostPid: identity.hostPid as number,
+      startedAt: identity.startedAt,
+      ...(identity.hostFingerprint !== undefined ? {
+        hostFingerprint: normalizeEventIntegrityFingerprint(identity.hostFingerprint)!,
+      } : {}),
+      ...(hasRemote ? {
+        remoteLaunchId: remoteLaunchId as string,
+        remoteIncarnation: remoteIncarnation as string,
+      } : {}),
+    },
+    createdAt: marker.createdAt,
+    fenceError: marker.fenceError,
+  };
+}
+
+const OPTIONAL_STRING_SESSION_KEYS = ["notes", "id", "prefix", "uuid", "requestedAgent", "homePath", "lastPrompt", "lastPromptAt", "transcriptPath", "providerSessionId", "terminalTranscriptDiscoveryAt", "sealHighWaterFilename", "title", "autoTitleAt", "colony", "swarmId", "caste", "brief", "briefedAt", "lastError", "node", "remoteLaunchId", "remoteIncarnation", "lastObservedState", "lastObservedStateAt", "recoveryRequestedAt", "recoveryMessageId", "recoveryNextAttemptAt", "runId", "executionRunId", "flowName", "accountId", "agentPaneId", "combId", "parentId", "reportsToId", "spawnedById", "forkedFromId", "forkedAt", "seedMode", "forkCheckpoint", "model", "modelExtraArgs", "runnerTier", "poolKey", "kitVersion", "kitProfile", "lastReviveCommand"] as const;
 
 const KNOWN_SESSION_KEYS = new Set<string>([
   "name", "agent", "cwd", "command", "tmuxTarget", "createdAt", "updatedAt", "status",
   ...OPTIONAL_STRING_SESSION_KEYS,
   "launchArgv",
   "sandboxWriteRoots",
+  "executionRuntimeCredentialLeaseIds",
   "substrate",
   "runnerPid",
   "runnerFingerprint",
@@ -1919,6 +2062,7 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "providerTitleKind",
   "autoTitleAttempts",
   "runtimeGeneration",
+  "cellBrokerCapabilityHash",
   "recoveryAttemptCount",
   "buzAccept",
   "taskSupply",
@@ -1926,6 +2070,8 @@ const KNOWN_SESSION_KEYS = new Set<string>([
   "contract",
   "preamble",
   "combActivations",
+  "deliveryStopDoubt",
+  "eventIntegrityDoubt",
   "stateMachine",
   "stateUnverified",
 ]);
@@ -1999,6 +2145,19 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
 
   if (object.autoswap === true) record.autoswap = true;
 
+  if (object.deliveryStopDoubt !== undefined) {
+    const marker = normalizeDeliveryStopDoubt(object.deliveryStopDoubt);
+    if (!marker) throw new Error(`Invalid session record ${path}: malformed deliveryStopDoubt`);
+    record.deliveryStopDoubt = marker;
+  }
+
+
+  if (object.eventIntegrityDoubt !== undefined) {
+    const marker = normalizeHsrEventIntegrityDoubt(object.eventIntegrityDoubt);
+    if (!marker) throw new Error(`Invalid session record ${path}: malformed eventIntegrityDoubt`);
+    record.eventIntegrityDoubt = marker;
+  }
+
   // Extra sandbox write roots: only well-formed absolute paths survive the
   // load; a malformed entry is dropped rather than thrown (forward-compatible
   // like buzAccept), and an empty result omits the field entirely.
@@ -2007,6 +2166,15 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
       (value): value is string => typeof value === "string" && value.length > 0 && isAbsolute(value),
     );
     if (roots.length > 0) record.sandboxWriteRoots = [...roots];
+  }
+  if (
+    Array.isArray(object.executionRuntimeCredentialLeaseIds) &&
+    object.executionRuntimeCredentialLeaseIds.length > 0 &&
+    object.executionRuntimeCredentialLeaseIds.every(
+      (value) => typeof value === "string" && value.length > 0 && value.length <= 128,
+    )
+  ) {
+    record.executionRuntimeCredentialLeaseIds = [...object.executionRuntimeCredentialLeaseIds] as string[];
   }
 
   // Session preamble: forward-compatible like contract — a malformed block is
@@ -2105,6 +2273,9 @@ function normalizeSessionRecord(value: unknown, path: string): SessionRecord {
   }
   if (typeof object.runtimeGeneration === "number" && Number.isSafeInteger(object.runtimeGeneration) && object.runtimeGeneration >= 0) {
     record.runtimeGeneration = object.runtimeGeneration;
+  }
+  if (typeof object.cellBrokerCapabilityHash === "string" && /^sha256:[a-f0-9]{64}$/.test(object.cellBrokerCapabilityHash)) {
+    record.cellBrokerCapabilityHash = object.cellBrokerCapabilityHash;
   }
   if (typeof object.recoveryAttemptCount === "number" && Number.isSafeInteger(object.recoveryAttemptCount) && object.recoveryAttemptCount >= 0) {
     record.recoveryAttemptCount = object.recoveryAttemptCount;

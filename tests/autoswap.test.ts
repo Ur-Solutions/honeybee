@@ -5,6 +5,7 @@ import { dispatchAutoswaps, selectSwapTarget, type AutoswapCandidate } from "../
 import type { UsageTickOutcome } from "../src/daemon/usageSampler.js";
 import type { SessionRecord } from "../src/store.js";
 import type { UsageSummary } from "../src/usage.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const NOW = Date.parse("2026-06-10T12:00:00.000Z");
 
@@ -74,6 +75,7 @@ test("dispatchAutoswaps swaps an opted-in exhausted bee to the deterministic nex
     account("codex-other", "2026-01-01T00:00:00Z", "codex"),
   ];
   const outcomes = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    loadRecord: async () => record(),
     listAccounts: async () => accounts,
     accountHasCredentials: async () => true,
     usageSummary: async (id) => summary(id),
@@ -88,8 +90,69 @@ test("dispatchAutoswaps swaps an opted-in exhausted bee to the deterministic nex
   assert.deepEqual(outcomes, [{ bee: "CL.a", from: "claude-current", to: "claude-spare", ok: true }]);
 });
 
+test("dispatchAutoswaps performs zero account work for canonical-active stop doubt", async () => {
+  const at = "2026-06-10T00:00:00.000Z";
+  const snapshot = record();
+  const stopDoubt = record({
+    status: "kill_failed",
+    stateMachine: lifecycleCursor("CL.a", "active", at),
+  });
+  let listed = 0;
+  let swapped = 0;
+  const outcomes = await dispatchAutoswaps([snapshot], [outcome("CL.a")], {
+    loadRecord: async () => stopDoubt,
+    listAccounts: async () => {
+      listed += 1;
+      return [];
+    },
+    swapAccount: async (candidate) => {
+      swapped += 1;
+      return candidate;
+    },
+    now: () => NOW,
+  });
+
+  assert.equal(listed, 0, "stop doubt is fenced before credential/account discovery");
+  assert.equal(swapped, 0, "automatic recovery must never relaunch across explicit stop intent");
+  assert.deepEqual(outcomes, [{
+    bee: "CL.a",
+    from: "claude-current",
+    ok: false,
+    skipped: "bee is not runnable (stop state unresolved)",
+  }]);
+});
+
+test("dispatchAutoswaps ignores an old-account exhaustion after an explicit account change", async () => {
+  const snapshot = record({ accountId: "claude-current" });
+  const current = record({ accountId: "claude-manual" });
+  let listed = 0;
+  let swapped = 0;
+  const outcomes = await dispatchAutoswaps([snapshot], [outcome("CL.a")], {
+    loadRecord: async () => current,
+    listAccounts: async () => {
+      listed += 1;
+      return [];
+    },
+    swapAccount: async (candidate) => {
+      swapped += 1;
+      return candidate;
+    },
+    now: () => NOW,
+  });
+
+  assert.equal(listed, 0, "stale exhaustion is fenced before account discovery");
+  assert.equal(swapped, 0, "stale exhaustion cannot replace the manually switched runtime");
+  assert.deepEqual(outcomes, [{
+    bee: "CL.a",
+    from: "claude-manual",
+    ok: false,
+    skipped: "exhaustion trigger account is no longer current",
+  }]);
+});
+
 test("dispatchAutoswaps never rotates a bee onto a paused account", async () => {
   const outcomes = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    loadRecord: async () => record(),
     listAccounts: async () => [
       account("claude-current", "2026-01-01T00:00:00Z"),
       { ...account("claude-spare", "2026-01-02T00:00:00Z"), pausedAt: "2026-06-01T00:00:00Z" },
@@ -109,6 +172,7 @@ test("dispatchAutoswaps never rotates a bee onto a paused account", async () => 
 test("dispatchAutoswaps skips bees without opt-in and reports no-candidate cases", async () => {
   // Not opted in: no outcome at all.
   const ignored = await dispatchAutoswaps([record({ autoswap: undefined })], [outcome("CL.a")], {
+    loadRecord: async () => record({ autoswap: undefined }),
     listAccounts: async () => [],
     now: () => NOW,
   });
@@ -116,6 +180,7 @@ test("dispatchAutoswaps skips bees without opt-in and reports no-candidate cases
 
   // Opted in, but every alternative lacks creds or is cooling off.
   const outcomes = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    loadRecord: async () => record(),
     listAccounts: async () => [account("claude-current", "2026-01-01T00:00:00Z"), account("claude-dry", "2026-01-02T00:00:00Z")],
     accountHasCredentials: async (candidate) => candidate.id !== "claude-dry",
     usageSummary: async (id) => summary(id),
@@ -130,6 +195,7 @@ test("dispatchAutoswaps skips bees without opt-in and reports no-candidate cases
 
   // Swap errors surface in the outcome instead of throwing.
   const failing = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    loadRecord: async () => record(),
     listAccounts: async () => [account("claude-current", "2026-01-01T00:00:00Z"), account("claude-spare", "2026-01-02T00:00:00Z")],
     accountHasCredentials: async () => true,
     usageSummary: async (id) => summary(id),
@@ -157,6 +223,7 @@ test("dispatchAutoswaps narrows candidates to the bee's provider (glm stays with
   ];
   const beeRecord = record({ name: "OC.a", agent: "opencode", accountId: "zai-current" });
   const outcomes = await dispatchAutoswaps([beeRecord], [{ bee: "OC.a", account: "zai-current", sampled: false, exhausted: true }], {
+    loadRecord: async () => beeRecord,
     listAccounts: async () => accounts,
     accountHasCredentials: async () => true,
     usageSummary: async (id) => summary(id),
@@ -180,6 +247,7 @@ test("dispatchAutoswaps tolerates undefined provider (legacy claude account stil
     account("claude-spare", "2026-01-02T00:00:00Z"),
   ];
   const outcomes = await dispatchAutoswaps([record()], [outcome("CL.a")], {
+    loadRecord: async () => record(),
     listAccounts: async () => accounts,
     accountHasCredentials: async () => true,
     usageSummary: async (id) => summary(id),

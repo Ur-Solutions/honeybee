@@ -3,8 +3,10 @@ import type { ChildProcess } from "node:child_process";
 import type {
   RunnerAdapter,
   RunnerEvent,
+  RunnerInputAnswer,
   RunnerInputQuestion,
   RunnerOpts,
+  RunnerPreparedAnswer,
   RunnerSession,
   RunnerTier,
 } from "../types.js";
@@ -278,6 +280,8 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
   const child: ChildProcess = await spawnSessionChild(spawn.command, spawn.args, {
     cwd: opts.cwd,
     env: spawn.env,
+    onChildSpawnPending: opts.onChildSpawnPending,
+    onChildSpawnFailure: opts.onChildSpawnFailure,
     onChildSpawn: opts.onChildSpawn,
   });
   if (!child.stdin || !child.stdout) throw new Error("hsr kimi: ACP child has no stdio pipes");
@@ -308,6 +312,8 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
       void telemetry?.stop();
       if (active) settleTurn(activeGeneration, false);
     },
+    eventHost: opts.eventHost,
+    onEventPersistenceFailure: opts.onEventPersistenceFailure,
   });
   const { events, ingestEvent, snapshot, hasExited } = plumbing;
 
@@ -406,10 +412,10 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
     );
   }
 
-  const cancelPendingInputs = (): void => {
+  const cancelPendingInputs = async (): Promise<void> => {
     for (const [requestId, pending] of pendingInputs) {
-      pendingInputs.delete(requestId);
-      peer.respond(pending.id, { outcome: { outcome: "cancelled" } });
+      await peer.respond(pending.id, { outcome: { outcome: "cancelled" } });
+      if (pendingInputs.get(requestId) === pending) pendingInputs.delete(requestId);
     }
   };
 
@@ -469,6 +475,25 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
     throw new Error(`hsr kimi ACP setup failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  const prepareAnswer = async (requestId: string, answer: RunnerInputAnswer): Promise<RunnerPreparedAnswer> => {
+    const pending = pendingInputs.get(requestId);
+    if (!pending) throw new Error(`hsr kimi: no pending input for requestId ${requestId}`);
+    if (!peer.canRespond()) throw new Error("hsr kimi: ACP stdin is not writable");
+    const answerText = typeof answer === "string" ? answer : JSON.stringify(answer);
+    const response = encodeKimiPermissionAnswer(pending.params, answerText);
+    return {
+      async dispatch(): Promise<void> {
+        await peer.respond(pending.id, response);
+        if (pendingInputs.get(requestId) === pending) pendingInputs.delete(requestId);
+      },
+    };
+  };
+
+  const answer = async (requestId: string, value: RunnerInputAnswer): Promise<void> => {
+    const prepared = await prepareAnswer(requestId, value);
+    await prepared.dispatch();
+  };
+
   const session: RunnerSession = {
     sessionId,
     tier: "stream",
@@ -482,7 +507,7 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
     },
     async interrupt() {
       if (hasExited()) return { status: "already_idle" } as const;
-      cancelPendingInputs();
+      await cancelPendingInputs();
       if (!active) return { status: "already_idle" } as const;
       const settlement = activeSettlement;
       const generation = activeGeneration;
@@ -496,20 +521,14 @@ export async function startKimiRunner(opts: RunnerOpts, dependencies: KimiRunner
       ]);
       return { status: "interrupt_requested" } as const;
     },
-    async answer(requestId, answer): Promise<void> {
-      const pending = pendingInputs.get(requestId);
-      if (!pending) throw new Error(`hsr kimi: no pending input for requestId ${requestId}`);
-      const answerText = typeof answer === "string" ? answer : JSON.stringify(answer);
-      const response = encodeKimiPermissionAnswer(pending.params, answerText);
-      pendingInputs.delete(requestId);
-      peer.respond(pending.id, response);
-    },
+    prepareAnswer,
+    answer,
     events,
     snapshot,
     async stop(): Promise<void> {
       if (stopping) return plumbing.exitedPromise;
       stopping = true;
-      cancelPendingInputs();
+      await cancelPendingInputs().catch(() => undefined);
       if (active && !hasExited()) {
         cancelledGenerations.add(activeGeneration);
         peer.notify("session/cancel", { sessionId });

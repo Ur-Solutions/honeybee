@@ -20,9 +20,10 @@
  *     subscribe {bee, afterSeq} — durable replay then live tail under ONE
  *              monotonic seq numbering: reply {ok:true, gap?}, emit hsr.event
  *              for every retained event with seq > afterSeq, then keep
- *              streaming live appends. Live events produced DURING the backlog
- *              emission are buffered and merged on seq (no dupes, no holes) —
- *              the remoteEventMirror backfill pattern, keyed on seq.
+ *              streaming live appends. The backlog is consumed in bounded
+ *              exact pages; live events produced DURING replay set a dirty bit
+ *              and are reread durably from the last seq (no dupes, no holes,
+ *              and no second unbounded in-memory queue).
  *     ackEvents {bee, upToSeq} — advance the durable consumer watermark.
  *     everything else — dispatched into the controller methods map the serve
  *              mode uses (spawn/send/interrupt/answer/pendingInput/snapshot/
@@ -47,11 +48,12 @@
  * Node builtins + local HSR modules only — bundles dependency-free.
  */
 
+import { createHash } from "node:crypto";
 import { listHsrBees } from "./observe.js";
 import {
-  markHsrConsumerSubscribed,
+  markHsrConsumerSubscribedStrict,
   onHsrEventAppended,
-  readHsrEventsAfterSeq,
+  readHsrEventsPageAfterSeqStrict,
   readHsrMeta,
   readHsrSeqState,
 } from "./runDir.js";
@@ -124,6 +126,10 @@ export type GatewayConnectOptions = {
   backoffMaxMs?: number;
   /** Presence poll cadence (best-effort status edges); tests shrink it. */
   presencePollMs?: number;
+  /** Outbound replay backpressure tuning; production defaults are conservative. */
+  replayHighWaterBytes?: number;
+  replayDrainStepMs?: number;
+  replayDrainMaxMs?: number;
 };
 
 export type GatewayConnectHandle = {
@@ -135,10 +141,16 @@ type BeePresence = { bee: string; status: string; sessionId?: string; lastSeq?: 
 
 /**
  * One per-connection subscription. `cursor` is the highest seq already emitted
- * to the gateway; `buffer` holds live tap events while the durable backlog is
- * being emitted (null once armed — the steady live-tail state).
+ * to the gateway; replay state records only whether a later durable page is
+ * needed while the immutable backlog snapshot is being emitted.
  */
-type Subscription = { cursor: number; buffer: RunnerEvent[] | null };
+type Subscription = {
+  cursor: number;
+  /** Durable backlog is being replayed in bounded immutable pages. */
+  replaying: boolean;
+  /** A same-process append landed after the current immutable page opened. */
+  dirty: boolean;
+};
 
 /**
  * All state bound to ONE physical socket. Every respond/notify/emit and the
@@ -172,6 +184,12 @@ export function gatewayUrlWithCell(gatewayUrl: string, cellId: string): string {
   return url.toString();
 }
 
+/** Stable durable-consumer identity reused across every reconnect. */
+export function gatewayEventConsumerId(gatewayUrl: string, cellId: string): string {
+  const authority = gatewayUrlWithCell(gatewayUrl, cellId);
+  return `gateway:${createHash("sha256").update(authority).digest("hex").slice(0, 40)}`;
+}
+
 /** The hello/presence row for one bee, read off its run dir. Null without meta. */
 async function presenceRow(bee: string): Promise<BeePresence | null> {
   const meta = await readHsrMeta(bee);
@@ -201,10 +219,14 @@ async function enumerateBees(): Promise<BeePresence[]> {
  */
 export function connectToGateway(options: GatewayConnectOptions): GatewayConnectHandle {
   const url = gatewayUrlWithCell(options.gatewayUrl, options.cellId);
+  const eventConsumerId = gatewayEventConsumerId(options.gatewayUrl, options.cellId);
   const backoffInitialMs = Math.max(1, options.backoffInitialMs ?? DEFAULT_BACKOFF_INITIAL_MS);
   const backoffMaxMs = Math.max(backoffInitialMs, options.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS);
   const presencePollMs = Math.max(1, options.presencePollMs ?? DEFAULT_PRESENCE_POLL_MS);
   const stableOpenMs = Math.max(backoffInitialMs, DEFAULT_STABLE_OPEN_MS);
+  const replayHighWaterBytes = Math.max(0, options.replayHighWaterBytes ?? REPLAY_HIGH_WATER_BYTES);
+  const replayDrainStepMs = Math.max(1, options.replayDrainStepMs ?? REPLAY_DRAIN_STEP_MS);
+  const replayDrainMaxMs = Math.max(replayDrainStepMs, options.replayDrainMaxMs ?? REPLAY_DRAIN_MAX_MS);
 
   let closed = false;
   // The one connection that owns the transport right now. Every socket-scoped
@@ -239,40 +261,75 @@ export function connectToGateway(options: GatewayConnectOptions): GatewayConnect
   /** Emit one live event if it advances the subscription cursor (dupe guard). */
   function emitLive(conn: Connection, bee: string, sub: Subscription, event: RunnerEvent): void {
     const seq = event.seq;
-    if (typeof seq !== "number" || seq <= sub.cursor) return;
+    if (!isOpen(conn.socket) || typeof seq !== "number" || seq <= sub.cursor) return;
     sub.cursor = seq;
     notify(conn, "hsr.event", { bee, event });
   }
 
+  function closeForReplayBackpressure(conn: Connection): void {
+    try {
+      conn.socket.close();
+    } catch {
+      // already closing
+    }
+  }
+
   // ONE tap for the handle's lifetime: appends for a subscribed bee stream (or
-  // buffer, mid-replay) to the CURRENT connection's socket; a superseded
+  // mark dirty, mid-replay) to the CURRENT connection's socket; a superseded
   // connection no longer receives taps, and everything else is ignored.
   const offTap = onHsrEventAppended((bee, event) => {
     const conn = current;
     if (!conn) return;
     const sub = conn.subscriptions.get(bee);
     if (!sub) return;
-    if (sub.buffer !== null) {
-      sub.buffer.push(event);
+    if (sub.replaying) {
+      // The event is durable. Remember only that another exact page is needed;
+      // retaining every live event while a large backlog drains would merely
+      // move the unbounded suffix from disk into memory.
+      sub.dirty = true;
+      return;
+    }
+    // The process-local tap cannot await an async drain. Once the gateway is
+    // behind, close before enqueueing more live frames and let its durable ack
+    // drive an exact paged replay on the next connection. Also close if this
+    // one frame crosses the threshold; at most one bounded frame sits above
+    // the configured high-water.
+    if (conn.socket.bufferedAmount > replayHighWaterBytes) {
+      closeForReplayBackpressure(conn);
       return;
     }
     emitLive(conn, bee, sub, event);
+    if (conn.socket.bufferedAmount > replayHighWaterBytes) closeForReplayBackpressure(conn);
   });
 
-  /** Yield while the socket's send buffer is over the replay high-water. */
+  /**
+   * Yield while the socket's send buffer is over the replay high-water.
+   * A peer that cannot drain within the bounded window loses this connection:
+   * continuing would merely move the durable on-disk backlog into an
+   * unbounded WebSocket buffer. Its next connection resumes from the last
+   * durable gateway ack.
+   */
   async function drainReplay(conn: Connection): Promise<void> {
     let waited = 0;
-    while (isOpen(conn.socket) && current === conn && conn.socket.bufferedAmount > REPLAY_HIGH_WATER_BYTES && waited < REPLAY_DRAIN_MAX_MS) {
-      await new Promise<void>((resolve) => setTimeout(resolve, REPLAY_DRAIN_STEP_MS));
-      waited += REPLAY_DRAIN_STEP_MS;
+    while (isOpen(conn.socket) && current === conn && conn.socket.bufferedAmount > replayHighWaterBytes && waited < replayDrainMaxMs) {
+      await new Promise<void>((resolve) => setTimeout(resolve, replayDrainStepMs));
+      waited += replayDrainStepMs;
+    }
+    if (!isOpen(conn.socket) || current !== conn) {
+      throw new Error("gateway replay connection closed before its buffered events drained");
+    }
+    if (conn.socket.bufferedAmount > replayHighWaterBytes) {
+      closeForReplayBackpressure(conn);
+      throw new Error(`gateway replay backpressure did not drain within ${replayDrainMaxMs}ms`);
     }
   }
 
   /**
    * subscribe {bee, afterSeq}: durable replay then seamless live tail.
    * Registration happens BEFORE the backlog read, so any event that lands
-   * during the read is either already IN the read (it hit disk first) or
-   * buffered by the tap — the seq cursor merges the two without dupes/holes.
+   * during the read is either already IN its immutable page snapshot or marks
+   * the subscription dirty for another durable page — the seq cursor merges
+   * the two without dupes/holes or an unbounded live-event buffer.
    */
   async function handleSubscribe(conn: Connection, id: number, params: unknown): Promise<void> {
     const p = (params ?? {}) as { bee?: unknown; afterSeq?: unknown };
@@ -286,33 +343,81 @@ export function connectToGateway(options: GatewayConnectOptions): GatewayConnect
       return;
     }
     const afterSeq = p.afterSeq;
-    // Mark this bee as having an active durable consumer so its un-acked events
-    // survive compaction (exact resume) even before the first ack lands.
-    await markHsrConsumerSubscribed(bee).catch(() => undefined);
-    const sub: Subscription = { cursor: afterSeq, buffer: [] };
+    // Mark this stable gateway as an active durable consumer so its un-acked
+    // events survive compaction before the first ack lands. Admission is
+    // strict: a late new consumer cannot claim an already-folded prefix.
+    try {
+      await markHsrConsumerSubscribedStrict(bee, eventConsumerId);
+    } catch (error) {
+      respondError(conn, id, CODE_INTERNAL, error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const sub: Subscription = { cursor: afterSeq, replaying: true, dirty: false };
     // Still current AND still the registered subscription for this bee — a
     // superseded socket or a re-subscribe must never write back.
-    const alive = (): boolean => current === conn && conn.subscriptions.get(bee) === sub;
+    const alive = (): boolean => isOpen(conn.socket) && current === conn && conn.subscriptions.get(bee) === sub;
     conn.subscriptions.set(bee, sub); // a re-subscribe replaces the prior cursor
-    const { events, gap } = await readHsrEventsAfterSeq(bee, afterSeq);
-    if (!alive()) return; // socket superseded / re-subscribed mid-read — drop
-    // The response (gap included) precedes the replayed events; WS frames on
-    // one socket are ordered, so the gateway sees exactly response → backlog
-    // → live.
-    respond(conn, id, { ok: true, ...(gap ? { gap } : {}) });
-    for (const event of events) {
-      if (!alive()) return; // replaced/torn down mid-replay
-      emitLive(conn, bee, sub, event);
-      if (conn.socket.bufferedAmount > REPLAY_HIGH_WATER_BYTES) await drainReplay(conn);
-    }
-    // Arm the live tail: merge everything buffered during the backlog emission
-    // through the same cursor (events present in both phases skip on seq).
-    const buffered = sub.buffer ?? [];
-    sub.buffer = null;
-    for (const event of buffered) {
-      if (!alive()) return;
-      emitLive(conn, bee, sub, event);
-      if (conn.socket.bufferedAmount > REPLAY_HIGH_WATER_BYTES) await drainReplay(conn);
+    let responded = false;
+    try {
+      // Drain one immutable bounded snapshot at a time. Appends racing a
+      // snapshot set only `dirty`; after its final page we open another exact
+      // snapshot at the projected cursor. No replay response or in-memory
+      // buffer grows with a slow consumer's retained suffix.
+      for (;;) {
+        sub.dirty = false;
+        let pageToken: string | undefined;
+        do {
+          const page = await readHsrEventsPageAfterSeqStrict(
+            bee,
+            sub.cursor,
+            eventConsumerId,
+            pageToken,
+          );
+          if (!alive()) return;
+          if (!responded) {
+            respond(conn, id, { ok: true, ...(page.gap ? { gap: page.gap } : {}) });
+            responded = true;
+          }
+          for (const event of page.events) {
+            if (!alive()) return;
+            emitLive(conn, bee, sub, event);
+            if (conn.socket.bufferedAmount > replayHighWaterBytes) await drainReplay(conn);
+          }
+          if (page.gap) {
+            // The ordered response already exposed the missing range. Do not
+            // invent a seamless live tail across it; the gateway must resume
+            // from its reconciled durable cursor.
+            sub.replaying = false;
+            return;
+          }
+          if (page.throughSeq !== sub.cursor) {
+            throw new Error(`gateway replay cursor for ${bee} disagrees with its exact page high-water`);
+          }
+          pageToken = page.pageToken;
+          if (page.hasMore !== (pageToken !== undefined)) {
+            throw new Error(`gateway replay continuation for ${bee} is malformed`);
+          }
+        } while (pageToken);
+        if (!sub.dirty) {
+          // Synchronous transition: the append tap cannot interleave between
+          // the final dirty check and arming the live tail.
+          sub.replaying = false;
+          return;
+        }
+      }
+    } catch (error) {
+      if (!responded) {
+        respondError(conn, id, CODE_INTERNAL, error instanceof Error ? error.message : String(error));
+      } else {
+        // A later page proved corruption/busy after the ordered success frame.
+        // Drop this socket so the gateway resumes from its last durable ack;
+        // never continue a live tail across an unproven suffix.
+        try {
+          conn.socket.close();
+        } catch {
+          // already closing
+        }
+      }
     }
   }
 
@@ -328,7 +433,16 @@ export function connectToGateway(options: GatewayConnectOptions): GatewayConnect
     }
     const ctx: RpcConnectionCtx = { connectionId: conn.id, close: () => conn.socket.close() };
     try {
-      const result = await handler(params, ctx);
+      const consumerScopedParams = (
+        method === "spawn"
+        || method === "events"
+        || method === "ackEvents"
+        || method === "observe"
+        || method === "unobserve"
+      ) && params && typeof params === "object" && !Array.isArray(params)
+        ? { ...(params as Record<string, unknown>), consumerId: eventConsumerId }
+        : params;
+      const result = await handler(consumerScopedParams, ctx);
       // A completion whose socket is no longer current is dropped, not sent —
       // this is what stops a stale request-id from satisfying the new socket.
       if (current !== conn) return;

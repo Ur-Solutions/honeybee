@@ -25,6 +25,8 @@ import {
   updateSession,
   type SessionRecord,
 } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
+import { localGithubSessionCredentialLeaseId } from "../src/execution/localCredentials.js";
 
 function makeRecord(dir: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -118,6 +120,21 @@ test("store root is read at call time and session files are private", async () =
     else process.env.HIVE_STORE_ROOT = oldRoot;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("execution runtime credential authority survives the SessionRecord round trip", async () => {
+  await withTempStore(async (dir) => {
+    const runId = "run-store-credential-1";
+    const leaseId = localGithubSessionCredentialLeaseId(runId);
+    await saveSession(makeRecord(dir, {
+      substrate: "hsr",
+      executionRunId: runId,
+      executionRuntimeCredentialLeaseIds: [leaseId],
+    }));
+    const loaded = await loadSession("CO.abc");
+    assert.equal(loaded?.executionRunId, runId);
+    assert.deepEqual(loaded?.executionRuntimeCredentialLeaseIds, [leaseId]);
+  });
 });
 
 test("updateSession merges a patch field-level under the session lock", async () => {
@@ -678,6 +695,19 @@ test("only live or uncertain records need observation heartbeat persistence", ()
   assert.equal(shouldPersistObservationHeartbeat({ status: "kill_failed" }), true);
   assert.equal(shouldPersistObservationHeartbeat({ status: "dead" }), false);
   assert.equal(shouldPersistObservationHeartbeat({ status: "done" }), false);
+  const at = "2026-05-28T00:00:00.000Z";
+  assert.equal(shouldPersistObservationHeartbeat({
+    status: "done",
+    stateMachine: lifecycleCursor("heartbeat-active-done", "active", at),
+  }), true);
+  assert.equal(shouldPersistObservationHeartbeat({
+    status: "dead",
+    stateMachine: lifecycleCursor("heartbeat-active-dead", "active", at),
+  }), true);
+  assert.equal(shouldPersistObservationHeartbeat({
+    status: "running",
+    stateMachine: lifecycleCursor("heartbeat-archived-running", "archived", at),
+  }), false);
 });
 
 test("touchSession cannot resurrect a deleted session", async () => {

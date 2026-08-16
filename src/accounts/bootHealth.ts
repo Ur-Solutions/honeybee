@@ -7,6 +7,8 @@ export const ACCOUNT_BOOT_FAILURE_COOLDOWN_MS = 10 * 60_000;
 
 export type AccountBootFailure = {
   failedAt: string;
+  /** Absent records were written by older builds and mean adapter boot. */
+  stage?: "boot" | "activation";
 };
 
 type AccountBootHealthFile = Record<string, AccountBootFailure | undefined>;
@@ -29,8 +31,12 @@ async function readAccountBootHealthFile(): Promise<AccountBootHealthFile> {
     for (const [accountId, value] of Object.entries(parsed as Record<string, unknown>)) {
       if (!value || typeof value !== "object" || Array.isArray(value)) continue;
       const failedAt = (value as Record<string, unknown>).failedAt;
+      const stage = (value as Record<string, unknown>).stage;
       if (typeof failedAt === "string" && Number.isFinite(Date.parse(failedAt))) {
-        file[accountId] = { failedAt };
+        file[accountId] = {
+          failedAt,
+          ...(stage === "boot" || stage === "activation" ? { stage } : {}),
+        };
       }
     }
     return file;
@@ -53,24 +59,37 @@ export async function recentAccountBootFailures(
     entry[1] !== undefined && isRecent(entry[1], now, cooldownMs)));
 }
 
-/** Record the latest failed boot, pruning expired entries under the same lock. */
-export async function recordAccountBootFailure(accountId: string, now = Date.now()): Promise<void> {
+/** Record the latest failed account-startup stage, pruning expired entries. */
+export async function recordAccountBootFailure(
+  accountId: string,
+  now = Date.now(),
+  stage: "boot" | "activation" = "boot",
+): Promise<void> {
   await withFileLock(accountBootHealthLockPath(), async () => {
     const file = await readAccountBootHealthFile();
     const kept: AccountBootHealthFile = {};
     for (const [id, failure] of Object.entries(file)) {
       if (failure && isRecent(failure, now, ACCOUNT_BOOT_FAILURE_COOLDOWN_MS)) kept[id] = failure;
     }
-    kept[accountId] = { failedAt: new Date(now).toISOString() };
+    kept[accountId] = { failedAt: new Date(now).toISOString(), stage };
     await atomicWriteFile(accountBootHealthPath(), `${JSON.stringify(kept, null, 2)}\n`, { mode: 0o600 });
   });
 }
 
-/** A successful boot closes this account's breaker immediately. */
-export async function clearAccountBootFailure(accountId: string): Promise<void> {
+/** A proven-successful startup stage closes only its matching breaker. */
+export async function clearAccountBootFailure(
+  accountId: string,
+  stage?: "boot" | "activation",
+  /** Do not let an older success erase a newer concurrent failure. */
+  observedBefore?: number,
+): Promise<void> {
   await withFileLock(accountBootHealthLockPath(), async () => {
     const file = await readAccountBootHealthFile();
-    if (!file[accountId]) return;
+    const current = file[accountId];
+    if (!current) return;
+    const currentStage = current.stage ?? "boot";
+    if (stage !== undefined && stage !== currentStage) return;
+    if (observedBefore !== undefined && Date.parse(current.failedAt) >= observedBefore) return;
     delete file[accountId];
     await atomicWriteFile(accountBootHealthPath(), `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
   });

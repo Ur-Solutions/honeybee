@@ -38,3 +38,34 @@ export function formatBuzInjection(message: BuzMessage): string {
   };
   return `${BUZ_INJECTION_MARKER}\n${JSON.stringify(meta)}\n\n${message.body}`;
 }
+
+/**
+ * Bind a durable injection back to immutable mailbox identity. `tier` is
+ * intentionally ignored: an interrupt/next-tool attempt can be rewritten to
+ * deliveredAs=queue after an ambiguous handoff without changing the logical
+ * message that may already have reached the provider.
+ */
+export function matchesBuzInjection(text: string, message: BuzMessage): boolean {
+  if (message.from.kind !== "bee") return text === message.body;
+  const prefix = `${BUZ_INJECTION_MARKER}\n`;
+  if (!text.startsWith(prefix)) return false;
+  const split = text.indexOf("\n\n", prefix.length);
+  if (split < 0) return false;
+  let meta: Partial<BuzInjectionMeta>;
+  try {
+    meta = JSON.parse(text.slice(prefix.length, split)) as Partial<BuzInjectionMeta>;
+  } catch {
+    return false;
+  }
+  return meta.version === 1 &&
+    meta.from === message.from.id &&
+    meta.id === message.id &&
+    meta.sentAt === message.sentAt &&
+    meta.subject === message.subject &&
+    text.slice(split + 2) === message.body;
+}
+
+/** Rebuild an attempted-tier injection without mutating the mailbox record. */
+export function formatBuzInjectionAs(message: BuzMessage, deliveredAs: BuzMessage["deliveredAs"]): string {
+  return formatBuzInjection({ ...message, deliveredAs });
+}

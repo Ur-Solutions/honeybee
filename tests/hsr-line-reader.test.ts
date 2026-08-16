@@ -58,6 +58,16 @@ test("does not emit a final line that has no trailing newline", () => {
   assert.deepEqual(readAll(["done\npartial"]), ["done"]);
 });
 
+test("flushes one final unterminated frame only at proven EOF", () => {
+  const out: string[] = [];
+  const feed = makeLineReader((line) => out.push(line));
+  feed(Buffer.from("done\nfinal-without-newline", "utf8"));
+  assert.deepEqual(out, ["done"]);
+  feed.end();
+  feed.end();
+  assert.deepEqual(out, ["done", "final-without-newline"]);
+});
+
 test("each reader instance keeps its own buffer", () => {
   const outA: string[] = [];
   const outB: string[] = [];

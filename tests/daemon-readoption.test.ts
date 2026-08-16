@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   isHsrReAdoptionCandidate,
+  isObserverCursorCandidate,
   markBootCursorsUnverified,
   markObserverOffline,
   probeHsrReAdoption,
@@ -15,6 +16,7 @@ import {
 import type { UnverifiedCursorMarker } from "../src/stateMachine.js";
 import type { HsrMeta } from "../src/hsr/runDir.js";
 import { ledgerPath, loadSession, saveSession, type SessionRecord } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 const observedAt = "2026-08-11T19:00:00.000Z";
 const hostBirth = { pgid: 4701, startedAt: "Tue Aug 11 18:59:00 2026" };
@@ -239,6 +241,22 @@ test("boot sweep probes three live HSR records without changing their runner pid
   assert.deepEqual(live.map(({ name, runnerPid }) => ({ name, runnerPid })), before, "the sweep is observation-only");
   assert.ok(records.every(isHsrReAdoptionCandidate) === false, "mixed record set includes excluded records");
   assert.deepEqual(records.filter(isHsrReAdoptionCandidate).map(({ name }) => name), ["restart-a", "restart-b", "restart-c"]);
+});
+
+test("re-adoption and observer marking obey canonical lifecycle over stale status scalars", () => {
+  const canonicalActive = record("canonical-active-stale-done", {
+    status: "done",
+    stateMachine: lifecycleCursor("canonical-active-stale-done", "active", observedAt),
+  });
+  const canonicalArchived = record("canonical-archived-stale-running", {
+    status: "running",
+    stateMachine: lifecycleCursor("canonical-archived-stale-running", "archived", observedAt),
+  });
+
+  assert.equal(isHsrReAdoptionCandidate(canonicalActive), true);
+  assert.equal(isObserverCursorCandidate(canonicalActive), true);
+  assert.equal(isHsrReAdoptionCandidate(canonicalArchived), false);
+  assert.equal(isObserverCursorCandidate(canonicalArchived), false);
 });
 
 test("shutdown stamps observer uncertainty without changing any bee cursor or pid", async () => {

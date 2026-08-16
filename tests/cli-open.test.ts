@@ -46,7 +46,10 @@ test("open codex-auto defaults to yolo", async () => {
       join(dir, "vault", "accounts.json"),
       JSON.stringify([{ id: "codex-one", tool: "codex", label: "one", addedAt: "2026-06-17T00:00:00.000Z" }]),
     );
-    await writeFile(join(dir, "vault", "codex", "codex-one", "auth.json"), `{"id":"codex-token"}`);
+    await writeFile(
+      join(dir, "vault", "codex", "codex-one", "auth.json"),
+      JSON.stringify({ OPENAI_API_KEY: "test-only-key" }),
+    );
 
     const { stdout } = await hive(dir, "open", "codex-auto", "--raw", "--print");
 

@@ -1,12 +1,19 @@
 import { rm } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { canonicalActivationHomePath, readActivationHomeOwner, withActivationHomeLock } from "./accounts/activation.js";
+import { assertNoUnresolvedHsrAnswerReceiptsForBee } from "./answerReceipt.js";
+import {
+  assertNoCanonicalHsrEventIntegrityDoubt,
+  assertNoUnresolvedHsrEventIntegrity,
+} from "./hsr/eventIntegrity.js";
+import { persistCanonicalDeliveryStopDoubt } from "./deliveryDoubt.js";
 import {
   enqueueCredentialHarvestWorkItem,
   removeCredentialHarvestWorkItemForHome,
   type CredentialHarvestWorkItem,
 } from "./accounts/credentialHarvestQueue.js";
-import { hsrRoot } from "./hsr/runDir.js";
+import { removeHsrRunDirUnderEventAuthority } from "./hsr/runDir.js";
+import { preservePendingHsrTurnReceiptsForPurge } from "./hsr/pendingTurns.js";
 import {
   withSessionLifecycleLock,
   withSessionLifecycleTransaction,
@@ -19,15 +26,17 @@ import {
   deleteSessionLocked,
   isActiveSessionRecord,
   listSessions,
+  loadSession,
   safeName,
   transitionSession,
   updateSession,
   withSessionLock,
   type SessionRecord,
 } from "./store.js";
-import type { ProbeEvidence } from "./stateMachine.js";
+import { isArchivedSessionLifecycle, type ProbeEvidence } from "./stateMachine.js";
 import { syncCredentialPairIsolated } from "./daemon/credentialSweepProcess.js";
 import { LOCAL_NODE_NAME } from "./node.js";
+import { clearPublishedBeeNameLaunchReservationForPurge } from "./nameAdmission.js";
 import { dropPoolClaimsForBee } from "./pool.js";
 import { stopFailedRequestId } from "./requests/keys.js";
 import { cancelOpenRequests, openRequest, removeBeeRequests, resolveRequest } from "./requests/store.js";
@@ -52,6 +61,8 @@ export type TransactionalKillOptions = {
   afterFinalCredentialQuarantine?: (item: CredentialHarvestWorkItem) => Promise<void>;
   /** Deterministic race-test hook after old-runtime teardown confirmation. */
   afterTeardown?: (record: SessionRecord) => Promise<void>;
+  /** Deterministic crash-window hook after the irreversible stop dispatch. */
+  afterStopDispatch?: (record: SessionRecord) => Promise<void>;
 };
 
 export type PurgeSessionDataOptions = Pick<
@@ -60,6 +71,19 @@ export type PurgeSessionDataOptions = Pick<
 > & {
   /** Clean-sweep CAS guard: accepted mail may make a previously dead snapshot active. */
   preserveRecoveryRequest?: boolean;
+  /** Clean-sweep CAS guard: filing may retire a stale candidate before purge wins the lock. */
+  preserveArchived?: boolean;
+  /** Clean-sweep CAS guard: an unconfirmed stop must retain its exact retry handle and artifacts. */
+  preserveKillFailed?: boolean;
+};
+
+export type TransactionalCleanOptions = TransactionalKillOptions & {
+  /** Stale clean snapshots must not erase a newly accepted recovery obligation. */
+  preserveRecoveryRequest?: boolean;
+  /** Filing which wins after clean selection owns the historical record. */
+  preserveArchived?: boolean;
+  /** Unconfirmed explicit stop retains its exact retry locator and artifacts. */
+  preserveKillFailed?: boolean;
 };
 
 export type KillOutcome =
@@ -68,6 +92,7 @@ export type KillOutcome =
 
 const DEFAULT_POLL_ATTEMPTS = 4;
 const DEFAULT_POLL_INTERVAL_MS = 750;
+const STOP_INTENT_PENDING_ERROR = "explicit stop is in progress; exact runtime cleanup is not yet confirmed";
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,6 +105,20 @@ function errorMessage(error: unknown): string {
     return JSON.stringify(error);
   } catch {
     return String(error);
+  }
+}
+
+async function eventIntegrityStopBlock(
+  record: SessionRecord,
+  operation: "session kill" | "session retire",
+): Promise<string | undefined> {
+  try {
+    assertNoCanonicalHsrEventIntegrityDoubt(record, operation);
+    await assertNoUnresolvedHsrEventIntegrity(record.name, operation);
+    return undefined;
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== "HIVE_HSR_EVENT_INTEGRITY_UNRESOLVED") throw error;
+    return errorMessage(error);
   }
 }
 
@@ -110,10 +149,20 @@ export async function purgeSessionData(
   if (safeName(record.name) !== record.name) {
     return withSessionLifecycleLock(record.name, async () => {
       if (options.preserveRecoveryRequest && record.recoveryRequestedAt) return false;
+      if (options.preserveArchived && isArchivedSessionLifecycle(record)) return false;
+      if (options.preserveKillFailed && record.status === "kill_failed") return false;
+      await assertNoUnresolvedHsrAnswerReceiptsForBee(record.name, "session purge");
+      assertNoCanonicalHsrEventIntegrityDoubt(record, "session purge");
+      await assertNoUnresolvedHsrEventIntegrity(record.name, "session purge");
       await runFinalCredentialSync(record, options, "purge");
+      if (record.deliveryStopDoubt) {
+        await persistCanonicalDeliveryStopDoubt(record, record.deliveryStopDoubt);
+      }
       await withSessionLock(record.name, async () => {
+        await clearPublishedBeeNameLaunchReservationForPurge(record);
+        if (record.substrate === "hsr") await preservePendingHsrTurnReceiptsForPurge(record.name);
         await rm(containedArtifactPath(sealsRoot(), record.name), { recursive: true, force: true });
-        await rm(containedArtifactPath(hsrRoot(), record.name), { recursive: true, force: true });
+        await removeHsrRunDirUnderEventAuthority(record.name);
         await removeBeeRequests(record.name);
         await deleteSessionLocked(record.name);
       });
@@ -124,29 +173,149 @@ export async function purgeSessionData(
   const purged = await withSessionLifecycleTransactionIfPresent(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
     if (options.preserveRecoveryRequest && current.recoveryRequestedAt) return false;
+    if (options.preserveArchived && isArchivedSessionLifecycle(current)) return false;
+    if (options.preserveKillFailed && current.status === "kill_failed") return false;
     await purgeSessionDataInTransaction(lifecycle, options, current);
     return true;
   });
   return purged ?? true;
 }
 
+/**
+ * Remove one generation after its caller has already proved that exact
+ * runtime incarnation stopped. This is intentionally narrower than
+ * transactionalKill: it performs no second, potentially ambiguous teardown,
+ * but it retains the same lifecycle-generation CAS and clears the matching
+ * name-admission residue before deleting the canonical SessionRecord.
+ *
+ * Callers MUST bind `record` to the exact stopped birth before invoking this
+ * helper. A replacement generation is a LifecycleConflictError, never a
+ * purge target.
+ */
+export async function purgeSessionAfterConfirmedRuntimeStop(
+  record: SessionRecord,
+  options: PurgeSessionDataOptions = {},
+): Promise<boolean> {
+  const purged = await withSessionLifecycleTransactionIfPresent(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    await purgeSessionAfterConfirmedRuntimeStopInTransaction(lifecycle, current, options);
+    return true;
+  });
+  return purged ?? true;
+}
+
+/** Lifecycle-lock-owned form used by stop-intent -> signal -> purge protocols. */
+export async function purgeSessionAfterConfirmedRuntimeStopInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  current: SessionRecord,
+  options: PurgeSessionDataOptions = {},
+): Promise<void> {
+  await purgeSessionDataInTransaction(lifecycle, options, current, { runtimeStopConfirmed: true });
+}
+
+export type ConfirmedRuntimeRetireProof = {
+  substrateKind: Substrate["kind"];
+  attempts?: number;
+  alreadyGone?: boolean;
+  detail?: string;
+};
+
+/**
+ * Archive an exact generation after a caller has already confirmed its
+ * runtime stopped while holding the lifecycle transaction. This is the
+ * control-RPC counterpart to transactionalRetire: no second signal is sent,
+ * but credential recovery, reservation settlement, proof-carrying archive,
+ * request closure, pool cleanup, and ledger publication remain identical.
+ */
+export async function retireSessionAfterConfirmedRuntimeStopInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  current: SessionRecord,
+  proof: ConfirmedRuntimeRetireProof,
+  options: TransactionalKillOptions = {},
+): Promise<SessionRecord> {
+  await lifecycle.refresh();
+  await runFinalCredentialSync(current, options, "retire");
+  await clearPublishedBeeNameLaunchReservationForPurge(current, {
+    runtimeStopConfirmed: true,
+  });
+  const at = new Date().toISOString();
+  const transitionKey = `retire:${current.name}:${current.runtimeGeneration ?? 0}:${at}`;
+  const hsr = proof.substrateKind === "hsr" || proof.substrateKind === "remote-hsr";
+  const probe: ProbeEvidence = {
+    kind: "probe",
+    probeId: `${transitionKey}:probe`,
+    observerId: "hive-retire",
+    observedAt: at,
+    outcome: "dead",
+    target: {
+      substrate: hsr ? "hsr" : "local-tmux",
+      ...(current.node ? { node: current.node } : {}),
+      ...(hsr
+        ? { ...(current.runnerPid ? { runnerPid: current.runnerPid } : {}) }
+        : { tmuxTarget: current.tmuxTarget, ...(current.agentPaneId ? { agentPaneId: current.agentPaneId } : {}) }),
+    },
+    detail: proof.detail
+      ?? (proof.alreadyGone
+        ? "explicit retire verified the runtime was already absent"
+        : `explicit retire verified runtime absence after ${proof.attempts ?? 1} teardown attempt(s)`),
+  };
+  const transitioned = await transitionSession(current.name, {
+    eventId: transitionKey,
+    at,
+    type: "bee.archived",
+    cause: "retire",
+    evidence: { kind: "operator", actionId: transitionKey, observedAt: at, action: "retire" },
+    probe,
+  });
+  if (!transitioned) throw new Error(`Session ${current.name} vanished before its retire transition`);
+  const retired = await updateSession(current.name, {
+    updatedAt: at,
+    lastError: undefined,
+  }) ?? transitioned.record;
+  await resolveRequest(retired.name, stopFailedRequestId(retired.name, retired.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);
+  await cancelOpenRequests(retired.name, {}, "scope-closed", "retired").catch(() => undefined);
+  if (retired.poolKey) await dropPoolClaimsForBee(retired.poolKey, retired.name).catch(() => undefined);
+  if (options.emitLedger !== false) {
+    await appendLedger({
+      type: "session.retire",
+      session: current.name,
+      node: current.node ?? LOCAL_NODE_NAME,
+      ok: true,
+      attempts: proof.attempts ?? 1,
+    });
+  }
+  return retired;
+}
+
 async function purgeSessionDataInTransaction(
   lifecycle: SessionLifecycleTransaction,
   options: PurgeSessionDataOptions,
   refreshedRecord?: SessionRecord,
+  internal: { runtimeStopConfirmed?: boolean } = {},
 ): Promise<void> {
   const record = refreshedRecord ?? await lifecycle.refresh();
+  // Answer receipts live outside hsrRoot. Preserve the canonical row (including
+  // remote node/launch/incarnation locator) until operator reconciliation has
+  // settled every provider-bound answer.
+  await assertNoUnresolvedHsrAnswerReceiptsForBee(record.name, "session purge");
+  assertNoCanonicalHsrEventIntegrityDoubt(record, "session purge");
+  await assertNoUnresolvedHsrEventIntegrity(record.name, "session purge");
   // Credential harvest can touch the keychain, vault, and account locks. It is
   // deliberately bounded and completed before any artifact/session lock is
   // acquired or any retry handle is deleted.
   await runFinalCredentialSync(record, options, "purge");
+  if (record.deliveryStopDoubt) {
+    await persistCanonicalDeliveryStopDoubt(record, record.deliveryStopDoubt);
+  }
   // The short record lock below is the destructive CAS point. Everything in
   // the callback is known not to re-acquire that lock; if cleanup is
   // interrupted, the canonical record remains the retry handle until the last
   // delete step.
   await lifecycle.destructiveCommit(async (current) => {
+    await clearPublishedBeeNameLaunchReservationForPurge(current, internal);
+    if (current.substrate === "hsr") await preservePendingHsrTurnReceiptsForPurge(current.name);
     await rm(containedArtifactPath(sealsRoot(), current.name), { recursive: true, force: true });
-    await rm(containedArtifactPath(hsrRoot(), current.name), { recursive: true, force: true });
+    await removeHsrRunDirUnderEventAuthority(current.name);
     await removeBeeRequests(current.name);
     await deleteSessionLocked(current.name);
   });
@@ -184,6 +353,7 @@ async function teardownSession(
   let attempts = 0;
   let killReturnedFailure = false;
   let killStderr: string | undefined;
+  let exactIncarnationStopped = false;
 
   // Fast path: if the session is already gone, skip the substrate.kill call so
   // we report "alreadyGone" instead of swallowing an error from killing a
@@ -205,13 +375,18 @@ async function teardownSession(
   // while its detached harness child can remain live. Its kill implementation
   // is the strict incarnation/group cleanup hook and must always run.
   const needsLocalHsrCleanup = substrate.kind === "hsr";
+  let stopDispatched = false;
   if (!alreadyGone || record.launcherPgid || needsRemoteCleanup || needsRemoteGroupProof || needsLocalHsrCleanup) {
     attempts += 1;
+    stopDispatched = true;
     try {
       const killResult = await substrate.kill(record.tmuxTarget, {
         launcherPgid: record.launcherPgid,
         launcherFingerprint: record.launcherFingerprint,
+        remoteLaunchId: record.remoteLaunchId,
+        remoteIncarnation: record.remoteIncarnation,
       });
+      exactIncarnationStopped = killResult.incarnationStopped === true;
       if (!killResult.ok) {
         killReturnedFailure = true;
         killStderr = killResult.stderr?.trim() || killResult.stdout?.trim() || `kill exited with code ${killResult.exitCode}`;
@@ -222,11 +397,17 @@ async function teardownSession(
     }
   }
 
+  // This hook is deliberately after the irreversible substrate call but
+  // before any absence proof or terminal SessionRecord commit. Production has
+  // no hook; fault tests use it to prove that a coordinator crash leaves the
+  // pre-dispatch durable stop-intent fence authoritative.
+  if (stopDispatched) await options.afterStopDispatch?.(record);
+
   // Poll hasSession a few times so substrates with eventually-consistent
   // teardown (ssh-tmux, slow tmux server) have a chance to settle.
   let stillRunning = false;
   let lastProbeError: string | undefined;
-  for (let i = 0; i < pollAttempts; i += 1) {
+  for (let i = 0; !exactIncarnationStopped && i < pollAttempts; i += 1) {
     try {
       const exists = await substrate.hasSession(record.tmuxTarget);
       if (!exists) {
@@ -512,46 +693,111 @@ export async function transactionalKill(
 ): Promise<KillOutcome> {
   return withSessionLifecycleTransaction(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
-    const emitLedger = options.emitLedger !== false;
-    const node = current.node ?? LOCAL_NODE_NAME;
-    const verdict = await teardownSession(current, options);
-    await options.afterTeardown?.(current);
+    return transactionalKillInTransaction(lifecycle, current, options);
+  });
+}
 
-    // Pane/session absence cannot override an indeterminate exact process-group
-    // stop: an escaped child may have survived after tmux removed the target.
-    if (verdict.stillRunning || verdict.killReturnedFailure) {
-      const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
-      const failed = await lifecycle.commit({
-        status: "kill_failed",
-        lastError,
-        updatedAt: new Date().toISOString(),
-      });
-      await openStopFailedRequest(failed, lastError);
-      if (emitLedger) {
-        await appendLedger({
-          type: "session.kill",
-          session: current.name,
-          node,
-          ok: false,
-          attempts: verdict.attempts,
-          lastError,
-        });
-      }
-      return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
-    }
+async function transactionalKillInTransaction(
+  lifecycle: SessionLifecycleTransaction,
+  current: SessionRecord,
+  options: TransactionalKillOptions,
+): Promise<KillOutcome> {
+  const emitLedger = options.emitLedger !== false;
+  const node = current.node ?? LOCAL_NODE_NAME;
+  // Persist explicit stop intent before the first signal/RPC. The lifecycle
+  // lock is reclaimed when a process dies, so the lock alone cannot fence a
+  // crash after dispatch. `kill_failed` is the canonical non-runnable stop-
+  // doubt state; success below purges it, while any crash/error leaves an
+  // exact locator that every work-admission path refuses.
+  const stopping = await lifecycle.commit({
+    status: "kill_failed",
+    lastError: STOP_INTENT_PENDING_ERROR,
+    updatedAt: new Date().toISOString(),
+  });
+  const verdict = await teardownSession(stopping, options);
+  await options.afterTeardown?.(stopping);
 
-    await lifecycle.refresh();
-    await purgeSessionDataInTransaction(lifecycle, options);
+  // Pane/session absence cannot override an indeterminate exact process-group
+  // stop: an escaped child may have survived after tmux removed the target.
+  if (verdict.stillRunning || verdict.killReturnedFailure) {
+    const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
+    const failed = await lifecycle.commit({
+      status: "kill_failed",
+      lastError,
+      updatedAt: new Date().toISOString(),
+    });
+    await openStopFailedRequest(failed, lastError);
     if (emitLedger) {
       await appendLedger({
         type: "session.kill",
         session: current.name,
         node,
-        ok: true,
+        ok: false,
         attempts: verdict.attempts,
+        lastError,
       });
     }
-    return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
+    return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
+  }
+
+  // Process absence is not permission to erase unresolved provider-event
+  // history. Normalize this manual fence into the same stable KillOutcome
+  // contract as retire instead of letting the purge assertion escape as a raw
+  // exception after the exact runtime has already stopped.
+  const stopped = await lifecycle.refresh();
+  const integrityBlock = await eventIntegrityStopBlock(stopped, "session kill");
+  if (integrityBlock) {
+    const lastError = integrityBlock;
+    await lifecycle.commit({
+      status: "kill_failed",
+      lastError,
+      updatedAt: new Date().toISOString(),
+    });
+    if (emitLedger) {
+      await appendLedger({
+        type: "session.kill",
+        session: current.name,
+        node,
+        ok: false,
+        attempts: verdict.attempts,
+        lastError,
+      });
+    }
+    return { ok: false, lastError, stillRunning: false, attempts: verdict.attempts };
+  }
+
+  await purgeSessionDataInTransaction(lifecycle, options, undefined, { runtimeStopConfirmed: true });
+  if (emitLedger) {
+    await appendLedger({
+      type: "session.kill",
+      session: current.name,
+      node,
+      ok: true,
+      attempts: verdict.attempts,
+    });
+  }
+  return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
+}
+
+/**
+ * Clean a stale/dead candidate without turning coarse target absence into
+ * process-exit proof. The preservation checks and strict teardown share one
+ * lifecycle transaction: an accepted recovery request, archive, or stop-doubt
+ * write that wins after candidate selection performs zero cleanup.
+ *
+ * `null` means one of those protected facts won. Otherwise the KillOutcome is
+ * the same exact-stop result as an explicit `hive kill`.
+ */
+export async function transactionalCleanSession(
+  record: SessionRecord,
+  options: TransactionalCleanOptions = {},
+): Promise<KillOutcome | null> {
+  return withSessionLifecycleTransaction(record, async (lifecycle) => {
+    const current = await lifecycle.refresh();
+    if (options.preserveRecoveryRequest && current.recoveryRequestedAt) return null;
+    if (options.preserveArchived && isArchivedSessionLifecycle(current)) return null;
+    if (options.preserveKillFailed && current.status === "kill_failed") return null;
+    return transactionalKillInTransaction(lifecycle, current, options);
   });
 }
 
@@ -571,13 +817,34 @@ export async function transactionalRetire(
 ): Promise<KillOutcome> {
   return withSessionLifecycleTransaction(record, async (lifecycle) => {
     const current = await lifecycle.refresh();
-    if (current.status === "done" || current.stateMachine?.lifecycle === "archived") {
+    if (isArchivedSessionLifecycle(current)) {
+      const existingIntegrityBlock = await eventIntegrityStopBlock(current, "session retire");
+      if (existingIntegrityBlock) {
+        return { ok: false, lastError: existingIntegrityBlock, stillRunning: false, attempts: 0 };
+      }
+      // A coordinator may have completed the proof-carrying archive transition
+      // and died before removing a predecessor-only replacement journal. The
+      // canonical archived cursor is durable exact-stop evidence, so heal that
+      // residue here. Do not extend the proof to legacy scalar `done`: those
+      // rows do not carry the transition/probe that makes cleanup conclusive.
+      if (current.stateMachine?.lifecycle === "archived") {
+        await clearPublishedBeeNameLaunchReservationForPurge(current, {
+          runtimeStopConfirmed: true,
+        });
+      }
       return { ok: true, alreadyGone: true, attempts: 0 };
     }
     const emitLedger = options.emitLedger !== false;
     const node = current.node ?? LOCAL_NODE_NAME;
-    const verdict = await teardownSession(current, options);
-    await options.afterTeardown?.(current);
+    // See transactionalKill: the persistent stop-intent fence must precede
+    // every irreversible local or remote teardown side effect.
+    const stopping = await lifecycle.commit({
+      status: "kill_failed",
+      lastError: STOP_INTENT_PENDING_ERROR,
+      updatedAt: new Date().toISOString(),
+    });
+    const verdict = await teardownSession(stopping, options);
+    await options.afterTeardown?.(stopping);
 
     if (verdict.stillRunning || verdict.killReturnedFailure) {
       const lastError = verdict.lastError ?? "exact runtime cleanup is unconfirmed";
@@ -600,56 +867,64 @@ export async function transactionalRetire(
       return { ok: false, lastError, stillRunning: true, attempts: verdict.attempts };
     }
 
-    await lifecycle.refresh();
-    await runFinalCredentialSync(current, options, "retire");
-    const at = new Date().toISOString();
-    const transitionKey = `retire:${current.name}:${current.runtimeGeneration ?? 0}:${at}`;
-    const probe: ProbeEvidence = {
-      kind: "probe",
-      probeId: `${transitionKey}:probe`,
-      observerId: "hive-retire",
-      observedAt: at,
-      outcome: "dead",
-      target: {
-        substrate: verdict.substrateKind === "hsr" || verdict.substrateKind === "remote-hsr" ? "hsr" : "local-tmux",
-        ...(current.node ? { node: current.node } : {}),
-        ...(verdict.substrateKind === "hsr" || verdict.substrateKind === "remote-hsr"
-          ? { ...(current.runnerPid ? { runnerPid: current.runnerPid } : {}) }
-          : { tmuxTarget: current.tmuxTarget, ...(current.agentPaneId ? { agentPaneId: current.agentPaneId } : {}) }),
-      },
-      detail: verdict.alreadyGone
-        ? "explicit retire verified the runtime was already absent"
-        : `explicit retire verified runtime absence after ${verdict.attempts} teardown attempt(s)`,
-    };
-    const transitioned = await transitionSession(current.name, {
-      eventId: transitionKey,
-      at,
-      type: "bee.archived",
-      cause: "retire",
-      evidence: { kind: "operator", actionId: transitionKey, observedAt: at, action: "retire" },
-      probe,
-    });
-    if (!transitioned) throw new Error(`Session ${current.name} vanished before its retire transition`);
-    // The explicit transition owns lifecycle/status. This metadata-only merge
-    // retires an earlier failed-stop message without bypassing the state table.
-    const retired = await updateSession(current.name, {
-      updatedAt: at,
-      lastError: undefined,
-    }) ?? transitioned.record;
-    // Request closures happen only after the generation-checked terminal
-    // commit. A stale retire can therefore never close a replacement's asks.
-    await resolveRequest(retired.name, stopFailedRequestId(retired.name, retired.runtimeGeneration ?? 0), { by: "stop-succeeded" }).catch(() => undefined);
-    await cancelOpenRequests(retired.name, {}, "scope-closed", "retired").catch(() => undefined);
-    if (retired.poolKey) await dropPoolClaimsForBee(retired.poolKey, retired.name).catch(() => undefined);
-    if (emitLedger) {
-      await appendLedger({
-        type: "session.retire",
-        session: current.name,
-        node,
-        ok: true,
-        attempts: verdict.attempts,
+    // Exact process absence does not prove that every provider event made it
+    // into the durable HSR log. The host can discover that doubt while the
+    // stop is in flight (or publish only the outside-run-dir head before its
+    // canonical projection). Never turn either form into a successful archive:
+    // automatic Flight/Comb/execution cleanup treats retire success as
+    // ownership release and could otherwise start fresh work across an unknown
+    // provider/tool effect.
+    const stopped = await lifecycle.refresh();
+    const integrityBlock = await eventIntegrityStopBlock(stopped, "session retire");
+    if (integrityBlock) {
+      const lastError = integrityBlock;
+      await lifecycle.commit({
+        status: "kill_failed",
+        lastError,
+        updatedAt: new Date().toISOString(),
       });
+      if (emitLedger) {
+        await appendLedger({
+          type: "session.retire",
+          session: current.name,
+          node,
+          ok: false,
+          attempts: verdict.attempts,
+          lastError,
+        });
+      }
+      return { ok: false, lastError, stillRunning: false, attempts: verdict.attempts };
     }
+
+    await retireSessionAfterConfirmedRuntimeStopInTransaction(
+      lifecycle,
+      stopping,
+      {
+        substrateKind: verdict.substrateKind,
+        attempts: verdict.attempts,
+        alreadyGone: verdict.alreadyGone,
+      },
+      options,
+    );
     return { ok: true, alreadyGone: verdict.alreadyGone && !verdict.killReturnedFailure, attempts: verdict.attempts };
   });
+}
+
+/**
+ * Production cleanup adapter for schedulers that retain only a Bee name.
+ * Archived rows still pass through transactionalRetire so its durable
+ * ambiguity checks run; record absence is acceptable only when the
+ * purge-surviving event-history authority is also absent.
+ */
+export async function retireSessionByNameExactly(
+  beeName: string,
+  operation = "automatic session retire",
+): Promise<void> {
+  const record = await loadSession(beeName);
+  if (!record) {
+    await assertNoUnresolvedHsrEventIntegrity(beeName, operation);
+    return;
+  }
+  const outcome = await transactionalRetire(record);
+  if (!outcome.ok) throw new Error(`${operation}: ${outcome.lastError}`);
 }

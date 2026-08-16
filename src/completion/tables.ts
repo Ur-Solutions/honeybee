@@ -146,7 +146,7 @@ export const FLAGS_BY_COMMAND: Record<string, string[]> = {
   search: ["--colony", "--swarm", "--bee", "--type", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   seals: ["--colony", "--swarm", "--bee", "--status", "--since", "--regex", "--case", "--limit", "--json"],
   buz: [
-    "--tier", "--sender", "--sender-human", "--prompt", "-p", "--subject",
+    "--tier", "--sender", "--sender-human", "--prompt", "-p", "--subject", "--message-id", "--new",
     "--unread", "--limit", "--from", "--consume", "--read", "--older-than", "--all",
     "--accept",
   ],

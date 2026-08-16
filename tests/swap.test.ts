@@ -4,11 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { accountDir, type AccountRecord } from "../src/accounts.js";
+import { matchesCellBrokerCapability } from "../src/cellBrokerCapability.js";
 import type { HsrRunPayload } from "../src/hsr/runnerHost.js";
+import type { HsrMeta } from "../src/hsr/runDir.js";
+import { readBeeNameLaunchReservation } from "../src/nameAdmission.js";
 import { loadSession, saveSession, type SessionRecord } from "../src/store.js";
 import type { LaunchSpec, Substrate } from "../src/substrates/types.js";
 import { resumeArgs, swapAccount } from "../src/swap.js";
 import { claudeSessionFilePath } from "../src/threadCopy.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -41,7 +45,11 @@ function fakeSubstrate(initiallyAlive: boolean) {
     newSession: async (target, _cwd, spec) => {
       calls.push({ method: "newSession", target, spec });
       alive = true;
-      return { paneId: "%0" };
+      return {
+        paneId: "%0",
+        launcherPgid: 43210,
+        launcherFingerprint: { pgid: 43210, startedAt: "Sat Aug 15 12:00:00 2026" },
+      };
     },
     kill: async (target, killOptions) => {
       calls.push({ method: "kill", target, killOptions });
@@ -82,6 +90,20 @@ function record(overrides: Partial<SessionRecord> = {}): SessionRecord {
 }
 
 const account: AccountRecord = { id: "claude-new", tool: "claude", label: "new@a.b", addedAt: "2026-06-01T00:00:00.000Z" };
+
+function admittedHsrMeta(bee: string, hostPid: number): HsrMeta {
+  return {
+    bee,
+    harness: "codex",
+    tier: "server",
+    hostPid,
+    hostFingerprint: { pgid: hostPid, startedAt: "Sat Aug 15 12:00:00 2026" },
+    childAdmission: "admitted",
+    startedAt: "2026-08-15T12:00:00.000Z",
+    controlSocket: "/tmp/hsr-test.sock",
+    status: "running",
+  };
+}
 
 async function seedOpencodeAuth(account: AccountRecord, token: string, root = accountDir(account), mtimeIso?: string): Promise<void> {
   const path = join(root, "xdg-data", "opencode", "auth.json");
@@ -131,6 +153,7 @@ test("swapAccount re-keys a Claude thread when moving it to another account", as
     assert.equal(updated.transcriptPath, targetTranscript);
     assert.equal(await readFile(targetTranscript, "utf8"), "{\"type\":\"user\",\"sessionId\":\"uuid-new\"}\n");
     assert.equal(updated.status, "running");
+    assert.equal(updated.lastError, undefined, "successful publication clears the temporary work fence detail");
     const persisted = await loadSession("CL.test");
     assert.equal(persisted?.accountId, "claude-new");
     assert.equal(persisted?.homePath, targetHome);
@@ -164,8 +187,95 @@ test("swapAccount refuses activation when tmux is gone but the old exact group s
 
     assert.equal(activations, 0, "credentials are not activated after an unconfirmed stop");
     assert.equal(rig.calls.some((call) => call.method === "newSession"), false, "replacement runtime is not launched");
-    assert.deepEqual(rig.calls[0]?.killOptions, { launcherPgid: 4242, launcherFingerprint: fingerprint });
-    assert.equal((await loadSession(existing.name))?.accountId, existing.accountId);
+    assert.deepEqual(rig.calls[0]?.killOptions, {
+      launcherPgid: 4242,
+      launcherFingerprint: fingerprint,
+      remoteLaunchId: undefined,
+      remoteIncarnation: undefined,
+    });
+    const fenced = await loadSession(existing.name);
+    assert.equal(fenced?.accountId, existing.accountId);
+    assert.equal(fenced?.status, "kill_failed", "work is fenced before the predecessor stop attempt");
+    const journal = await readBeeNameLaunchReservation(existing.name);
+    assert.equal(journal?.operation, "swap-account");
+    assert.equal(journal?.phase, "stopping");
+  });
+});
+
+test("automatic swap revalidates stop doubt under the lifecycle lock before side effects", async () => {
+  await withTempStore(async (dir) => {
+    const rig = fakeSubstrate(true);
+    const at = "2026-06-10T00:00:00.000Z";
+    const snapshot = record();
+    await saveSession(snapshot);
+    await writeFile(
+      join(dir, "sessions", `${snapshot.name}.json`),
+      `${JSON.stringify({
+        ...snapshot,
+        status: "kill_failed",
+        updatedAt: at,
+        stateMachine: lifecycleCursor(snapshot.name, "active", at),
+      }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    let activations = 0;
+
+    await assert.rejects(
+      swapAccount(snapshot, account, {
+        authorization: "automatic",
+        substrate: rig.substrate,
+        sleep: async () => undefined,
+        listAccounts: async () => [
+          { id: "claude-old", tool: "claude", label: "old", addedAt: at },
+          account,
+        ],
+        activate: async () => {
+          activations += 1;
+          return [];
+        },
+      }),
+      /unresolved stop state; automatic account swap is fenced/,
+    );
+
+    assert.equal(activations, 0);
+    assert.deepEqual(rig.calls, [], "automatic swap neither stops nor relaunches a stop-doubt runtime");
+    assert.equal((await loadSession(snapshot.name))?.status, "kill_failed");
+  });
+});
+
+test("automatic swap revalidates the exhausted account under the lifecycle lock", async () => {
+  await withTempStore(async () => {
+    const rig = fakeSubstrate(true);
+    const current = record({ accountId: "claude-manual", autoswap: true });
+    await saveSession(current);
+    let activations = 0;
+
+    await assert.rejects(
+      swapAccount(current, account, {
+        authorization: "automatic",
+        automaticTriggerAccountId: "claude-old",
+        substrate: rig.substrate,
+        sleep: async () => undefined,
+        listAccounts: async () => [
+          {
+            id: "claude-manual",
+            tool: "claude",
+            label: "manual",
+            addedAt: "2026-06-10T00:00:00.000Z",
+          },
+          account,
+        ],
+        activate: async () => {
+          activations += 1;
+          return [];
+        },
+      }),
+      /changed account before automatic swap admission/,
+    );
+
+    assert.equal(activations, 0);
+    assert.deepEqual(rig.calls, [], "the stale trigger is rejected before stop or relaunch");
+    assert.equal((await loadSession(current.name))?.accountId, "claude-manual");
   });
 });
 
@@ -279,6 +389,7 @@ test("swapAccount launches an HSR Claude bee on the re-keyed target-account thre
         return 4321;
       },
       waitForHsrHost: async () => true,
+      readHsrMeta: async () => admittedHsrMeta("CL.hsr", 4321),
     });
 
     assert.equal(calls.some((call) => call.method === "newSession"), false);
@@ -322,6 +433,8 @@ test("swapAccount relaunches an HSR bee through the runner host in the target ac
       homePath: "/tmp/home-c",
       accountId: "codex-old",
       providerSessionId: "thread-123",
+      executionRunId: "run-cell-swap",
+      runtimeGeneration: 4,
     });
     await saveSession(existing);
     let payload: HsrRunPayload | undefined;
@@ -335,6 +448,7 @@ test("swapAccount relaunches an HSR bee through the runner host in the target ac
         return 4321;
       },
       waitForHsrHost: async () => true,
+      readHsrMeta: async () => admittedHsrMeta("CO.test", 4321),
     });
 
     assert.equal(calls.some((call) => call.method === "newSession"), false);
@@ -344,6 +458,10 @@ test("swapAccount relaunches an HSR bee through the runner host in the target ac
     assert.equal(payload?.accountId, "codex-new");
     assert.equal(payload?.spec.env.CODEX_HOME, join(dir, "homes", codexAccount.id));
     assert.equal(payload?.spec.args.includes("resume"), false);
+    assert.equal(payload?.filesystemWriteScope, "cwd");
+    assert.equal(typeof payload?.cellBrokerCapability, "string");
+    assert.equal(updated.runtimeGeneration, 5);
+    assert.equal(matchesCellBrokerCapability(updated, payload?.cellBrokerCapability), true);
     assert.equal(updated.runnerPid, 4321);
     assert.equal(updated.accountId, "codex-new");
   });

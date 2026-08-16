@@ -179,6 +179,28 @@ export async function readBeeRequests(bee: string): Promise<InterventionRequestR
   return (await readRequestFile(bee)).requests;
 }
 
+/** Ownership-sensitive read: only a missing file means no requests. */
+export async function readBeeRequestsStrict(bee: string): Promise<InterventionRequestRecord[]> {
+  let raw: string;
+  try {
+    raw = await readFile(requestFilePath(bee), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  const parsed = parseRequestFile(raw, bee);
+  let rawRequests: unknown;
+  try {
+    rawRequests = (JSON.parse(raw) as { requests?: unknown }).requests;
+  } catch (error) {
+    throw new Error(`malformed request ownership file for ${bee}`, { cause: error });
+  }
+  if (!parsed || parsed.bee !== bee || !Array.isArray(rawRequests) || parsed.requests.length !== rawRequests.length) {
+    throw new Error(`malformed request ownership file for ${bee}`);
+  }
+  return parsed.requests;
+}
+
 /**
  * Bees with a request file, from one readdir. Entries are the on-disk stems —
  * safeName(bee) — so gate membership checks with safeName(name).

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { stripAnsi } from "../src/format.js";
 import { type BeeState, cleanStatePriority, deriveState, formatStateCell, isDoneState, isTerminalState, liveTargetKey, STATE_PRESENTATION, stateLabel } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 function bee(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -58,6 +59,21 @@ test("kill_failed: record explicitly marked", () => {
   });
   assert.equal(result.state, "kill_failed");
   assert.match(result.detail, /tmux refused/);
+});
+
+test("deriveState preserves stop doubt while canonical archive still wins", () => {
+  const at = "2026-05-28T11:30:00.000Z";
+  const active = bee({
+    status: "kill_failed",
+    stateMachine: lifecycleCursor("state-active-stale-kill-failed", "active", at),
+  });
+  assert.equal(deriveState(active, { liveTargets: new Set(), now: NOW }).state, "kill_failed");
+
+  const archived = bee({
+    status: "kill_failed",
+    stateMachine: lifecycleCursor("state-archived-stale-kill-failed", "archived", at),
+  });
+  assert.equal(deriveState(archived, { liveTargets: new Set([archived.tmuxTarget]), now: NOW }).state, "done");
 });
 
 test("blocked: trust prompt in pane", () => {

@@ -13,6 +13,7 @@ import type {
   RunnerInputAnswer,
   RunnerInputQuestion,
   RunnerOpts,
+  RunnerPreparedAnswer,
   RunnerSendOpts,
   RunnerSession,
   RunnerTier,
@@ -37,6 +38,8 @@ export type OpenCodeAdapterDependencies = {
   startupTimeoutMs?: number;
   requestTimeoutMs?: number;
   reconnectBaseMs?: number;
+  /** @internal deterministic terminal-drain barrier for adapter tests. */
+  beforeProviderEvent?: (event: unknown) => Promise<void> | void;
 };
 
 type OpenCodeSessionInfo = {
@@ -459,11 +462,26 @@ export async function startOpenCodeRunner(
   const child = await spawnSessionChild(spawn.command, spawn.args, {
     cwd: opts.cwd,
     env: spawn.env,
+    onChildSpawnPending: opts.onChildSpawnPending,
+    onChildSpawnFailure: opts.onChildSpawnFailure,
     onChildSpawn: opts.onChildSpawn,
   });
   const sseAbort = new AbortController();
+  let sseLoop: Promise<void> | undefined;
   let stopping = false;
-  const plumbing = attachSessionPlumbing(opts.bee, child, { onChildExit: () => sseAbort.abort() });
+  const plumbing = attachSessionPlumbing(opts.bee, child, {
+    onChildExit: async () => {
+      // Child `close` proves stdout/stderr EOF, but OpenCode's provider stream
+      // is a separate HTTP connection. A parsed SSE frame may already be in
+      // its async handler when the server process closes. Abort future reads
+      // and join that consumer before sessionBase stamps the terminal exit so
+      // no final provider event can land above (or be dropped behind) it.
+      sseAbort.abort();
+      await sseLoop?.catch(() => undefined);
+    },
+    eventHost: opts.eventHost,
+    onEventPersistenceFailure: opts.onEventPersistenceFailure,
+  });
   const { ingestEvent, events, snapshot, hasExited } = plumbing;
 
   const startupLines: string[] = [];
@@ -487,8 +505,12 @@ export async function startOpenCodeRunner(
     const parsed = parseOpenCodeStartupUrl(line);
     if (parsed) resolveUrl(parsed);
   };
-  child.stdout?.on("data", makeLineReader(onStartupLine));
-  child.stderr?.on("data", makeLineReader(onStartupLine));
+  const startupStdoutReader = makeLineReader(onStartupLine);
+  const startupStderrReader = makeLineReader(onStartupLine);
+  child.stdout?.on("data", startupStdoutReader);
+  child.stdout?.once("end", () => startupStdoutReader.end());
+  child.stderr?.on("data", startupStderrReader);
+  child.stderr?.once("end", () => startupStderrReader.end());
   child.once("exit", (code, signal) => {
     rejectUrl(new Error(`hsr opencode: server exited before startup (code ${code ?? "null"}, signal ${signal ?? "none"})`));
   });
@@ -793,6 +815,7 @@ export async function startOpenCodeRunner(
     if (!event || !type || !properties) return;
     if (type === "server.connected" || type === "server.heartbeat") return;
     if (eventSessionId(properties) !== sessionId) return;
+    await dependencies.beforeProviderEvent?.(eventValue);
 
     if (type === "message.updated") {
       const info = asObject(properties.info);
@@ -964,7 +987,7 @@ export async function startOpenCodeRunner(
     if (!connected) throw new Error("OpenCode SSE ended before server.connected");
   }
 
-  const sseLoop = (async () => {
+  sseLoop = (async () => {
     while (!stopping && !hasExited()) {
       try {
         const response = await eventRequest();
@@ -1007,6 +1030,39 @@ export async function startOpenCodeRunner(
     throw new Error(`hsr opencode SSE setup failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  const prepareAnswer = async (requestId: string, answer: RunnerInputAnswer): Promise<RunnerPreparedAnswer> => {
+    const pending = pendingInputs.get(requestId);
+    if (!pending) throw new Error(`hsr opencode: no pending input for requestId ${requestId}`);
+    if (stopping || hasExited()) throw new Error("hsr opencode: server process has exited or is stopping");
+    return {
+      async dispatch(): Promise<void> {
+        if (pending.kind === "permission") {
+          const text = typeof answer === "string" ? answer : JSON.stringify(answer);
+          await jsonRequest(`/permission/${encodeURIComponent(requestId)}/reply`, {
+            method: "POST",
+            body: JSON.stringify({ reply: permissionReply(text) }),
+          });
+        } else {
+          const text = typeof answer === "string" ? answer.trim().toLowerCase() : "";
+          if (["reject", "cancel", "dismiss"].includes(text)) {
+            await jsonRequest(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" });
+          } else {
+            await jsonRequest(`/question/${encodeURIComponent(requestId)}/reply`, {
+              method: "POST",
+              body: JSON.stringify({ answers: questionAnswers(answer, pending) }),
+            });
+          }
+        }
+        if (pendingInputs.get(requestId) === pending) pendingInputs.delete(requestId);
+      },
+    };
+  };
+
+  const answer = async (requestId: string, value: RunnerInputAnswer): Promise<void> => {
+    const prepared = await prepareAnswer(requestId, value);
+    await prepared.dispatch();
+  };
+
   const session: RunnerSession = {
     sessionId,
     tier: "server",
@@ -1028,28 +1084,8 @@ export async function startOpenCodeRunner(
       }
       return { status: "interrupt_requested" } as const;
     },
-    async answer(requestId: string, answer: RunnerInputAnswer): Promise<void> {
-      const pending = pendingInputs.get(requestId);
-      if (!pending) throw new Error(`hsr opencode: no pending input for requestId ${requestId}`);
-      if (pending.kind === "permission") {
-        const text = typeof answer === "string" ? answer : JSON.stringify(answer);
-        await jsonRequest(`/permission/${encodeURIComponent(requestId)}/reply`, {
-          method: "POST",
-          body: JSON.stringify({ reply: permissionReply(text) }),
-        });
-      } else {
-        const text = typeof answer === "string" ? answer.trim().toLowerCase() : "";
-        if (["reject", "cancel", "dismiss"].includes(text)) {
-          await jsonRequest(`/question/${encodeURIComponent(requestId)}/reject`, { method: "POST" });
-        } else {
-          await jsonRequest(`/question/${encodeURIComponent(requestId)}/reply`, {
-            method: "POST",
-            body: JSON.stringify({ answers: questionAnswers(answer, pending) }),
-          });
-        }
-      }
-      pendingInputs.delete(requestId);
-    },
+    prepareAnswer,
+    answer,
     events,
     snapshot,
     async stop(): Promise<void> {
@@ -1061,7 +1097,7 @@ export async function startOpenCodeRunner(
         await jsonRequest(`/session/${encodeURIComponent(sessionId)}/abort`, { method: "POST" }).catch(() => undefined);
       }
       sseAbort.abort();
-      await sseLoop.catch(() => undefined);
+      await sseLoop?.catch(() => undefined);
       await plumbing.stop();
     },
   };

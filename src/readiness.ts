@@ -1,6 +1,7 @@
 import { hasAgentDriver, isDriverActive, isDriverReady } from "./drivers.js";
 import type { SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
+import { withRunnableSessionAdmission } from "./delivery.js";
 
 export type ReadinessFailureReason = "trust" | "blocked" | "timeout";
 
@@ -22,6 +23,11 @@ export type WaitForAgentReadyOptions = {
   trustGraceMs?: number;
   /** Substrate override (used by tests); defaults to substrateFor(record). */
   substrate?: Pick<Substrate, "capture" | "sendEnter" | "sendKey">;
+  /** Explicit lifecycle-admission seam for hermetic readiness tests. */
+  admitMutation?: <T>(
+    snapshot: SessionRecord,
+    effect: (current: SessionRecord) => Promise<T>,
+  ) => Promise<T>;
 };
 
 const DEFAULT_TRUST_GRACE_MS = 10_000;
@@ -39,6 +45,22 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
   let droidYoloCycles = 0;
   let lastPane = "";
   const substrate = options.substrate ?? substrateFor(record);
+  const admitMutation = options.admitMutation ?? (<T>(
+    snapshot: SessionRecord,
+    effect: (current: SessionRecord) => Promise<T>,
+  ) => withRunnableSessionAdmission(snapshot, (_lifecycle, current) => effect(current)));
+
+  const drive = async (
+    stillApplicable: (pane: string) => boolean,
+    effect: (current: SessionRecord) => Promise<void>,
+  ): Promise<boolean> => admitMutation(record, async (current) => {
+    // Re-observe inside the lifecycle admission. A stop may have won after the
+    // outer poll, or the prompt may have advanced; neither permits a stale key.
+    const freshPane = await substrate.capture(current.tmuxTarget, 100, current.agentPaneId).catch(() => "");
+    if (!stillApplicable(freshPane)) return false;
+    await effect(current);
+    return true;
+  });
 
   while (Date.now() < deadline) {
     const pane = await substrate.capture(record.tmuxTarget, 100, record.agentPaneId).catch(() => "");
@@ -55,20 +77,27 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
         throw new AgentReadinessError("trust", `Agent startup is waiting for a trust/safety confirmation in ${record.name}; rerun without --no-accept-trust to acknowledge it`, pane);
       }
       if (trustAttempts < 3) {
-        if (bypass) {
+        const acted = await drive(
+          bypass ? isBypassPermissionsPane : isTrustPromptPane,
+          async (current) => {
+          if (bypass) {
           // claude's bypass-permissions dialog defaults its selector to
           // "1. No, exit", so a bare Enter would KILL the bee. The digit key
           // jumps straight to and confirms "2. Yes, I accept".
-          await substrate.sendKey(record.tmuxTarget, "2", record.agentPaneId);
+            await substrate.sendKey(current.tmuxTarget, "2", current.agentPaneId);
         } else {
           // The directory-trust prompt pre-selects the affirmative option, so
           // Enter accepts it.
-          await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
+            await substrate.sendEnter(current.tmuxTarget, current.agentPaneId);
         }
-        trustAttempts += 1;
-        deadline = Math.max(deadline, Date.now() + grace);
-        await sleep(1000);
-        continue;
+          },
+        );
+        if (acted) {
+          trustAttempts += 1;
+          deadline = Math.max(deadline, Date.now() + grace);
+          await sleep(1000);
+          continue;
+        }
       }
       // Three attempts didn't clear it — keep polling but stop sending keys.
     }
@@ -80,27 +109,39 @@ export async function waitForAgentReady(record: SessionRecord, options: WaitForA
     // bee's renderer behavior. Both are gated on acceptTrust: it is the
     // caller's "drive startup dialogs for me" switch.
     if (acceptTrust && isResumeChoicePane(pane) && resumeAttempts < 3) {
-      await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
-      resumeAttempts += 1;
-      deadline = Math.max(deadline, Date.now() + grace);
-      await sleep(1000);
-      continue;
+      const acted = await drive(isResumeChoicePane, async (current) => {
+        await substrate.sendEnter(current.tmuxTarget, current.agentPaneId);
+      });
+      if (acted) {
+        resumeAttempts += 1;
+        deadline = Math.max(deadline, Date.now() + grace);
+        await sleep(1000);
+        continue;
+      }
     }
     if (acceptTrust && isRendererTourPane(pane) && tourAttempts < 3) {
-      await substrate.sendKey(record.tmuxTarget, "Down", record.agentPaneId);
-      await sleep(300);
-      await substrate.sendEnter(record.tmuxTarget, record.agentPaneId);
-      tourAttempts += 1;
-      deadline = Math.max(deadline, Date.now() + grace);
-      await sleep(1000);
-      continue;
+      const acted = await drive(isRendererTourPane, async (current) => {
+        await substrate.sendKey(current.tmuxTarget, "Down", current.agentPaneId);
+        await sleep(300);
+        await substrate.sendEnter(current.tmuxTarget, current.agentPaneId);
+      });
+      if (acted) {
+        tourAttempts += 1;
+        deadline = Math.max(deadline, Date.now() + grace);
+        await sleep(1000);
+        continue;
+      }
     }
 
     if (record.agent === "droid" && options.raiseDroidAutonomy && shouldRaiseDroidAutonomy(pane) && droidYoloCycles < 4) {
-      await substrate.sendKey(record.tmuxTarget, "C-l", record.agentPaneId);
-      droidYoloCycles += 1;
-      await sleep(700);
-      continue;
+      const acted = await drive(shouldRaiseDroidAutonomy, async (current) => {
+        await substrate.sendKey(current.tmuxTarget, "C-l", current.agentPaneId);
+      });
+      if (acted) {
+        droidYoloCycles += 1;
+        await sleep(700);
+        continue;
+      }
     }
 
     if (isAgentReadyPane(record.agent, pane)) return;

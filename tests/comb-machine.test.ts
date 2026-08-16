@@ -10,6 +10,7 @@ import { judgeCombEvidence } from "../src/comb/evidence.js";
 import type { ActivationRecord, CombSpec, JsonValue, RunRecord } from "../src/comb/types.js";
 import type { SealRecord } from "../src/seal.js";
 import { withFileLock } from "../src/lock.js";
+import type { SessionRecord } from "../src/store.js";
 
 async function withTempStore(fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "honeybee-comb-machine-"));
@@ -309,7 +310,7 @@ test("cross-controller run sweep lock prevents duplicate irreversible spawns", a
   });
 });
 
-test("crash recovery fails after the adoption window but owns and cleans up a late spawn", async () => {
+test("crash recovery holds unknown launch ownership and late-confirms an exact returned spawn", async () => {
   await withTempStore(async (dir) => {
     const definition: CombSpec = {
       formatVersion: 2,
@@ -330,17 +331,30 @@ test("crash recovery fails after the adoption window but owns and cleans up a la
     let spawns = 0;
     let signalSpawn!: () => void;
     let releaseSpawn!: (result: { name: string; id?: string }) => void;
+    let publishedBeforeBrief: SessionRecord | null = null;
+    let exposePublished = false;
     const spawnStarted = new Promise<void>((resolve) => { signalSpawn = resolve; });
     const spawnResult = new Promise<{ name: string; id?: string }>((resolve) => { releaseSpawn = resolve; });
     const deps: CombSweepDeps = {
       listRuns: listSweepableRuns,
       latestSeal: async () => null,
-      spawnAgent: async () => {
+      spawnAgent: async (request) => {
         spawns += 1;
+        publishedBeforeBrief = {
+          name: request.name,
+          agent: request.agent,
+          cwd: request.cwd,
+          command: request.agent,
+          tmuxTarget: request.name,
+          createdAt: new Date(now).toISOString(),
+          updatedAt: new Date(now).toISOString(),
+          status: "running",
+          contract: { completion: "seal", taskId: request.taskId, attempt: request.attempt },
+        };
         signalSpawn();
         return spawnResult;
       },
-      lookupAgent: async () => null,
+      lookupAgent: async () => exposePublished ? publishedBeforeBrief : null,
       retireAgent: async () => undefined,
       now: () => now,
     };
@@ -352,18 +366,83 @@ test("crash recovery fails after the adoption window but owns and cleans up a la
     assert.equal((await loadRun(run.id))?.activations["work@1#0"]?.status, "active");
 
     now += 101;
+    exposePublished = true;
     const afterWindow = await sweepCombs(deps, [], new Map());
-    assert.equal(afterWindow.some((outcome) => outcome.error === "executing spawn was not adoptable"), true);
+    assert.equal(afterWindow.some((outcome) => outcome.error?.includes("durable launch-and-delivery receipt")), true);
+    const held = (await loadRun(run.id))!;
+    assert.equal(Object.values(held.effects)[0]?.status, "ambiguous");
     releaseSpawn({ name: `late-${run.id}` });
     await interruptedSweep;
 
     const stored = (await loadRun(run.id))!;
     assert.equal(spawns, 1);
-    assert.equal(stored.activations["work@1#0"]?.status, "failed");
-    assert.equal(stored.activations["work@1#0"]?.failure?.code, "spawn-adoption-missing");
+    assert.equal(stored.activations["work@1#0"]?.status, "active");
+    assert.equal(stored.activations["work@1#0"]?.failure, undefined);
     assert.equal(Object.values(stored.effects)[0]?.status, "confirmed");
     assert.equal(stored.activations["work@1#0"]?.beeHandles[0]?.name, `late-${run.id}`);
-    assert.equal(stored.cleanup.status, "complete");
+    assert.equal(stored.cleanup.status, "not-required");
+  });
+});
+
+test("automatic terminal cleanup retires only after source lifecycle admission exits", async () => {
+  await withTempStore(async (dir) => {
+    const run = await createRun({
+      definition: {
+        formatVersion: 2,
+        name: "cleanup-lock-order",
+        input: { kind: "informal", description: "none" },
+        nodes: [reviewerNode("work")],
+        edges: [],
+      },
+      input: null,
+      cwd: dir,
+      productKey: "test",
+      origin: { kind: "manual", actor: "test" },
+      policies: { maxAttemptsPerActivation: 1, retryBackoffMs: 0 },
+    });
+    const beeName = `cleanup-${run.id}`;
+    const baseDeps: CombSweepDeps = {
+      listRuns: listSweepableRuns,
+      latestSeal: async () => null,
+      spawnAgent: async () => ({ name: beeName }),
+      lookupAgent: async () => null,
+      retireAgent: async () => undefined,
+      now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    };
+    await sweepCombs(baseDeps, [], new Map());
+
+    const source: SessionRecord = {
+      name: beeName,
+      agent: "claude",
+      cwd: dir,
+      command: "claude",
+      tmuxTarget: beeName,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:00.000Z",
+      status: "running",
+    };
+    let admissionHeld = false;
+    const retired: string[] = [];
+    const outcomes = await sweepCombs({
+      ...baseDeps,
+      withAgentSourceAdmission: async (sources, fn) => {
+        assert.deepEqual(sources.map((record) => record.name), [beeName]);
+        admissionHeld = true;
+        try {
+          return await fn(sources);
+        } finally {
+          admissionHeld = false;
+        }
+      },
+      retireAgent: async (name) => {
+        assert.equal(admissionHeld, false, "cleanup must not re-enter the held source lifecycle lock");
+        retired.push(name);
+      },
+    }, [source], new Map([[beeName, "dead"]]));
+
+    assert.deepEqual(retired, [beeName]);
+    assert.ok(outcomes.some((outcome) => outcome.action === "cleanup" && outcome.detail === "retired"));
+    assert.equal((await loadRun(run.id))?.cleanup.status, "complete");
   });
 });
 

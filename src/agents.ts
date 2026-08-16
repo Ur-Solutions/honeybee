@@ -11,6 +11,12 @@ import { writeSpawnOptions } from "./hiveState.js";
 import { allocateBeeIdentity } from "./ids.js";
 import { isWellFormedPaneId } from "./paneId.js";
 import { LOCAL_NODE_NAME, type NodeRecord } from "./node.js";
+import { withBeeNameLaunchAdmission } from "./nameAdmission.js";
+import {
+  cleanupLaunchedTmuxIncarnation,
+  launchPublicationError,
+  rollbackFreshLaunchPublication,
+} from "./launchPublication.js";
 import { safeName, saveSession, type SessionRecord } from "./store.js";
 import { resolveSpawningBeeId } from "./spawnParent.js";
 import { mergeCallerEnv } from "./spawnEnv.js";
@@ -128,11 +134,24 @@ export type ResolveAgentOptions = {
   provider?: string;
   /** Caller-supplied spawn env, validated against honeybee-owned keys. */
   env?: Record<string, string>;
+  /** Trusted execution-protocol launch: ignore every local command/home/env overlay. */
+  protocolLaunch?: boolean;
 };
 
 export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options: ResolveAgentOptions = {}): AgentSpec {
   const requestedCfg = beeConfig(String(kind));
-  const profile = resolveProfile(kind, options.home ?? requestedCfg.home);
+  const profile = options.protocolLaunch
+    ? (() => {
+        const exactKind = String(kind);
+        const homeEnv = homeEnvForAgent(exactKind);
+        const selectedHome = typeof options.home === "string" ? options.home : undefined;
+        return {
+          kind: exactKind,
+          homeEnv,
+          homePath: selectedHome && homeEnv ? resolveHome(exactKind, selectedHome) : undefined,
+        };
+      })()
+    : resolveProfile(kind, options.home ?? requestedCfg.home);
   const canonicalCfg = profile.kind !== kind ? beeConfig(profile.kind) : requestedCfg;
   // Per-profile env keys (HIVE_MINIMAX_CMD) win over the canonical kind's keys
   // (HIVE_OPENCODE_CMD) so aliased profiles override independently. For a plain
@@ -143,13 +162,16 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
   const yoloEnv = (suffix: string) => truthyEnv(process.env[`HIVE_${suffix}_YOLO`]);
   // The requested (profile) command wins over the canonical kind's command:
   // the whole point of a profile is its own command (e.g. model selection).
-  const commandOverride = cmdEnv(requestedSuffix) ?? cmdEnv(canonicalSuffix) ?? requestedCfg.command ?? canonicalCfg.command;
-  const yoloFallback =
-    yoloEnv(requestedSuffix) ||
-    yoloEnv(canonicalSuffix) ||
-    truthyEnv(process.env.HIVE_YOLO) ||
-    requestedCfg.yolo === true ||
-    canonicalCfg.yolo === true;
+  const commandOverride = options.protocolLaunch
+    ? undefined
+    : cmdEnv(requestedSuffix) ?? cmdEnv(canonicalSuffix) ?? requestedCfg.command ?? canonicalCfg.command;
+  const yoloFallback = options.protocolLaunch
+    ? false
+    : yoloEnv(requestedSuffix) ||
+      yoloEnv(canonicalSuffix) ||
+      truthyEnv(process.env.HIVE_YOLO) ||
+      requestedCfg.yolo === true ||
+      canonicalCfg.yolo === true;
   // A caller-supplied yolo decision (e.g. from the CLI's dangerousMode, which
   // applies per-agent defaults and opt-outs) is authoritative; only fall back
   // to env/config when the caller has no opinion.
@@ -166,11 +188,12 @@ export function resolveAgent(kind: AgentKind, extraArgs: string[] = [], options:
     Object.assign(env, identityEnvForAgent(profile.kind, profile.homePath));
   }
   const redactedEnvKeys = new Set<string>();
-  const gatewayEnv = liveGatewayEnv();
+  const gatewayEnv = options.protocolLaunch ? {} : liveGatewayEnv();
   Object.assign(env, gatewayEnv);
   for (const key of Object.keys(gatewayEnv)) redactedEnvKeys.add(key);
-  mergeCallerEnv(env, options.env);
-  for (const key of Object.keys(options.env ?? {})) redactedEnvKeys.add(key);
+  const callerEnv = options.protocolLaunch ? undefined : options.env;
+  mergeCallerEnv(env, callerEnv);
+  for (const key of Object.keys(callerEnv ?? {})) redactedEnvKeys.add(key);
   // The account's model selector is appended ONLY when the base command came
   // from the driver default — never when a config/env `command` override is in
   // play, since such a command may already embed `--model …` and appending
@@ -214,14 +237,19 @@ export function shellCommand(spec: AgentSpec, options: { forExec?: boolean } = {
  * has stamped it. Idempotent, and a no-op for static-env recipes or spawns
  * without a home.
  */
-export function refreshIdentityEnv(spec: AgentSpec, callerEnv?: Record<string, string>): void {
+export function refreshIdentityEnv(
+  spec: AgentSpec,
+  callerEnv?: Record<string, string>,
+  options: { protocolLaunch?: boolean } = {},
+): void {
   if (!spec.homePath) return;
   Object.assign(spec.env, identityEnvForAgent(spec.kind, spec.homePath));
-  const gatewayEnv = liveGatewayEnv();
+  const gatewayEnv = options.protocolLaunch ? {} : liveGatewayEnv();
   Object.assign(spec.env, gatewayEnv);
   for (const key of Object.keys(gatewayEnv)) (spec.redactedEnvKeys ??= new Set()).add(key);
-  mergeCallerEnv(spec.env, callerEnv);
-  for (const key of Object.keys(callerEnv ?? {})) (spec.redactedEnvKeys ??= new Set()).add(key);
+  const acceptedCallerEnv = options.protocolLaunch ? undefined : callerEnv;
+  mergeCallerEnv(spec.env, acceptedCallerEnv);
+  for (const key of Object.keys(acceptedCallerEnv ?? {})) (spec.redactedEnvKeys ??= new Set()).add(key);
 }
 
 /**
@@ -486,12 +514,14 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
   const name = safeName(opts.name ?? identity.id);
   const spawnedById = opts.spawnedById ?? (await resolveSpawningBeeId());
   stampBeeIdentityEnv(spec.env, { name, id: identity.id, comb: name, ...(spawnedById ? { parent: spawnedById } : {}) });
+  return withBeeNameLaunchAdmission(name, async (reservation) => {
   const tmuxTarget = safeTmuxTargetForFlow(name);
   const nodeName = opts.node?.name ?? LOCAL_NODE_NAME;
   const substrate = opts.node ? substrateForRecord(opts.node) : localSubstrate();
   if (await substrate.hasSession(tmuxTarget)) {
     throw new Error(`tmux session already exists${isRemote && opts.node ? ` on ${opts.node.name}` : ""}: ${tmuxTarget}`);
   }
+  await reservation.markLaunchDispatch();
   const launch = await substrate.newSession(tmuxTarget, opts.cwd, { command: spec.command, args: spec.args, env: spec.env, tmuxOptions: spec.tmuxOptions });
   const command = shellCommand(spec);
 
@@ -529,7 +559,23 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     ...(opts.runId ? { runId: opts.runId } : {}),
     ...(opts.flowName ? { flowName: opts.flowName } : {}),
   };
-  await saveSession(record);
-  await writeSpawnOptions(record);
-  return record;
+  try {
+    await reservation.recordTmuxLaunch({
+      substrate: substrate.kind === "ssh-tmux" ? "ssh-tmux" : "local-tmux",
+      target: tmuxTarget,
+      ...(nodeName !== LOCAL_NODE_NAME ? { node: nodeName } : {}),
+      launch,
+    });
+    await saveSession(record);
+    await writeSpawnOptions(record);
+    await reservation.promotePublished(record);
+    return record;
+  } catch (error) {
+    const rollback = await rollbackFreshLaunchPublication(reservation, record, {
+      context: `Flow tmux launch publication failed for ${name}`,
+      cleanup: () => cleanupLaunchedTmuxIncarnation(substrate, tmuxTarget, launch),
+    });
+    throw launchPublicationError(error, rollback.cleanup, rollback.ownershipPersisted, rollback);
+  }
+  }, { operation: "flow-spawn" });
 }

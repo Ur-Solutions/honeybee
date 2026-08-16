@@ -6,8 +6,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { deadSessionRecords, idleOlderThanMillis, olderThanMillis, parseAge } from "../src/clean.js";
-import { liveTargetKey } from "../src/state.js";
-import type { SessionRecord } from "../src/store.js";
+import { cleanCandidate, cleanCandidateFor, cleanSessionExactly, cleanTuiItem } from "../src/commands/clean.js";
+import { purgeSessionData } from "../src/kill.js";
+import { deriveState, liveTargetKey } from "../src/state.js";
+import { loadSession, saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
+import type { Substrate } from "../src/substrates/types.js";
 import { hasSession as tmuxHasSession, kill as tmuxKill, newSession as tmuxNewSession } from "../src/tmux.js";
 
 const execFileAsync = promisify(execFile);
@@ -36,6 +39,198 @@ test("deadSessionRecords protects an accepted message until recovery resolves", 
   const recovering = session("CO.recovering", "CO-recovering");
   recovering.recoveryRequestedAt = "2026-08-10T00:00:00.000Z";
   assert.deepEqual(deadSessionRecords([recovering], new Set()), []);
+});
+
+test("clean purge preserves a record archived after stale candidate selection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-archive-race-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    const stale = session("archive-race", "archive-race");
+    await saveSession(stale);
+    await transitionSession(stale.name, {
+      type: "bee.archived",
+      eventId: "clean-archive-race",
+      at: stale.updatedAt,
+      cause: "retire",
+      evidence: { kind: "operator", actionId: "clean-archive-race", observedAt: stale.updatedAt, action: "retire" },
+      probe: {
+        kind: "probe",
+        probeId: "clean-archive-race",
+        observerId: "clean-test",
+        observedAt: stale.updatedAt,
+        outcome: "dead",
+        target: { substrate: "local-tmux", tmuxTarget: stale.tmuxTarget },
+      },
+    });
+
+    const purged = await purgeSessionData(stale, {
+      preserveArchived: true,
+      finalCredentialSync: async () => undefined,
+    });
+    assert.equal(purged, false);
+    assert.equal((await loadSession(stale.name))?.stateMachine?.lifecycle, "archived");
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("clean purge preserves a recovery accepted after stale candidate selection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-recovery-race-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    const stale = session("recovery-race", "recovery-race");
+    await saveSession(stale);
+    await updateSession(stale.name, {
+      recoveryRequestedAt: "2026-08-15T10:00:00.000Z",
+      recoveryMessageId: "019c0000-0000-7000-8000-000000000001",
+    });
+
+    const purged = await purgeSessionData(stale, {
+      preserveArchived: true,
+      preserveRecoveryRequest: true,
+      finalCredentialSync: async () => undefined,
+    });
+    assert.equal(purged, false);
+    assert.equal((await loadSession(stale.name))?.recoveryMessageId, "019c0000-0000-7000-8000-000000000001");
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("interactive clean disables stop-doubt rows and refuses a defensive direct clean", async () => {
+  const now = Date.parse("2026-08-15T12:00:00.000Z");
+  const stopDoubt = session("stop-doubt", "stop-doubt");
+  stopDoubt.status = "kill_failed";
+  stopDoubt.lastError = "exact stop unconfirmed";
+  const candidate = cleanCandidateFor(
+    stopDoubt,
+    [stopDoubt],
+    deriveState(stopDoubt, { liveTargets: new Set(), now }),
+    false,
+    now,
+  );
+
+  assert.equal(candidate.mode, "disabled");
+  assert.equal(candidate.disabledReason, "stop unconfirmed");
+  assert.equal(cleanTuiItem(candidate).disabledReason, "stop unconfirmed");
+  assert.deepEqual(await cleanCandidate(candidate), {
+    name: stopDoubt.name,
+    ok: false,
+    detail: "disabled: stop unconfirmed",
+  });
+});
+
+test("clean delete CAS preserves stop doubt that wins after stale selection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-stop-doubt-race-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    const stale = session("stop-doubt-race", "stop-doubt-race");
+    await saveSession(stale);
+    await mkdir(join(dir, "seals", stale.name), { recursive: true });
+    await mkdir(join(dir, "hsr", stale.name), { recursive: true });
+    await writeFile(join(dir, "seals", stale.name, "seal.json"), "seal retry evidence");
+    await writeFile(join(dir, "hsr", stale.name, "events.jsonl"), "runtime retry evidence");
+
+    const now = Date.parse("2026-08-15T12:00:00.000Z");
+    const candidate = cleanCandidateFor(
+      stale,
+      [stale],
+      deriveState(stale, { liveTargets: new Set(), now }),
+      false,
+      now,
+    );
+    assert.equal(candidate.mode, "delete", "the stale pre-race snapshot was cleanable");
+    await updateSession(stale.name, {
+      status: "kill_failed",
+      lastError: "exact process-group stop remains unconfirmed",
+    });
+
+    const outcome = await cleanCandidate(candidate);
+    assert.deepEqual(outcome, {
+      name: stale.name,
+      ok: false,
+      detail: "preserved stop doubt",
+    });
+    const current = await loadSession(stale.name);
+    assert.equal(current?.status, "kill_failed");
+    assert.equal(current?.lastError, "exact process-group stop remains unconfirmed");
+    assert.equal(await readFile(join(dir, "seals", stale.name, "seal.json"), "utf8"), "seal retry evidence");
+    assert.equal(await readFile(join(dir, "hsr", stale.name, "events.jsonl"), "utf8"), "runtime retry evidence");
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("clean exact-stops a detached HSR child even when its host target is already absent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeybee-clean-hsr-child-"));
+  const previous = process.env.HIVE_STORE_ROOT;
+  process.env.HIVE_STORE_ROOT = dir;
+  try {
+    const record: SessionRecord = {
+      ...session("hsr-dead-host-live-child", "hsr-dead-host-live-child"),
+      substrate: "hsr",
+      launcherPgid: 91234,
+      launcherFingerprint: {
+        pgid: 91234,
+        startedAt: "2026-08-15T12:34:56.000Z",
+      },
+    };
+    await saveSession(record);
+    await mkdir(join(dir, "hsr", record.name), { recursive: true });
+    await writeFile(join(dir, "hsr", record.name, "child-locator"), "must survive until exact stop");
+
+    let killCalls = 0;
+    const substrate: Substrate = {
+      kind: "hsr",
+      node: "local",
+      probe: async () => ({ ok: true }),
+      hasSession: async () => false,
+      newSession: async () => ({ paneId: "%unused" }),
+      kill: async (_target, options) => {
+        killCalls += 1;
+        assert.equal(options?.launcherPgid, record.launcherPgid);
+        assert.deepEqual(options?.launcherFingerprint, record.launcherFingerprint);
+        return { ok: true, stdout: "", stderr: "", exitCode: 0, incarnationStopped: true };
+      },
+      capture: async () => "",
+      sendText: async () => undefined,
+      sendEnter: async () => undefined,
+      sendKey: async () => undefined,
+      listSessions: async () => [],
+      listPanes: async () => new Set<string>(),
+      listSessionStates: async () => new Map<string, string>(),
+      setUserOptions: async () => undefined,
+      setWindowOptions: async () => undefined,
+      renameWindow: async () => undefined,
+      attachCommand: () => ["true"],
+      attachSession: async () => undefined,
+    };
+
+    const result = await cleanSessionExactly(record, "removed crashed", {
+      substrate,
+      emitLedger: false,
+      finalCredentialSync: async () => undefined,
+      pollIntervalMs: 0,
+    });
+
+    assert.deepEqual(result, { kind: "cleaned", detail: "removed crashed" });
+    assert.equal(killCalls, 1, "HSR cleanup must run even after the host liveness probe is negative");
+    assert.equal(await loadSession(record.name), null);
+    await assert.rejects(readFile(join(dir, "hsr", record.name, "child-locator"), "utf8"), /ENOENT/);
+  } finally {
+    if (previous === undefined) delete process.env.HIVE_STORE_ROOT;
+    else process.env.HIVE_STORE_ROOT = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("olderThanMillis filters by last update age", () => {

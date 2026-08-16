@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -76,6 +76,11 @@ test("demote aborts before HSR spawn when pane kill cannot confirm the old proce
     const persisted = JSON.parse(await readFile(join(store, "sessions", `${bee}.json`), "utf8")) as Record<string, unknown>;
     assert.equal(persisted.substrate, undefined, "record remains a tmux incarnation");
     assert.equal(persisted.runtimeGeneration, undefined, "no replacement generation is committed");
+    assert.equal(persisted.status, "kill_failed", "demote fences work before signalling the pane");
+    const journalFiles = await readdir(join(store, "launch-reservations"));
+    const journal = JSON.parse(await readFile(join(store, "launch-reservations", journalFiles[0]!), "utf8")) as Record<string, unknown>;
+    assert.equal(journal.operation, "demote");
+    assert.equal(journal.phase, "stopping");
     assert.equal(await hasSession(target), false, "pane absence alone did not authorize HSR spawn");
   } finally {
     const cleanup = await Promise.allSettled([
@@ -93,5 +98,41 @@ test("demote aborts before HSR spawn when pane kill cannot confirm the old proce
       rm(socketDir, { recursive: true, force: true }),
       rm(store, { recursive: true, force: true }),
     ]);
+  }
+});
+
+test("demote refuses a remote HSR record before stop or replacement admission", async () => {
+  const store = await mkdtemp(join(tmpdir(), "hive-demote-remote-store-"));
+  const bee = "CO.remote-demote";
+  try {
+    await mkdir(join(store, "sessions"), { recursive: true });
+    const record = {
+      name: bee,
+      agent: "codex",
+      requestedAgent: "codex",
+      cwd: "/remote/cwd",
+      command: "codex",
+      tmuxTarget: bee,
+      providerSessionId: "remote-thread",
+      node: "remote-one",
+      remoteLaunchId: "launch-old",
+      remoteIncarnation: "inc-old",
+      createdAt: "2026-08-07T00:00:00.000Z",
+      updatedAt: "2026-08-07T00:00:00.000Z",
+      status: "running",
+    };
+    await writeFile(join(store, "sessions", `${bee}.json`), `${JSON.stringify(record, null, 2)}\n`);
+    await assert.rejects(
+      execFileAsync(process.execPath, ["tests/cli-entry.mjs", "demote", bee], {
+        cwd: process.cwd(),
+        env: { ...process.env, HIVE_STORE_ROOT: store, HIVE_NO_KEYCHAIN: "1", NO_COLOR: "1", TERM: "dumb" },
+      }),
+      /remote node remote-one; demote only supports local tmux bees/,
+    );
+    const persisted = JSON.parse(await readFile(join(store, "sessions", `${bee}.json`), "utf8")) as Record<string, unknown>;
+    assert.equal(persisted.status, "running");
+    assert.equal((await readdir(join(store, "launch-reservations")).catch(() => [])).length, 0);
+  } finally {
+    await rm(store, { recursive: true, force: true });
   }
 });

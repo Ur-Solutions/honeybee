@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { connectRpcClient } from "../src/hsr/rpc.js";
+import { answerLocalHsrSessionInAdmission } from "../src/hsr/answer.js";
 import { runHsrHost, type HsrHostHandle } from "../src/hsr/host.js";
 import { stubAdapter } from "../src/hsr/adapters/stub.js";
 import { hsrObservations, pendingNeedsInput, type HsrObservation } from "../src/hsr/observe.js";
-import { ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta, writeHsrMeta, type HsrMeta } from "../src/hsr/runDir.js";
+import { appendHsrEvent, ensureHsrRunDir, hsrEventsPath, hsrRunDir, readHsrMeta, writeHsrMeta, type HsrMeta } from "../src/hsr/runDir.js";
 import { listMessages } from "../src/buz.js";
 import { createNeedsInputDispatcher } from "../src/daemon/needsInput.js";
 import { saveSession, type SessionRecord } from "../src/store.js";
@@ -160,14 +161,12 @@ test("needs-input dispatcher: routes to living parent, de-dupes, escalates when 
       // 3. `hive answer` path: answer the child directly over its control socket.
       const meta = await readHsrMeta("child");
       assert.ok(meta?.controlSocket, "child has a control socket");
-      const answerClient = await connectRpcClient(meta!.controlSocket);
-      try {
-        const pending = await pendingNeedsInput("child");
-        assert.ok(pending, "child still pending before answer");
-        await answerClient.call("answer", { requestId: pending!.requestId, answer: "yes" });
-      } finally {
-        answerClient.close();
-      }
+      const pending = await pendingNeedsInput("child");
+      assert.ok(pending, "child still pending before answer");
+      assert.equal(
+        (await answerLocalHsrSessionInAdmission(childRecord, pending!.requestId, "yes")).result.status,
+        "settled",
+      );
       // The stub resolves the turn; the needs_input clears.
       await waitFor(async () => (await pendingNeedsInput("child")) === null, "child needs-input cleared after answer");
     } finally {
@@ -180,6 +179,8 @@ test("needs-input dispatcher consumes the per-tick event snapshot when provided"
   await withTempStore(async () => {
     const childRecord = hsrRecord("snapshot-child", { id: "snapshot-child-id", parentId: "snapshot-parent-id" });
     const parentRecord = hsrRecord("snapshot-parent", { id: "snapshot-parent-id" });
+    await saveSession(childRecord);
+    await saveSession(parentRecord);
     const dispatch = createNeedsInputDispatcher();
     const states = new Map<string, BeeState>([
       ["snapshot-child", "blocked"],
@@ -272,5 +273,76 @@ test("needs-input dispatcher: routes later id-less requests instead of colliding
     assert.equal(messages.length, 2, "parent receives both distinct questions");
     assert.ok(messages.some((entry) => entry.message.body.includes("first?")));
     assert.ok(messages.some((entry) => entry.message.body.includes("second?")));
+  });
+});
+
+test("host refresh scopes current state, auth, exhaustion, and pending input to the new epoch", async () => {
+  await withTempStore(async () => {
+    const bee = "epoch-refresh";
+    let active: HsrHostHandle | undefined;
+    try {
+      active = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee) });
+      const firstMeta = await readHsrMeta(bee);
+      assert.ok(firstMeta?.hostFingerprint);
+      const firstHost = {
+        hostPid: firstMeta.hostPid,
+        startedAt: firstMeta.startedAt,
+        hostFingerprint: firstMeta.hostFingerprint,
+      };
+      const firstClient = await connectRpcClient(active.controlSocket);
+      try {
+        await firstClient.call("send", { text: "ask me" });
+      } finally {
+        firstClient.close();
+      }
+      await waitFor(async () => (await pendingNeedsInput(bee))?.question === "proceed?", "first epoch pending");
+      await appendHsrEvent(bee, {
+        type: "error",
+        ts: Date.now(),
+        message: "Not logged in - run /login",
+        host: firstHost,
+      });
+      await appendHsrEvent(bee, {
+        type: "exhausted",
+        ts: Date.now(),
+        resetHint: "old-host-limit",
+        host: firstHost,
+      });
+
+      await active.stop();
+      active = await runHsrHost({ bee, adapter: stubAdapter, opts: optsFor(bee) });
+      const secondMeta = await readHsrMeta(bee);
+      assert.ok(secondMeta?.hostFingerprint);
+      const secondHost = {
+        hostPid: secondMeta.hostPid,
+        startedAt: secondMeta.startedAt,
+        hostFingerprint: secondMeta.hostFingerprint,
+      };
+      assert.notDeepEqual(secondHost, firstHost, "refresh publishes a distinct exact host epoch");
+
+      assert.equal(await pendingNeedsInput(bee), null, "unresolved predecessor request is not grafted onto the new host");
+      const clean = (await hsrObservations({ bees: [bee], includeEvents: true })).get(bee);
+      assert.equal(clean?.state, "ready", "predecessor unfinished/auth markers do not classify the new host");
+      assert.equal(clean?.eventSnapshot?.pendingNeedsInput, null);
+      assert.equal(clean?.eventSnapshot?.usage.latestExhausted, undefined, "predecessor exhaustion is not current");
+      assert.ok(clean?.eventSnapshot?.events.every((event) => event.host?.startedAt === secondHost.startedAt));
+
+      const secondClient = await connectRpcClient(active.controlSocket);
+      try {
+        await secondClient.call("send", { text: "ask different" });
+      } finally {
+        secondClient.close();
+      }
+      await waitFor(async () => (await pendingNeedsInput(bee))?.question === "different prompt?", "second epoch pending");
+      const pending = await pendingNeedsInput(bee);
+      assert.equal(pending?.requestId, "r1", "provider request ids may restart with the host");
+      assert.equal(pending?.question, "different prompt?");
+      assert.deepEqual(pending?.host, secondHost);
+      const blocked = (await hsrObservations({ bees: [bee], includeEvents: true })).get(bee);
+      assert.equal(blocked?.state, "blocked");
+      assert.equal(blocked?.eventSnapshot?.pendingNeedsInput?.question, "different prompt?");
+    } finally {
+      await active?.stop().catch(() => undefined);
+    }
   });
 });

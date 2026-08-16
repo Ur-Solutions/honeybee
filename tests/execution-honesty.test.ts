@@ -1,12 +1,11 @@
 // Contract honesty (P0/P1 checkpoint): the corpus profile's REQUIRED event
 // list must contain only families this runtime can actually produce today,
-// and no surface (profile, node.describe, run.command) may claim the answer
-// command is deliverable while needs_input.opened is not bridged into the
-// protocol event stream. The rich families stay in the schema vocabulary as
+// and no surface may claim run.command answer is safe while v1 lacks a signed
+// runner-host epoch. The rich families stay in the schema vocabulary as
 // optionalEventTypes so fixtures and future emitters need no corpus change.
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
+import { createExecutionValidator, loadExecutionContract, type JsonObject } from "../src/execution/contract.js";
 import { PRODUCED_EVENT_TYPES, SUPPORTED_COMMANDS } from "../src/execution/describe.js";
 
 const contract = loadExecutionContract();
@@ -42,11 +41,22 @@ test("un-emitted rich families moved to optionalEventTypes keep their schema voc
   assert.deepEqual(overlap, []);
 });
 
-test("answer stays schema vocabulary but is never advertised as a deliverable runtime command", () => {
-  // The corpus command vocabulary keeps `answer` (run-command-body still
-  // validates it, like `checkpoint`)...
-  assert.ok((localCore.commands as string[]).includes("answer"));
-  // ...but the node's advertised per-driver command set — the honesty
-  // surface — must not claim it until needs_input.opened is bridged.
+test("answer stays schema vocabulary but is never advertised without an expected host epoch", () => {
+  assert.ok(!(localCore.commands as string[]).includes("answer"), "baseline clients must not send answer");
+  assert.ok(!(localCore.commands as string[]).includes("checkpoint"), "baseline clients must not send unsupported checkpoint");
+  assert.ok(!required.includes("needs_input.opened"));
+  assert.ok(!required.includes("needs_input.resolved"));
   assert.deepEqual([...SUPPORTED_COMMANDS], ["send", "interrupt"]);
+  const answer = createExecutionValidator(contract).validate("run-command", {
+    kind: "answer",
+    inputRequestId: "request-1",
+    answer: "yes",
+  });
+  assert.equal(answer.valid, true, `answer must remain forward-compatible schema vocabulary: ${answer.errors.join("; ")}`);
+  const checkpoint = createExecutionValidator(contract).validate("run-command", { kind: "checkpoint" });
+  assert.equal(
+    checkpoint.valid,
+    true,
+    `checkpoint must remain forward-compatible schema vocabulary: ${checkpoint.errors.join("; ")}`,
+  );
 });

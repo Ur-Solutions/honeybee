@@ -30,16 +30,27 @@ export type LineReaderOpts = {
   onOverflow?: () => void;
 };
 
+export type LineReader = ((chunk: Buffer) => void) & {
+  /**
+   * Flush a final unterminated frame at a proven stream EOF. Provider NDJSON
+   * writers are allowed to omit the trailing newline on their last record;
+   * callers must invoke this only after the readable has emitted `end`.
+   */
+  end(): void;
+};
+
 /**
  * Build a `(chunk: Buffer) => void` data handler that splits the stream into
  * lines and invokes `onLine` once per non-blank line. Stateful over partial
  * lines — create one per stream.
  */
-export function makeLineReader(onLine: (line: string) => void, opts: LineReaderOpts = {}): (chunk: Buffer) => void {
+export function makeLineReader(onLine: (line: string) => void, opts: LineReaderOpts = {}): LineReader {
   const maxLineLength = opts.maxLineLength ?? Number.POSITIVE_INFINITY;
   let buffer = "";
   let discarding = false;
-  return (chunk: Buffer): void => {
+  let ended = false;
+  const feed = ((chunk: Buffer): void => {
+    if (ended) return;
     buffer += chunk.toString("utf8");
     for (;;) {
       const nl = buffer.indexOf("\n");
@@ -66,5 +77,21 @@ export function makeLineReader(onLine: (line: string) => void, opts: LineReaderO
       }
       if (line.trim().length > 0) onLine(line);
     }
+  }) as LineReader;
+  feed.end = (): void => {
+    if (ended) return;
+    ended = true;
+    if (discarding) {
+      buffer = "";
+      return;
+    }
+    const line = buffer.replace(/\r$/, "");
+    buffer = "";
+    if (line.length > maxLineLength) {
+      opts.onOverflow?.();
+      return;
+    }
+    if (line.trim().length > 0) onLine(line);
   };
+  return feed;
 }

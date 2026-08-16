@@ -16,8 +16,11 @@ import {
 } from "./storage.js";
 import { formatBuzInjection } from "./inject.js";
 import { classifyBuzDeliveryFailure } from "./errors.js";
-import { clearMessageRecovery } from "./recovery.js";
+import { clearMessageRecovery, openMessageDeliveryRequest } from "./recovery.js";
+import { clearCompletedPendingHsrTurnReceipt, isHsrDeliveryAmbiguous } from "../hsr/pendingTurns.js";
 import { type BuzMessage, type DaemonDrainContext, type DrainResult } from "../buz.js";
+import { messageDeliveryRequestId } from "../requests/keys.js";
+import { readBeeRequests } from "../requests/store.js";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Daemon integration seam (PATCH 9 will call this on transition).
@@ -85,8 +88,51 @@ export async function processQueueForBee(
       }
 
       try {
-        await context.transport.substrate.sendText(context.transport.tmuxTarget, formatBuzInjection(message), context.transport.agentPaneId);
+        const ambiguityRequest = (await readBeeRequests(record.name)).find((request) =>
+          request.id === messageDeliveryRequestId(record.name, message.id) &&
+          request.status === "open" &&
+          request.evidence.detail === "delivery-ambiguous");
+        if (ambiguityRequest) {
+          result.errors.push({
+            id: message.id,
+            message: "delivery is parked behind a manual ambiguity request",
+            code: "HIVE_HSR_DELIVERY_AMBIGUOUS",
+          });
+          break;
+        }
+        await context.transport.substrate.sendText(
+          context.transport.tmuxTarget,
+          formatBuzInjection(message),
+          context.transport.agentPaneId,
+          {
+            deliveryId: message.id,
+            completionRequired: true,
+            ...(record.remoteLaunchId ? { remoteLaunchId: record.remoteLaunchId } : {}),
+            ...(record.remoteIncarnation ? { remoteIncarnation: record.remoteIncarnation } : {}),
+          },
+        );
       } catch (error) {
+        if (isHsrDeliveryAmbiguous(error)) {
+          const detail = error instanceof Error ? error.message : String(error);
+          await openMessageDeliveryRequest(record, message.id, "delivery-ambiguous").catch(() => undefined);
+          result.errors.push({
+            id: message.id,
+            message: detail,
+            code: "HIVE_HSR_DELIVERY_AMBIGUOUS",
+          });
+          await appendLedger({
+            type: "buz.deliver",
+            messageId: message.id,
+            recipient: record.name,
+            tier: "queue",
+            ok: false,
+            failureClass: "delivery-ambiguous",
+            error: detail,
+          });
+          // Preserve strict mailbox order and stop blind retries. The exact
+          // queued file remains until an operator reconciles provider outcome.
+          break;
+        }
         const failureClass = (context.classifyFailure ?? classifyBuzDeliveryFailure)(error);
         const errorCode = typeof (error as { code?: unknown } | null)?.code === "string"
           ? (error as { code: string }).code
@@ -145,9 +191,12 @@ export async function processQueueForBee(
         await rename(entry.path, target);
         await rm(`${entry.path}.retries`, { force: true }).catch(() => undefined);
       });
+      // The inbox rename is the external mailbox's durable acknowledgement.
+      // Only now may a local-HSR completed tombstone be removed; if cleanup
+      // fails, retaining it is safe and prevents any future duplicate.
+      await clearCompletedPendingHsrTurnReceipt(record.name, message.id).catch(() => undefined);
 
       result.delivered.push(message.id);
-      await clearMessageRecovery(record.name, message.id, { resolveRequestBy: "buz-delivery" }).catch(() => undefined);
       await appendLedger({
         type: "buz.deliver",
         messageId: message.id,
@@ -160,6 +209,15 @@ export async function processQueueForBee(
       if (result.delivered.length >= deliverLimit) break;
     }
   }, { timeoutMs: DELIVERY_LOCK_TIMEOUT_MS });
+
+  // Never acquire lifecycle while holding the delivery lock. HSR admission
+  // owns those locks in the opposite (authoritative) order. A lifecycle-owned
+  // daemon drain defers this one step further until its outer admission exits.
+  if (!context.deferRecoveryClear) {
+    for (const messageId of result.delivered) {
+      await clearMessageRecovery(record.name, messageId, { resolveRequestBy: "buz-delivery" }).catch(() => undefined);
+    }
+  }
 
   if (result.delivered.length > 0 || result.quarantined.length > 0) {
     await appendLedger({

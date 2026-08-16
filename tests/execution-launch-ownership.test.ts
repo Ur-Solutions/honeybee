@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { JsonObject } from "../src/execution/contract.js";
 import { executionError } from "../src/execution/errors.js";
+import { requireExecutionBinding } from "../src/execution/nodeState.js";
 import {
+  activateRunLaunchAttempt,
   appendRunEvents,
   commitRunTerminalResult,
   readReservation,
@@ -10,11 +12,16 @@ import {
   type RunLaunchOwner,
 } from "../src/execution/runStore.js";
 import { inspectRunLaunchOwner } from "../src/execution/service.js";
+import { claimWorkingCopy, readWorkingCopy, registerWorkingCopy } from "../src/execution/workingCopies.js";
 import {
+  buildOperationEnvelope,
   buildRunStartEnvelope,
   countingLauncher,
+  fakeControl,
   installTestAuthority,
   makeService,
+  SNAPSHOT_DIGEST,
+  type TestAuthority,
   withTempStore,
 } from "./executionTestKit.js";
 
@@ -40,6 +47,61 @@ function owner(
     hostname: identity.hostname ?? "test-host",
     processFingerprint: { pgid: pid, startedAt: `birth-${pid}` },
   };
+}
+
+async function createActivatedOwnerDeathWithOccupiedCopy(
+  ctx: TestAuthority,
+  options: { reconcileBeforeReturn?: boolean } = {},
+) {
+  await registerWorkingCopy({
+    workingCopyId: "wc-0001",
+    productId: "prod-honeycomb-app",
+    path: "/tmp/honeybee-activated-owner-death",
+    snapshotDigest: SNAPSHOT_DIGEST,
+  });
+  const ownerA = owner("owner-activated-hidden-runtime", 41601);
+  const ownerB = owner("owner-recovering-hidden-runtime", 41602);
+  const serviceA = makeService({
+    launcher: countingLauncher().launcher,
+    launchOwner: ownerA,
+    afterLaunchClaim: async (reservation, attemptId) => {
+      const nodeId = (await requireExecutionBinding()).nodeId;
+      await appendRunEvents(
+        reservation.runId,
+        "0.1",
+        [
+          { type: "environment.materializing", payload: {}, origin: { nodeId } },
+          { type: "harness.starting", payload: { operationId: reservation.runId }, origin: { nodeId } },
+        ],
+        { onlyIfAbsentTypes: true },
+      );
+      assert.equal((await activateRunLaunchAttempt(reservation.runId, attemptId)).activated, true);
+      // Model the real crash window after the launcher has claimed the Cell
+      // and may have forked, but before it published a SessionRecord.
+      await claimWorkingCopy("wc-0001", reservation.runId);
+      throw executionError("AUTHORITY_UNAVAILABLE", "simulated coordinator death after launch side effect");
+    },
+  });
+  const interrupted = (await serviceA.runStart(buildRunStartEnvelope(ctx))) as JsonObject;
+  assert.equal((interrupted.error as JsonObject).code, "AUTHORITY_UNAVAILABLE");
+
+  const control = fakeControl();
+  const recoveryLauncher = countingLauncher();
+  const serviceB = makeService({
+    launcher: recoveryLauncher.launcher,
+    control: control.control,
+    launchOwner: ownerB,
+    inspectLaunchOwner: async (candidate) => candidate.ownerId === ownerA.ownerId ? "dead" : "alive",
+  });
+  if (options.reconcileBeforeReturn !== false) {
+    const replay = (await serviceB.runStart(
+      buildRunStartEnvelope(ctx, { requestId: "req-reconcile-hidden-runtime" }),
+    )) as JsonObject;
+    assert.deepEqual(replay.result, { runId: RUN_ID, state: "lost" });
+    assert.equal((await readReservation(RUN_ID))!.indeterminateCause, "readiness_evidence_missing");
+  }
+  assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+  return { service: serviceB, control, recoveryLauncher };
 }
 
 test("same owner resumes durable preparation after transient launch-event publication failure", async () => {
@@ -170,6 +232,159 @@ test("two services: hostname change on the same machine permits proven-dead owne
     claimed.release();
     await a;
     assert.equal(counting.calls.length, 1, "the stale A continuation revalidates its attempt token before launch");
+  });
+});
+
+test("two services: a dead owner after activation is not relaunched when runtime evidence is missing", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const firstCounting = countingLauncher();
+    const secondCounting = countingLauncher();
+    const ownerA = owner("owner-activated", 41501);
+    const ownerB = owner("owner-recovering", 41502);
+    let activatedAttemptId = "";
+
+    const serviceA = makeService({
+      launcher: firstCounting.launcher,
+      launchOwner: ownerA,
+      afterLaunchClaim: async (reservation, attemptId) => {
+        const nodeId = (await requireExecutionBinding()).nodeId;
+        await appendRunEvents(
+          reservation.runId,
+          "0.1",
+          [
+            { type: "environment.materializing", payload: {}, origin: { nodeId } },
+            { type: "harness.starting", payload: { operationId: reservation.runId }, origin: { nodeId } },
+          ],
+          { onlyIfAbsentTypes: true },
+        );
+        const activation = await activateRunLaunchAttempt(reservation.runId, attemptId);
+        assert.equal(activation.activated, true);
+        activatedAttemptId = attemptId;
+        throw executionError("AUTHORITY_UNAVAILABLE", "simulated coordinator crash after launch activation");
+      },
+    });
+
+    const interrupted = (await serviceA.runStart(buildRunStartEnvelope(ctx))) as JsonObject;
+    assert.equal((interrupted.error as JsonObject).code, "AUTHORITY_UNAVAILABLE");
+    assert.equal(firstCounting.calls.length, 0, "crash lands after activation but before launcher invocation");
+    let reservation = (await readReservation(RUN_ID))!;
+    assert.equal(reservation.launchAttempt?.stage, "launching");
+    assert.equal(reservation.launchAttempt?.attemptId, activatedAttemptId);
+
+    const serviceB = makeService({
+      launcher: secondCounting.launcher,
+      launchOwner: ownerB,
+      inspectLaunchOwner: async (candidate) => candidate.ownerId === ownerA.ownerId ? "dead" : "alive",
+    });
+    const replay = (await serviceB.runStart(
+      buildRunStartEnvelope(ctx, { requestId: "req-after-activated-owner-death" }),
+    )) as JsonObject;
+
+    assert.deepEqual(replay.result, { runId: RUN_ID, state: "lost" });
+    assert.equal(secondCounting.calls.length, 0, "missing evidence never authorizes a second launcher");
+    reservation = (await readReservation(RUN_ID))!;
+    assert.equal(reservation.launchAttempt?.owner.ownerId, ownerA.ownerId, "activated ownership is never replaced");
+    assert.equal(reservation.launchAttempt?.attemptId, activatedAttemptId);
+    assert.equal(reservation.launchAttempt?.takeoverOf, undefined);
+    assert.equal(reservation.indeterminateCause, "readiness_evidence_missing");
+    assert.ok(reservation.indeterminateAt, "the unknowable launch outcome is durable");
+
+    const events = await readRunEvents(RUN_ID);
+    assert.deepEqual(events.map((event) => event.type), [
+      "run.accepted",
+      "environment.materializing",
+      "harness.starting",
+      "run.lost",
+    ]);
+    assert.equal((events.at(-1)!.payload as JsonObject).cause, "readiness_evidence_missing");
+
+    const repeated = (await serviceB.runStart(
+      buildRunStartEnvelope(ctx, { requestId: "req-after-activated-owner-death-replay" }),
+    )) as JsonObject;
+    assert.deepEqual(repeated.result, { runId: RUN_ID, state: "lost" });
+    assert.equal(secondCounting.calls.length, 0);
+    assert.equal(
+      (await readRunEvents(RUN_ID)).filter((event) => event.type === "run.lost").length,
+      1,
+      "reconciliation repairs or deduplicates the one durable loss episode",
+    );
+  });
+});
+
+test("cancel cannot turn an activated owner-death gap into false runtime-down proof", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const { service, control } = await createActivatedOwnerDeathWithOccupiedCopy(ctx);
+
+    const cancelled = (await service.runCancel(
+      buildOperationEnvelope(ctx, `${RUN_ID}/cancel-hidden-runtime`, { runId: RUN_ID, reason: "operator cancel" }),
+    )) as JsonObject;
+
+    assert.deepEqual(cancelled.result, { runId: RUN_ID, state: "lost" });
+    const reservation = (await readReservation(RUN_ID))!;
+    assert.equal(reservation.result, undefined);
+    assert.ok(reservation.cancel);
+    assert.equal(reservation.launchOccupancyCleanup, undefined);
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+    assert.equal(control.calls.filter((call) => call.method === "stop").length, 0, "an absent record is not a stoppable identity");
+  });
+});
+
+test("cancel arriving first cannot hide an activated dead-owner launch from inventory reconciliation", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const { service, control, recoveryLauncher } = await createActivatedOwnerDeathWithOccupiedCopy(
+      ctx,
+      { reconcileBeforeReturn: false },
+    );
+
+    const beforeCancel = (await readReservation(RUN_ID))!;
+    assert.equal(beforeCancel.launchAttempt?.stage, "launching");
+    assert.equal(beforeCancel.indeterminateAt, undefined);
+
+    const cancelled = (await service.runCancel(
+      buildOperationEnvelope(ctx, `${RUN_ID}/cancel-first-hidden-runtime`, { runId: RUN_ID, reason: "operator cancel" }),
+    )) as JsonObject;
+    assert.deepEqual(cancelled.result, { runId: RUN_ID, state: "starting" });
+    assert.ok((await readReservation(RUN_ID))!.cancel, "the desired cancellation is durable before recovery");
+
+    const page = await service.reconcileInventory({ limit: 8 });
+    assert.equal(page.outcomes.find((outcome) => outcome.runId === RUN_ID)?.action, "reconciled");
+    const reconciled = (await readReservation(RUN_ID))!;
+    assert.equal(reconciled.indeterminateCause, "readiness_evidence_missing");
+    assert.equal(reconciled.result, undefined);
+    assert.equal(recoveryLauncher.calls.length, 0, "an activated attempt is never relaunched");
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+    assert.equal(control.calls.filter((call) => call.method === "stop").length, 0);
+
+    const repeated = await service.reconcileInventory({ limit: 8 });
+    assert.equal(repeated.outcomes.find((outcome) => outcome.runId === RUN_ID)?.action, "stable");
+    assert.equal(recoveryLauncher.calls.length, 0);
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+  });
+});
+
+test("release cannot free an activated owner-death Cell without positive runtime-down proof", async () => {
+  await withTempStore(async () => {
+    const ctx = await installTestAuthority();
+    const { service, control } = await createActivatedOwnerDeathWithOccupiedCopy(ctx);
+
+    const released = (await service.runRelease(
+      buildOperationEnvelope(ctx, `${RUN_ID}/release-hidden-runtime`, { runId: RUN_ID }),
+    )) as JsonObject;
+
+    assert.deepEqual(released.result, {
+      environmentState: "releasing",
+      steps: { completed: 0, unrecoverable: 0, pending: 4 },
+      cause: "harness stop unconfirmed; cleanup fenced until a retry confirms the stop",
+    });
+    const reservation = (await readReservation(RUN_ID))!;
+    assert.equal(reservation.result, undefined);
+    assert.equal(reservation.releasedAt, undefined);
+    assert.equal(reservation.launchOccupancyCleanup, undefined);
+    assert.equal((await readWorkingCopy("wc-0001"))!.occupancy?.claimedByRunId, RUN_ID);
+    assert.equal(control.calls.filter((call) => call.method === "stop").length, 0);
   });
 });
 

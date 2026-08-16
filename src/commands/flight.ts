@@ -14,6 +14,7 @@ import { appendLedger, listSessions, loadSession, type SessionRecord } from "../
 import { parseBeeState, type BeeState } from "../state.js";
 import { createFlightSweeper } from "../daemon/flightSweep.js";
 import { hsrActivitySignal, paneActivitySignal, trustedHsrObservationSource, type BeeActivitySignal } from "../flight/controller.js";
+import { assertNoUnresolvedHsrEventIntegrity } from "../hsr/eventIntegrity.js";
 import { substrateFor } from "../substrates/index.js";
 import { withFileLock } from "../lock.js";
 import { listNodes } from "../node.js";
@@ -499,61 +500,71 @@ async function flightResolve(parsed: Parsed): Promise<void> {
   const flight = await resolveFlight(parsed.args[1]);
   const slotId = parsed.args[2];
   if (!slotId) throw new Error(`slot id required\n${USAGE}`);
-  const slot = (await listSlots(flight.id)).find((entry) => entry.slotId === slotId);
-  if (!slot) throw new Error(`no slot ${slotId} in ${flight.id}`);
   const resolutions = (["retry", "abandon", "accept"] as const).filter((name) => truthy(flag(parsed, name)));
   if (resolutions.length !== 1) throw new Error("pass exactly one of --retry, --abandon, --accept");
   const resolution = resolutions[0]!;
-  const resolvable = ["escalated", "stalled", "blocked", "abandoned"];
-  if (!resolvable.includes(slot.state)) {
-    throw new Error(`slot ${slotId} is ${slot.state}; resolve applies to: ${resolvable.join(", ")}`);
-  }
-
-  const now = new Date().toISOString();
-  const history = [
-    ...slot.history,
-    { attempt: slot.attempt, generation: slot.generation, ...(slot.taskId ? { taskId: slot.taskId } : {}), ...(slot.beeName ? { beeName: slot.beeName } : {}), outcome: `operator-${resolution}`, at: now },
-  ];
-  let next: SlotRecord;
-  if (resolution === "retry") {
-    // Retry keeps the lease: same generation, same taskId (if any) — the next
-    // sweep re-attempts the SAME packet.
-    next = { ...slot, state: "vacant", since: now, evidence: {}, history };
-    delete next.beeName;
-    delete next.beeId;
-    delete next.nudgedAt;
-    delete next.attemptStartedAt;
-  } else if (slot.taskId) {
-    // Queue lane: the verdict lands on the TASK — file the packet and recycle
-    // the lane onto the next one instead of killing lane capacity.
-    await finishTask(flight.id, slot.taskId, resolution === "accept" ? "done" : "failed", { reason: `operator-${resolution}` });
-    await appendLedger({ type: `flight.task.${resolution === "accept" ? "done" : "failed"}`, flight: flight.id, slot: slotId, task: slot.taskId, generation: slot.generation, reason: `operator-${resolution}` });
-    next = { ...slot, generation: slot.generation + 1, attempt: 0, state: "vacant", since: now, evidence: {}, history };
-    delete next.taskId;
-    delete next.beeName;
-    delete next.beeId;
-    delete next.nudgedAt;
-    delete next.attemptStartedAt;
-    delete next.idempotencyKey;
-  } else if (resolution === "abandon") {
-    next = { ...slot, state: "abandoned", since: now, history };
-  } else {
-    next = { ...slot, state: "done", since: now, history };
-  }
-  await saveSlot(next);
-  await appendLedger({ type: "flight.slot.resolved", flight: flight.id, slot: slotId, resolution, ...(slot.taskId ? { task: slot.taskId } : {}), ...(slot.beeName ? { bee: slot.beeName } : {}) });
-
-  // Retry/abandon write the current bee off — retire it (best effort) so the
-  // verdict doesn't leak a live runner host.
-  if (resolution !== "accept" && slot.beeName) {
-    const record = await loadSession(slot.beeName);
-    if (record && record.status === "running") {
-      const { transactionalRetire } = await import("../kill.js");
-      await transactionalRetire(record).catch((error: unknown) => {
-        console.error(note(`warn: could not retire ${slot.beeName}: ${error instanceof Error ? error.message : String(error)}`));
-      });
+  await withFlightSweepLock(flight.id, async () => {
+    const slot = (await listSlots(flight.id)).find((entry) => entry.slotId === slotId);
+    if (!slot) throw new Error(`no slot ${slotId} in ${flight.id}`);
+    const resolvable = ["escalated", "stalled", "blocked", "abandoned"];
+    if (!resolvable.includes(slot.state)) {
+      throw new Error(`slot ${slotId} is ${slot.state}; resolve applies to: ${resolvable.join(", ")}`);
     }
-  }
+
+    // Retry/abandon releases this worker's slot authority. Exact retirement
+    // must therefore commit first: an unresolved event-history receipt means
+    // provider/tool effects are still owned by this generation, and neither a
+    // vacancy nor a task verdict may authorize replacement work across it.
+    if (resolution !== "accept" && slot.beeName) {
+      const record = await loadSession(slot.beeName);
+      if (record) {
+        const { transactionalRetire } = await import("../kill.js");
+        const retired = await transactionalRetire(record);
+        if (!retired.ok) {
+          throw new Error(`cannot resolve ${slotId}: strict retire of ${slot.beeName} failed: ${retired.lastError}`);
+        }
+      } else {
+        // Exact purge is the only normal path to record absence, but its
+        // outside event-history authority intentionally survives. Prove that
+        // no such head remains before treating the absent row as released.
+        await assertNoUnresolvedHsrEventIntegrity(slot.beeName, `flight resolve ${slotId}`);
+      }
+    }
+
+    const now = new Date().toISOString();
+    const history = [
+      ...slot.history,
+      { attempt: slot.attempt, generation: slot.generation, ...(slot.taskId ? { taskId: slot.taskId } : {}), ...(slot.beeName ? { beeName: slot.beeName } : {}), outcome: `operator-${resolution}`, at: now },
+    ];
+    let next: SlotRecord;
+    if (resolution === "retry") {
+      // Retry keeps the lease: same generation, same taskId (if any) — the next
+      // sweep re-attempts the SAME packet.
+      next = { ...slot, state: "vacant", since: now, evidence: {}, history };
+      delete next.beeName;
+      delete next.beeId;
+      delete next.nudgedAt;
+      delete next.attemptStartedAt;
+    } else if (slot.taskId) {
+      // Queue lane: the verdict lands on the TASK — file the packet and recycle
+      // the lane onto the next one instead of killing lane capacity.
+      await finishTask(flight.id, slot.taskId, resolution === "accept" ? "done" : "failed", { reason: `operator-${resolution}` });
+      await appendLedger({ type: `flight.task.${resolution === "accept" ? "done" : "failed"}`, flight: flight.id, slot: slotId, task: slot.taskId, generation: slot.generation, reason: `operator-${resolution}` });
+      next = { ...slot, generation: slot.generation + 1, attempt: 0, state: "vacant", since: now, evidence: {}, history };
+      delete next.taskId;
+      delete next.beeName;
+      delete next.beeId;
+      delete next.nudgedAt;
+      delete next.attemptStartedAt;
+      delete next.idempotencyKey;
+    } else if (resolution === "abandon") {
+      next = { ...slot, state: "abandoned", since: now, history };
+    } else {
+      next = { ...slot, state: "done", since: now, history };
+    }
+    await saveSlot(next);
+    await appendLedger({ type: "flight.slot.resolved", flight: flight.id, slot: slotId, resolution, ...(slot.taskId ? { task: slot.taskId } : {}), ...(slot.beeName ? { bee: slot.beeName } : {}) });
+  });
 
   if (isPretty()) console.log(actionLine("ok", "flight", [bold(flight.id), slotId, `resolved: ${resolution}`]));
   else console.log(`resolved\t${flight.id}\t${slotId}\t${resolution}`);

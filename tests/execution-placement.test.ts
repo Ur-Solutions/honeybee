@@ -11,6 +11,8 @@ import type { JsonObject } from "../src/execution/contract.js";
 import { ensureHsrRunDir, writeHsrMeta } from "../src/hsr/runDir.js";
 import { hsrSubstrate } from "../src/hsr/substrate.js";
 import { captureProcessBirthFingerprint } from "../src/hsr/processIdentity.js";
+import type { SpawnedRuntimeHandle } from "../src/spawnRuntime.js";
+import { loadSession, saveSession } from "../src/store.js";
 import { withTempStore, SNAPSHOT_DIGEST } from "./executionTestKit.js";
 
 const NODE = "node-test";
@@ -105,29 +107,54 @@ test("HSR readiness timeout stops a runtime that becomes ready just after the de
     await registerCopy();
     let lateReady = false;
     let stopCalls = 0;
-    const launcher = createHsrRunLauncher({
-      nodeId: async () => NODE,
-      readinessTimeoutMs: 1,
-      spawn: async (request) => ({ name: request.beeName, id: "CO.canonical" }),
-      waitForReadiness: async () => {
-        lateReady = true; // readiness raced the timeout boundary
-        return false;
-      },
+    const beeName = "xr-provisional";
+    const runnerFingerprint = { pgid: 43126, startedAt: "Fri Aug 15 12:00:02 2026" };
+    const runtime: SpawnedRuntimeHandle = {
+      identity: { kind: "hsr", beeName, hostPid: 43126, hostFingerprint: runnerFingerprint },
       stop: async () => {
         stopCalls += 1;
         return { stopped: lateReady, detail: "late-ready host stopped and confirmed" };
+      },
+    };
+    const launcher = createHsrRunLauncher({
+      nodeId: async () => NODE,
+      readinessTimeoutMs: 1,
+      spawn: async (request, _config, cwd, onRuntimeLaunched) => {
+        const at = new Date().toISOString();
+        await saveSession({
+          name: request.beeName,
+          agent: "claude",
+          cwd,
+          command: "claude",
+          tmuxTarget: request.beeName,
+          substrate: "hsr",
+          runnerPid: runtime.identity.hostPid,
+          runnerFingerprint,
+          createdAt: at,
+          updatedAt: at,
+          status: "running",
+          id: "CO.canonical",
+          executionRunId: request.runId,
+        });
+        await onRuntimeLaunched?.(runtime);
+        return { name: request.beeName, id: "CO.canonical", runtime };
+      },
+      waitForReadiness: async () => {
+        lateReady = true; // readiness raced the timeout boundary
+        return false;
       },
     });
     await assert.rejects(
       () => launcher({
         runId: "run-0001",
-        beeName: "xr-provisional",
+        beeName,
         intent: { ...intentFor(), harness: { driverId: "claude", config: {} } },
         lease: {},
       }),
       (error: unknown) => error instanceof ExecutionProtocolError && !(error instanceof IndeterminateExecutionError),
     );
     assert.equal(stopCalls, 1, "timeout always stops even when readiness lands late");
+    assert.equal(await loadSession(beeName), null, "the timed-out generation cannot be recovered after occupancy release");
   });
 });
 

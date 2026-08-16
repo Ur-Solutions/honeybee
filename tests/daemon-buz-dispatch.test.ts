@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,12 +8,12 @@ import {
   formatBuzInjection,
   listMessages,
   parseBuzMessage,
-  sendBuzMessage,
+  sendBuzMessageInAdmission as sendBuzMessage,
   type BuzSender,
 } from "../src/buz.js";
 import {
   createBuzDrainDispatcher,
-  dispatchBuzDrains,
+  dispatchBuzDrains as dispatchBuzDrainsProduction,
   findStaleBuzQueues,
   selectBuzDispatchTriggers,
 } from "../src/daemon/buzDispatcher.js";
@@ -29,6 +29,21 @@ import type { BeeState } from "../src/state.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
 import { loadSession, saveSession, transitionSession, updateSession, type SessionRecord } from "../src/store.js";
 import type { Substrate } from "../src/substrates/index.js";
+
+async function dispatchBuzDrains(
+  ...args: Parameters<typeof dispatchBuzDrainsProduction>
+): ReturnType<typeof dispatchBuzDrainsProduction> {
+  // Most dispatcher fixtures historically used in-memory SessionRecords. The
+  // production path now revalidates the canonical row under the lifecycle
+  // lock, so publish only absent fixtures before exercising it.
+  for (const record of args[0]) {
+    if (!(await loadSession(record.name))) {
+      await saveSession(record, { probeEvidence: terminalProbe(record) });
+    }
+  }
+  return dispatchBuzDrainsProduction(...args);
+}
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 async function withTempStore(fn: () => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "hive-buz-dispatch-"));
@@ -169,26 +184,39 @@ test("selectBuzDispatchTriggers skips idle bees with an empty queue", async () =
   assert.equal(triggers.length, 0);
 });
 
-test("selectBuzDispatchTriggers drains ready bees, leaves cold recovery to its own lane, and probes kill_failed liveness", async () => {
+test("selectBuzDispatchTriggers drains runnable bees and fences stop doubt regardless of liveness", async () => {
   const ready = makeRecord("ready");
   const crashed = makeRecord("crashed");
   const stopFailed = makeRecord("stop-failed", { status: "kill_failed" });
   const archived = makeRecord("archived", { status: "done" });
+  const canonicalActive = makeRecord("canonical-active-stale-done", {
+    status: "done",
+    stateMachine: lifecycleCursor("canonical-active-stale-done", "active", "2026-05-28T00:00:00.000Z"),
+  });
+  const canonicalArchived = makeRecord("canonical-archived-stale-running", {
+    status: "running",
+    stateMachine: lifecycleCursor("canonical-archived-stale-running", "archived", "2026-05-28T00:00:00.000Z"),
+  });
   const current = new Map<string, BeeState>([
     [ready.name, "ready"],
     [crashed.name, "crashed"],
     [stopFailed.name, "kill_failed"],
     [archived.name, "done"],
+    [canonicalActive.name, "ready"],
+    [canonicalArchived.name, "ready"],
   ]);
   const triggers = await selectBuzDispatchTriggers(
-    [ready, crashed, stopFailed, archived],
+    [ready, crashed, stopFailed, archived, canonicalActive, canonicalArchived],
     [],
     queueNonEmpty,
     current,
   );
   assert.deepEqual(
     triggers.map((trigger) => [trigger.record.name, trigger.action]),
-    [["ready", "drain"], ["stop-failed", "ensure"]],
+    [
+      ["ready", "drain"],
+      ["canonical-active-stale-done", "drain"],
+    ],
   );
 });
 
@@ -292,8 +320,10 @@ test("createBuzDrainDispatcher keeps stale diagnostics current but logs only the
 });
 
 test("createBuzDrainDispatcher reports scan failures without rejecting delivery", async () => {
-  const recipient = makeRecord("alpha");
-  const dispatcher = createBuzDrainDispatcher({
+  await withTempStore(async () => {
+    const recipient = makeRecord("alpha");
+    await saveSession(recipient);
+    const dispatcher = createBuzDrainDispatcher({
     now: () => Date.parse("2026-07-28T12:00:00.000Z"),
     scanIntervalMs: 1,
     hasQueuedMessages: async () => true,
@@ -303,13 +333,14 @@ test("createBuzDrainDispatcher reports scan failures without rejecting delivery"
     },
   });
 
-  const outcomes = await dispatcher(
-    [recipient],
-    [],
-    new Map<string, BeeState>([["alpha", "idle_with_output"]]),
-  );
-  assert.deepEqual(outcomes[0]!.result.delivered, ["delivered"]);
-  assert.equal(outcomes[1]!.diagnosticError, "mailbox unavailable");
+    const outcomes = await dispatcher(
+      [recipient],
+      [],
+      new Map<string, BeeState>([["alpha", "idle_with_output"]]),
+    );
+    assert.deepEqual(outcomes[0]!.result.delivered, ["delivered"]);
+    assert.equal(outcomes[1]!.diagnosticError, "mailbox unavailable");
+  });
 });
 
 test("createBuzDrainDispatcher backs off then opens the circuit on identical illegal transitions", async () => {
@@ -402,8 +433,10 @@ test("createBuzDrainDispatcher backs off then opens the circuit on identical ill
 });
 
 test("persistent transport errors are quarantined per recipient without quarantining valid mail", async () => {
+  await withTempStore(async () => {
   let now = Date.parse("2026-08-12T08:00:00.000Z");
   const recipient = makeRecord("CO.transport-stuck");
+  await saveSession(recipient);
   const states = new Map<string, BeeState>([[recipient.name, "ready"]]);
   let attempts = 0;
   const dispatcher = createBuzDrainDispatcher({
@@ -446,11 +479,14 @@ test("persistent transport errors are quarantined per recipient without quaranti
   }
   assert.equal(attempts, 3, "one broken recipient cannot emit failures forever");
   assert.deepEqual(opened[0]?.result.quarantined, [], "the valid message remains recoverable");
+  });
 });
 
 test("an open circuit half-open probe delivers after transport recovery without a state transition", async () => {
+  await withTempStore(async () => {
   let now = Date.parse("2026-08-12T09:00:00.000Z");
   const recipient = makeRecord("CO.transport-recovers", { lastObservedState: "crashed" });
+  await saveSession(recipient, { probeEvidence: terminalProbe(recipient) });
   const states = new Map<string, BeeState>([[recipient.name, "ready"]]);
   let attempts = 0;
   let healthy = false;
@@ -483,6 +519,7 @@ test("an open circuit half-open probe delivers after transport recovery without 
   assert.deepEqual(recovered[0]?.result.delivered, ["message-1"]);
   assert.equal(recovered[0]?.retryQuarantine, undefined);
   assert.equal(attempts, 3, "the bounded half-open probe observes transport recovery");
+  });
 });
 
 // ─── dispatchBuzDrains end-to-end ────────────────────────────────────────
@@ -519,6 +556,37 @@ test("dispatchBuzDrains drains queue on active->idle_with_output and moves to in
     assert.deepEqual(calls, [formatBuzInjection(a.message), formatBuzInjection(b.message)]);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "queue"))).length, 0);
     assert.equal((await readdir(beeMailboxDir(recipient.name, "inbox"))).length, 2);
+  });
+});
+
+test("dispatchBuzDrains promotes queued A when the current recovery owner B is delivered", async () => {
+  await withTempStore(async () => {
+    const recipient = makeRecord("CO.promote-after-delivery", { lastObservedState: "idle_with_output" });
+    await saveSession(recipient);
+    const a = await sendBuzMessage({ recipient, sender, tier: "queue", body: "A" });
+    const b = await sendBuzMessage({ recipient, sender, tier: "queue", body: "B" });
+    assert.ok(a.queuePath && b.queuePath);
+
+    // Force B to be the next FIFO delivery while A remains queued, recreating
+    // a current-owner settlement with an older obligation still on disk.
+    const stamp = Date.parse("2026-08-12T10:00:00.000Z");
+    await utimes(b.queuePath, new Date(stamp), new Date(stamp));
+    await utimes(a.queuePath, new Date(stamp + 1_000), new Date(stamp + 1_000));
+    await updateSession(recipient.name, {
+      recoveryRequestedAt: new Date(stamp).toISOString(),
+      recoveryMessageId: b.message.id,
+      recoveryAttemptCount: 2,
+    });
+
+    const outcomes = await dispatchBuzDrains([recipient], [], {
+      currentStates: new Map([[recipient.name, "idle_with_output"]]),
+      resolveSubstrate: () => fakeSubstrate(),
+    });
+    assert.deepEqual(outcomes[0]?.result.delivered, [b.message.id]);
+    const after = (await loadSession(recipient.name))!;
+    assert.equal(after.recoveryMessageId, a.message.id);
+    assert.equal(after.recoveryAttemptCount, 0);
+    assert.equal(after.recoveryNextAttemptAt, undefined);
   });
 });
 
@@ -611,7 +679,24 @@ test("needs-you death fails closed when the adapter cannot reconcile its provide
     };
     const beforeDeath = (await loadSession(recipient.name))!;
     const [death] = await reconcileRuntimeDeaths([beforeDeath], {
-      probe: async () => deadProbe,
+      probe: async () => ({
+        evidence: deadProbe,
+        deadHsr: {
+          meta: {
+            bee: beforeDeath.name,
+            harness: "stub",
+            tier: "stream",
+            hostPid: 2_147_000_000,
+            childAdmission: "none",
+            startupFailure: { stage: "adapter-start", message: "fixture provider never started" },
+            startedAt: new Date(now - 4_000).toISOString(),
+            controlSocket: "",
+            status: "exited",
+            endedAt: new Date(now - 3_500).toISOString(),
+          },
+          hostVerdict: "gone",
+        },
+      }),
       transition: transitionSession,
       // This is the production incident shape: the structured needs_input tail
       // looks unfinished even though bounded work has already suspended.
@@ -673,7 +758,7 @@ test("needs-you death fails closed when the adapter cannot reconcile its provide
   });
 });
 
-test("dispatchBuzDrains keeps draining a live kill_failed bee", async () => {
+test("dispatchBuzDrains never admits queued work through a live kill_failed bee", async () => {
   await withTempStore(async () => {
     const recipient = makeRecord("CO.stop-failed", { status: "kill_failed" });
     const sent = await sendBuzMessage({ recipient, sender, tier: "queue", body: "still there?" });
@@ -681,7 +766,33 @@ test("dispatchBuzDrains keeps draining a live kill_failed bee", async () => {
       currentStates: new Map([[recipient.name, "kill_failed"]]),
       resolveSubstrate: () => fakeSubstrate({ hasSession: async () => true }),
     });
-    assert.deepEqual(outcomes[0]?.result.delivered, [sent.message.id]);
+    assert.deepEqual(outcomes, []);
+    assert.deepEqual((await listMessages(recipient.name, "queue")).map(({ message }) => message.id), [sent.message.id]);
+  });
+});
+
+test("daemon drain revalidates a stale runnable snapshot after canonical delivery doubt wins", async () => {
+  await withTempStore(async () => {
+    const stale = makeRecord("CO.delivery-doubt-race", { lastObservedState: "idle_with_output" });
+    await saveSession(stale);
+    const sent = await sendBuzMessage({ recipient: stale, sender, tier: "queue", body: "must remain staged" });
+    await updateSession(stale.name, {
+      status: "kill_failed",
+      lastError: `Buz delivery ${sent.message.id} may have crossed provider acceptance`,
+    });
+    let drains = 0;
+
+    const outcomes = await dispatchBuzDrainsProduction([stale], [], {
+      drain: async () => {
+        drains += 1;
+        return { delivered: [sent.message.id], quarantined: [], errors: [] };
+      },
+    });
+
+    assert.equal(drains, 0, "fresh lifecycle admission refuses before mailbox/provider work");
+    assert.equal(outcomes.length, 1);
+    assert.match(outcomes[0]?.result.errors[0]?.message ?? "", /not runnable|kill_failed|stop/i);
+    assert.deepEqual((await listMessages(stale.name, "queue")).map(({ message }) => message.id), [sent.message.id]);
   });
 });
 
@@ -756,14 +867,13 @@ test("runBuzRecoverySweep persists backoff across sweeps and opens needs-action 
   });
 });
 
-test("runBuzRecoverySweep age-gates old cold mail instead of mass-reviving it", async () => {
+test("runBuzRecoverySweep resumes accepted cold mail after a sleep longer than 15 minutes", async () => {
   await withTempStore(async () => {
     const now = Date.parse("2026-08-10T12:00:00.000Z");
-    const record = await seedRecoveryRecord("CO.old-mail", now - 60 * 60_000);
+    const record = await seedRecoveryRecord("CO.slept-mail", now - 24 * 60 * 60_000);
     let wakes = 0;
     const outcomes = await runBuzRecoverySweep([record], {
       now: () => now,
-      maxRequestAgeMs: 10 * 60_000,
       isLive: async () => false,
       assertCwd: async () => undefined,
       wakeRecipient: async (candidate) => {
@@ -771,10 +881,37 @@ test("runBuzRecoverySweep age-gates old cold mail instead of mass-reviving it", 
         return candidate;
       },
     });
-    assert.equal(wakes, 0);
-    assert.equal(outcomes[0]?.action, "undeliverable");
-    assert.equal(outcomes[0]?.reason, "recovery-request-expired");
-    assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "recovery-request-expired");
+    assert.equal(wakes, 1, "daemon downtime does not spend or expire the bounded wake budget");
+    assert.equal(outcomes[0]?.action, "started");
+    assert.equal((await loadSession(record.name))?.recoveryMessageId, record.recoveryMessageId);
+    assert.equal((await readBeeRequests(record.name)).length, 0);
+  });
+});
+
+test("runBuzRecoverySweep never classifies a remote cwd against the controller filesystem", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const record = await seedRecoveryRecord("CO.remote-cold-mail", now, {
+      cwd: "/remote/node/checkout-that-is-not-local",
+      node: "remote-hsr-node",
+    });
+    let wakes = 0;
+    const outcomes = await runBuzRecoverySweep([record], {
+      now: () => now,
+      isLive: async () => false,
+      resolveSubstrate: () => fakeSubstrate({ kind: "remote-hsr", node: "remote-hsr-node" }),
+      wakeRecipient: async () => {
+        wakes += 1;
+        throw new Error("remote authority is temporarily unavailable");
+      },
+    });
+
+    assert.equal(wakes, 1, "cold remote recovery reaches the authority path instead of local stat");
+    assert.equal(outcomes[0]?.action, "failed");
+    assert.notEqual(outcomes[0]?.reason, "missing-cwd");
+    assert.equal((await listMessages(record.name, "queue")).length, 1);
+    assert.equal((await listMessages(record.name, "quarantine")).length, 0);
+    assert.equal((await readBeeRequests(record.name)).length, 0);
   });
 });
 
@@ -799,17 +936,87 @@ test("runBuzRecoverySweep treats missing providerSessionId as a one-shot undeliv
   });
 });
 
-test("runBuzRecoverySweep turns a now-dead kill_failed delivery into needs-action", async () => {
+test("runBuzRecoverySweep turns kill_failed delivery into needs-action even when the escaped runtime is live", async () => {
   await withTempStore(async () => {
     const now = Date.parse("2026-08-10T12:00:00.000Z");
     const record = await seedRecoveryRecord("CO.stopped-after-accept", now, { status: "kill_failed" });
     const outcomes = await runBuzRecoverySweep([record], {
       now: () => now,
-      isLive: async () => false,
+      isLive: async () => true,
     });
     assert.equal(outcomes[0]?.action, "undeliverable");
     assert.equal(outcomes[0]?.reason, "archive-unresolved");
     assert.equal((await readBeeRequests(record.name))[0]?.evidence.detail, "archive-unresolved");
+  });
+});
+
+test("runBuzRecoverySweep separates stale lifecycle scalars from current stop doubt", async () => {
+  await withTempStore(async () => {
+    const now = Date.parse("2026-08-10T12:00:00.000Z");
+    const at = new Date(now).toISOString();
+    const activeSeed = await seedRecoveryRecord("CO.active-stale-done", now, {
+      status: "running",
+      lastObservedState: undefined,
+    });
+    await transitionSession(activeSeed.name, {
+      type: "turn.started",
+      eventId: "buz-active-stale-done",
+      at,
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "buz-active-stale-done", observedAt: at, hook: "turn-start" },
+    });
+    await updateSession(activeSeed.name, { status: "done" });
+    const active = (await loadSession(activeSeed.name))!;
+
+    const stopDoubtSeed = await seedRecoveryRecord("CO.active-stop-doubt", now, {
+      status: "running",
+      lastObservedState: undefined,
+    });
+    await transitionSession(stopDoubtSeed.name, {
+      type: "turn.started",
+      eventId: "buz-active-stop-doubt",
+      at,
+      cause: "first-turn",
+      evidence: { kind: "hook", hookId: "buz-active-stop-doubt", observedAt: at, hook: "turn-start" },
+    });
+    await updateSession(stopDoubtSeed.name, { status: "kill_failed" });
+    const stopDoubt = (await loadSession(stopDoubtSeed.name))!;
+
+    const archivedSeed = await seedRecoveryRecord("CO.archived-stale-running", now, {
+      status: "running",
+      lastObservedState: undefined,
+    });
+    await transitionSession(archivedSeed.name, {
+      type: "bee.archived",
+      eventId: "buz-archived-stale-running",
+      at,
+      cause: "retire",
+      evidence: { kind: "operator", actionId: "buz-archived-stale-running", observedAt: at, action: "retire" },
+      probe: {
+        kind: "probe",
+        probeId: "buz-archived-stale-running",
+        observerId: "buz-recovery-fixture",
+        observedAt: at,
+        outcome: "dead",
+        target: { substrate: "local-tmux", tmuxTarget: archivedSeed.tmuxTarget },
+      },
+    });
+    await updateSession(archivedSeed.name, { status: "running" });
+    const archived = (await loadSession(archivedSeed.name))!;
+    const wakes: string[] = [];
+    const outcomes = await runBuzRecoverySweep([active, stopDoubt, archived], {
+      now: () => now,
+      isLive: async () => false,
+      assertCwd: async () => undefined,
+      wakeRecipient: async (candidate) => {
+        wakes.push(candidate.name);
+        return candidate;
+      },
+    });
+    assert.deepEqual(wakes, [active.name]);
+    assert.equal(outcomes.find((outcome) => outcome.recipient === active.name)?.action, "started");
+    assert.equal(outcomes.find((outcome) => outcome.recipient === stopDoubt.name)?.reason, "archive-unresolved");
+    assert.equal(outcomes.find((outcome) => outcome.recipient === archived.name)?.reason, "archive-unresolved");
   });
 });
 

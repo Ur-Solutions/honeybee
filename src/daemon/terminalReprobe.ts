@@ -19,7 +19,7 @@ import {
   type ProcessIdentityVerdict,
   type ProcessRow,
 } from "../hsr/processIdentity.js";
-import type { ProbeEvidence } from "../stateMachine.js";
+import { isActiveSessionLifecycle, type ProbeEvidence } from "../stateMachine.js";
 import { isActiveSessionRecord, loadSession, markSessionVerified, type SessionRecord } from "../store.js";
 import {
   probeHsrControl,
@@ -104,7 +104,7 @@ export async function reprobeTerminalCursors(
       // remoteEventMirror's to own on both sides of this sweep.
       if (!meta || meta.mirrorOfNode) continue;
       const record = await (deps.loadRecord ?? loadSession)(bee);
-      if (!record || record.substrate !== "hsr" || record.status !== "running") continue;
+      if (!record || record.substrate !== "hsr" || !isActiveSessionLifecycle(record)) continue;
       if (record.runnerPid !== undefined && record.runnerPid !== meta.hostPid) continue;
       // Cheap numeric pre-filter only skips obvious dead hosts. It never proves
       // life; birth identity plus the control socket below do that.

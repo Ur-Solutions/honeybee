@@ -2,20 +2,50 @@
 // their metadata (title, tags, ownership, colony).
 // Extracted from cli.ts (HIVE-15).
 import { actionLine, bold, dim, isPretty, note } from "../format.js";
+import {
+  assertNoUnresolvedHsrAnswerOwnership,
+  HsrAnswerAmbiguousError,
+  HsrAnswerConflictError,
+  HsrAnswerDiscardedError,
+  HsrAnswerInFlightError,
+  canonicalHsrAnswerDigest,
+  createHsrAnswerOperation,
+  hsrAnswerOperationOwnsRecord,
+  hsrAnswerReconciliationCandidates,
+  hsrAnswerSource,
+  markHsrAnswerOperationAmbiguous,
+  markHsrAnswerOperationSending,
+  offerHsrAnswerOperation,
+  parseHsrAnswerHostCapabilities,
+  parseHsrAnswerRpcResult,
+  readHsrAnswerReceipt,
+  readHsrAnswerReceipts,
+  reconcileHsrAnswerOperation,
+  sameHsrAnswerHostIdentity,
+  type HsrAnswerOperation,
+  type HsrAnswerRpcResult,
+} from "../answerReceipt.js";
+import { deliverSessionText, withRunnableSessionAdmission } from "../delivery.js";
 import { writeHiveState, writeHiveTags, writeHiveTitle } from "../hiveState.js";
-import { pendingNeedsInput } from "../hsr/observe.js";
+import { pendingNeedsInput, type PendingNeedsInput } from "../hsr/observe.js";
 import { connectRpcClient } from "../hsr/rpc.js";
+import { hsrAnswerHostFromMeta, persistHsrAnswerAmbiguity } from "../hsr/answer.js";
+import { assertHsrSourceEventLogIntegrity } from "../hsr/eventIntegrity.js";
+import type { RunnerInputAnswer } from "../hsr/types.js";
+import { withSessionLifecycleLock } from "../lifecycle.js";
 import { readHsrMeta } from "../hsr/runDir.js";
 import { gatherTitleContext, generateTitle } from "../naming.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { flag, truthy, type Parsed } from "../parse.js";
-import { needsInputRequestId } from "../requests/keys.js";
-import { openAndResolveRequest } from "../requests/store.js";
-import { nextTurnPatch, recordSeal, sealArtifactExampleJson, sealHelpText, validateSealArtifact, type SealRecord } from "../seal.js";
+import { answerAmbiguityRequestId, needsInputRequestId } from "../requests/keys.js";
+import { openAndResolveRequest, openRequest, resolveRequest } from "../requests/store.js";
+import { sealArtifactExampleJson, sealHelpText, validateSealArtifact, type SealRecord } from "../seal.js";
+import { recordRunnableSessionSeal } from "../sealAdmission.js";
 import { resolveSelector } from "../selectors.js";
-import { appendLedger, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, loadSession, updateSession, type SessionRecord } from "../store.js";
 import { ensureLiveRuntimeForSend, markLiveRuntimeSteered } from "../recovery/wake.js";
 import { substrateFor } from "../substrates/index.js";
+import type { RemoteHsrSubstrate } from "../substrates/remote-hsr.js";
 import { dedupeTags, effectiveTags, isValidTagValue, rejectReservedNamespaceTag } from "../tags.js";
 import { tmux } from "../tmux.js";
 import { readFile } from "node:fs/promises";
@@ -50,8 +80,7 @@ export async function cmdSeal(parsed: Parsed) {
   if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
 
   for (const record of records) {
-    const stored = await recordSeal(record.name, artifact);
-    await writeHiveState(record, "done");
+    const stored = await recordRunnableSessionSeal(record, artifact, { mirrorDone: true });
     printSealResult(record.name, stored);
   }
 }
@@ -400,21 +429,9 @@ export async function cmdSend(parsed: Parsed) {
       else console.error(`skip\t${record.name}\tdead`);
       continue;
     }
-    // Snapshot before delivery so a very fast seal from the new turn remains
-    // above the boundary. Persist only after sendText succeeds: a failed send
-    // must leave the completed turn's seal authoritative.
-    const turn = await nextTurnPatch(steeredRecord);
-    await substrateFor(steeredRecord).sendText(steeredRecord.tmuxTarget, prompt, steeredRecord.agentPaneId);
-    const now = new Date().toISOString();
-    await updateSession(steeredRecord.name, {
-      ...turn,
-      updatedAt: now,
-      status: "running",
-      lastPrompt: prompt,
-      lastPromptAt: now,
-    });
-    await writeHiveState(steeredRecord, "working");
-    await appendLedger({ type: "prompt.send", session: steeredRecord.name, agent: steeredRecord.agent, node: steeredRecord.node ?? LOCAL_NODE_NAME, cwd: steeredRecord.cwd, chars: prompt.length });
+    const delivered = await deliverSessionText(steeredRecord, prompt);
+    await writeHiveState(delivered.record, "working").catch(() => undefined);
+    await appendLedger({ type: "prompt.send", session: steeredRecord.name, agent: steeredRecord.agent, node: steeredRecord.node ?? LOCAL_NODE_NAME, cwd: steeredRecord.cwd, chars: prompt.length }).catch(() => undefined);
     if (isPretty()) console.log(actionLine("ok", "send", [bold(steeredRecord.name), `${prompt.length} chars`]));
     else console.log(`sent\t${steeredRecord.name}\t${prompt.length} chars`);
     sent += 1;
@@ -428,86 +445,360 @@ export async function cmdSend(parsed: Parsed) {
 
 
 /**
- * Answer the pending needs_input of a blocked HSR bee over its control socket.
+ * Answer the pending needs_input of a blocked HSR bee through its local or
+ * remote control authority.
  * The daemon routes an HSR bee's needs_input to its parent as a buz; the parent
  * (or a human) replies with `hive answer <bee> <text>`. Defaults to "yes" when
  * no text is supplied (the common permission-approve case).
  */
+function parseAnswerValue(answer: string): RunnerInputAnswer {
+  if (answer.trim().startsWith("[")) {
+    try {
+      const value = JSON.parse(answer) as unknown;
+      if (
+        Array.isArray(value) &&
+        value.every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))
+      ) return value as string[][];
+    } catch {
+      // Preserve the legacy behavior: malformed/non-matrix JSON is plain text.
+    }
+  }
+  return answer;
+}
+
+function requestInputForPending(record: SessionRecord, pending: PendingNeedsInput) {
+  const openedAt = Number.isFinite(pending.ts) && pending.ts > 0 ? new Date(pending.ts).toISOString() : undefined;
+  return {
+    id: needsInputRequestId(record.name, pending),
+    kind: pending.kind,
+    scope: "turn" as const,
+    grade: "structured" as const,
+    generation: record.runtimeGeneration ?? 0,
+    ...(openedAt !== undefined ? { openedAt } : {}),
+    question: pending.question,
+    ...(pending.tool !== undefined ? { tool: pending.tool } : {}),
+    ...(pending.options !== undefined ? { options: pending.options } : {}),
+    ...(pending.optionDetails !== undefined ? { optionDetails: pending.optionDetails } : {}),
+    ...(pending.questions !== undefined ? { questions: pending.questions } : {}),
+    ...(pending.multiSelect !== undefined ? { multiSelect: pending.multiSelect } : {}),
+    ...(pending.input !== undefined ? { input: pending.input } : {}),
+    evidence: {
+      grade: "structured" as const,
+      source: "hsr-events",
+      ...(openedAt !== undefined ? { observedAt: openedAt } : {}),
+      detail: "needs_input",
+    },
+  };
+}
+
+function receiptResult(phase: Awaited<ReturnType<typeof readHsrAnswerReceipt>>): HsrAnswerRpcResult | null {
+  if (!phase) return null;
+  if (phase.phase === "settled") return { status: "settled", replayed: true, ...(phase.host ? { host: phase.host } : {}) };
+  if (phase.phase === "ambiguous") return { status: "ambiguous", reason: phase.reason!, ...(phase.host ? { host: phase.host } : {}) };
+  if (phase.phase === "discarded") return { status: "discarded" };
+  if (phase.phase === "dispatching") return { status: "in-flight" };
+  return null;
+}
+
+async function reconcileAnswerFromCli(parsed: Parsed): Promise<void> {
+  const target = parsed.args[1];
+  const requestId = parsed.args[2];
+  const digest = stringFlag(parsed, ["digest"]);
+  const generationRaw = stringFlag(parsed, ["generation"]);
+  const delivered = truthy(flag(parsed, "delivered"));
+  const discard = truthy(flag(parsed, "discard"));
+  if (!target || !requestId || !digest || generationRaw === undefined || delivered === discard) {
+    throw new Error(
+      "Usage: hive answer reconcile <bee> <request-id> --generation <n> --digest <sha256> --delivered|--discard",
+    );
+  }
+  const generation = Number(generationRaw);
+  if (!Number.isSafeInteger(generation) || generation < 0 || !/^[a-f0-9]{64}$/.test(digest)) {
+    throw new Error("answer reconciliation requires an exact non-negative generation and lowercase sha256 digest");
+  }
+  const resolved = await resolveSession(target).catch(() => null);
+  const bee = resolved?.name ?? target;
+  const reconciled = await withSessionLifecycleLock(bee, async () => {
+    const current = await loadSession(bee);
+    const matches = hsrAnswerReconciliationCandidates({
+      receipts: await readHsrAnswerReceipts(bee),
+      requestId,
+      runtimeGeneration: generation,
+      answerDigest: digest,
+      current,
+    });
+    if (matches.length !== 1) {
+      throw new Error(
+        matches.length === 0
+          ? `no exact answer receipt matches ${bee}/${generation}/${requestId}/${digest}`
+          : `multiple answer receipts match ${bee}/${generation}/${requestId}/${digest}`,
+      );
+    }
+    const operation = matches[0]!.operation;
+    if (!current && operation.source.remoteLaunchId) {
+      throw new Error(
+        `remote answer reconciliation for ${bee} requires its preserved canonical node/launch/incarnation locator`,
+      );
+    }
+    const currentOwnsOperation = !!current && hsrAnswerOperationOwnsRecord(operation, current);
+    if (current && !currentOwnsOperation && (current.runtimeGeneration ?? 0) === generation) {
+      throw new Error(`answer reconciliation source does not own ${bee}'s current generation`);
+    }
+
+    // A remote provider receipt is the first authority. Mirror it locally only
+    // after the node confirms the exact terminal verdict; an unconfirmed remote
+    // call leaves the controller receipt unresolved and retryable.
+    if (currentOwnsOperation && substrateFor(current!).kind === "remote-hsr") {
+      const remote = substrateFor(current!) as RemoteHsrSubstrate;
+      const remoteResult = await remote.reconcileAnswerRemote(
+        bee,
+        operation,
+        delivered ? "delivered" : "discard",
+        {
+          ...(current!.remoteLaunchId ? { remoteLaunchId: current!.remoteLaunchId } : {}),
+          ...(current!.remoteIncarnation ? { remoteIncarnation: current!.remoteIncarnation } : {}),
+        },
+      );
+      if ((delivered && remoteResult.status !== "settled") || (!delivered && remoteResult.status !== "discarded")) {
+        throw new Error(
+          remoteResult.status === "ambiguous" || remoteResult.status === "conflict"
+            ? remoteResult.reason
+            : `remote answer reconciliation remains ${remoteResult.status}`,
+        );
+      }
+    }
+
+    const receipt = await reconcileHsrAnswerOperation(bee, operation, delivered ? "delivered" : "discard");
+    // Reconciliation never revives or dispatches. Only a delivered verdict is
+    // strong enough to close the original provider request.
+    if (delivered && currentOwnsOperation) {
+      await resolveRequest(
+        bee,
+        needsInputRequestId(bee, { requestId, ts: 0, host: operation.host }),
+        { by: "hive-answer-reconcile", resolution: "delivered" },
+      );
+    }
+    await resolveRequest(
+      bee,
+      answerAmbiguityRequestId(bee, generation, requestId, digest, operation.host),
+      { by: "hive-answer-reconcile", resolution: delivered ? "delivered" : "discarded" },
+    );
+    return receipt;
+  });
+  if (isPretty()) console.log(actionLine("ok", "answer reconcile", [bold(bee), dim(reconciled.phase)]));
+  else console.log(`answer-reconciled\t${bee}\t${requestId}\t${reconciled.phase}`);
+}
+
 export async function cmdAnswer(parsed: Parsed) {
+  if (parsed.args[0] === "reconcile") return reconcileAnswerFromCli(parsed);
   const target = parsed.args[0];
   if (!target) throw new Error("Usage: hive answer <bee> [text]");
   const text = stringFlag(parsed, ["answer", "a"]) ?? parsed.args.slice(1).join(" ");
   const answer = text.length > 0 ? text : "yes";
+  const wireAnswer = parseAnswerValue(answer);
 
   let record = await resolveSession(target);
-  if (record.substrate !== "hsr") {
+  const initialSubstrate = substrateFor(record);
+  if (record.substrate !== "hsr" && initialSubstrate.kind !== "remote-hsr") {
     throw new Error(`hive answer applies to HSR bees only; ${record.name} is ${record.substrate ?? "local-tmux"}`);
   }
-  const pending = await pendingNeedsInput(record.name);
-  if (!pending) throw new Error(`No pending needs-input for ${record.name}`);
   // Intentional parking preserves the durable needs-you request. Lazily wake
-  // that same provider session and rebind its request generation before the
-  // answer RPC so a parked question remains answerable.
-  record = (await ensureLiveRuntimeForSend(record)).record;
-  const meta = await readHsrMeta(record.name);
-  if (!meta?.controlSocket) throw new Error(`No control socket for ${record.name}`);
-
-  // Keep the legacy plain-text answer path, while allowing a structured
-  // OpenCode response to travel losslessly as JSON, e.g.
-  // `hive answer OP.x '[["A","B"],["C"]]'`.
-  let wireAnswer: string | string[][] = answer;
-  if (pending.kind === "question" && answer.trim().startsWith("[")) {
-    try {
-      const parsedAnswer = JSON.parse(answer) as unknown;
-      if (
-        Array.isArray(parsedAnswer) &&
-        parsedAnswer.every((items) => Array.isArray(items) && items.every((item) => typeof item === "string"))
-      ) {
-        wireAnswer = parsedAnswer as string[][];
-      }
-    } catch {
-      // The adapter will treat malformed/non-matrix JSON as a plain answer,
-      // retaining the pre-existing CLI behavior.
+  // that same local provider session and rebind its request generation before
+  // the exact lifecycle/host-qualified answer admission below. Remote HSRs are
+  // already governed by their node authority and are never locally parked.
+  if (record.substrate === "hsr") {
+    if (record.stateMachine?.runtime === "parked") {
+      const pendingBeforeWake = await pendingNeedsInput(record.name);
+      if (!pendingBeforeWake) throw new Error(`No pending needs-input for ${record.name}`);
     }
+    record = (await ensureLiveRuntimeForSend(record)).record;
   }
+  let answeredRequestId: string | undefined;
 
-  const client = await connectRpcClient(meta.controlSocket);
-  try {
-    await client.call("answer", { requestId: pending.requestId, answer: wireAnswer });
-  } finally {
-    client.close();
-  }
+  await withRunnableSessionAdmission(record, async (_lifecycle, current) => {
+    const currentSubstrate = substrateFor(current);
+    if (current.substrate !== "hsr" && currentSubstrate.kind !== "remote-hsr") {
+      throw new Error(`hive answer applies to HSR bees only; ${current.name} is ${current.substrate ?? "local-tmux"}`);
+    }
+    const authority = {
+      ...(current.remoteLaunchId ? { remoteLaunchId: current.remoteLaunchId } : {}),
+      ...(current.remoteIncarnation ? { remoteIncarnation: current.remoteIncarnation } : {}),
+    };
+    // Read the pending request only after lifecycle admission. A replacement
+    // must not turn a pre-lock requestId into an answer for the next runtime.
+    // Remote reads are also token-qualified at the remote authority.
+    const pendingState = currentSubstrate.kind === "remote-hsr"
+      ? await (currentSubstrate as RemoteHsrSubstrate).pendingInputRemote(current.name, authority)
+      : await (async () => {
+          const meta = await readHsrMeta(current.name);
+          if (!meta) throw new Error(`No HSR host metadata for ${current.name}`);
+          await assertHsrSourceEventLogIntegrity({
+            bee: current.name,
+            meta,
+            operation: "hive answer",
+          });
+          return { pending: await pendingNeedsInput(current.name), host: hsrAnswerHostFromMeta(meta) };
+        })();
+    const { pending, host } = pendingState;
+    let operation: HsrAnswerOperation;
+    if (pending) {
+      operation = createHsrAnswerOperation(current, pending.requestId, wireAnswer, host);
+    } else {
+      // A provider may have accepted and closed the prompt while the outer RPC
+      // reply was lost. Recover the one exact generation+digest receipt instead
+      // of requiring the now-absent pending event or issuing a second response.
+      const digest = canonicalHsrAnswerDigest(wireAnswer);
+      const candidates = (await readHsrAnswerReceipts(current.name)).filter((receipt) =>
+        receipt.phase !== "discarded" && receipt.operation.answerDigest === digest &&
+        hsrAnswerOperationOwnsRecord(receipt.operation, current) &&
+        sameHsrAnswerHostIdentity(receipt.operation.host, host));
+      if (candidates.length !== 1) {
+        throw new Error(
+          candidates.length === 0
+            ? `No pending needs-input or matching answer receipt for ${current.name}`
+            : `Multiple answer receipts match ${current.name}; retry with the exact provider request after reconciliation`,
+        );
+      }
+      operation = candidates[0]!.operation;
+    }
 
-  // Durable resolution AFTER the RPC succeeded, under the SAME id the live
-  // view derives (requests/keys.ts). The events tail keeps showing
-  // pendingNeedsInput until turn_end, so this resolved record is what flips
-  // BeeView out of needs-reply immediately — and openRequest's idempotency is
-  // what stops the daemon's next reconcile tick from re-opening it. Daemon
-  // down: no open record exists yet, so this backfills open+resolve in one
-  // locked write. Best-effort: the answer already landed on the runner.
-  const openedAt = Number.isFinite(pending.ts) && pending.ts > 0 ? new Date(pending.ts).toISOString() : undefined;
-  const callerBee = process.env.HIVE_BEE;
-  await openAndResolveRequest(
-    record.name,
-    {
-      id: needsInputRequestId(record.name, pending),
-      kind: pending.kind,
-      scope: "turn",
-      grade: "structured",
-      generation: record.runtimeGeneration ?? 0,
-      ...(openedAt !== undefined ? { openedAt } : {}),
-      question: pending.question,
-      ...(pending.tool !== undefined ? { tool: pending.tool } : {}),
-      ...(pending.options !== undefined ? { options: pending.options } : {}),
-      ...(pending.optionDetails !== undefined ? { optionDetails: pending.optionDetails } : {}),
-      ...(pending.questions !== undefined ? { questions: pending.questions } : {}),
-      ...(pending.multiSelect !== undefined ? { multiSelect: pending.multiSelect } : {}),
-      ...(pending.input !== undefined ? { input: pending.input } : {}),
-      evidence: { grade: "structured", source: "hsr-events", ...(openedAt !== undefined ? { observedAt: openedAt } : {}), detail: "needs_input" },
-    },
-    { by: callerBee ? `hive-answer:${callerBee}` : "hive-answer", resolution: answer },
-  ).catch(() => undefined);
+    // Answer admission may bypass the general lifecycle fence only for an
+    // exact retry of this operation. An unresolved answer for any other
+    // provider request must keep all new provider effects fenced.
+    await assertNoUnresolvedHsrAnswerOwnership(current, "hive answer", operation);
+    if (pending && currentSubstrate.kind === "remote-hsr") {
+      await offerHsrAnswerOperation(current.name, operation);
+    }
 
-  if (isPretty()) console.log(actionLine("ok", "answer", [bold(record.name), dim(pending.requestId)]));
-  else console.log(`answered\t${record.name}\t${pending.requestId}`);
+    const offered = await readHsrAnswerReceipt(current.name, operation);
+    let result = receiptResult(offered);
+    // A terminal local receipt is sufficient proof; otherwise the exact same
+    // operation crosses the local/remote host authority boundary.
+    if (!result || result.status === "in-flight") {
+      if (currentSubstrate.kind === "remote-hsr") {
+        result = await (currentSubstrate as RemoteHsrSubstrate).answerRemote(
+          current.name,
+          operation,
+          wireAnswer,
+          authority,
+        );
+      } else {
+        const meta = await readHsrMeta(current.name);
+        if (!meta?.controlSocket) throw new Error(`No control socket for ${current.name}`);
+        const client = await connectRpcClient(meta.controlSocket);
+        try {
+          parseHsrAnswerHostCapabilities(await client.call("answerCapabilities"));
+          if (pending) {
+            result = receiptResult(await offerHsrAnswerOperation(current.name, operation));
+          }
+          if (!result || result.status === "in-flight") {
+            await markHsrAnswerOperationSending(current.name, operation);
+            try {
+              result = parseHsrAnswerRpcResult(await client.call("answer", { operation, answer: wireAnswer }));
+            } catch (error) {
+              // The host receipt is in this store. It can prove a lost outer RPC
+              // reply without another provider write; offered still means the
+              // host never claimed and the original transport error is retryable.
+              let receipt = await readHsrAnswerReceipt(current.name, operation);
+              if (receipt?.phase === "sending") {
+                const reason = `host answer RPC outcome was lost after request transport: ${error instanceof Error ? error.message : String(error)}`;
+                try {
+                  receipt = await markHsrAnswerOperationAmbiguous(current.name, operation, reason);
+                } catch {
+                  receipt = await readHsrAnswerReceipt(current.name, operation);
+                }
+              }
+              const after = receiptResult(receipt);
+              if (!after) throw error;
+              result = after;
+            }
+          }
+        } finally {
+          client.close();
+        }
+      }
+    }
+
+    if (result.status === "conflict") {
+      // A remote conflict may name a different digest that already owns this
+      // exact provider request. Publish a conservative local fence even though
+      // the remote protocol intentionally does not disclose that answer digest.
+      if (currentSubstrate.kind === "remote-hsr") {
+        await persistHsrAnswerAmbiguity(current, operation, result.reason);
+      }
+      throw new HsrAnswerConflictError(operation, result.reason);
+    }
+    if (result.status === "discarded") {
+      await reconcileHsrAnswerOperation(current.name, operation, "discard");
+      throw new HsrAnswerDiscardedError(operation, `HSR answer ${operation.requestId} was explicitly discarded`);
+    }
+    if (result.status === "in-flight") {
+      throw new HsrAnswerInFlightError(operation, `HSR answer ${operation.requestId} is still dispatching`);
+    }
+    if (result.status === "ambiguous") {
+      const generation = current.runtimeGeneration ?? 0;
+      const errors: unknown[] = [];
+      try {
+        await persistHsrAnswerAmbiguity(current, operation, result.reason, result.host);
+      } catch (error) {
+        errors.push(error);
+      }
+      if (pending) {
+        await openRequest(current.name, requestInputForPending(current, { ...pending, host })).catch((error) => errors.push(error));
+      }
+      await openRequest(current.name, {
+        id: answerAmbiguityRequestId(
+          current.name,
+          generation,
+          operation.requestId,
+          operation.answerDigest,
+          operation.host,
+        ),
+        kind: "manual-action",
+        scope: "runtime-generation",
+        grade: "structured",
+        generation,
+        question: "An answer crossed provider dispatch, but local handoff or HTTP acceptance cannot be proven. Inspect the provider request before reconciling delivered or discard.",
+        input: { operation },
+        evidence: { grade: "structured", source: "hsr-answer-receipt", detail: "answer-ambiguous" },
+      }).catch((error) => errors.push(error));
+      throw new HsrAnswerAmbiguousError(
+        operation,
+        result.reason,
+        errors.length > 0 ? { cause: new AggregateError(errors, "could not preserve answer ambiguity requests") } : undefined,
+      );
+    }
+
+    await reconcileHsrAnswerOperation(current.name, operation, "delivered");
+    if (currentSubstrate.kind === "remote-hsr") {
+      // The remote host receipt is authoritative for provider handoff; mirror
+      // its settled proof into this caller-side receipt before metadata closes.
+    }
+    answeredRequestId = operation.requestId;
+
+    // Durable resolution AFTER the RPC succeeded, under the SAME lifecycle
+    // admission and id the live view derives. Stop cannot win between provider
+    // acceptance and this request settlement.
+    const callerBee = process.env.HIVE_BEE;
+    if (pending) {
+      await openAndResolveRequest(
+        current.name,
+        requestInputForPending(current, { ...pending, host }),
+        { by: callerBee ? `hive-answer:${callerBee}` : "hive-answer", resolution: answer },
+      );
+    } else {
+      await resolveRequest(current.name, needsInputRequestId(current.name, {
+        requestId: operation.requestId,
+        ts: 0,
+        host: operation.host,
+      }), {
+        by: callerBee ? `hive-answer:${callerBee}` : "hive-answer",
+        resolution: answer,
+      });
+    }
+  }, { operation: "hive answer", deferAnswerOwnershipToExactOperation: true });
+
+  if (!answeredRequestId) throw new Error(`No pending needs-input for ${record.name}`);
+  if (isPretty()) console.log(actionLine("ok", "answer", [bold(record.name), dim(answeredRequestId)]));
+  else console.log(`answered\t${record.name}\t${answeredRequestId}`);
 }

@@ -618,6 +618,37 @@ test("BeeHandle returned by HiveFacade.spawn() exposes no tmuxTarget", () => {
   assert.equal((handle as Record<string, unknown>).tmuxTarget, undefined);
 });
 
+test("Flow send and brief treat post-accept ledger failures as repair-only", async () => {
+  await withTempStore(async (dir) => {
+    const record: SessionRecord = {
+      name: "flow-post-accept-mirror",
+      id: "flow-post-accept-mirror",
+      agent: "stub",
+      cwd: dir,
+      command: "stub",
+      tmuxTarget: "flow-post-accept-mirror",
+      createdAt: "2026-08-15T16:00:00.000Z",
+      updatedAt: "2026-08-15T16:00:00.000Z",
+      status: "running",
+    };
+    await saveSession(record);
+    const deliveries: string[] = [];
+    const facade = new HiveFacade({
+      flowName: "mirror-fault",
+      runId: "run-mirror-fault",
+      deliverSessionText: async (current, text) => {
+        deliveries.push(text);
+        return { record: current, deliveredAt: "2026-08-15T16:01:00.000Z" };
+      },
+      appendLedger: async () => { throw new Error("injected Flow ledger failure"); },
+    });
+
+    await facade.send(record.name, "one Flow send");
+    await facade.brief(record.name, "one Flow brief");
+    assert.deepEqual(deliveries, ["one Flow send", "one Flow brief"]);
+  });
+});
+
 /* ---------- Patch 12: background runs + cancel ----------------- */
 
 // We test the background fork mechanism by overriding the CLI entry with a

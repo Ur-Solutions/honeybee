@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { canonicalAgentKind } from "../agents.js";
 import { atomicWriteFile, storeRoot } from "../fsx.js";
 import { withFileLock } from "../lock.js";
+import { isActiveSessionLifecycle } from "../stateMachine.js";
 import { listActiveSessions, type SessionRecord } from "../store.js";
 
 /**
@@ -60,7 +61,10 @@ const ZERO_COMMITMENT_STATES = new Set([
 
 /** Commitment points a single session contributes to its bound account. */
 export function sessionCommitmentPercent(session: SessionRecord): number {
-  if (session.status !== "running" || !session.accountId) return 0;
+  // A canonical active cursor keeps stale legacy terminal spellings probeable,
+  // but `kill_failed` is freshly-written stop uncertainty. It must reserve no
+  // provider capacity until ownership is resolved.
+  if (session.status === "kill_failed" || !isActiveSessionLifecycle(session) || !session.accountId) return 0;
   const state = session.lastObservedState ?? "";
   if (ZERO_COMMITMENT_STATES.has(state)) return 0;
   return BUSY_STATES.has(state) ? AUTO_COMMITMENT_BUSY_PERCENT : AUTO_COMMITMENT_PARKED_PERCENT;

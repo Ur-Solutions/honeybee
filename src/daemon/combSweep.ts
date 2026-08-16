@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { sendBuzMessage } from "../buz.js";
 import { deliverPromptText } from "../cli/shared.js";
+import { deliverSessionTextInAdmission, withRunnableSessionAdmission } from "../delivery.js";
 import { pickAutoAccount, resolveAccountFlag, spawnBee } from "../commands/spawn.js";
 import { releaseClaim } from "../comb/claims.js";
 import {
@@ -11,6 +12,7 @@ import {
 import { combRunDir } from "../comb/store.js";
 import {
   sweepCombs,
+  AgentActivationAmbiguousError,
   type AgentAdoptRequest,
   type AgentSpawnRequest,
   type CombSweepDeps,
@@ -18,11 +20,17 @@ import {
   type HumanPacketQuarantineNotice,
 } from "../comb/controller.js";
 import { listSweepableRuns, loadRun } from "../comb/store.js";
-import { transactionalRetire } from "../kill.js";
+import { retireSessionByNameExactly } from "../kill.js";
+import {
+  assertNoCanonicalHsrEventIntegrityDoubt,
+  assertNoUnresolvedHsrEventIntegrity,
+} from "../hsr/eventIntegrity.js";
+import { withSessionLifecycleTransaction } from "../lifecycle.js";
 import { withFileLock } from "../lock.js";
 import { scanLatestSeal } from "../seal.js";
 import type { BeeState } from "../state.js";
-import { loadSession, touchSession, type SessionRecord } from "../store.js";
+import { isArchivedSessionLifecycle, isRunnableSessionRecord } from "../stateMachine.js";
+import { loadSession, type SessionRecord } from "../store.js";
 
 export type CombSweeper = (
   records: SessionRecord[],
@@ -32,6 +40,31 @@ export type CombSweeper = (
 export type CombSweeperOptions = {
   detached?: boolean;
 };
+
+/** Exact source gate shared by the production sweeper and integrity tests. */
+export async function withCombAutomaticSourceAdmission<T>(
+  sources: SessionRecord[],
+  fn: (current: SessionRecord[]) => Promise<T>,
+): Promise<T> {
+  const ordered = [...new Map(sources.map((source) => [source.name, source])).values()]
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const enter = async (index: number, current: SessionRecord[]): Promise<T> => {
+    const source = ordered[index];
+    if (!source) return fn(current);
+    return withSessionLifecycleTransaction(source, async (lifecycle) => {
+      const fresh = await lifecycle.refresh();
+      assertNoCanonicalHsrEventIntegrityDoubt(fresh, "comb automatic retry");
+      await assertNoUnresolvedHsrEventIntegrity(fresh.name, "comb automatic retry");
+      // Frozen terminal/stall evidence cannot authorize a successor while the
+      // canonical source is runnable, retired, or otherwise unresolved.
+      if (fresh.status === "kill_failed" || isArchivedSessionLifecycle(fresh) || isRunnableSessionRecord(fresh)) {
+        throw new Error(`comb automatic retry: ${fresh.name} still owns runnable, unresolved, or retired source work`);
+      }
+      return enter(index + 1, [...current, fresh]);
+    });
+  };
+  return enter(0, []);
+}
 
 export function createCombSweeper(
   overrides: Partial<CombSweepDeps> = {},
@@ -46,11 +79,7 @@ export function createCombSweeper(
     spawnAgent: spawnCombAgent,
     adoptAgent: adoptCombAgent,
     lookupAgent: loadSession,
-    retireAgent: async (beeName) => {
-      const record = await loadSession(beeName);
-      if (!record || record.status !== "running") return;
-      await transactionalRetire(record);
-    },
+    retireAgent: (beeName) => retireSessionByNameExactly(beeName, "comb automatic cleanup"),
     listHumanPackets: listForumPackets,
     executeHumanEffect: executeForumPacketEffect,
     packetDigest: forumPacketDigest,
@@ -75,6 +104,7 @@ export function createCombSweeper(
     releaseClaim,
     withRunSweepLock: (runId, fn) =>
       withFileLock(join(combRunDir(runId), ".sweep.lock"), fn, { timeoutMs: 5_000, staleMs: 10 * 60_000 }),
+    withAgentSourceAdmission: withCombAutomaticSourceAdmission,
     now: () => Date.now(),
     ...overrides,
   };
@@ -150,95 +180,120 @@ async function spawnCombAgent(request: AgentSpawnRequest): Promise<{ name: strin
       attempt: request.attempt,
     },
   });
-  await touchSession(record.name, {
-    combActivations: [
-      ...(record.combActivations ?? []).map((binding) =>
-        binding.status === "current" && binding.runId === request.runId && binding.nodeId === request.activation.nodeId
-          ? { ...binding, status: "historical" as const, endedAt: new Date().toISOString() }
-          : binding,
-      ),
-      {
+  let bound: SessionRecord;
+  try {
+    bound = await bindAndDeliverCombAgent(record, request);
+  } catch (error) {
+    // The deterministic Bee name is already durably published. Preserve that
+    // ownership in the Comb effect instead of flattening a binding/delivery
+    // failure into a retryable spawn failure.
+    throw new AgentActivationAmbiguousError(
+      { name: record.name, ...(record.id ? { id: record.id } : {}) },
+      error,
+    );
+  }
+  return { name: bound.name, ...(bound.id ? { id: bound.id } : {}) };
+}
+
+export async function adoptCombAgent(
+  request: AgentAdoptRequest,
+  hooks: {
+    beforeSessionAdmission?: () => Promise<void>;
+    deliver?: typeof deliverPromptText;
+  } = {},
+): Promise<{ name: string; id?: string }> {
+  const record = await loadSession(request.name);
+  if (!record) throw new Error(`attached bee is not registered: ${request.name}`);
+  if (!isRunnableSessionRecord(record)) {
+    throw new Error(`attached bee ${record.name} is terminal (${record.status})`);
+  }
+  await hooks.beforeSessionAdmission?.();
+  let updated: SessionRecord;
+  try {
+    updated = await bindAndDeliverCombAgent(record, request, hooks.deliver);
+  } catch (error) {
+    throw new AgentActivationAmbiguousError(
+      { name: record.name, ...(record.id ? { id: record.id } : {}) },
+      error,
+    );
+  }
+  return { name: updated.name, ...(updated.id ? { id: updated.id } : {}) };
+}
+
+/** Lifecycle must stay outside every SessionRecord binding and prompt effect. */
+async function bindAndDeliverCombAgent(
+  snapshot: SessionRecord,
+  request: AgentSpawnRequest | AgentAdoptRequest,
+  deliver: typeof deliverPromptText = deliverPromptText,
+): Promise<SessionRecord> {
+  const deliveryId = `comb:${request.runId}:${request.activation.nodeId}:${request.activation.attempt}:${request.activation.itemIndex}:${request.taskId}`;
+  return withRunnableSessionAdmission(snapshot, async (lifecycle, admitted) => {
+    const now = new Date().toISOString();
+    const trackDigest = "trackDigest" in request ? request.trackDigest : undefined;
+    const exact = admitted.combActivations?.find(
+      (binding) =>
+        binding.runId === request.runId &&
+        binding.nodeId === request.activation.nodeId &&
+        binding.attempt === request.activation.attempt &&
+        binding.itemIndex === request.activation.itemIndex &&
+        (trackDigest === undefined || binding.trackDigest === trackDigest),
+    );
+    const bindingPatch = (current: SessionRecord, deliveredAt?: string): Partial<SessionRecord> => {
+      const currentExact = current.combActivations?.find(
+        (binding) =>
+          binding.runId === request.runId &&
+          binding.nodeId === request.activation.nodeId &&
+          binding.attempt === request.activation.attempt &&
+          binding.itemIndex === request.activation.itemIndex &&
+          (trackDigest === undefined || binding.trackDigest === trackDigest),
+      );
+      const deliveryAt = deliveredAt ?? currentExact?.deliveredAt;
+      const binding = {
         runId: request.runId,
         nodeId: request.activation.nodeId,
         attempt: request.activation.attempt,
         itemIndex: request.activation.itemIndex,
         taskId: request.taskId,
-        status: "current",
-        attachedAt: new Date().toISOString(),
-      },
-    ],
-  });
-  if (record.brief) await deliverPromptText(record, record.brief);
-  return { name: record.name, ...(record.id ? { id: record.id } : {}) };
-}
-
-async function adoptCombAgent(request: AgentAdoptRequest): Promise<{ name: string; id?: string }> {
-  const record = await loadSession(request.name);
-  if (!record) throw new Error(`attached bee is not registered: ${request.name}`);
-  if (record.status !== "running") {
-    throw new Error(`attached bee ${record.name} is terminal (${record.status})`);
-  }
-  const now = new Date().toISOString();
-  const exact = record.combActivations?.find(
-    (binding) =>
-      binding.runId === request.runId &&
-      binding.nodeId === request.activation.nodeId &&
-      binding.attempt === request.activation.attempt &&
-      binding.itemIndex === request.activation.itemIndex &&
-      binding.trackDigest === request.trackDigest,
-  );
-  const binding = {
-    runId: request.runId,
-    nodeId: request.activation.nodeId,
-    attempt: request.activation.attempt,
-    itemIndex: request.activation.itemIndex,
-    taskId: request.taskId,
-    status: "current" as const,
-    attachedAt: exact?.attachedAt ?? now,
-    trackDigest: request.trackDigest,
-    ...(exact?.deliveredAt ? { deliveredAt: exact.deliveredAt } : {}),
-  };
-  const otherBindings = (record.combActivations ?? [])
-    .filter(
-      (candidate) =>
-        !(
+        status: "current" as const,
+        attachedAt: currentExact?.attachedAt ?? now,
+        ...(trackDigest ? { trackDigest } : {}),
+        ...(deliveryAt ? { deliveredAt: deliveryAt } : {}),
+      };
+      const otherBindings = (current.combActivations ?? [])
+        .filter(
+          (candidate) =>
+            !(
+              candidate.runId === request.runId &&
+              candidate.nodeId === request.activation.nodeId &&
+              candidate.attempt === request.activation.attempt &&
+              candidate.itemIndex === request.activation.itemIndex
+            ),
+        )
+        .map((candidate) =>
+          candidate.status === "current" &&
           candidate.runId === request.runId &&
-          candidate.nodeId === request.activation.nodeId &&
-          candidate.attempt === request.activation.attempt &&
-          candidate.itemIndex === request.activation.itemIndex
-        ),
-    )
-    .map((candidate) =>
-      candidate.status === "current" &&
-      candidate.runId === request.runId &&
-      candidate.nodeId === request.activation.nodeId
-        ? { ...candidate, status: "historical" as const, endedAt: now }
-        : candidate
-    );
-  let updated = await touchSession(record.name, {
-    contract: {
-      completion: "seal",
-      taskId: request.taskId,
-      attempt: request.attempt,
-    },
-    brief: request.brief,
-    combActivations: [...otherBindings, binding],
-  });
-  if (!updated) throw new Error(`attached bee disappeared during adoption: ${record.name}`);
-  if (!exact?.deliveredAt) {
-    await deliverPromptText(updated, request.brief);
-    const deliveredAt = new Date().toISOString();
-    updated = await touchSession(updated.name, {
-      combActivations: updated.combActivations?.map((candidate) =>
-        candidate.runId === request.runId &&
-        candidate.nodeId === request.activation.nodeId &&
-        candidate.attempt === request.activation.attempt &&
-        candidate.itemIndex === request.activation.itemIndex &&
-        candidate.trackDigest === request.trackDigest
-          ? { ...candidate, deliveredAt }
-          : candidate
-      ),
-    }) ?? updated;
-  }
-  return { name: updated.name, ...(updated.id ? { id: updated.id } : {}) };
+          candidate.nodeId === request.activation.nodeId
+            ? { ...candidate, status: "historical" as const, endedAt: now }
+            : candidate
+        );
+      return {
+        contract: {
+          completion: "seal",
+          taskId: request.taskId,
+          attempt: request.attempt,
+        },
+        brief: request.brief,
+        combActivations: [...otherBindings, binding],
+      };
+    };
+
+    if (request.brief && !exact?.deliveredAt) {
+      return (await deliverSessionTextInAdmission(lifecycle, admitted, request.brief, {
+        deliver,
+        deliveryId,
+        metadata: (deliveredAt, current) => bindingPatch(current, deliveredAt),
+      })).record;
+    }
+    return lifecycle.commit(bindingPatch(admitted));
+  }, { operation: "comb agent activation" });
 }

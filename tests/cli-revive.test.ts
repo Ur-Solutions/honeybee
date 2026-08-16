@@ -61,7 +61,10 @@ async function readBee(store: string, name: string): Promise<Record<string, unkn
 }
 
 function hive(store: string, socket: string, args: string[], envOverrides: Record<string, string | undefined> = {}): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(process.execPath, ["tests/cli-entry.mjs", ...args], {
+  const cliArgs = process.env.HIVE_TEST_BUILT_CLI === "1"
+    ? ["tests/cli-entry.mjs", ...args]
+    : ["--import", "tsx", "tests/cli-entry.mjs", ...args];
+  return execFileAsync(process.execPath, cliArgs, {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -120,6 +123,10 @@ async function seedStoppedHsrRuntime(store: string, bee: string): Promise<void> 
       hostPid: deadPid,
       hostFingerprint: { pgid: deadPid, startedAt: "Fri Aug  7 00:00:00 2026" },
       childAdmission: "none",
+      startupFailure: {
+        stage: "adapter-start",
+        message: "fixture provider was durably never started",
+      },
       startedAt: "2026-08-07T00:00:00.000Z",
       controlSocket: hsrControlSocketPath(bee),
       status: "exited",

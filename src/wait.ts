@@ -8,6 +8,7 @@ import { isPermissionPromptPane } from "./readiness.js";
 import { listSeals, loadLatestSeal, type SealRecord } from "./seal.js";
 import { sessionLivenessFailure } from "./sessionLiveness.js";
 import { persistSessionTranscriptMetadata, resolveSessionTranscript } from "./sessionMetadata.js";
+import { isArchivedSessionLifecycle } from "./stateMachine.js";
 import { appendLedger, loadSession, type SessionRecord } from "./store.js";
 import { substrateFor, type Substrate } from "./substrates/index.js";
 import { lastAssistantText, latestTranscript, renderTranscript } from "./transcripts.js";
@@ -190,9 +191,10 @@ async function refreshWaitSession(record: SessionRecord, deps: WaitSessionDeps =
 }
 
 function recordedWaitTerminalState(record: SessionRecord): string | null {
-  if (record.status === "done") return "done";
-  if (record.status === "dead") return "killed";
+  if (isArchivedSessionLifecycle(record)) return "done";
   if (record.status === "kill_failed") return "kill_failed";
+  if (record.stateMachine !== undefined) return null;
+  if (record.status === "dead") return "killed";
   switch (record.lastObservedState) {
     case "crashed":
     case "error":

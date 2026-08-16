@@ -19,9 +19,10 @@
 //   - events are append-only, seq starts at 1, and replay after restart reads
 //     the same bytes (no in-memory-only control history).
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
+import { canonicalDigest } from "../comb/canonical.js";
 import type { ProcessBirthFingerprint } from "../hsr/processIdentity.js";
 import { withFileLock } from "../lock.js";
 import { safeName } from "../store.js";
@@ -29,6 +30,7 @@ import type { JsonValue } from "../comb/types.js";
 import type { JsonObject } from "./contract.js";
 import { executionError } from "./errors.js";
 import { ensureExecutionRoot, executionRoot } from "./nodeState.js";
+import { releaseWorkingCopy } from "./workingCopies.js";
 
 /* ---------------------------------------------------------------- */
 /* Paths                                                             */
@@ -127,6 +129,21 @@ export type RunTerminalResult = {
   finishedAt: string;
 };
 
+/**
+ * Durable compensation for an explicit-placement claim made by a launch that
+ * never became a running Run. The proof is written in the SAME reservation
+ * mutation as the terminal result, before occupancy is touched. A crash after
+ * that write is therefore restartable; releasing the exact run's claim is
+ * idempotent and a later reservation write records completion.
+ */
+export type RunLaunchOccupancyCleanup = {
+  workingCopyId: string;
+  state: "pending" | "released";
+  proof: "launcher-not-invoked" | "launcher-definite-failure" | "runtime-down";
+  requestedAt: string;
+  releasedAt?: string;
+};
+
 export type RunReservation = {
   version: 1;
   runId: string;
@@ -142,6 +159,14 @@ export type RunReservation = {
   jobId: string;
   leaseId: string;
   leaseExpiresAt: string;
+  /**
+   * Exact signed lease that passed admission validation. New reservations
+   * retain it so the node-owned reconciler can finish a crash that happened
+   * after admission but before the launcher was invoked. Older reservations
+   * may not carry it and therefore remain deliberately non-resumable without
+   * an identical run.start replay.
+   */
+  lease?: JsonObject;
   /**
    * Parent capability lease from the admitting envelope's authority claims.
    * REQUIRED: every per-run operation must present the same capabilityLeaseId;
@@ -173,6 +198,8 @@ export type RunReservation = {
   failureCause?: string;
   /** Terminal projection facts, appended once by the terminal reconciler. */
   result?: RunTerminalResult;
+  /** Failed-launch-only occupancy compensation; never used for a started Run. */
+  launchOccupancyCleanup?: RunLaunchOccupancyCleanup;
   /** Set when recovery declared the start outcome unknowable. */
   indeterminateAt?: string;
   /** Machine-readable reason reconciliation uses to retry/resolve lost state. */
@@ -292,6 +319,9 @@ export async function readReservation(runId: string): Promise<RunReservation | n
   if (parsed.runId !== runId) {
     throw executionError("AUTHORITY_UNAVAILABLE", `run reservation directory for ${runId} names a different run (${String(parsed.runId)})`);
   }
+  if (parsed.lease !== undefined && !isValidPersistedLease(parsed.lease, parsed)) {
+    throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} carries a malformed or mismatched durable lease`);
+  }
   if (parsed.initiator !== undefined && !isValidInitiator(parsed.initiator)) {
     // A malformed initiator would silently corrupt parent authorship on
     // relaunch (a fake or empty parent edge). Fail closed like every other
@@ -301,7 +331,89 @@ export async function readReservation(runId: string): Promise<RunReservation | n
   if (parsed.launchAttempt !== undefined && !isValidLaunchAttempt(parsed.launchAttempt)) {
     throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} carries a malformed launch owner`);
   }
+  if (parsed.launchOccupancyCleanup !== undefined && !isValidLaunchOccupancyCleanup(parsed.launchOccupancyCleanup)) {
+    throw executionError("AUTHORITY_UNAVAILABLE", `run reservation for ${runId} carries malformed launch occupancy cleanup state`);
+  }
   return parsed as unknown as RunReservation;
+}
+
+/** One independently readable entry from the durable Run inventory. */
+export type RunReservationInventoryEntry =
+  | { directory: string; reservation: RunReservation }
+  | { directory: string; error: string };
+
+export type RunReservationInventoryPage = {
+  entries: RunReservationInventoryEntry[];
+  /** Directory cursor for the next bounded page; null means wrap to head. */
+  nextAfterDirectory: string | null;
+};
+
+/**
+ * Enumerate a bounded page of durable reservations for the daemon reconciler.
+ * A corrupt/missing record is returned as its own error entry so one damaged
+ * Run can never hide healthy obligations later in the directory. Directory
+ * names are deterministic and sorted, making the cursor restart-safe without
+ * holding an open directory handle across ticks.
+ */
+export async function listRunReservationInventory(options: {
+  afterDirectory?: string;
+  limit?: number;
+} = {}): Promise<RunReservationInventoryPage> {
+  const runsRoot = join(executionRoot(), "runs");
+  let directories: string[];
+  try {
+    directories = (await readdir(runsRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { entries: [], nextAfterDirectory: null };
+    }
+    throw executionError("AUTHORITY_UNAVAILABLE", `run inventory is unreadable: ${String(error)}`);
+  }
+
+  const requestedLimit = options.limit ?? 32;
+  const limit = Number.isSafeInteger(requestedLimit)
+    ? Math.max(1, Math.min(256, requestedLimit))
+    : 32;
+  const start = options.afterDirectory
+    ? directories.findIndex((directory) => directory > options.afterDirectory!)
+    : 0;
+  if (start < 0 || start >= directories.length) {
+    return { entries: [], nextAfterDirectory: null };
+  }
+  const pageDirectories = directories.slice(start, start + limit);
+  const entries: RunReservationInventoryEntry[] = [];
+  for (const directory of pageDirectories) {
+    try {
+      const raw = await readFile(join(runsRoot, directory, "reservation.json"), "utf8");
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        throw executionError("AUTHORITY_UNAVAILABLE", `run reservation in ${directory} is corrupt`);
+      }
+      if (typeof parsed.runId !== "string" || runKey(parsed.runId) !== directory) {
+        throw executionError("AUTHORITY_UNAVAILABLE", `run reservation in ${directory} does not match its directory identity`);
+      }
+      const reservation = await readReservation(parsed.runId);
+      if (!reservation) {
+        throw executionError("AUTHORITY_UNAVAILABLE", `run reservation in ${directory} disappeared during inventory`);
+      }
+      entries.push({ directory, reservation });
+    } catch (error) {
+      entries.push({ directory, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  const lastDirectory = pageDirectories.at(-1) ?? null;
+  return {
+    entries,
+    nextAfterDirectory:
+      lastDirectory && directories.indexOf(lastDirectory) < directories.length - 1
+        ? lastDirectory
+        : null,
+  };
 }
 
 /** ActorContext initiator kinds admitted by the corpus (actor-context.schema.json). */
@@ -311,6 +423,24 @@ function isValidInitiator(value: unknown): value is { kind: string; id: string }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const { kind, id } = value as Record<string, unknown>;
   return typeof kind === "string" && INITIATOR_KINDS.has(kind) && typeof id === "string" && id.length > 0;
+}
+
+function isValidPersistedLease(value: unknown, reservation: Record<string, unknown>): value is JsonObject {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (reservation.intent === null || typeof reservation.intent !== "object" || Array.isArray(reservation.intent)) return false;
+  const lease = value as Record<string, unknown>;
+  const intent = reservation.intent as Record<string, unknown>;
+  return lease.runId === reservation.runId &&
+    lease.leaseId === reservation.leaseId &&
+    lease.expiresAt === reservation.leaseExpiresAt &&
+    lease.ownerScopeId === reservation.ownerScopeId &&
+    lease.workspaceId === reservation.workspaceId &&
+    lease.parentCapabilityLeaseId === reservation.capabilityLeaseId &&
+    intent.runId === reservation.runId &&
+    intent.jobId === reservation.jobId &&
+    intent.ownerScopeId === reservation.ownerScopeId &&
+    intent.workspaceId === reservation.workspaceId &&
+    canonicalDigest({ intent: reservation.intent, lease: value } as JsonValue) === reservation.requestDigest;
 }
 
 function isValidLaunchAttempt(value: unknown): value is RunLaunchAttempt {
@@ -330,6 +460,25 @@ function isValidLaunchAttempt(value: unknown): value is RunLaunchAttempt {
   const fingerprint = owner.processFingerprint as Record<string, unknown>;
   return Number.isSafeInteger(fingerprint.pgid) && Number(fingerprint.pgid) > 0 &&
     typeof fingerprint.startedAt === "string" && fingerprint.startedAt.length > 0;
+}
+
+function isValidLaunchOccupancyCleanup(value: unknown): value is RunLaunchOccupancyCleanup {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const cleanup = value as Record<string, unknown>;
+  if (typeof cleanup.workingCopyId !== "string" || cleanup.workingCopyId.length === 0) return false;
+  if (cleanup.state !== "pending" && cleanup.state !== "released") return false;
+  if (
+    cleanup.proof !== "launcher-not-invoked" &&
+    cleanup.proof !== "launcher-definite-failure" &&
+    cleanup.proof !== "runtime-down"
+  ) return false;
+  if (typeof cleanup.requestedAt !== "string" || !Number.isFinite(Date.parse(cleanup.requestedAt))) return false;
+  if (cleanup.releasedAt !== undefined && (
+    typeof cleanup.releasedAt !== "string" || !Number.isFinite(Date.parse(cleanup.releasedAt))
+  )) return false;
+  return cleanup.state === "released"
+    ? typeof cleanup.releasedAt === "string"
+    : cleanup.releasedAt === undefined;
 }
 
 async function writeReservation(reservation: RunReservation): Promise<void> {
@@ -364,6 +513,45 @@ export async function writeEffectIndex(entry: EffectIndexEntry): Promise<void> {
   await atomicWriteFile(effectIndexPath(entry.effectKey), `${JSON.stringify(entry, null, 2)}\n`, { mode: 0o600 });
 }
 
+/**
+ * Repair only the legitimate pending-index -> committed-index admission crash
+ * gap for an already-readable reservation. The exact run/effect/digest/method
+ * facts must agree; any conflicting index fails closed before reconciliation
+ * can authorize a launcher.
+ */
+export async function ensureRunReservationIndexed(reservation: RunReservation): Promise<RunReservation> {
+  return withFileLock(admissionLockPath(), async () => {
+    const current = await readReservation(reservation.runId);
+    if (!current) {
+      throw executionError("AUTHORITY_UNAVAILABLE", `run ${reservation.runId} disappeared during inventory admission repair`);
+    }
+    if (current.effectKey !== reservation.effectKey || current.requestDigest !== reservation.requestDigest) {
+      throw executionError("AUTHORITY_UNAVAILABLE", `run ${reservation.runId} changed identity during inventory admission repair`);
+    }
+    const indexed = await readEffectIndex(current.effectKey);
+    if (indexed && (
+      indexed.runId !== current.runId ||
+      indexed.requestDigest !== current.requestDigest ||
+      (indexed.method ?? "run.start") !== "run.start"
+    )) {
+      throw executionError(
+        "AUTHORITY_UNAVAILABLE",
+        `run ${current.runId} conflicts with its durable effect index; refusing autonomous reconciliation`,
+      );
+    }
+    if (!indexed || indexed.phase === "pending") {
+      await writeEffectIndex({
+        effectKey: current.effectKey,
+        requestDigest: current.requestDigest,
+        runId: current.runId,
+        method: "run.start",
+        phase: "committed",
+      });
+    }
+    return current;
+  });
+}
+
 /* ---------------------------------------------------------------- */
 /* Admission                                                         */
 /* ---------------------------------------------------------------- */
@@ -379,6 +567,8 @@ export type AdmissionInput = {
   jobId: string;
   leaseId: string;
   leaseExpiresAt: string;
+  /** Exact signed lease after successful validation (new production writes). */
+  lease?: JsonObject;
   capabilityLeaseId: string;
   intent: JsonObject;
   initiator?: { kind: string; id: string };
@@ -490,6 +680,7 @@ export async function admitRunStart(input: AdmissionInput): Promise<AdmissionOut
       jobId: input.jobId,
       leaseId: input.leaseId,
       leaseExpiresAt: input.leaseExpiresAt,
+      ...(input.lease ? { lease: input.lease } : {}),
       capabilityLeaseId: input.capabilityLeaseId,
       intent: input.intent,
       ...(input.initiator ? { initiator: input.initiator } : {}),
@@ -535,15 +726,18 @@ export type RunLaunchClaim = {
   reservation: RunReservation;
   /** True only for the caller that atomically installed this exact attempt. */
   claimed: boolean;
-  disposition: "claimed" | "owned" | "busy" | "positive-evidence" | "settled";
+  disposition: "claimed" | "owned" | "busy" | "positive-evidence" | "indeterminate" | "settled";
   attemptId?: string;
 };
 
 /**
- * Atomically claim the launch side effect, or take it over only after BOTH:
- * the previous owner incarnation is proven dead and no positive launch
- * evidence exists while the reservation lock is held. A live/unverifiable
- * owner is never stolen, regardless of claim age.
+ * Atomically claim the launch side effect, or take over a PREPARING attempt
+ * only after BOTH: the previous owner incarnation is proven dead and no
+ * positive launch evidence exists while the reservation lock is held. Once
+ * an attempt has crossed the durable `launching` fence, evidence absence can
+ * never prove that the non-idempotent launcher did not run. A live,
+ * unverifiable, or already-activated owner is never stolen, regardless of
+ * claim age.
  */
 export async function claimRunLaunchAttempt(
   runId: string,
@@ -558,7 +752,17 @@ export async function claimRunLaunchAttempt(
   return withFileLock(admissionLockPath(), async () => {
     const current = await readReservation(runId);
     if (!current) throw executionError("RUN_UNKNOWN", `runId ${runId} names no Run reserved on this node`);
-    if (current.result || current.cancel || current.phase === "started" || current.phase === "failed") {
+    if (current.result || current.phase === "started" || current.phase === "failed") {
+      return { reservation: current, claimed: false, disposition: "settled" };
+    }
+
+    // Cancellation closes every launch path that is still positively before
+    // the side-effect fence. An activated attempt is different: the old owner
+    // may have forked immediately before dying, so the node-owned inventory
+    // must still be able to inspect that exact owner and persist an honest
+    // loss episode. Returning `settled` for every cancelled reservation here
+    // used to strand that crash window in `starting` forever.
+    if (current.cancel && current.phase !== "launching") {
       return { reservation: current, claimed: false, disposition: "settled" };
     }
 
@@ -580,6 +784,9 @@ export async function claimRunLaunchAttempt(
     // Age cannot prove spawn absence, so fail closed instead of manufacturing
     // an owner and potentially launching a duplicate.
     if (!existing) return { reservation: current, claimed: false, disposition: "busy" };
+    if (current.cancel && existing.stage === "preparing") {
+      return { reservation: current, claimed: false, disposition: "settled" };
+    }
     if (existing.owner.ownerId === owner.ownerId) {
       return { reservation: current, claimed: false, disposition: "owned", attemptId: existing.attemptId };
     }
@@ -589,6 +796,19 @@ export async function claimRunLaunchAttempt(
     const evidence = await options.evidence();
     if (evidence.sessionExists) {
       return { reservation: current, claimed: false, disposition: "positive-evidence" };
+    }
+
+    // `launching` is the durable side-effect fence. The old process may have
+    // died immediately before OR after invoking the non-idempotent launcher;
+    // an empty session lookup cannot distinguish those worlds. Persist an
+    // honest, recoverable lost episode instead of authorizing a duplicate.
+    // A later matching readiness receipt may still converge this Run to
+    // started. Missing stage is legacy and deliberately means "already
+    // launching", so it follows the same fail-closed path.
+    if (existing.stage !== "preparing") {
+      const next = enterLossEpisode(current, "readiness_evidence_missing", clock().toISOString());
+      await writeReservation(next);
+      return { reservation: next, claimed: false, disposition: "indeterminate" };
     }
 
     const attemptId = randomUUID();
@@ -672,6 +892,86 @@ export type RunTerminalDecision = {
   failureCause?: string;
 };
 
+function explicitWorkingCopyId(reservation: RunReservation): string | undefined {
+  const placement = reservation.intent.placement;
+  if (placement === null || typeof placement !== "object" || Array.isArray(placement)) return undefined;
+  const { kind, workingCopyId } = placement as JsonObject;
+  return kind === "explicit" && typeof workingCopyId === "string" && workingCopyId.length > 0
+    ? workingCopyId
+    : undefined;
+}
+
+function scheduleLaunchOccupancyCleanup(
+  reservation: RunReservation,
+  proof: RunLaunchOccupancyCleanup["proof"] | undefined,
+  requestedAt: string,
+): RunReservation {
+  if (!proof || reservation.launchOccupancyCleanup) return reservation;
+  // A started/environment-backed Run owns its copy until explicit run.release;
+  // this compensation is ONLY for launches that terminalized before readiness
+  // was committed. Never turn ordinary terminal completion into auto-release.
+  if (reservation.phase === "started" || reservation.environment) return reservation;
+  const workingCopyId = explicitWorkingCopyId(reservation);
+  if (!workingCopyId) return reservation;
+  return {
+    ...reservation,
+    launchOccupancyCleanup: {
+      workingCopyId,
+      state: "pending",
+      proof,
+      requestedAt,
+    },
+  };
+}
+
+/**
+ * Finish a previously scheduled failed-launch compensation. The proof and
+ * terminal result are immutable once scheduled, so the per-copy release does
+ * NOT hold the global admission lock: evidence collection already holds the
+ * per-copy lock while persisting its operation result under admission, and
+ * reversing that order here would deadlock both workers. The working-copy
+ * primitive is scoped to runId and idempotent, so a crash after release but
+ * before the completion write is safely replayed after daemon restart; a
+ * successor owner's claim is never touched.
+ */
+export async function reconcileRunLaunchOccupancyCleanup(
+  reservation: RunReservation,
+  options: { now?: () => Date } = {},
+): Promise<RunReservation> {
+  const clock = options.now ?? (() => new Date());
+  if (!reservation.launchOccupancyCleanup || reservation.launchOccupancyCleanup.state === "released") {
+    return reservation;
+  }
+  const current = await readReservation(reservation.runId);
+  if (!current) throw executionError("RUN_UNKNOWN", `runId ${reservation.runId} names no Run reserved on this node`);
+  const cleanup = current.launchOccupancyCleanup;
+  if (!cleanup || cleanup.state === "released") return current;
+  // The scheduling write is proof that the launcher was either never called,
+  // returned a definite no-live-runtime refusal, or that exact stop/exit was
+  // confirmed. Any liveness doubt must be resolved before that proof can be
+  // scheduled; a terminal result cannot subsequently return to running.
+  if (!current.result || current.indeterminateAt || current.phase === "started" || current.environment) return current;
+  await releaseWorkingCopy(cleanup.workingCopyId, current.runId);
+  const releasedAt = clock().toISOString();
+  return mutateReservation(current.runId, (latest) => {
+    const latestCleanup = latest.launchOccupancyCleanup;
+    if (!latestCleanup || latestCleanup.state === "released") return latest;
+    // Cleanup identity is append-only. Fail closed if a corrupt/concurrent
+    // writer ever replaces it instead of marking the same obligation released.
+    if (
+      latestCleanup.workingCopyId !== cleanup.workingCopyId ||
+      latestCleanup.proof !== cleanup.proof ||
+      latestCleanup.requestedAt !== cleanup.requestedAt
+    ) {
+      throw executionError("AUTHORITY_UNAVAILABLE", `run ${current.runId} launch occupancy cleanup identity changed during release`);
+    }
+    return {
+      ...latest,
+      launchOccupancyCleanup: { ...latestCleanup, state: "released", releasedAt },
+    };
+  });
+}
+
 /**
  * Decide a Run's one durable terminal result while holding the reservation
  * lock. The freshest record wins: an already-committed result is immutable,
@@ -686,11 +986,20 @@ export async function commitRunTerminalResult(
     clearIndeterminate?: boolean;
     /** Additional fresh-record fence for path-specific terminal decisions. */
     canCommit?: (reservation: RunReservation) => boolean;
+    /** Positive proof authorizing failed-launch occupancy compensation. */
+    launchOccupancyCleanupProof?: RunLaunchOccupancyCleanup["proof"];
   } = {},
 ): Promise<RunReservation> {
   const clock = options.now ?? (() => new Date());
-  return mutateReservation(runId, (current) => {
-    if (current.result) return options.clearIndeterminate ? clearLossEpisode(current) : current;
+  const terminal = await mutateReservation(runId, (current) => {
+    if (current.result) {
+      const existing = options.clearIndeterminate ? clearLossEpisode(current) : current;
+      return scheduleLaunchOccupancyCleanup(
+        existing,
+        options.launchOccupancyCleanupProof,
+        clock().toISOString(),
+      );
+    }
     if (options.canCommit && !options.canCommit(current)) return current;
     const base = options.clearIndeterminate ? clearLossEpisode(current) : current;
 
@@ -706,14 +1015,20 @@ export async function commitRunTerminalResult(
       ...(decision.harnessExitCode !== undefined ? { harnessExitCode: decision.harnessExitCode } : {}),
       finishedAt,
     };
-    return {
+    const terminalized: RunReservation = {
       ...base,
       ...(outcome === "failed" && decision.failureCause
         ? { phase: "failed" as const, failedAt: finishedAt, failureCause: decision.failureCause }
         : {}),
       result,
     };
+    return scheduleLaunchOccupancyCleanup(
+      terminalized,
+      options.launchOccupancyCleanupProof,
+      finishedAt,
+    );
   });
+  return reconcileRunLaunchOccupancyCleanup(terminal, { now: clock });
 }
 
 /* ---------------------------------------------------------------- */
@@ -1056,6 +1371,8 @@ export async function appendRunEvents(
     skipTypesWhenMarkerPresent?: { markerType: string; types: string[] };
     /** Internal guard used by appendRunTerminalEvents. */
     terminalFamilyType?: RunTerminalEventType;
+    /** Internal guard used only by appendRunLossEpisodeEvents. */
+    terminalLossRebase?: boolean;
   } = {},
 ): Promise<StoredRunEvent[]> {
   await mkdir(runDir(runId), { recursive: true, mode: 0o700 });
@@ -1092,6 +1409,76 @@ export async function appendRunEvents(
           `run ${runId} event log terminal family conflicts with requested result ${requestedTerminalType}`,
         );
       }
+    }
+    const publishesLoss = inputs.some((input) => input.type === "run.lost");
+    const existingTerminal = log.events.filter((event) => RUN_TERMINAL_EVENT_TYPE_SET.has(event.type));
+    if (publishesLoss && existingTerminal.length > 0) {
+      if (!options.terminalLossRebase) {
+        throw executionError(
+          "AUTHORITY_UNAVAILABLE",
+          `run ${runId} cannot append run.lost after a terminal event without the reservation-fenced generation repair`,
+        );
+      }
+
+      // A terminal result and its event are separate writes. A later physical
+      // stop doubt can therefore race after the terminal event even though the
+      // durable reservation must honestly project lost until stop is proven.
+      // Terminal states have no outgoing edge in the execution contract, so
+      // replace that prematurely published terminal member in one cursor-reset
+      // generation before publishing the loss episode. The immutable result
+      // remains in reservation.json and is republished after legal recovery.
+      const oldHead = log.events.at(-1)?.seq ?? 0;
+      const retained = log.events.filter((event) => !RUN_TERMINAL_EVENT_TYPE_SET.has(event.type));
+      const present = new Set(retained.map((event) => event.type));
+      const presentKeys = new Set(retained.map((event) => eventFamilyKey(event.type, event.payload)));
+      const occupiedIds = new Set(retained.map((event) => event.eventId));
+      const appended: StoredRunEvent[] = [];
+      for (const input of inputs) {
+        if (
+          options.skipTypesWhenMarkerPresent &&
+          present.has(options.skipTypesWhenMarkerPresent.markerType) &&
+          options.skipTypesWhenMarkerPresent.types.includes(input.type)
+        ) continue;
+        if (options.onlyIfAbsentTypes && present.has(input.type)) continue;
+        if (options.onlyIfAbsentKeys && presentKeys.has(eventFamilyKey(input.type, input.payload))) continue;
+        const ingestedAt = new Date().toISOString();
+        let eventId: string;
+        do eventId = `evt-${runKey(runId)}-loss-rebase-${randomUUID()}`;
+        while (occupiedIds.has(eventId));
+        occupiedIds.add(eventId);
+        const event: StoredRunEvent = {
+          protocolVersion,
+          runId,
+          seq: 0,
+          eventId,
+          type: input.type,
+          occurredAt: input.occurredAt ?? ingestedAt,
+          ingestedAt,
+          origin: input.origin,
+          payload: input.payload,
+        };
+        present.add(event.type);
+        presentKeys.add(eventFamilyKey(event.type, event.payload));
+        appended.push(event);
+      }
+      const candidate = [...retained, ...appended].map((event, index) => ({ ...event, seq: index + 1 }));
+      const previousReset = acceptedCursorResetThroughSeq(candidate);
+      const resetThroughSeq = Math.max(oldHead, previousReset ?? 0);
+      const repaired = finishRewrittenEventGeneration(
+        runId,
+        protocolVersion,
+        candidate,
+        resetThroughSeq,
+        inputs[0]?.origin ?? retained[0]!.origin,
+        new Date().toISOString(),
+      );
+      await atomicWriteFile(
+        eventsPath(runId),
+        repaired.events.map((event) => `${JSON.stringify(event)}\n`).join(""),
+        { mode: 0o600 },
+      );
+      const publishedIds = new Set([...appended, ...repaired.markers].map((event) => event.eventId));
+      return repaired.events.filter((event) => publishedIds.has(event.eventId));
     }
     const present = new Set(log.events.map((event) => event.type));
     const presentKeys = new Set(log.events.map((event) => eventFamilyKey(event.type, event.payload)));
@@ -1130,6 +1517,48 @@ export async function appendRunEvents(
 }
 
 /**
+ * Publish one durable loss episode while serialized with terminal-result
+ * publication. If a terminal event won the earlier result/event crash window,
+ * appendRunEvents replaces that event with a cursor-reset loss generation;
+ * a stale caller can never retract a terminal event after another reconciler
+ * has already cleared this exact episode.
+ */
+export async function appendRunLossEpisodeEvents(
+  reservation: RunReservation,
+  protocolVersion: string,
+  inputs: RunEventInput[],
+  options: {
+    onlyIfAbsentTypes?: boolean;
+    onlyIfAbsentKeys?: boolean;
+    skipTypesWhenMarkerPresent?: { markerType: string; types: string[] };
+  } = {},
+): Promise<StoredRunEvent[]> {
+  if (!inputs.some((input) => input.type === "run.lost")) {
+    throw executionError("AUTHORITY_UNAVAILABLE", "loss-episode publication requires a run.lost event");
+  }
+  if (!reservation.indeterminateAt || !reservation.lossEpisodeId) {
+    throw executionError("AUTHORITY_UNAVAILABLE", `run ${reservation.runId} has no durable loss episode to publish`);
+  }
+  return withFileLock(admissionLockPath(), async () => {
+    const current = await readReservation(reservation.runId);
+    if (
+      !current ||
+      !current.indeterminateAt ||
+      current.lossEpisodeId !== reservation.lossEpisodeId
+    ) {
+      throw executionError(
+        "AUTHORITY_UNAVAILABLE",
+        `run ${reservation.runId} loss episode changed before its event generation could publish`,
+      );
+    }
+    return appendRunEvents(reservation.runId, protocolVersion, inputs, {
+      ...options,
+      terminalLossRebase: true,
+    });
+  });
+}
+
+/**
  * Append (or repair after a reservation-write crash gap) the one terminal
  * Run event derived from a durable reservation result. Admission + event
  * serialization treats completed/failed/cancelled as one mutually-exclusive
@@ -1155,6 +1584,12 @@ export async function appendRunTerminalEvents(
     if (!current) throw executionError("RUN_UNKNOWN", `runId ${reservation.runId} names no Run reserved on this node`);
     const result = current.result;
     if (!result) return [];
+    // A durable result can win before physical process-stop evidence. While
+    // that exact loss episode is unresolved, publishing the terminal member
+    // would make the contract stream terminal -> lost (or recovering ->
+    // completed), neither of which is legal. The result remains immutable
+    // and is self-healed into the stream after the episode clears.
+    if (current.indeterminateAt) return [];
 
     await mkdir(runDir(current.runId), { recursive: true, mode: 0o700 });
     return withFileLock(eventsLockPath(current.runId), async () => {
@@ -1332,7 +1767,11 @@ export function classifyLaunch(
     const receiptFactCanAppearLater =
       reservation.indeterminateCause === "readiness_evidence_missing" ||
       reservation.indeterminateCause === "session_ref_missing" ||
-      reservation.indeterminateCause === "environment_receipt_missing";
+      reservation.indeterminateCause === "environment_receipt_missing" ||
+      reservation.indeterminateCause === "launcher_outcome_indeterminate" ||
+      reservation.indeterminateCause === "spawn_cleanup_unconfirmed" ||
+      reservation.indeterminateCause === "launch_commit_cleanup_unconfirmed" ||
+      reservation.indeterminateCause === "start_outcome_indeterminate";
     // Losing the evidence that originally put the Run into a recoverable lost
     // state is never proof that spawn did not happen. Stay sticky rather than
     // falling through to reserved-not-started and launching a duplicate.
@@ -1346,9 +1785,10 @@ export function classifyLaunch(
     return "started-receipt-lost";
   }
   // Durable launch ownership is non-expiring. Another service may inspect the
-  // owner's exact process birth and CAS a takeover, but elapsed wall time alone
-  // never reopens the launch side effect. Legacy launching records have no
-  // birth-safe owner and therefore remain indeterminate forever.
+  // owner's exact process birth and CAS a takeover only while `preparing`;
+  // neither elapsed wall time nor missing runtime evidence can reopen an
+  // activated launch side effect. Legacy launching records have no birth-safe
+  // owner/stage proof and therefore remain indeterminate forever.
   if (reservation.launchAttempt?.stage === "preparing") {
     // The durable side-effect fence has not been crossed. Another local
     // in-flight continuation may still be publishing launch events; without

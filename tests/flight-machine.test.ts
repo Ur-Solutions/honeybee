@@ -268,6 +268,30 @@ test("node_unreachable holds every clock — no transition, no stall", () => {
   assert.equal(plan.events.length, 0);
 });
 
+test("failed-stop doubt holds lane ownership past every deadline until exact death resolves", () => {
+  const f = flight();
+  const current = slot({ state: "stalled", nudgedAt: iso(T0 + 1_000) });
+  const wayPastReplacement = T0 + 10 * Math.max(f.contract.readinessDeadlineMs, f.contract.stallMs);
+
+  for (const evidence of [
+    { beeStatus: "kill_failed" as const, beeState: "dead" as const, seal: seal() },
+    { beeStatus: "running" as const, beeState: "kill_failed" as const, seal: seal() },
+  ]) {
+    const held = planSlot(f, current, evidence, wayPastReplacement);
+    assert.equal(held.ownershipHeld, true);
+    assert.deepEqual(held.slot, current);
+    assert.equal(held.changed, false);
+    assert.equal(held.events.length, 0);
+    assert.equal(held.wantsNudge, false);
+    assert.equal(held.wantsSpawn, false);
+  }
+
+  const resolved = planSlot(f, current, { beeStatus: "dead", beeState: "dead", seal: null }, wayPastReplacement + 1);
+  assert.equal(resolved.ownershipHeld, false);
+  assert.equal(resolved.slot.state, "vacant");
+  assert.equal(resolved.wantsSpawn, true);
+});
+
 test("exit contracts: clean exit is completion (even sweep-invisible fast ones); crashes never are", () => {
   const f = flight({ contract: { ...FLIGHT_CONTRACT_DEFAULTS, completion: "exit" } });
   const worked = planSlot(f, slot(), { beeStatus: "dead", seal: null }, T0 + 60_000);
@@ -282,8 +306,6 @@ test("exit contracts: clean exit is completion (even sweep-invisible fast ones);
   const crashed = planSlot(f, slot(), { beeStatus: "dead", beeState: "crashed", seal: null }, T0 + 60_000);
   assert.equal(crashed.slot.state, "vacant");
   assert.ok(crashed.events.some((e) => e.type === "flight.slot.crashed"));
-  const killFailed = planSlot(f, slot(), { beeStatus: "kill_failed", seal: null }, T0 + 60_000);
-  assert.equal(killFailed.slot.state, "vacant");
 });
 
 test("draining flights never ask for replacement spawns", () => {

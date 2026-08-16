@@ -11,6 +11,7 @@ import { pickRoundRobinAccount } from "../src/limits/autoPick.js";
 import type { ProbeEvidence } from "../src/stateMachine.js";
 import { activeSessionIndexPath, rebuildActiveSessionIndex, saveSession, TERMINAL_OBSERVED_STATES, type SessionRecord } from "../src/store.js";
 import { appendUsageEvent, isRecentlyAuthFailed, usageSummary } from "../src/usage.js";
+import { lifecycleCursor } from "./lifecycle-fixtures.js";
 
 async function withTempStore<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const oldRoot = process.env.HIVE_STORE_ROOT;
@@ -1125,6 +1126,63 @@ test("pickLeastLoadedAccount skips recent boot failures before fetching limits",
   });
 });
 
+test("pickLeastLoadedAccount preflights unusable credentials and honors a retry exclusion fence", async () => {
+  await withTempStore(async () => {
+    const expired = await addAccount("claude", "expired@a.b");
+    const healthy = await addAccount("claude", "healthy@a.b");
+    let fetched: string[] = [];
+
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async () => true,
+      credentialUnavailableReason: async (account) =>
+        account.id === expired.id ? "OAuth token expired and has no refresh token" : null,
+      fetchLimits: async (accounts) => {
+        fetched = accounts.map((account) => account.id);
+        return accounts.map((account) => okLimits(account.id, 20, 10));
+      },
+    });
+
+    assert.equal(choice.account.id, healthy.id);
+    assert.deepEqual(fetched, [], "one usable candidate never pays a limits round-trip");
+    assert.match(choice.reason, new RegExp(`skipped ${expired.id} for unusable credential preflight`));
+
+    await assert.rejects(
+      pickLeastLoadedAccount("claude", {
+        hasCredentials: async () => true,
+        credentialUnavailableReason: async () => null,
+        excludeAccountIds: new Set([expired.id, healthy.id]),
+      }),
+      /No untried claude account remains/,
+    );
+  });
+});
+
+test("pickLeastLoadedAccount quarantines recent credential activation failures", async () => {
+  await withTempStore(async () => {
+    const rejected = await addAccount("claude", "rejected-refresh@a.b");
+    const now = Date.parse("2026-08-15T06:00:00.000Z");
+    await recordAccountBootFailure(rejected.id, now, "activation");
+
+    await assert.rejects(
+      pickLeastLoadedAccount("claude", {
+        hasCredentials: async () => true,
+        credentialUnavailableReason: async () => null,
+        now: () => now + 1,
+      }),
+      /No claude account is ready for automatic activation.*recent credential activation failed/,
+    );
+
+    const healthy = await addAccount("claude", "healthy-after-rejection@a.b");
+    const choice = await pickLeastLoadedAccount("claude", {
+      hasCredentials: async () => true,
+      credentialUnavailableReason: async () => null,
+      now: () => now + 1,
+    });
+    assert.equal(choice.account.id, healthy.id);
+    assert.match(choice.reason, new RegExp(`skipped ${rejected.id} for recent credential activation failure`));
+  });
+});
+
 test("pickLeastLoadedAccount uses a failed account as the last credentialed resort", async () => {
   await withTempStore(async () => {
     const only = await addAccount("codex", "only@a.b");
@@ -1437,6 +1495,43 @@ test("sessionCommitmentPercent weighs busy/parked work and explicitly zeros comp
   assert.equal(sessionCommitmentPercent({ ...liveSession("kill-failed", "a", "active"), status: "kill_failed" }), 0);
   assert.equal(sessionCommitmentPercent({ ...liveSession("s4", "a", "active"), status: "dead" }), 0);
   assert.equal(sessionCommitmentPercent({ ...liveSession("s5", "a", "active"), accountId: undefined }), 0);
+});
+
+test("session commitments use canonical lifecycle over stale mixed-version status scalars", () => {
+  const at = "2026-06-10T10:00:00.000Z";
+  const active = liveSession("canonical-active", "a", "active");
+  const archived = liveSession("canonical-archived", "a", "active");
+
+  for (const status of ["done", "dead"] as const) {
+    assert.equal(
+      sessionCommitmentPercent({
+        ...active,
+        status,
+        stateMachine: lifecycleCursor(`${active.name}-${status}`, "active", at),
+      }),
+      AUTO_COMMITMENT_BUSY_PERCENT,
+      `canonical active must outrank stale ${status}`,
+    );
+  }
+  assert.equal(
+    sessionCommitmentPercent({
+      ...active,
+      status: "kill_failed",
+      stateMachine: lifecycleCursor(`${active.name}-kill-failed`, "active", at),
+    }),
+    0,
+    "current failed-stop doubt never contributes account commitment",
+  );
+  assert.equal(
+    sessionCommitmentPercent({
+      ...archived,
+      status: "running",
+      stateMachine: lifecycleCursor(archived.name, "archived", at),
+    }),
+    0,
+    "canonical archive must outrank stale running",
+  );
+  assert.equal(sessionCommitmentPercent({ ...active, status: "dead" }), 0, "legacy dead fallback is preserved");
 });
 
 test("accountCommitments sums per account and filters by tool", async () => {

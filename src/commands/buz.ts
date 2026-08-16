@@ -1,11 +1,14 @@
 // `hive buz` — addressed bee-to-bee messaging (four-tier delivery + policy).
 // Extracted from cli.ts (HIVE-15).
-import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, requeueQuarantinedMessages, requestMessageRecoveryIfParked, resolveBuzAccept, sanitizeHumanName, sendBuzMessage, senderDisplay, type BuzMessage, type BuzSender, type BuzSendResult, type BuzTier } from "../buz.js";
+import { BUZ_TIERS, DEFAULT_BUZ_TIER, cancelQueuedBuzMessage, consumeMessage, countQuarantinedMessages, listMessages, parseAcceptFlag, purgeMailbox, readMessageById, reconcileAmbiguousBuzDelivery, requeueQuarantinedMessages, requestMessageRecoveryIfParked, resolveBuzAccept, sanitizeHumanName, sendBuzMessageInAdmission, senderDisplay, type BuzMessage, type BuzSender, type BuzSendResult, type BuzTier } from "../buz.js";
 import { parseAge } from "../clean.js";
+import { withRunnableSessionAdmission } from "../delivery.js";
+import { readDeliveryDoubt } from "../deliveryDoubt.js";
 import { actionLine, bold, dim, formatRelativeTime, formatTable, isPretty, note } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 import { resolveSelector } from "../selectors.js";
-import { appendLedger, listSessions, updateSession, type SessionRecord } from "../store.js";
+import { appendLedger, listSessions, safeName, updateSession, type SessionRecord } from "../store.js";
+import { readPendingHsrTurn } from "../hsr/pendingTurns.js";
 import { substrateFor } from "../substrates/index.js";
 import { resolveBeeInCurrentPane, resolveSession, stringFlag } from "../cli/shared.js";
 
@@ -28,12 +31,14 @@ export async function cmdBuz(parsed: Parsed) {
       return buzRead(parsed);
     case "cancel":
       return buzCancel(parsed);
+    case "reconcile":
+      return buzReconcile(parsed);
     case "purge":
       return buzPurge(parsed);
     case "config":
       return buzConfig(parsed);
     default:
-      throw new Error(`Unknown buz subcommand: ${sub ?? ""}\nUsage: hive buz <send|inbox|outbox|queue|quarantine|requeue|read|cancel|purge|config>`);
+      throw new Error(`Unknown buz subcommand: ${sub ?? ""}\nUsage: hive buz <send|inbox|outbox|queue|quarantine|requeue|read|cancel|reconcile|purge|config>`);
   }
 }
 
@@ -73,11 +78,14 @@ export function parseBuzTier(value: unknown): BuzTier {
 
 export async function buzSend(parsed: Parsed) {
   const target = parsed.args[1];
-  if (!target) throw new Error(`Usage: hive buz send <selector> [--sender <bee>|--sender-human <name>] [--tier <${BUZ_TIERS.join("|")}>] -p <body> (default tier: ${DEFAULT_BUZ_TIER}; sender defaults to the bee owning the current session)`);
+  if (!target) throw new Error(`Usage: hive buz send <selector> [--sender <bee>|--sender-human <name>] [--tier <${BUZ_TIERS.join("|")}>] [--message-id <uuidv7>|--new] -p <body> (default tier: ${DEFAULT_BUZ_TIER}; sender defaults to the bee owning the current session)`);
   const tier = parseBuzTier(flag(parsed, "tier") ?? DEFAULT_BUZ_TIER);
   const body = stringFlag(parsed, ["prompt", "p"]) ?? "";
   if (body.length === 0) throw new Error("buz: --prompt|-p body is required");
   const subject = typeof flag(parsed, "subject") === "string" ? String(flag(parsed, "subject")) : undefined;
+  const messageId = stringFlag(parsed, ["message-id"]);
+  const forceNewIntent = truthy(flag(parsed, "new"));
+  if (messageId && forceNewIntent) throw new Error("buz: --message-id and --new are mutually exclusive");
   const sender = await resolveBuzSender(parsed);
 
   const resolved = await resolveSelector(target);
@@ -85,20 +93,22 @@ export async function buzSend(parsed: Parsed) {
   if (records.length === 0) throw new Error(`No bees match selector: ${target}`);
 
   for (const record of records) {
-    // Live tiers (interrupt, next-tool) need a transport to paste/hold through;
-    // queue/passive are pure mailbox writes.
-    const transport = tier === "interrupt" || tier === "next-tool"
-      ? { substrate: substrateFor(record), tmuxTarget: record.tmuxTarget, agentPaneId: record.agentPaneId }
-      : undefined;
-    const result = await sendBuzMessage({
-      recipient: record,
-      sender,
-      tier,
-      body,
-      ...(subject ? { subject } : {}),
-      ...(transport ? { transport } : {}),
-      ...(record.node ? { node: record.node } : {}),
-    });
+    const result = await withRunnableSessionAdmission(record, async (lifecycle, current) => {
+      const transport = tier === "interrupt" || tier === "next-tool"
+        ? { substrate: substrateFor(current), tmuxTarget: current.tmuxTarget, agentPaneId: current.agentPaneId }
+        : undefined;
+      return sendBuzMessageInAdmission({
+        recipient: current,
+        sender,
+        tier,
+        body,
+        ...(messageId ? { messageId } : {}),
+        ...(forceNewIntent ? { forceNewIntent: true } : {}),
+        ...(subject ? { subject } : {}),
+        ...(transport ? { transport } : {}),
+        ...(current.node ? { node: current.node } : {}),
+      }, { lifecycle });
+    }, { operation: "hive buz send", ...(messageId ? { deliveryId: messageId } : {}) });
     if (result.message.deliveredAs === "queue" && !result.message.deliveredAt) {
       await requestMessageRecoveryIfParked(record, result.message.id);
     }
@@ -346,6 +356,39 @@ export async function buzCancel(parsed: Parsed) {
 
   if (isPretty()) console.log(actionLine("ok", "buz", [bold(record.name), `cancelled:${id}`]));
   else console.log(`buz.cancel\t${record.name}\t${id}`);
+}
+
+/** Explicitly settle a provider-ambiguous queued delivery without re-sending. */
+export async function buzReconcile(parsed: Parsed) {
+  const target = parsed.args[1];
+  const id = parsed.args[2];
+  const delivered = truthy(flag(parsed, "delivered"));
+  const discard = truthy(flag(parsed, "discard"));
+  if (!target || !id || delivered === discard) {
+    throw new Error("Usage: hive buz reconcile <bee> <message-id> --delivered|--discard");
+  }
+  const bee = await resolveBuzReconcileBeeName(target, id);
+  const result = await reconcileAmbiguousBuzDelivery(bee, id, delivered ? "delivered" : "discard");
+  if (isPretty()) console.log(actionLine("ok", "buz", [bold(bee), `${result.verdict}:${id}`, result.mailbox]));
+  else console.log(`buz.reconcile\t${bee}\t${id}\t${result.verdict}\t${result.mailbox}`);
+}
+
+/** Resolve aliases only while a SessionRecord exists; recordless repair must
+ * name the exact canonical bee whose durable receipt proves the target. */
+export async function resolveBuzReconcileBeeName(target: string, messageId: string): Promise<string> {
+  try {
+    return (await resolveSession(target)).name;
+  } catch (resolutionError) {
+    if (safeName(target) !== target) {
+      throw new Error("recordless buz reconciliation requires an exact canonical bee name", { cause: resolutionError });
+    }
+    const [turn, doubt] = await Promise.all([
+      readPendingHsrTurn(target, messageId),
+      readDeliveryDoubt(target, messageId),
+    ]);
+    if (!turn && !doubt) throw resolutionError;
+    return target;
+  }
 }
 
 

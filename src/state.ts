@@ -3,6 +3,7 @@ import { cyan, dim, gray, green, magenta, red, yellow } from "./format.js";
 import { LOCAL_NODE_NAME } from "./node.js";
 import { isWellFormedPaneId } from "./paneId.js";
 import { isAgentActivePane, isAgentReadyPane, isMcpWarningPane, isPermissionPromptPane, isTrustPromptPane } from "./readiness.js";
+import { isActiveSessionLifecycle, isArchivedSessionLifecycle } from "./stateMachine.js";
 import type { SessionRecord } from "./store.js";
 
 export type BeeState =
@@ -126,17 +127,17 @@ function bootingOrWedged(record: SessionRecord, now: number): DerivedState {
 }
 
 export function deriveState(record: SessionRecord, context: StateContext): DerivedState {
-  if (record.status === "kill_failed") {
-    return { state: "kill_failed", detail: record.lastError ?? "previous kill failed" };
-  }
-
   // A filed bee is a settled terminal fact (filed on `quest done` / retire): its
   // tmux target is gone, but it is FILED, not dead, and must never flip to
   // "offline" on an unreachable node. Short-circuit BEFORE the liveness/node
   // probe so the filed status always wins — even over a stray live target of
   // the same name.
-  if (record.status === "done") {
+  if (isArchivedSessionLifecycle(record)) {
     return { state: "done", detail: "filed" };
+  }
+
+  if (record.status === "kill_failed") {
+    return { state: "kill_failed", detail: record.lastError ?? "previous kill failed" };
   }
 
   // node_unreachable takes precedence over dead/done because we cannot trust the
@@ -348,7 +349,7 @@ function deadOrCrashed(record: SessionRecord, context: StateContext): DerivedSta
   if (record.recoveryRequestedAt) {
     return { state: "queued", detail: "message accepted — runtime recovery requested" };
   }
-  if (record.status === "running") {
+  if (isActiveSessionLifecycle(record)) {
     return { state: "crashed", detail: `exited without retire/kill — ${lastActivityHint(record, context)}` };
   }
   return { state: "dead", detail: lastActivityHint(record, context) };
