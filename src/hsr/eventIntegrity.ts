@@ -431,14 +431,19 @@ export async function persistHsrEventIntegrityFailure(input: {
         await rename(receiptPath(input.bee), target);
         existing = null;
       } else {
+        const deliveryIds = [...new Set([...existing.deliveryIds, ...input.deliveryIds])].sort();
+        const deliveryAuthorityChanged =
+          JSON.stringify(deliveryIds) !== JSON.stringify(existing.deliveryIds)
+          || existing.deliveryScanError !== input.deliveryScanError;
+        if (!deliveryAuthorityChanged) return existing;
         const next: HsrEventIntegrityReceipt = {
           ...existing,
-          deliveryIds: [...new Set([...existing.deliveryIds, ...input.deliveryIds])].sort(),
+          deliveryIds,
           ...(input.deliveryScanError ? { deliveryScanError: input.deliveryScanError } : {}),
           updatedAt: now,
         };
         if (!input.deliveryScanError) delete next.deliveryScanError;
-        if (JSON.stringify(next) !== JSON.stringify(existing)) await writeReceipt(next);
+        await writeReceipt(next);
         return next;
       }
     }
@@ -494,13 +499,19 @@ export async function persistHsrEventIntegrityFailure(input: {
       const receipt = await writeHead();
       if (current && !isArchivedSessionLifecycle(current) && receiptOwnsSession(receipt, current)) {
         const marker = canonicalMarker(receipt);
-        await saveSessionLocked({
-          ...current,
-          status: "kill_failed",
-          lastError: marker.fenceError,
-          eventIntegrityDoubt: marker,
-          updatedAt: new Date().toISOString(),
-        });
+        if (
+          current.status !== "kill_failed"
+          || current.lastError !== marker.fenceError
+          || JSON.stringify(current.eventIntegrityDoubt) !== JSON.stringify(marker)
+        ) {
+          await saveSessionLocked({
+            ...current,
+            status: "kill_failed",
+            lastError: marker.fenceError,
+            eventIntegrityDoubt: marker,
+            updatedAt: new Date().toISOString(),
+          });
+        }
       }
       return receipt;
     });
