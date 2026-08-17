@@ -69,6 +69,21 @@ function tmuxExecTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TMUX_EXEC_TIMEOUT_MS;
 }
 
+
+/**
+ * tmux servers started under a non-UTF-8 locale sanitize control characters in
+ * format output — tabs in `-F` fields become "_", fusing fields into tokens
+ * like "%110_18981" (the mis-stamp family documented in paneId.ts, and live
+ * state misreads via list-sessions "#{session_name}\t#{@hive_state}"). The
+ * server inherits its locale from the first client that starts it, so every
+ * hive tmux invocation guarantees a UTF-8 LC_CTYPE.
+ */
+function utf8Env(): NodeJS.ProcessEnv {
+  const locale = process.env.LC_ALL ?? process.env.LC_CTYPE ?? process.env.LANG ?? "";
+  if (/utf-?8/i.test(locale)) return process.env;
+  return { ...process.env, LC_CTYPE: "en_US.UTF-8" };
+}
+
 export async function tmux(args: string[], options: { reject?: boolean } = {}): Promise<TmuxResult> {
   const reject = options.reject ?? true;
   if (args[0] === "kill-server" && !tmuxSocket()) {
@@ -81,7 +96,7 @@ export async function tmux(args: string[], options: { reject?: boolean } = {}): 
     );
   }
   try {
-    const result = await execFileAsync("tmux", [...socketArgs(), ...args], { maxBuffer: 20 * 1024 * 1024, timeout: tmuxExecTimeoutMs() });
+    const result = await execFileAsync("tmux", [...socketArgs(), ...args], { maxBuffer: 20 * 1024 * 1024, timeout: tmuxExecTimeoutMs(), env: utf8Env() });
     return { ok: true, stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
   } catch (error) {
     const err = error as { stdout?: string; stderr?: string; message?: string; code?: number | string; killed?: boolean };
@@ -505,7 +520,7 @@ export async function attachSession(target: string): Promise<void> {
 
 async function tmuxWithStdin(args: string[], input: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("tmux", [...socketArgs(), ...args], { stdio: ["pipe", "ignore", "pipe"] });
+    const child = spawn("tmux", [...socketArgs(), ...args], { stdio: ["pipe", "ignore", "pipe"], env: utf8Env() });
     let stderr = "";
     let settled = false;
     const settle = (error?: Error) => {
