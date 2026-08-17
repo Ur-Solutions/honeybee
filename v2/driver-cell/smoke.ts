@@ -1,0 +1,541 @@
+/**
+ * WP5 manual smoke runner — the cell driver end to end: a REAL agent inside
+ * REAL confinement (SMOKE.md "cell smokes" section).
+ *
+ *   npm run v2:smoke:cell -- stub                 # wiring proof, no tokens (run first)
+ *   npm run v2:smoke:cell -- claude [--model m]   # real claude CLI from PATH (HSR mode)
+ *
+ * One bee, one cell, the whole lifecycle: provision (CoW expected on APFS —
+ * copy_mode printed honestly) → spawn via the CellDriver with sandbox ON
+ * explicitly (Seatbelt on darwin) → the agent WRITES a file in its cwd (proves
+ * cwd + write access inside confinement) → smoke-side sandbox probe (the
+ * profile must deny a write outside the cell) → the agent COMMITS its change →
+ * capture/land onto a NEW branch in the throwaway origin (zero-artifact
+ * assertions: transient ref gone, origin otherwise bit-identical) → dirty
+ * delete refused, forced removal, stop clean.
+ *
+ * Safety: everything — including the origin the cell is provisioned from — is
+ * a THROWAWAY fixture built in a fresh OS temp dir. Never ~/.hive, never any
+ * user repository. claude runs in HSR mode (`-p --input-format stream-json`)
+ * with its real home, so real auth just works; the sandbox profile keeps
+ * ~/.claude and caches writable (defaultWritablePaths) while confining every
+ * other write to the cell. Fails fast: a dead prerequisite skips its
+ * dependents instead of compounding timeouts (the WP3 smoke lesson).
+ */
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { devNull, homedir, platform, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { claudeAdapter, stubAdapter } from "../adapters/src/index.ts";
+import type { DeliverOutcome, DriverObservation } from "../harness/src/driver.ts";
+import { verifyProcessIdentity, type SpawnSpec } from "../driver-hsr/src/index.ts";
+import { CellDriver } from "./src/driver.ts";
+import { currentBranch, git, porcelainStatus, refSet, revParse, tryGit } from "./src/git.ts";
+import { CELL_SPACE_DIRECTORY } from "./src/layout.ts";
+import { isProvisioned, readLedger } from "./src/ledger.ts";
+import type { ProvisionedCell } from "./src/provision.ts";
+import { CellDeleteRefused } from "./src/remove.ts";
+import { bwrapArgs, defaultWritablePaths } from "./src/sandbox.ts";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const STUB = join(here, "test-agent", "agent.mjs");
+
+const harness = process.argv[2] ?? "";
+const modelFlag = process.argv.indexOf("--model");
+const model = modelFlag > 0 ? process.argv[modelFlag + 1] : undefined;
+
+if (!["stub", "claude"].includes(harness)) {
+  console.error("usage: npm run v2:smoke:cell -- <stub|claude> [--model <m>]");
+  process.exit(2);
+}
+
+const real = harness === "claude";
+const BOOT_TIMEOUT = real ? 120_000 : 10_000;
+const TURN_TIMEOUT = real ? 300_000 : 30_000;
+const BEE = "cell-smoke-1";
+
+// ---------------------------------------------------------------------------
+// Throwaway fixture world (fresh temp dir; NEVER a user repository)
+// ---------------------------------------------------------------------------
+
+const runDir = mkdtempSync(join(tmpdir(), "hive-cell-smoke-"));
+const logDir = join(runDir, "logs");
+const cellsRoot = join(runDir, "cells");
+mkdirSync(logDir, { recursive: true });
+mkdirSync(cellsRoot, { recursive: true });
+
+/** A tiny throwaway node project with a few commits — the cell's origin. */
+function makeThrowawayOrigin(): { repo: string; sha: string } {
+  const repo = join(runDir, "origin");
+  mkdirSync(repo, { recursive: true });
+  git(repo, ["init", "-b", "main"]);
+  // Local identity: a CoW-provisioned cell inherits this config, so in-cell
+  // commits work even where no global git identity exists.
+  git(repo, ["config", "user.name", "cell-smoke"]);
+  git(repo, ["config", "user.email", "smoke@hive.invalid"]);
+  writeFileSync(
+    join(repo, "package.json"),
+    `${JSON.stringify({ name: "cell-smoke-throwaway", version: "0.0.1", private: true, type: "module" }, null, 2)}\n`,
+  );
+  writeFileSync(join(repo, "index.mjs"), `export const greeting = "hello from the throwaway origin";\n`);
+  writeFileSync(join(repo, "README.md"), "# cell-smoke throwaway fixture\n\nProvision target for the WP5 cell smoke.\n");
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-m", "initial throwaway fixture"]);
+  writeFileSync(join(repo, "index.mjs"), `export const greeting = "hello from the throwaway origin";\nexport const version = 2;\n`);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-m", "second commit"]);
+  return { repo, sha: git(repo, ["rev-parse", "HEAD"]) };
+}
+
+const origin = makeThrowawayOrigin();
+
+interface OriginFingerprint {
+  refs: string;
+  head: string;
+  status: string;
+  branch: string | null;
+}
+
+/** Bit-identical assertion material (the capture-test fingerprint technique). */
+function fingerprintOrigin(repo: string): OriginFingerprint {
+  return {
+    refs: refSet(repo),
+    head: revParse(repo, "HEAD") ?? "",
+    status: porcelainStatus(repo),
+    branch: currentBranch(repo),
+  };
+}
+
+function fsckClean(repo: string): boolean {
+  const res = tryGit(repo, ["fsck", "--connectivity-only", "--no-dangling"]);
+  return res.status === 0 && (res.stdout + res.stderr).trim().length === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Driver: real cell machinery, sandbox ON explicitly (the point of this smoke)
+// ---------------------------------------------------------------------------
+
+function harnessSpec(): SpawnSpec {
+  if (harness === "claude") {
+    return {
+      adapter: claudeAdapter,
+      command: "claude",
+      args: [
+        "-p",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+        ...(model ? ["--model", model] : []),
+      ],
+      // env omitted → the driver passes process.env: real auth just works
+      // (HSR mode, real home; the readyAtSpawn path from WP3).
+    };
+  }
+  return {
+    adapter: stubAdapter,
+    command: process.execPath,
+    args: [STUB],
+    env: {
+      ...(process.env as Record<string, string>),
+      // Deterministic in-cell git for the stub's `@sh git commit` turn.
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_CONFIG_SYSTEM: devNull,
+      GIT_AUTHOR_NAME: "cell-smoke",
+      GIT_AUTHOR_EMAIL: "smoke@hive.invalid",
+      GIT_COMMITTER_NAME: "cell-smoke",
+      GIT_COMMITTER_EMAIL: "smoke@hive.invalid",
+    },
+  };
+}
+
+const driver = new CellDriver({
+  cellsRoot,
+  nodeKind: "workstation", // default OFF — the per-cell override below turns it ON explicitly
+  resolveHarness: () => harnessSpec(),
+  resolveCell: () => ({
+    provision: {
+      beeId: BEE,
+      originRepo: origin.repo,
+      sha: origin.sha,
+      wrapper: BEE,
+      repoName: "throwaway",
+      cellId: "s1",
+    },
+    sandbox: true, // explicit per-cell ON (Seatbelt on darwin, bwrap on linux)
+  }),
+  hsr: { sessionLogDir: logDir, stopKillGraceMs: 2_000 },
+});
+
+// ---------------------------------------------------------------------------
+// Checklist plumbing (fail-fast, per-section wall time)
+// ---------------------------------------------------------------------------
+
+const results: Array<[string, boolean, string]> = [];
+function check(name: string, ok: boolean, detail = ""): void {
+  results.push([name, ok, detail]);
+  console.log(`${ok ? "✓" : "✗"} ${name}${detail ? ` — ${detail}` : ""}`);
+}
+function skip(why: string, ...names: string[]): void {
+  for (const name of names) check(name, false, `skipped: ${why}`);
+}
+
+let sectionName = "";
+let sectionT0 = 0;
+function endSection(): void {
+  if (sectionName) console.log(`  [${sectionName}] wall time: ${((Date.now() - sectionT0) / 1000).toFixed(1)}s`);
+  sectionName = "";
+}
+function section(name: string): void {
+  endSection();
+  sectionName = name;
+  sectionT0 = Date.now();
+  console.log(`\n── ${name} ──`);
+}
+
+const events: DriverObservation[] = [];
+function drain(): void {
+  events.push(...driver.observe());
+}
+async function waitFor(kind: DriverObservation["kind"], timeoutMs: number): Promise<DriverObservation | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    drain();
+    const hit = events.find((e) => e.kind === kind && e.beeId === BEE);
+    if (hit) return hit;
+    if (Date.now() > deadline) return null;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+/** Daemon semantics: not_ready means retry, not failure (WP3 smoke lesson). */
+async function deliverRetrying(messageId: number, body: string, timeoutMs: number): Promise<DeliverOutcome> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const out = driver.deliver(BEE, 1, messageId, body);
+    if (out.accepted || out.reason !== "not_ready") return out;
+    if (Date.now() > deadline) return out;
+    await new Promise((r) => setTimeout(r, 500));
+    drain();
+  }
+}
+
+/** Run a write probe through the SAME confinement wrapper the bee runs under. */
+function sandboxWriteProbe(cell: ProvisionedCell, target: string): { status: number | null; stderr: string } {
+  const shellCmd = `echo probe > '${target}'`;
+  if (platform() === "darwin") {
+    const res = spawnSync("sandbox-exec", ["-f", cell.paths.sandboxProfilePath, "/bin/sh", "-c", shellCmd], {
+      encoding: "utf8",
+    });
+    return { status: res.status, stderr: (res.stderr ?? "").trim() };
+  }
+  const args = bwrapArgs(
+    { cellDir: cell.paths.wrapperDir, writablePaths: defaultWritablePaths() },
+    "/bin/sh",
+    ["-c", shellCmd],
+  );
+  const res = spawnSync("bwrap", args, { encoding: "utf8" });
+  return { status: res.status, stderr: (res.stderr ?? "").trim() };
+}
+
+// Check names for fail-fast skip lists (declared once so skips cannot drift).
+const WRITE_CHECKS = [
+  "write-prompt deliver accepted",
+  "write turn completed (turn_started → turn_ended)",
+  "SMOKE_CELL.txt exists inside the cell with CELL_OK (cwd + write access proven)",
+];
+const COMMIT_CHECKS = [
+  "commit-prompt deliver accepted",
+  "commit turn completed",
+  "cell HEAD advanced + worktree clean (agent committed)",
+];
+const CAPTURE_CHECKS = [
+  "capture landed on new branch smoke/landed",
+  "landed sha on the branch matches the cell HEAD",
+  "transient ref gone (no refs/hive, no refs/notes in origin)",
+  "origin otherwise bit-identical (exactly one new ref)",
+  "origin fsck clean",
+];
+
+// ---------------------------------------------------------------------------
+// The smoke
+// ---------------------------------------------------------------------------
+
+const t0 = Date.now();
+console.log(`cell smoke: ${harness}${model ? ` (--model ${model})` : ""}`);
+console.log(`run dir: ${runDir}`);
+console.log(`throwaway origin: ${origin.repo} @ ${origin.sha.slice(0, 12)}`);
+console.log(`sandbox: ON (explicit per-cell override; ${platform() === "darwin" ? "Seatbelt" : "bwrap"})`);
+
+try {
+  // ---- provision + spawn --------------------------------------------------
+  section("provision + spawn");
+  const provT0 = Date.now();
+  const cell = driver.ensureCell(BEE, "smoke-provision-1");
+  const provMs = Date.now() - provT0;
+  console.log(`  copy_mode: ${cell.copyMode} (CoW expected on APFS; clone = honest fallback) — provisioned in ${(provMs / 1000).toFixed(2)}s`);
+
+  const ledger = readLedger(cell.paths.ledgerPath);
+  check(
+    "provision: cell.json ledger valid (copy_mode recorded honestly)",
+    ledger != null &&
+      isProvisioned(ledger) &&
+      ledger.beeId === BEE &&
+      ledger.sha === origin.sha &&
+      ledger.copy_mode === cell.copyMode,
+    ledger ? `copy_mode=${ledger.copy_mode}` : "no ledger",
+  );
+  check(
+    "provision: layout shape -space- + box/",
+    CELL_SPACE_DIRECTORY.test(cell.paths.spaceName) &&
+      cell.paths.spaceName.includes("-space-") &&
+      existsSync(cell.paths.boxDir) &&
+      existsSync(join(cell.paths.spaceDir, ".git")),
+    cell.paths.spaceName,
+  );
+  check(
+    "provision: checkout byte-clean at the pinned sha",
+    revParse(cell.paths.spaceDir, "HEAD") === origin.sha &&
+      porcelainStatus(cell.paths.spaceDir) === "" &&
+      existsSync(join(cell.paths.spaceDir, "package.json")),
+  );
+
+  driver.start(BEE, 1);
+  const live = driver.snapshotLive().find((p) => p.beeId === BEE);
+  const identityOk = live != null && verifyProcessIdentity(live.pid, live.pidStartedAt, 5_000);
+  let cwdDetail = "";
+  let cwdOk = true;
+  if (live != null && platform() === "darwin") {
+    // lsof cwd of the live pid: the runtime must actually sit in the space.
+    const lsof = spawnSync("lsof", ["-a", "-p", String(live.pid), "-d", "cwd", "-Fn"], { encoding: "utf8" });
+    const cwdLine = (lsof.stdout ?? "").split("\n").find((l) => l.startsWith("n"));
+    if (lsof.status === 0 && cwdLine) {
+      const procCwd = cwdLine.slice(1);
+      cwdOk = procCwd === realpathSync(cell.paths.spaceDir);
+      cwdDetail = `cwd=${procCwd}`;
+    } else {
+      cwdDetail = "cwd unverified (lsof gave nothing)";
+    }
+  }
+  check(
+    "spawn inside cell + exact pid identity",
+    identityOk && cwdOk,
+    live ? `pid ${live.pid}${cwdDetail ? `, ${cwdDetail}` : ""}` : "no live process",
+  );
+  check(
+    "sandbox profile materialized in box/",
+    existsSync(cell.paths.sandboxProfilePath) || platform() !== "darwin",
+    platform() === "darwin" ? cell.paths.sandboxProfilePath : "linux: bwrap wraps argv, no profile file",
+  );
+
+  const booted = await waitFor("booted", BOOT_TIMEOUT);
+  check("booted observation", booted != null, harnessSpec().adapter.readyAtSpawn ? "synthetic (ready at spawn)" : "");
+  const agentAlive = identityOk && booted != null;
+  if (!agentAlive) skip("no booted runtime", ...WRITE_CHECKS);
+
+  // ---- turn 1: the agent WRITES a file in its cwd -------------------------
+  let wrote = false;
+  if (agentAlive) {
+    section("turn 1 — agent writes a file inside the cell");
+    events.length = 0;
+    const prompt = real
+      ? "Create a file named SMOKE_CELL.txt containing exactly CELL_OK, then reply with exactly DONE"
+      : "@sh printf 'CELL_OK' > SMOKE_CELL.txt";
+    const d1 = await deliverRetrying(1, prompt, TURN_TIMEOUT);
+    check(WRITE_CHECKS[0] as string, d1.accepted, d1.reason ?? "");
+    if (!d1.accepted) {
+      skip("delivery refused", ...WRITE_CHECKS.slice(1));
+    } else {
+      const t1s = await waitFor("turn_started", TURN_TIMEOUT);
+      const t1e = t1s != null ? await waitFor("turn_ended", TURN_TIMEOUT) : null;
+      check(WRITE_CHECKS[1] as string, t1s != null && t1e != null, t1s == null ? "no turn_started" : t1e == null ? "no turn_ended" : "");
+      const marker = join(cell.paths.spaceDir, "SMOKE_CELL.txt");
+      wrote = existsSync(marker) && readFileSync(marker, "utf8").includes("CELL_OK");
+      check(WRITE_CHECKS[2] as string, wrote, wrote ? marker : `missing or wrong content: ${marker}`);
+    }
+  }
+
+  // ---- sandbox confinement probe (smoke-side, not the agent) --------------
+  section("sandbox confinement probe");
+  const insideTarget = join(cell.paths.boxDir, "probe-inside.txt");
+  const inside = sandboxWriteProbe(cell, insideTarget);
+  check(
+    "sandbox probe: write inside the cell allowed",
+    inside.status === 0 && existsSync(insideTarget),
+    inside.status === 0 ? "" : inside.stderr,
+  );
+  rmSync(insideTarget, { force: true });
+  // Outside probe target lives in $HOME — user-writable without the sandbox,
+  // NOT under the cell or any allow-listed subtree — so a denial can only
+  // come from the profile (tmp is scratch-allowed by design and would lie).
+  const outsideTarget = join(homedir(), `.cell-smoke-probe-${process.pid}.txt`);
+  const outside = sandboxWriteProbe(cell, outsideTarget);
+  const outsideDenied = outside.status !== 0 && !existsSync(outsideTarget);
+  rmSync(outsideTarget, { force: true }); // only exists if confinement FAILED
+  check(
+    "sandbox probe: write outside the cell denied (same wrapped command)",
+    outsideDenied,
+    outsideDenied ? `denied: ${outsideTarget}` : `NOT denied (status ${outside.status})`,
+  );
+
+  // ---- turn 2: the agent COMMITS its change -------------------------------
+  let committed = false;
+  let cellHead: string | null = null;
+  if (!agentAlive || !wrote) {
+    skip(agentAlive ? "nothing written to commit" : "no booted runtime", ...COMMIT_CHECKS);
+  } else {
+    section("turn 2 — agent commits inside the cell");
+    events.length = 0;
+    const prompt = real
+      ? "Run: git add -A && git commit -m smoke — then reply with exactly DONE"
+      : "@sh git add -A && git commit -m smoke";
+    const d2 = await deliverRetrying(2, prompt, TURN_TIMEOUT);
+    check(COMMIT_CHECKS[0] as string, d2.accepted, d2.reason ?? "");
+    if (!d2.accepted) {
+      skip("delivery refused", ...COMMIT_CHECKS.slice(1));
+    } else {
+      const t2s = await waitFor("turn_started", TURN_TIMEOUT);
+      const t2e = t2s != null ? await waitFor("turn_ended", TURN_TIMEOUT) : null;
+      check(COMMIT_CHECKS[1] as string, t2s != null && t2e != null, t2s == null ? "no turn_started" : t2e == null ? "no turn_ended" : "");
+      cellHead = revParse(cell.paths.spaceDir, "HEAD");
+      committed = cellHead != null && cellHead !== origin.sha && porcelainStatus(cell.paths.spaceDir) === "";
+      check(
+        COMMIT_CHECKS[2] as string,
+        committed,
+        cellHead === origin.sha ? "HEAD did not advance" : `HEAD ${cellHead?.slice(0, 12) ?? "none"}`,
+      );
+    }
+  }
+
+  // ---- capture: the native exit path onto a NEW branch --------------------
+  if (!committed || cellHead == null) {
+    skip("no committed cell work", ...CAPTURE_CHECKS);
+  } else {
+    section("capture — land onto a new branch in the throwaway origin");
+    const before = fingerprintOrigin(origin.repo);
+    const report = driver.capture(BEE, { targetBranch: "smoke/landed", mode: "merge", opId: "smoke-capture-1" });
+    check(
+      CAPTURE_CHECKS[0] as string,
+      report.status === "landed",
+      `status=${report.status}${report.reason ? ` reason=${report.reason}` : ""}`,
+    );
+    const branchTip = revParse(origin.repo, "refs/heads/smoke/landed");
+    check(
+      CAPTURE_CHECKS[1] as string,
+      report.resultSha === cellHead && branchTip === cellHead,
+      `branch tip ${branchTip?.slice(0, 12) ?? "none"}`,
+    );
+    const after = fingerprintOrigin(origin.repo);
+    check(
+      CAPTURE_CHECKS[2] as string,
+      !after.refs.includes("refs/hive") && !after.refs.includes("refs/notes"),
+    );
+    const beforeRefs = before.refs.split("\n");
+    const newRefs = after.refs.split("\n").filter((r) => !beforeRefs.includes(r));
+    check(
+      CAPTURE_CHECKS[3] as string,
+      after.head === before.head &&
+        after.status === before.status &&
+        after.branch === before.branch &&
+        newRefs.length === 1 &&
+        newRefs[0] === `refs/heads/smoke/landed ${cellHead}`,
+      `new refs: [${newRefs.join(", ")}]`,
+    );
+    check(CAPTURE_CHECKS[4] as string, fsckClean(origin.repo));
+  }
+
+  // ---- teardown: live guard, stop clean, dirty delete, forced removal -----
+  section("teardown — stop + delete guards");
+  if (driver.hasProcess(BEE, 1)) {
+    let liveBlocked = false;
+    let liveDetail = "";
+    try {
+      driver.removeCell(BEE);
+    } catch (err) {
+      liveBlocked = err instanceof Error && /live runtime/.test(err.message);
+      liveDetail = (err as Error).message;
+    }
+    check("live runtime blocks removeCell", liveBlocked, liveDetail);
+  } else {
+    check("live runtime blocks removeCell", false, "skipped: runtime already gone");
+  }
+
+  events.length = 0;
+  const stopped = driver.stop(BEE, 1, "stopped_by_user");
+  const exited = await waitFor("exited", 15_000);
+  check(
+    "stop clean (exited with stopped cause)",
+    stopped.hadProcess && exited?.exitCause === "stopped_by_user",
+    `hadProcess=${stopped.hadProcess} exitCause=${exited?.exitCause ?? "none"}`,
+  );
+
+  // Keep the ledger for inspection — the forced removal below deletes the cell.
+  try {
+    copyFileSync(cell.paths.ledgerPath, join(runDir, "cell.json"));
+  } catch {
+    // Ledger missing would already have failed the provision check.
+  }
+
+  writeFileSync(join(cell.paths.spaceDir, "DIRTY.txt"), "uncommitted on purpose\n");
+  let refused = false;
+  let refuseDetail = "";
+  try {
+    driver.removeCell(BEE);
+  } catch (err) {
+    refused = err instanceof CellDeleteRefused && err.report.uncommitted;
+    refuseDetail = (err as Error).message;
+  }
+  check("dirty delete refused without force (A2)", refused, refuseDetail);
+
+  const removal = driver.removeCell(BEE, { force: true });
+  check(
+    "forced removal deletes the cell wrapper",
+    removal.deleted && removal.forced && !existsSync(cell.paths.wrapperDir),
+    `deleted=${removal.deleted} forced=${removal.forced}`,
+  );
+
+  // ---- session log --------------------------------------------------------
+  const logPath = join(logDir, `${BEE}.jsonl`);
+  if (existsSync(logPath)) {
+    const lines = readFileSync(logPath, "utf8").trim().split("\n");
+    const parseable = lines.filter((l) => {
+      try {
+        JSON.parse(l);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    check("session log is verbatim native jsonl", lines.length > 0 && parseable.length === lines.length, `${lines.length} lines`);
+  } else {
+    check("session log is verbatim native jsonl", false, "no log file — runtime emitted zero lines");
+  }
+  endSection();
+
+  // ---- verdict ------------------------------------------------------------
+  const failed = results.filter(([, ok]) => !ok);
+  console.log(`\nartifacts kept for inspection under: ${runDir}`);
+  console.log(`(the cell wrapper itself was removed by the forced-removal check; its cell.json is copied to the run dir)`);
+  console.log(`total wall time: ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  console.log(
+    failed.length === 0
+      ? `\nCELL SMOKE ${harness}: ALL ${results.length} CHECKS PASS`
+      : `\nCELL SMOKE ${harness}: ${failed.length}/${results.length} FAILED`,
+  );
+  process.exitCode = failed.length === 0 ? 0 : 1;
+} finally {
+  try {
+    driver.stop(BEE, 1, "stopped_by_system");
+  } catch {
+    // Already stopped.
+  }
+  driver.disposeAll();
+}
