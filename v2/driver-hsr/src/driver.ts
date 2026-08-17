@@ -198,6 +198,19 @@ export class HsrDriver implements RuntimeDriver {
     child.stdin?.on("error", () => undefined);
 
     for (const line of spec.adapter.bootLines()) this.writeLine(proc, line);
+
+    if (spec.adapter.readyAtSpawn) {
+      // claude stream-json emits nothing until the first stdin message; treat
+      // spawn as ready (stdin buffers safely) instead of deadlocking on init.
+      proc.phase = "idle";
+      this.events.push({
+        beeId,
+        generation,
+        kind: "booted",
+        pid: proc.pid,
+        pidStartedAt: proc.pidStartedAt,
+      });
+    }
   }
 
   deliver(beeId: string, generation: number, messageId: number, body: string): DeliverOutcome {
@@ -471,8 +484,8 @@ export class HsrDriver implements RuntimeDriver {
   private onSignal(p: ManagedProcess, signal: ReturnType<HarnessAdapter["parseLine"]>[number]): void {
     switch (signal.kind) {
       case "booted": {
+        if (signal.sessionId) p.sessionId = signal.sessionId; // late init still carries it
         if (p.phase !== "booting") return; // duplicate readiness — normalize away
-        if (signal.sessionId) p.sessionId = signal.sessionId;
         // booted = "live and working its initial turn" (running). The adapter
         // follows with turn_ended when the harness boots straight to ready.
         p.phase = "running";

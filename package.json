@@ -47,7 +47,8 @@
     "test:source": "node --import tsx --test --test-concurrency=8 --test-reporter=dot tests/*.test.ts",
     "execution:digest": "tsx scripts/update-execution-digest.mjs",
     "dev": "tsx src/cli.ts",
-    "hive": "node dist/cli.js"
+    "hive": "node dist/cli.js",
+    "v2:smoke": "node --experimental-strip-types v2/driver-hsr/smoke.ts"
   },
   "engines": {
     "node": ">=20"
