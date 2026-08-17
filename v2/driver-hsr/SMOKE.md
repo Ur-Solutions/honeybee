@@ -125,3 +125,72 @@ Result log (tmux smokes):
 | 2026-08-17 | codex (tmux) | trmd | ALL 18 PASS | echo-verified delivery; transcript+notify phases 12-13s |
 | 2026-08-17 | grok (tmux) | trmd | ALL 9 PASS | FIRST LIVE VALIDATION of the fixture-derived parser; typed delivery |
 | 2026-08-17 | claude (tmux) | trmd | ALL 18 PASS | trust-dialog fix verified; transcript 14.7s, hooks 11.0s; events contract 2/2 |
+
+---
+
+# WP5 manual smoke — cell driver (a real agent inside real confinement)
+
+CI proves the cell driver's pieces (provisioning matrix, capture, sandbox
+profile, delete guards) in isolation against the stub. This runner
+(`v2/driver-cell/smoke.ts`) walks the whole lifecycle in one piece — the one
+thing CI cannot: a real agent doing real work INSIDE the real sandbox, then its
+work landing through the native exit path.
+
+```
+npm run v2:smoke:cell -- stub                 # wiring proof, no tokens (run first)
+npm run v2:smoke:cell -- claude [--model m]   # real claude from PATH (HSR mode)
+```
+
+## What one run covers
+
+Everything happens against a THROWAWAY origin the runner builds in a fresh OS
+temp dir (a tiny node project, a few commits) — never `~/.hive`, never a user
+repository. ONE bee, ONE cell, sandbox ON by explicit per-cell override
+(Seatbelt on darwin; A4's workstation default stays OFF):
+
+1. **Provision** — via the real `CellDriver.ensureCell`: `copy_mode` printed
+   honestly (CoW expected on APFS), `cell.json` ledger valid, layout shape
+   `-space-` + `box/`, checkout byte-clean at the pinned sha.
+2. **Spawn** — inner HSR driver, pid + exact start-time identity, `lsof`-verified
+   cwd = the space, Seatbelt profile materialized in `box/`.
+3. **Agent writes** — prompt: create `SMOKE_CELL.txt` containing `CELL_OK`,
+   reply DONE. The file must exist in the space (cwd + write access proven from
+   inside confinement). The stub variant runs the same write through `/bin/sh`
+   inside the sandboxed child (`@sh` directive of
+   `v2/driver-cell/test-agent/agent.mjs`) — same cwd, same confinement.
+4. **Confinement probe** — smoke-side, not the agent: the SAME wrapped command
+   (the driver-generated profile) must allow a write inside the cell and DENY
+   one outside it. The outside target lives in `$HOME` (user-writable without
+   the sandbox, not on any allow-list) because tmp is scratch-allowed by design
+   and would lie.
+5. **Agent commits** — `git add -A && git commit -m smoke`; cell HEAD advances,
+   worktree clean.
+6. **Capture** — `driver.capture()` onto NEW branch `smoke/landed` (merge mode):
+   landed sha on the branch, transient ref gone, origin otherwise bit-identical
+   (fingerprint: ref set + HEAD + porcelain status + current branch; exactly one
+   new ref), fsck clean — the A1 zero-artifact guarantee, live.
+7. **Delete guards + stop** — live runtime blocks `removeCell`; stop clean
+   (exited with stopped cause); dirty delete refused without force (A2); forced
+   removal deletes the wrapper. Session log is verbatim native jsonl.
+
+Fails fast (a dead prerequisite skips its dependents), prints per-section wall
+time, keeps run-dir artifacts (origin, logs, a copy of `cell.json`), exit code
+is the verdict.
+
+## claude-mode notes
+
+- claude runs in HSR mode (`-p --input-format stream-json --output-format
+  stream-json --verbose`) from PATH with its REAL home — auth just works (the
+  WP3 readyAtSpawn path); no tmux, no isolated home.
+- The sandbox profile keeps `~/.claude`, `~/.claude.json`, caches and OS scratch
+  writable (`defaultWritablePaths`), so the real agent runs confined without
+  losing its own state dirs. Every other write outside the cell is denied.
+- The throwaway origin sets a local git identity, and a CoW-provisioned cell
+  inherits it — the in-cell commit works even without a global gitconfig.
+
+Result log (cell smokes):
+
+| date | harness | operator | result | notes |
+|---|---|---|---|---|
+| 2026-08-17 | stub | (runner proof) | ALL 24 PASS | copy_mode=cow on APFS; sandboxed stub wrote + committed in-cell; outside write denied; total 0.9s |
+| | claude | | | (operator runs `npm run v2:smoke:cell -- claude`) |
