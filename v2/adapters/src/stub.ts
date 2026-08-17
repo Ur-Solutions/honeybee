@@ -78,6 +78,7 @@ export function parseStubLine(line: string): AdapterSignal[] {
 export const stubAdapter: HarnessAdapter = {
   harness: "stub",
   acceptsMidTurn: true, // the agent queues stdin lines and works them FIFO
+  readyAtSpawn: false,
   bootLines(): string[] {
     return [];
   },

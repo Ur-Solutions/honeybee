@@ -9,11 +9,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { HsrDriver } from "../src/index.ts";
-import { stubAdapter } from "../../adapters/src/index.ts";
+import { claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
 import {
   AGENT_PATH,
   drainEvidenceUntil,
@@ -354,5 +355,54 @@ test("session log survives across generations as one verbatim stream (Q1)", asyn
     assert.deepEqual(readies, ["gen1", "gen2"]);
   } finally {
     rig.cleanup();
+  }
+});
+
+test("readyAtSpawn: silent-until-input runtime (claude stream-json) is deliverable at spawn", async (t) => {
+  // Encodes the WP3 smoke discovery: claude -p --input-format stream-json
+  // emits NOTHING until the first stdin message. Waiting for init deadlocks;
+  // readyAtSpawn adapters must get a synthetic booted and accept delivery
+  // immediately, with stdin buffering carrying the message.
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-ras-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "silent-claude.mjs");
+  writeFileSync(fake, `
+    process.stdin.setEncoding("utf8");
+    let buf = "";
+    process.stdin.on("data", (c) => {
+      buf += c;
+      let i;
+      while ((i = buf.indexOf("\\n")) >= 0) {
+        buf = buf.slice(i + 1);
+        // First contact: init arrives only now, then the turn result.
+        process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "late-sess" }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ok" }) + "\\n");
+      }
+    });
+  `);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({
+      adapter: claudeAdapter,
+      command: process.execPath,
+      args: [fake],
+    }),
+  });
+  try {
+    driver.start("ras-1", 1);
+    const first = driver.observe();
+    assert.ok(first.some((e) => e.kind === "booted"), "synthetic booted at spawn");
+    const out = driver.deliver("ras-1", 1, 1, "hello");
+    assert.equal(out.accepted, true, `deliver at spawn: ${out.reason ?? "accepted"}`);
+    const seen: string[] = [];
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !seen.includes("turn_ended")) {
+      seen.push(...driver.observe().map((e) => e.kind));
+      await sleep(50);
+    }
+    assert.ok(seen.includes("turn_started"), "driver-synthesized turn_started");
+    assert.ok(seen.includes("turn_ended"), "turn_ended from the late stream");
+  } finally {
+    driver.stop("ras-1", 1, "stopped_by_system");
   }
 });

@@ -118,6 +118,7 @@ export const claudeAdapter: HarnessAdapter = {
   // queues them at its own safe boundary (verified by the old system's
   // nativeSteering path).
   acceptsMidTurn: true,
+  readyAtSpawn: true,
   bootLines(): string[] {
     return [];
   },

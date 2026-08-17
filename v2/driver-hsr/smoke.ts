@@ -5,18 +5,19 @@
  *   npm run v2:smoke -- claude [--model m]   # real claude CLI from PATH
  *   npm run v2:smoke -- codex  [--model m]   # real codex app-server from PATH
  *
- * Spawns ONE real bee (plus one short-lived boot-refusal bee), runs two short
- * turns, stops it, and prints a ✓/✗ checklist. Everything lives in a fresh
- * temp dir; ~/.hive is never touched.
+ * Spawns ONE real bee (plus one short-lived boot-delivery bee), runs two short
+ * turns, stops it, and prints a ✓/✗ checklist. Delivery uses daemon semantics:
+ * a not_ready refusal is retried, never treated as failure — refusal is only a
+ * failure where the contract says it must not happen. Everything lives in a
+ * fresh temp dir; ~/.hive is never touched.
  */
-import { mkdtempSync } from "node:fs";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HsrDriver, type SpawnSpec } from "./src/index.ts";
 import { claudeAdapter, codexAdapter, stubAdapter } from "../adapters/src/index.ts";
-import type { DriverObservation } from "../harness/src/driver.ts";
+import type { DeliverOutcome, DriverObservation } from "../harness/src/driver.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const harness = process.argv[2];
@@ -65,6 +66,7 @@ function specFor(): SpawnSpec {
   }
 }
 
+const spec = specFor();
 const driver = new HsrDriver({ sessionLogDir: logDir, resolve: () => specFor() });
 const results: Array<[string, boolean, string]> = [];
 function check(name: string, ok: boolean, detail = ""): void {
@@ -90,6 +92,22 @@ async function waitFor(
     await new Promise((r) => setTimeout(r, 100));
   }
 }
+/** Daemon semantics: not_ready means retry, not failure. */
+async function deliverRetrying(
+  beeId: string,
+  messageId: number,
+  body: string,
+  timeoutMs: number,
+): Promise<DeliverOutcome> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const out = driver.deliver(beeId, 1, messageId, body);
+    if (out.accepted || out.reason !== "not_ready") return out;
+    if (Date.now() > deadline) return out;
+    await new Promise((r) => setTimeout(r, 500));
+    drain();
+  }
+}
 
 const BOOT_TIMEOUT = harness === "stub" ? 5_000 : 120_000;
 const TURN_TIMEOUT = harness === "stub" ? 5_000 : 300_000;
@@ -100,31 +118,45 @@ try {
   const live = driver.snapshotLive().find((p) => p.beeId === "smoke-1");
   check("pid + start-time captured at spawn", !!live, live ? `pid ${live.pid}` : "no live process");
   const booted = await waitFor("booted", "smoke-1", BOOT_TIMEOUT);
-  check("booted observation", !!booted);
-  // claude boots ready-for-input: driver synthesizes turn boundaries around injects.
+  check("booted observation", !!booted, spec.adapter.readyAtSpawn ? "synthetic (ready at spawn)" : "");
 
-  // 2–3. first turn via deliver
-  const d1 = driver.deliver("smoke-1", 1, 1, "Reply with exactly: SMOKE_TURN_1");
-  check("first deliver accepted", d1.accepted, d1.reason ?? "");
-  const t1s = await waitFor("turn_started", "smoke-1", TURN_TIMEOUT);
-  const t1e = await waitFor("turn_ended", "smoke-1", TURN_TIMEOUT);
-  check("turn_started then turn_ended", !!t1s && !!t1e);
+  if (!booted) {
+    // Fail fast: everything downstream needs a live runtime — do not compound
+    // timeouts for 20 minutes (lesson from the first claude smoke run).
+    check("first turn", false, "skipped: no boot");
+    check("follow-up turn", false, "skipped: no boot");
+  } else {
+    // 2–3. first turn
+    const d1 = await deliverRetrying("smoke-1", 1, "Reply with exactly: SMOKE_TURN_1", TURN_TIMEOUT);
+    check("first deliver accepted", d1.accepted, d1.reason ?? "");
+    const t1s = await waitFor("turn_started", "smoke-1", TURN_TIMEOUT);
+    const t1e = await waitFor("turn_ended", "smoke-1", TURN_TIMEOUT);
+    check("turn_started then turn_ended", !!t1s && !!t1e);
 
-  // 3b. follow-up turn
-  events.length = 0;
-  const d2 = driver.deliver("smoke-1", 1, 2, "Reply with exactly: SMOKE_TURN_2");
-  check("follow-up deliver accepted", d2.accepted, d2.reason ?? "");
-  const t2e = await waitFor("turn_ended", "smoke-1", TURN_TIMEOUT);
-  check("second turn completed", !!t2e);
+    // 3b. follow-up turn (retry covers harness-internal continuation turns)
+    events.length = 0;
+    const d2 = await deliverRetrying("smoke-1", 2, "Reply with exactly: SMOKE_TURN_2", TURN_TIMEOUT);
+    check("follow-up deliver accepted", d2.accepted, d2.reason ?? "");
+    const t2e = await waitFor("turn_ended", "smoke-1", TURN_TIMEOUT);
+    check("second turn completed", !!t2e);
+  }
 
-  // 4. deliver-while-booting refuses (fresh bee, deliver before any events drain)
+  // 4. delivery-at-boot contract — adapter-specific by design
   driver.start("smoke-2", 1);
-  const early = driver.deliver("smoke-2", 1, 3, "too early");
-  check("deliver while booting refused not_ready", !early.accepted && early.reason === "not_ready",
-    early.accepted ? "was accepted" : early.reason ?? "");
-  const boot2 = await waitFor("booted", "smoke-2", BOOT_TIMEOUT);
-  const late = boot2 ? driver.deliver("smoke-2", 1, 4, "Reply with exactly: SMOKE_LATE") : { accepted: false, reason: "no boot" as const };
-  check("accepted after boot", late.accepted, ("reason" in late && late.reason) || "");
+  const early = driver.deliver("smoke-2", 1, 3, "Reply with exactly: SMOKE_EARLY");
+  if (spec.adapter.readyAtSpawn) {
+    check("deliver at spawn accepted (readyAtSpawn)", early.accepted, early.reason ?? "");
+    const et = await waitFor("turn_ended", "smoke-2", TURN_TIMEOUT);
+    check("spawn-time delivery produced a turn", !!et);
+  } else {
+    check("deliver while booting refused not_ready", !early.accepted && early.reason === "not_ready",
+      early.accepted ? "was accepted" : early.reason ?? "");
+    const boot2 = await waitFor("booted", "smoke-2", BOOT_TIMEOUT);
+    const late = boot2
+      ? await deliverRetrying("smoke-2", 4, "Reply with exactly: SMOKE_LATE", TURN_TIMEOUT)
+      : ({ accepted: false, reason: "not_ready" } as DeliverOutcome);
+    check("accepted after boot", late.accepted, boot2 ? (late.reason ?? "") : "no boot");
+  }
   driver.stop("smoke-2", 1, "stopped_by_user");
 
   // 5. stop
@@ -135,16 +167,23 @@ try {
   check("exited with stopped cause", exited?.exitCause === "stopped_by_user",
     `exitCause=${exited?.exitCause ?? "none"}`);
 
-  // session log verbatim
-  const log = readFileSync(join(logDir, "smoke-1.jsonl"), "utf8").trim().split("\n");
-  const parseable = log.filter((l) => { try { JSON.parse(l); return true; } catch { return false; } });
-  check("session log is verbatim native jsonl", log.length > 0 && parseable.length === log.length,
-    `${log.length} lines`);
+  // session log verbatim (file exists only if the runtime emitted any lines)
+  const logPath = join(logDir, "smoke-1.jsonl");
+  if (existsSync(logPath)) {
+    const log = readFileSync(logPath, "utf8").trim().split("\n");
+    const parseable = log.filter((l) => { try { JSON.parse(l); return true; } catch { return false; } });
+    check("session log is verbatim native jsonl", log.length > 0 && parseable.length === log.length,
+      `${log.length} lines`);
+  } else {
+    check("session log is verbatim native jsonl", false, "no log file — runtime emitted zero lines");
+  }
 
   console.log(`\nsession logs: ${logDir}`);
   console.log("step 6 (auth-failure evidence) remains manual — see SMOKE.md.");
   const failed = results.filter(([, ok]) => !ok);
-  console.log(failed.length === 0 ? `\nSMOKE ${harness}: ALL ${results.length} CHECKS PASS` : `\nSMOKE ${harness}: ${failed.length}/${results.length} FAILED`);
+  console.log(failed.length === 0
+    ? `\nSMOKE ${harness}: ALL ${results.length} CHECKS PASS`
+    : `\nSMOKE ${harness}: ${failed.length}/${results.length} FAILED`);
   process.exit(failed.length === 0 ? 0 : 1);
 } finally {
   try { driver.stop("smoke-1", 1, "stopped_by_system"); } catch { /* already gone */ }

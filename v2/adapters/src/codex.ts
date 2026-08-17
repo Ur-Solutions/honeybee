@@ -183,6 +183,7 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
     // different RPC, out of WP3 scope) — the driver refuses mid-turn and the
     // daemon retries at the next idle.
     acceptsMidTurn: false,
+    readyAtSpawn: false,
     bootLines(): string[] {
       return [JSON.stringify({
         jsonrpc: "2.0",
