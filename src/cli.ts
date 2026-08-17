@@ -15,6 +15,7 @@ import { cmdClean } from "./commands/clean.js";
 import { cmdColony } from "./commands/colony.js";
 import { cmdCompletion, cmdConfig } from "./commands/config.js";
 import { cmdDaemon, cmdSessions, cmdSync } from "./commands/daemon.js";
+import { cmdDeploy } from "./commands/deploy.js";
 import { cmdEvents } from "./commands/events.js";
 import { cmdExecution } from "./commands/execution.js";
 import { cmdFlight } from "./commands/flight.js";
@@ -267,6 +268,9 @@ async function dispatch(parsed: ReturnType<typeof parse>) {
     case "daemon":
       await cmdDaemon(parsed);
       break;
+    case "deploy":
+      await cmdDeploy(parsed);
+      break;
     case "account":
       await cmdAccount(parsed);
       break;
@@ -448,6 +452,7 @@ function printHelp() {
         ["node", "<list|register|…>", "manage substrate endpoints (local + ssh-tmux)"],
         ["substrate", "list", "show available substrate kinds"],
         ["daemon", "<status|logs|…>", "manage the hive daemon LaunchAgent + inspect state/logs"],
+        ["deploy", "[<sha>]", "versioned deploy to ~/.hive/runtime + daemon restart (--rollback, --list, --init)"],
         ["sessions", "reconcile", "index sessions across all homes; flag dupes and conflicts"],
         ["sync", "manifest", "write the syncthing include/exclude manifest"],
       ],
