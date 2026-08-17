@@ -194,3 +194,4 @@ Result log (cell smokes):
 |---|---|---|---|---|
 | 2026-08-17 | stub | (runner proof) | ALL 24 PASS | copy_mode=cow on APFS; sandboxed stub wrote + committed in-cell; outside write denied; total 0.9s |
 | | claude | | | (operator runs `npm run v2:smoke:cell -- claude`) |
+| 2026-08-17 | claude (cell) | trmd/CL.7920 | ALL 24 PASS | 10.4s; real claude wrote+committed inside Seatbelt, capture landed, origin bit-identical; fixed late-init phantom turn_ended + added -p permission bypass |

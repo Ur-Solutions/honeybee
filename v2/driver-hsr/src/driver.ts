@@ -158,6 +158,10 @@ export class HsrDriver implements RuntimeDriver {
     // Own process group (spec point 1): detached puts the child in a new
     // group whose pgid is the child's pid, so group signals reach the whole
     // agent process tree and never any sibling of ours.
+    if (process.env.HIVE_SPAWN_TRACE) {
+      // Diagnostics only: exact spawn shape for post-mortem replay.
+      appendFileSync(process.env.HIVE_SPAWN_TRACE, JSON.stringify({ command: spec.command, args: spec.args, cwd: spec.cwd, envKeys: Object.keys(spec.env ?? {}).length, at: Date.now() }) + "\n");
+    }
     const child = spawn(spec.command, spec.args, {
       cwd: spec.cwd,
       env: spec.env ?? { ...process.env },
@@ -428,6 +432,9 @@ export class HsrDriver implements RuntimeDriver {
   // -------------------------------------------------------------------------
 
   private writeLine(p: ManagedProcess, line: string): void {
+    if (process.env.HIVE_SPAWN_TRACE) {
+      appendFileSync(process.env.HIVE_SPAWN_TRACE, JSON.stringify({ write: line.slice(0, 160), at: Date.now(), stack: new Error().stack?.split("\n").slice(2, 6).join(" | ") }) + "\n");
+    }
     try {
       p.child?.stdin?.write(`${line}\n`);
     } catch {
@@ -477,7 +484,18 @@ export class HsrDriver implements RuntimeDriver {
       if (line.trim().length === 0) continue;
       // Q1: append the raw native line verbatim, before any interpretation.
       this.appendSessionLog(p.beeId, line);
-      for (const signal of adapter.parseLine(line)) this.onSignal(p, signal);
+      const signals = adapter.parseLine(line);
+      // A late `booted` (readyAtSpawn harnesses emit init only after the first
+      // message) is informational — the process is already live and mid-turn.
+      // Its companion bootedToIdle `turn_ended` must NOT close the in-flight
+      // turn (live 2026-08-17: the cell smoke saw a phantom turn_ended ~100ms
+      // after delivery and tore claude down mid-turn). Drop the trailing idle
+      // marker whenever the booted itself is a no-op duplicate.
+      const lateBoot = p.phase !== "booting" && signals.some((sig) => sig.kind === "booted");
+      for (const signal of signals) {
+        if (lateBoot && signal.kind === "turn_ended") continue;
+        this.onSignal(p, signal);
+      }
     }
   }
 

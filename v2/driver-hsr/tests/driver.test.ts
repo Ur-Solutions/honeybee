@@ -406,3 +406,54 @@ test("readyAtSpawn: silent-until-input runtime (claude stream-json) is deliverab
     driver.stop("ras-1", 1, "stopped_by_system");
   }
 });
+
+test("late init must not close an in-flight turn (cell smoke 2026-08-17 phantom turn_ended)", async (t) => {
+  // Real claude: init arrives ~100ms AFTER the first message, then the model
+  // works for a while, then `result`. Before the fix the adapter's
+  // bootedToIdle turn_ended (companion of the late init) closed the live turn
+  // ~100ms in — callers saw "turn ended", found no output, tore claude down.
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-lateinit-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "late-init-claude.mjs");
+  writeFileSync(fake, `
+    process.stdin.setEncoding("utf8");
+    let buf = "";
+    process.stdin.on("data", (c) => {
+      buf += c;
+      let i;
+      while ((i = buf.indexOf("\\n")) >= 0) {
+        buf = buf.slice(i + 1);
+        // init arrives late, THEN the model "works" 600ms, THEN result.
+        process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "late-sess" }) + "\\n");
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "DONE" }) + "\\n");
+        }, 600);
+      }
+    });
+  `);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({ adapter: claudeAdapter, command: process.execPath, args: [fake] }),
+  });
+  try {
+    driver.start("li-1", 1);
+    driver.observe(); // synthetic booted
+    assert.equal(driver.deliver("li-1", 1, 1, "work").accepted, true);
+    const t0 = Date.now();
+    let endedAt: number | null = null;
+    const seen: string[] = [];
+    while (Date.now() - t0 < 3000) {
+      for (const e of driver.observe()) {
+        seen.push(e.kind);
+        if (e.kind === "turn_ended" && endedAt == null) endedAt = Date.now() - t0;
+      }
+      if (endedAt != null) break;
+      await sleep(25);
+    }
+    assert.ok(endedAt != null, "the real result must end the turn");
+    assert.ok(endedAt >= 500, `turn_ended must wait for the real result (~600ms), got ${endedAt}ms — phantom late-init turn_ended`);
+    assert.equal(seen.filter((k) => k === "turn_ended").length, 1, "exactly one turn_ended");
+  } finally {
+    driver.stop("li-1", 1, "stopped_by_system");
+  }
+});
