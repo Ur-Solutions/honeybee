@@ -63,6 +63,15 @@ export interface HarnessAdapter {
    * booting refusal.
    */
   readonly acceptsMidTurn: boolean;
+  /**
+   * Whether the runtime is deliverable the moment it is spawned. claude's
+   * stream-json mode emits NOTHING (not even init) until the first user
+   * message arrives on stdin — waiting for a booted line deadlocks (found by
+   * the WP3 manual smoke). readyAtSpawn adapters get a synthetic booted
+   * observation at spawn and start in the idle phase; stdin buffering makes
+   * early delivery safe.
+   */
+  readonly readyAtSpawn: boolean;
   /** Lines to write to the runtime's stdin immediately after spawn. */
   bootLines(): string[];
   /** Pure, stateless: one raw native stream line → zero or more signals. */
