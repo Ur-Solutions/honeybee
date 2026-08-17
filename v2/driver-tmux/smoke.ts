@@ -30,6 +30,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -113,10 +114,27 @@ function prepClaudeHome(home: string, cwd: string, eventsPath: string | null): v
   // isolated config dir usually authenticates as-is; elsewhere creds live in
   // ~/.claude/.credentials.json — copy READ-ONLY into the isolated home.
   const creds = join(homedir(), ".claude", ".credentials.json");
+  const dst = join(home, ".credentials.json");
   if (existsSync(creds)) {
-    const dst = join(home, ".credentials.json");
     copyFileSync(creds, dst);
     credCopies.push(dst);
+  } else if (process.platform === "darwin") {
+    // macOS: claude stores OAuth creds in the Keychain, and an ISOLATED config
+    // dir does NOT read them (verified live: pane shows "Not logged in").
+    // Extract and place them in the isolated home; shredded at teardown.
+    try {
+      const secret = execFileSync(
+        "security",
+        ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        { encoding: "utf8" },
+      ).trim();
+      if (secret) {
+        writeFileSync(dst, secret, { mode: 0o600 });
+        credCopies.push(dst);
+      }
+    } catch {
+      // No Keychain item / access denied — the login fail-fast below reports it.
+    }
   }
 }
 
@@ -374,13 +392,23 @@ async function runPhase(ctx: PhaseCtx): Promise<void> {
     if (real) console.log(`  watch live: tmux -S ${socketPath} attach -t '${sessionName}'`);
 
     const ready = await waitPaneReady(sessionName, READY_TIMEOUT);
-    check(phase, "TUI ready in pane", ready, ready ? "" : `no stable pane content within ${READY_TIMEOUT}ms`);
-    if (!ready) {
+    const paneNow = paneContent(sessionName) ?? "";
+    const loggedOut = /Not logged in|Run \/login/i.test(paneNow);
+    check(
+      phase,
+      "TUI ready in pane",
+      ready && !loggedOut,
+      !ready ? `no stable pane content within ${READY_TIMEOUT}ms` : loggedOut ? "harness is NOT LOGGED IN" : "",
+    );
+    if (!ready || loggedOut) {
       printPaneTail(phase, sessionName);
       printAuthHelp(phase, ctx.home, sessionName);
-      skipRest("TUI never became ready", "first deliver accepted", ...LATER);
+      skipRest(loggedOut ? "not logged in" : "TUI never became ready", "first deliver accepted", ...LATER);
       return;
     }
+    // Let the TUI finish post-draw work before pasting — a paste during the
+    // initial redraw gets swallowed silently (verified live).
+    await sleep(real ? 2_000 : 100);
 
     // Drop the synthetic boot turn_ended (bootedToIdle) before counting turns.
     drain();
@@ -393,7 +421,13 @@ async function runPhase(ctx: PhaseCtx): Promise<void> {
       skipRest("delivery refused", ...LATER);
       return;
     }
-    const t1s = await waitFor("turn_started", TURN_TIMEOUT);
+    let t1s = await waitFor("turn_started", real ? 12_000 : 2_000);
+    if (t1s == null) {
+      // The TUI may have eaten the paste during a redraw. One retry.
+      console.log(`  [${phase}] no turn within grace — retrying the paste once`);
+      driver.deliver(ctx.beeId, 1, 1, "Reply with exactly SMOKE_TMUX_1 and nothing else");
+      t1s = await waitFor("turn_started", TURN_TIMEOUT);
+    }
     const t1e = t1s != null ? await waitFor("turn_ended", TURN_TIMEOUT) : null;
     check(
       phase,
