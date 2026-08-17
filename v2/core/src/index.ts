@@ -15,4 +15,5 @@ export {
   type LivePid,
 } from "./store.ts";
 export { replayAudit } from "./audit.ts";
+export { deriveBeeView } from "./view.ts";
 export { SCHEMA_SQL } from "./schema.ts";

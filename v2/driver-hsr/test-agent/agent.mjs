@@ -11,6 +11,9 @@
  *   env STUB_HANG_ON_BOOT=1     never emit ready (boot hang)
  *   env STUB_EXIT_BEFORE_READY=1  exit(7) before ready (spawn/boot crash)
  *   env STUB_IGNORE_SIGTERM=1   ignore SIGTERM (forces the driver's KILL escalation)
+ *   env STUB_SURVIVE_STDIN_CLOSE=1  keep running after stdin closes and swallow
+ *                               stdout EPIPE — simulates an agent that outlives
+ *                               a daemon SIGKILL (WP4 re-adoption tests)
  *   env STUB_TURN_MS            per-turn work duration in ms (default 5)
  *   env STUB_SESSION_ID         session id reported in ready (default stub-<pid>)
  *   message body directives:
@@ -100,10 +103,19 @@ rl.on("line", (raw) => {
   }
 });
 
-// stdin closing means the parent is gone or stopping us; exit cleanly.
+// stdin closing means the parent is gone or stopping us; exit cleanly —
+// unless the WP4 re-adoption tests asked us to outlive our parent.
 rl.on("close", () => {
-  process.exit(0);
+  if (env.STUB_SURVIVE_STDIN_CLOSE !== "1") process.exit(0);
 });
+
+if (env.STUB_SURVIVE_STDIN_CLOSE === "1") {
+  // Writes to a dead parent's pipe must not kill the survivor.
+  process.stdout.on("error", () => {});
+  process.stderr.on("error", () => {});
+  // Keep the event loop alive with no work pending.
+  setInterval(() => {}, 60_000);
+}
 
 if (env.STUB_HANG_ON_BOOT !== "1") {
   setTimeout(() => {

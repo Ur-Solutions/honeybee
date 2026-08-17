@@ -34,6 +34,16 @@
  *     restart (the driver object outlives the store connection; a machine
  *     reboot kills driver and children together and B7 reconciliation takes
  *     over from snapshotLive()).
+ *
+ * WP4 addition — cross-restart re-adoption (contract §3.2): when the daemon
+ * PROCESS restarts, the ChildProcess handles and pipes are gone but detached
+ * children may survive. `adopt(beeId, generation, pid, pidStartedAt)` verifies
+ * exact identity (pid alive + OS start time within tolerance of the recorded
+ * spawn stamp) and registers the process as *degraded*: it counts as live
+ * (snapshotLive/hasProcess — so reconcileAtBoot keeps its runtime row, B7),
+ * can be stopped (signaled by verified pid), and its death is observed by
+ * polling — but it has no event stream and no stdin, so `deliver` refuses and
+ * the daemon's degraded-runtime policy rotates it out when mail arrives.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
@@ -46,6 +56,7 @@ import type {
   StopCause,
 } from "../../harness/src/driver.ts";
 import type { HarnessAdapter } from "../../adapters/src/index.ts";
+import { pidAlive, verifyProcessIdentity } from "./psutil.ts";
 
 /** What `start` needs to know per bee: which agent, how to spawn it. */
 export interface SpawnSpec {
@@ -63,6 +74,8 @@ export interface HsrDriverConfig {
   sessionLogDir: string;
   /** Bounded wait between TERM and KILL escalation (spec point 4). Default 5000ms. */
   stopKillGraceMs?: number;
+  /** Start-time tolerance for cross-restart re-adoption identity checks. Default 5000ms. */
+  adoptToleranceMs?: number;
   now?: () => number;
 }
 
@@ -80,8 +93,12 @@ interface ManagedProcess {
   generation: number;
   pid: number;
   pidStartedAt: number;
-  child: ChildProcess;
-  adapter: HarnessAdapter;
+  /** Null for a re-adopted (degraded) process — the handle died with the previous daemon. */
+  child: ChildProcess | null;
+  /** Null for a re-adopted (degraded) process — there is no event stream to normalize. */
+  adapter: HarnessAdapter | null;
+  /** True when this process was re-adopted across a daemon restart (no pipes). */
+  degraded: boolean;
   /** Driver-side accept-point phase; the store's state is derived downstream. */
   phase: "booting" | "running" | "idle";
   sessionId: string | null;
@@ -96,6 +113,7 @@ export class HsrDriver implements RuntimeDriver {
   private readonly cfg: HsrDriverConfig;
   private readonly now: () => number;
   private readonly graceMs: number;
+  private readonly adoptTolMs: number;
   /** Keyed by beeId — at most one live process per bee (driver-level invariant). */
   private readonly procs = new Map<string, ManagedProcess>();
   /**
@@ -115,6 +133,7 @@ export class HsrDriver implements RuntimeDriver {
     this.cfg = cfg;
     this.now = cfg.now ?? Date.now;
     this.graceMs = cfg.stopKillGraceMs ?? 5000;
+    this.adoptTolMs = cfg.adoptToleranceMs ?? 5000;
     mkdirSync(cfg.sessionLogDir, { recursive: true });
   }
 
@@ -154,6 +173,7 @@ export class HsrDriver implements RuntimeDriver {
       pidStartedAt: this.now(),
       child,
       adapter: spec.adapter,
+      degraded: false,
       phase: "booting",
       sessionId: null,
       stopCause: null,
@@ -198,6 +218,10 @@ export class HsrDriver implements RuntimeDriver {
     if (!p || p.generation !== generation || p.exited) {
       return { accepted: false, reason: "no_process" };
     }
+    // A re-adopted process has no stdin (pipes died with the previous daemon).
+    // Refuse deterministically; the daemon's degraded-runtime policy rotates
+    // the generation so the mailbox record reaches a fresh runtime.
+    if (p.degraded || p.adapter == null) return { accepted: false, reason: "not_ready" };
     // Q2 resolution: a booting runtime refuses; the daemon retries.
     if (p.phase === "booting") return { accepted: false, reason: "not_ready" };
     // A dying (TERM'd) process has no accept point: it might still read stdin
@@ -211,7 +235,7 @@ export class HsrDriver implements RuntimeDriver {
     }
     const encoded = p.adapter.encodeMessage(body, { sessionId: p.sessionId, messageId });
     if (encoded == null) return { accepted: false, reason: "not_ready" };
-    if (!p.child.stdin || p.child.stdin.destroyed || !p.child.stdin.writable) {
+    if (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable) {
       // stdin gone means the process is dying; its exit observation follows.
       return { accepted: false, reason: "no_process" };
     }
@@ -254,6 +278,9 @@ export class HsrDriver implements RuntimeDriver {
   }
 
   observe(): DriverObservation[] {
+    // Adopted (degraded) processes have no exit callback — their death is a
+    // fact recovered by polling the exact pid (cheap signal-0 probe).
+    this.pollDegraded();
     const out = this.events;
     this.events = [];
     return out;
@@ -278,8 +305,52 @@ export class HsrDriver implements RuntimeDriver {
   }
 
   // -------------------------------------------------------------------------
-  // Beyond the WP2 interface — what the (future) real daemon needs
+  // Beyond the WP2 interface — what the real daemon needs
   // -------------------------------------------------------------------------
+
+  /**
+   * Cross-restart re-adoption (contract §3.2, spec 04 boot sequence): claim a
+   * surviving process from a previous daemon generation by exact identity.
+   * Returns false — never throws — when the pid is gone, unreadable, recycled
+   * (start-time mismatch) or the bee already has a live process.
+   */
+  adopt(beeId: string, generation: number, pid: number, pidStartedAt: number): boolean {
+    if (pid <= 0) return false;
+    if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
+    if (!verifyProcessIdentity(pid, pidStartedAt, this.adoptTolMs)) return false;
+    this.procs.set(beeId, {
+      beeId,
+      generation,
+      pid,
+      pidStartedAt,
+      child: null,
+      adapter: null,
+      degraded: true,
+      // Unknown phase — the event stream died with the old daemon. "running"
+      // is the safe claim: hang policy bounds it, and turn_ended can never be
+      // observed for it anyway.
+      phase: "running",
+      sessionId: null,
+      stopCause: null,
+      killTimer: null,
+      stdoutRest: "",
+      exited: false,
+    });
+    return true;
+  }
+
+  /** Whether (bee, generation) is a live re-adopted process with no event stream. */
+  isDegraded(beeId: string, generation: number): boolean {
+    const p = this.procs.get(beeId);
+    return p !== undefined && p.generation === generation && p.degraded && !p.exited;
+  }
+
+  private pollDegraded(): void {
+    for (const p of [...this.procs.values()]) {
+      if (!p.degraded || p.exited) continue;
+      if (!pidAlive(p.pid)) this.onExit(p, null, null);
+    }
+  }
 
   /**
    * Process identity captured at spawn, for core's createBee/reviveBee `proc`
@@ -317,6 +388,27 @@ export class HsrDriver implements RuntimeDriver {
     return this.snapshotLive();
   }
 
+  /**
+   * Daemon shutdown: release every event-loop reference to the children
+   * WITHOUT signaling them — runtimes deliberately survive a daemon stop and
+   * the next boot re-adopts them (contract §3.2). The OS closes our pipe ends
+   * when the process exits; agents that exit on stdin EOF stop then, agents
+   * that survive it stay adoptable.
+   */
+  detachAll(): void {
+    for (const p of this.procs.values()) {
+      if (p.killTimer) {
+        clearTimeout(p.killTimer);
+        p.killTimer = null;
+      }
+      p.child?.unref();
+      // stdio pipes are net.Socket instances (unref exists at runtime).
+      for (const stream of [p.child?.stdin, p.child?.stdout, p.child?.stderr]) {
+        (stream as unknown as { unref?: () => void } | null | undefined)?.unref?.();
+      }
+    }
+  }
+
   /** Test/teardown only: SIGKILL every child group and drop pending events. */
   disposeAll(): void {
     this.pendingStarts.clear();
@@ -337,7 +429,7 @@ export class HsrDriver implements RuntimeDriver {
 
   private writeLine(p: ManagedProcess, line: string): void {
     try {
-      p.child.stdin?.write(`${line}\n`);
+      p.child?.stdin?.write(`${line}\n`);
     } catch {
       // A write race against a dying child; its exit observation follows.
     }
@@ -345,12 +437,29 @@ export class HsrDriver implements RuntimeDriver {
 
   private signalGroup(p: ManagedProcess, signal: "SIGTERM" | "SIGKILL"): void {
     if (p.pid <= 0) return;
+    if (p.degraded) {
+      // Adopted pid: parenthood does not protect it from recycling, so the
+      // exact identity (pid + start-time) is re-verified immediately before
+      // every signal. A failed check means the process is gone; the poll in
+      // observe() owns the exit bookkeeping.
+      if (!verifyProcessIdentity(p.pid, p.pidStartedAt, this.adoptTolMs)) return;
+      try {
+        process.kill(-p.pid, signal);
+      } catch {
+        try {
+          process.kill(p.pid, signal);
+        } catch {
+          // Already gone.
+        }
+      }
+      return;
+    }
     try {
       // Negative pid = the child's own process group (created by detached).
       process.kill(-p.pid, signal);
     } catch {
       try {
-        p.child.kill(signal);
+        p.child?.kill(signal);
       } catch {
         // Already gone; the exit callback owns the bookkeeping.
       }
@@ -358,6 +467,8 @@ export class HsrDriver implements RuntimeDriver {
   }
 
   private onStdout(p: ManagedProcess, chunk: string): void {
+    const adapter = p.adapter;
+    if (!adapter) return; // degraded processes have no stream (and no stdout wiring)
     const data = p.stdoutRest + chunk;
     const lines = data.split("\n");
     p.stdoutRest = lines.pop() ?? "";
@@ -366,7 +477,7 @@ export class HsrDriver implements RuntimeDriver {
       if (line.trim().length === 0) continue;
       // Q1: append the raw native line verbatim, before any interpretation.
       this.appendSessionLog(p.beeId, line);
-      for (const signal of p.adapter.parseLine(line)) this.onSignal(p, signal);
+      for (const signal of adapter.parseLine(line)) this.onSignal(p, signal);
     }
   }
 
