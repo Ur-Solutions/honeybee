@@ -3,8 +3,16 @@
 CI proves the driver against the stub agent only. This checklist verifies the two real
 adapters against live claude/codex streams once, manually. Budget: one short turn each.
 
-Setup: a scratch script that wires `HsrDriver` + the claude/codex adapter + a temp
-`CoreStore`, mirroring `tests/harness/real.test.ts`'s wiring minus faults.
+Setup: none — the runner is checked in. From the repo root:
+
+```
+npm run v2:smoke -- stub     # wiring proof, no tokens (run first)
+npm run v2:smoke -- claude   # real claude from PATH   [--model <m>]
+npm run v2:smoke -- codex    # real codex from PATH    [--model <m>]
+```
+
+The runner automates steps 1–5 below and prints a ✓/✗ checklist plus the session-log
+path; step 6 (auth-failure evidence) remains manual.
 
 ## Per harness (claude, then codex)
 
