@@ -37,7 +37,7 @@ import { fileURLToPath } from "node:url";
 import { TmuxDriver, type TmuxSpawnSpec } from "./src/driver.ts";
 import { exactPaneTarget, TmuxServer } from "./src/tmux.ts";
 import { parseEventsFileLine } from "./src/events-file.ts";
-import { claudeProjectKey, findTranscript, type TranscriptLocator } from "./src/transcripts.ts";
+import { canonicalCwd, claudeProjectKey, findTranscript, type TranscriptLocator } from "./src/transcripts.ts";
 import { verifyProcessIdentity } from "../driver-hsr/src/psutil.ts";
 import type { DriverObservation } from "../harness/src/driver.ts";
 
@@ -215,7 +215,7 @@ function makePhase(kind: PhaseKind): PhaseCtx {
   // notify carries ONLY end-of-turn evidence, so its delivery-confirmation
   // grace must cover a whole real turn (a shorter grace would both flag the
   // delivery unconfirmed AND fold the eventual turn_ended away).
-  const graceMs = kind === "notify" ? TURN_TIMEOUT : real ? 30_000 : 5_000;
+  const graceMs = kind === "notify" ? (real ? 60_000 : 5_000) : real ? 30_000 : 5_000;
   const quiesceMs = real ? 1_500 : 300;
 
   switch (harness) {
@@ -261,7 +261,8 @@ function makePhase(kind: PhaseKind): PhaseCtx {
       // Real home (no relocation var); observation tails the transcript grok
       // itself writes under ~/.grok — read-only, keyed to the fresh temp cwd.
       const locator: TranscriptLocator = {
-        dir: join(homedir(), ".grok", "sessions", encodeURIComponent(cwd)),
+        // grok keys sessions off process.cwd() (symlink-free) — canonical, like claude.
+        dir: join(homedir(), ".grok", "sessions", encodeURIComponent(canonicalCwd(cwd))),
         match: /chat_history\.jsonl$/,
         depth: 2,
       };
@@ -272,6 +273,9 @@ function makePhase(kind: PhaseKind): PhaseCtx {
           args: [],
           cwd,
           env: {},
+          // Live 2026-08-17: grok takes NOTHING from the tmux paste buffer;
+          // paced literal keystrokes land (echo-verified by the driver).
+          deliveryMode: "type",
           observation: { transcript: { locator, parser: "grok" }, quiesceMs, deliveryGraceMs: graceMs },
         },
       };
@@ -469,8 +473,17 @@ async function runPhase(ctx: PhaseCtx): Promise<void> {
 
     // Follow-up turn (idle → deliver → a second boundary pair).
     events.length = 0;
+    // Post-turn TUIs redraw; settle briefly, then daemon semantics: one
+    // re-deliver if no turn starts within grace (echo-verify already retries
+    // the injection itself; this covers observer-side misses).
+    await sleep(real ? 1_500 : 100);
     const d2 = driver.deliver(ctx.beeId, 1, 2, "Reply with exactly SMOKE_TMUX_2 and nothing else");
-    const t2s = d2.accepted ? await waitFor("turn_started", TURN_TIMEOUT) : null;
+    let t2s = d2.accepted ? await waitFor("turn_started", real ? 15_000 : 2_000) : null;
+    if (d2.accepted && t2s == null) {
+      console.log(`  [${phase}] follow-up: no turn within grace — retrying the paste once`);
+      driver.deliver(ctx.beeId, 1, 2, "Reply with exactly SMOKE_TMUX_2 and nothing else");
+      t2s = await waitFor("turn_started", TURN_TIMEOUT);
+    }
     const t2e = t2s != null ? await waitFor("turn_ended", TURN_TIMEOUT) : null;
     check(
       phase,
@@ -513,7 +526,9 @@ try {
   console.log(`tmux smoke: ${harness}${model ? ` (--model ${model})` : ""}`);
   console.log(`run dir: ${runDir}\nprivate socket: ${socketPath}`);
   for (const kind of PHASES[harness] ?? []) {
+    const phaseT0 = Date.now();
     await runPhase(makePhase(kind));
+    console.log(`  [${kind}] phase wall time: ${((Date.now() - phaseT0) / 1000).toFixed(1)}s`);
   }
   const failed = results.filter(([, ok]) => !ok);
   console.log(`\nartifacts kept for inspection under: ${runDir}`);

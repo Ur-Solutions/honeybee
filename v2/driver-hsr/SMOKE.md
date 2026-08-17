@@ -14,6 +14,16 @@ npm run v2:smoke -- codex    # real codex from PATH    [--model <m>]
 The runner automates steps 1–5 below and prints a ✓/✗ checklist plus the session-log
 path; step 6 (auth-failure evidence) remains manual.
 
+## Echo-verified delivery (2026-08-17 hardening)
+
+The tmux driver now PROVES injected text is visible in the input line before it
+presses Enter (paste or typed), retypes once on mismatch, and otherwise surfaces an
+immediate `echo_mismatch` unconfirmed note instead of submitting blind. Live evidence
+that forced this: grok ignores the tmux paste buffer entirely (now `deliveryMode:
+"type"`), grok eats the first keystrokes of an unpaced burst, and codex swallows a
+paste during its post-turn redraw. Claude's transcript locator now realpaths the cwd
+(`/var` → `/private/var`), matching where claude actually writes.
+
 ## Per harness (claude, then codex)
 
 1. **Spawn** — `start()` a bee running the real CLI with a trivial prompt.

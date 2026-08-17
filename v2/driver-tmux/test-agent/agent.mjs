@@ -23,6 +23,21 @@
  * TMUX_STUB_DEAF=1 (reads input but never reacts — the unconfirmed-delivery
  * fixture).
  *
+ * Delivery-misbehavior simulation (spec05.deliver.* fixtures — models the
+ * live TUI failures observed 2026-08-17). Any of these switches the stub
+ * from readline to RAW-mode input (manual echo, like a real TUI):
+ *   TMUX_STUB_DROP_PASTE=1                paste-sized input chunks (>16 bytes
+ *                                         in one read) are ignored entirely —
+ *                                         grok takes nothing from paste-buffer
+ *   TMUX_STUB_EAT_FIRST=<n>               the first n input bytes vanish once
+ *                                         (a lagging input handler eating the
+ *                                         first keystrokes — grok's PE_TEST_XYZ)
+ *   TMUX_STUB_SWALLOW_PASTE_AFTER_TURN=1  after each completed turn, the next
+ *                                         paste-sized chunk is swallowed once
+ *                                         (codex's post-turn redraw swallow)
+ *   TMUX_STUB_EAT_ALL=1                   all input vanishes, never echoed
+ *                                         (the echo-mismatch fixture)
+ *
  * Message directives (same vocabulary as the HSR stub):
  *   "@crash"  turn starts, process exits 9 mid-turn
  *   "@exit"   turn completes, then exits 0 (clean)
@@ -122,6 +137,8 @@ function completion() {
 
 const queue = [];
 let busy = false;
+/** Armed after each turn when TMUX_STUB_SWALLOW_PASTE_AFTER_TURN=1. */
+let swallowNextPaste = false;
 
 function workNext() {
   if (busy) return;
@@ -136,6 +153,7 @@ function workNext() {
     assistantRow(`echo:${body}`);
     completion();
     busy = false;
+    if (env.TMUX_STUB_SWALLOW_PASTE_AFTER_TURN === "1") swallowNextPaste = true;
     if (body.includes("@exit")) {
       setTimeout(() => process.exit(0), 15);
       return;
@@ -147,13 +165,66 @@ function workNext() {
 initTranscript();
 console.log(`stub ready (${style}/${format})`);
 
-const rl = createInterface({ input: process.stdin });
-rl.on("line", (raw) => {
-  const line = String(raw).trim();
-  if (!line) return;
-  if (env.TMUX_STUB_DEAF === "1") return; // swallow input silently
-  queue.push(line);
-  workNext();
-});
-// In a pane, stdin closing means the pty is being torn down; just exit.
-rl.on("close", () => process.exit(0));
+const dropPaste = env.TMUX_STUB_DROP_PASTE === "1";
+const eatFirst = Number(env.TMUX_STUB_EAT_FIRST || "0");
+const swallowPasteAfterTurn = env.TMUX_STUB_SWALLOW_PASTE_AFTER_TURN === "1";
+const eatAll = env.TMUX_STUB_EAT_ALL === "1";
+const rawSim = dropPaste || eatFirst > 0 || swallowPasteAfterTurn || eatAll;
+
+if (rawSim && process.stdin.isTTY) {
+  // RAW-mode TUI simulation: the pty no longer echoes, so the stub echoes
+  // accepted bytes itself — exactly what makes echo-verify meaningful.
+  const PASTE_THRESHOLD = 16; // one read bigger than this = paste, not typing
+  process.stdin.setRawMode(true);
+  let lineBuf = "";
+  let eatRemaining = eatFirst;
+  process.stdin.on("data", (data) => {
+    let chunk = data.toString("utf8");
+    if (eatAll) return; // consumed, never echoed, never processed
+    const pasteSized = chunk.length > PASTE_THRESHOLD;
+    if (pasteSized && dropPaste) return; // the TUI ignores paste entirely
+    if (pasteSized && swallowNextPaste) {
+      swallowNextPaste = false; // one post-turn redraw swallow, then normal
+      return;
+    }
+    if (eatRemaining > 0) {
+      const eaten = Math.min(eatRemaining, chunk.length);
+      chunk = chunk.slice(eaten);
+      eatRemaining -= eaten;
+      if (chunk.length === 0) return;
+    }
+    for (const ch of chunk) {
+      const code = ch.charCodeAt(0);
+      if (ch === "\r" || ch === "\n") {
+        process.stdout.write("\r\n");
+        const line = lineBuf.trim();
+        lineBuf = "";
+        if (line && env.TMUX_STUB_DEAF !== "1") {
+          queue.push(line);
+          workNext();
+        }
+      } else if (code === 0x15) {
+        // C-u: clear the input line (and its visual echo, like a TUI would)
+        lineBuf = "";
+        process.stdout.write("\r\x1b[K");
+      } else if (code === 0x03 || code === 0x04) {
+        process.exit(0); // C-c / C-d
+      } else {
+        lineBuf += ch;
+        process.stdout.write(ch);
+      }
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
+} else {
+  const rl = createInterface({ input: process.stdin });
+  rl.on("line", (raw) => {
+    const line = String(raw).trim();
+    if (!line) return;
+    if (env.TMUX_STUB_DEAF === "1") return; // swallow input silently
+    queue.push(line);
+    workNext();
+  });
+  // In a pane, stdin closing means the pty is being torn down; just exit.
+  rl.on("close", () => process.exit(0));
+}

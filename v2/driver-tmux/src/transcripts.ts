@@ -37,7 +37,7 @@
  *    (tests/transcripts.test.ts), NOT from a captured live stream — verify
  *    in a real-grok smoke before relying on it in production.
  */
-import { readdirSync, statSync, type Dirent } from "node:fs";
+import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
 
 export type TranscriptEvent =
@@ -100,9 +100,27 @@ export const claudeTranscriptParser: TranscriptParser = {
   },
 };
 
-/** The v1 project-key derivation for a claude transcript dir. */
+/**
+ * Canonical cwd for cwd-derived transcript locator paths: resolved AND
+ * realpathed. Harness CLIs key their transcript dirs off `process.cwd()`,
+ * which the OS reports symlink-free — on macOS a `/var/...` spawn cwd
+ * becomes `/private/var/...` inside the CLI (verified live 2026-08-17:
+ * claude wrote `projects/-private-var-folders-...` while our raw-path key
+ * bound nothing). Falls back to the resolved raw path when realpath throws
+ * (path not created yet).
+ */
+export function canonicalCwd(cwd: string): string {
+  const resolved = resolve(cwd);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/** The v1 project-key derivation for a claude transcript dir (realpathed cwd). */
 export function claudeProjectKey(cwd: string): string {
-  return resolve(cwd).normalize("NFC").replace(/[^a-zA-Z0-9]/g, "-");
+  return canonicalCwd(cwd).normalize("NFC").replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 // ---------------------------------------------------------------------------
