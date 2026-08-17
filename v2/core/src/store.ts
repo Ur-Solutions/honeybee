@@ -50,6 +50,8 @@ export interface CoreStoreOptions {
 }
 
 export interface CreateBeeInput {
+  /** Known process identity at spawn time, so a daemon restart mid-boot can re-adopt (WP2 finding). */
+  proc?: { pid: number; pidStartedAt: number };
   id?: string;
   name: string;
   agent: string;
@@ -315,7 +317,7 @@ export class CoreStore {
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });
-      const runtime = this.insertRuntime(id, 1, at);
+      const runtime = this.insertRuntime(id, 1, at, input.proc);
       return { bee, runtime };
     });
   }
@@ -419,13 +421,18 @@ export class CoreStore {
     return rows.map(mapRuntime);
   }
 
-  private insertRuntime(beeId: string, generation: number, at: number): RuntimeRow {
+  private insertRuntime(
+    beeId: string,
+    generation: number,
+    at: number,
+    proc?: { pid: number; pidStartedAt: number },
+  ): RuntimeRow {
     this.db
       .prepare(
         `INSERT INTO runtimes(bee_id, generation, state, exit_cause, pid, pid_started_at, started_at, updated_at)
-         VALUES(?, ?, 'booting', NULL, NULL, NULL, ?, ?)`,
+         VALUES(?, ?, 'booting', NULL, ?, ?, ?, ?)`,
       )
-      .run(beeId, generation, at, at);
+      .run(beeId, generation, proc?.pid ?? null, proc?.pidStartedAt ?? null, at, at);
     const runtime = this.currentRuntime(beeId);
     if (!runtime || runtime.generation !== generation) throw new CoreError("runtime insert lost");
     this.audit("runtime.created", beeId, { runtime });
@@ -494,7 +501,7 @@ export class CoreStore {
   }
 
   /** B2 — no transition out of stopped; revival creates generation N+1 (booting). */
-  reviveBee(beeId: string): RuntimeRow {
+  reviveBee(beeId: string, opts: { proc?: { pid: number; pidStartedAt: number } } = {}): RuntimeRow {
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       if (bee.lifecycle === "archived") this.applyUnarchive(beeId); // Q3 spirit: revival implies active
@@ -505,7 +512,7 @@ export class CoreStore {
         );
       }
       const generation = (current?.generation ?? 0) + 1;
-      return this.insertRuntime(beeId, generation, this.now());
+      return this.insertRuntime(beeId, generation, this.now(), opts.proc);
     });
   }
 
