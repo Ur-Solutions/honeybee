@@ -278,9 +278,8 @@ test("spec01.11: derived reads — stopped bee is reachable and waiting-for-you 
   assert.equal(view.working, false);
   assert.equal(view.waitingForYou, true); // unread output exists
 
-  store.markOutputRead(bee.id);
-  view = store.view(bee.id);
-  assert.equal(view.waitingForYou, false); // no unread output
+  view = store.view(bee.id, { readCursor: view.lastOutputAt ?? 0 });
+  assert.equal(view.waitingForYou, false); // client cursor at last output: nothing unread
   assert.equal(view.reachable, true);
 
   store.reviveBee(bee.id);
@@ -335,7 +334,6 @@ test("spec01.13: audit rows exist for every write — replaying audit reproduces
   store.markDelivered(msg.message.id, 1);
   store.markDelivered(msg.message.id, 1); // deliver_noop
   store.updateRuntimeState(a.id, 1, "stopped", { exitCause: "clean" });
-  store.markOutputRead(a.id);
 
   store.updateRuntimeState(b.id, 1, "stopped", { exitCause: "crashed" });
   store.send(b.id, "wake"); // enqueues send_wake

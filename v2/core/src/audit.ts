@@ -138,10 +138,6 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         mustBee(p.beeId as string).lastOutputAt = p.at as number;
         break;
       }
-      case "output.read": {
-        mustBee(p.beeId as string).outputReadAt = p.at as number;
-        break;
-      }
       // Recorded no-ops and informational rows: state unchanged by definition.
       case "runtime.stale_update":
       case "flag.clear_noop":

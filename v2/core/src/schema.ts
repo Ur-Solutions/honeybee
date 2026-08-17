@@ -21,8 +21,7 @@ CREATE TABLE IF NOT EXISTS bees (
   lifecycle        TEXT NOT NULL CHECK (lifecycle IN ('active','archived')),
   created_at       INTEGER NOT NULL,
   archived_at      INTEGER,
-  last_output_at   INTEGER,
-  output_read_at   INTEGER
+  last_output_at   INTEGER
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.

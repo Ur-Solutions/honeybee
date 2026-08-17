@@ -80,7 +80,6 @@ export interface BeeRow {
   /** Last time the bee's runtime produced output (canonical fact, recorded by daemon). */
   lastOutputAt: number | null;
   /** Last time the operator read the bee's output (drives B8 waiting_for_you on stopped). */
-  outputReadAt: number | null;
 }
 
 export interface RuntimeRow {
@@ -147,6 +146,8 @@ export interface BeeView {
   exitCause: ExitCause | null;
   working: boolean;
   waitingForYou: boolean;
+  /** Raw output-recency fact; clients compare against their own read cursor. */
+  lastOutputAt: number | null;
   reachable: boolean;
   blocked: boolean;
   flags: Flag[];
