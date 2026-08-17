@@ -45,3 +45,70 @@ Result log:
 |---|---|---|---|---|
 | 2026-08-17 | claude | trmd | ALL 11 PASS | after readyAtSpawn fix (4a8c6c42); 6 log lines |
 | 2026-08-17 | codex | trmd | ALL 11 PASS | codex-cli app-server; 53 log lines |
+
+---
+
+# WP5 manual smoke — tmux driver against real TUIs
+
+CI proves the tmux driver against the pane stub only. This runner
+(`v2/driver-tmux/smoke.ts`) verifies the two surfaces that need a live harness:
+the per-harness **transcript formats** (the whole point for grok, whose parser is
+fixture-derived) and the **events-file hook/notify contract** against real hook
+invocations. One command per harness; each spawns real TUIs via the real
+`TmuxDriver` on a private per-run socket — the ambient tmux server and `~/.hive`
+are never touched.
+
+```
+npm run v2:smoke:tmux -- stub               # wiring proof, no tokens (run first)
+npm run v2:smoke:tmux -- claude [--model m] # transcript phase + hooks phase
+npm run v2:smoke:tmux -- codex  [--model m] # transcript phase + notify phase
+npm run v2:smoke:tmux -- grok               # transcript phase only
+```
+
+## Phases and checklist
+
+Every phase spawns ONE bee and walks: spawn + exact pid identity → booted →
+TUI ready in pane → first delivered prompt produces `turn_started`/`turn_ended`
+→ follow-up turn → delivery confirmed (no unconfirmed note) → stop clean. The
+runner fails fast (a dead prerequisite skips its dependents) and prints the
+transcript/events paths plus a `tmux -S <socket> attach` command for watching
+the live TUI.
+
+- **transcript phase** — observation source 2, the mandatory A3 baseline. The
+  turn boundary must come from the harness's transcript file; the bound path is
+  printed and checked.
+- **hooks phase (claude)** — the runner prepares an ISOLATED temp
+  `CLAUDE_CONFIG_DIR` whose `settings.json` wires `UserPromptSubmit`/`Stop`/
+  `Notification` hooks to append their stdin payload to the driver's events
+  file (the `events-file.ts` contract, verbatim). The driver runs with NO
+  transcript source, so the boundary pair can only come from real hook
+  invocations; the raw events file is additionally re-parsed and checked.
+- **notify phase (codex)** — same idea with an ISOLATED temp `CODEX_HOME` whose
+  `config.toml` points `notify` at a helper that appends codex's
+  `agent-turn-complete` payload to the events file. Only end-of-turn evidence
+  exists, so the driver's pending-confirm synthesis supplies `turn_started`.
+- The contrary-evidence flag-clear path is NOT covered here: the tmux driver
+  has no evidence channel (flags are an adapter-stream concern, HSR smoke
+  step 6) — nothing to test on this surface.
+
+## Auth + home isolation caveats
+
+- The runner **never modifies the real `~/.claude` / `~/.codex`** — it only
+  copies credential files INTO the isolated homes (claude
+  `.credentials.json` when present; codex `auth.json`) and shreds the copies at
+  teardown. On macOS claude authenticates via the shared Keychain, so the
+  isolated home usually works as-is (approve the Keychain prompt if one
+  appears).
+- If a harness cannot run unauthenticated from the temp home, the runner prints
+  exact copy-in instructions instead of silently failing.
+- grok has no home-relocation env var: it runs against the real `~/.grok`, and
+  the runner only TAILS the transcript grok itself writes there (read-only; no
+  grok config touched).
+- Run-dir artifacts (transcripts, events files, isolated homes minus the
+  credential copies) are kept under the printed temp dir for inspection.
+
+Result log (tmux smokes):
+
+| date | harness | operator | result | notes |
+|---|---|---|---|---|
+| 2026-08-17 | stub | (runner proof) | ALL 27 PASS | 3 phases: transcript (grok fmt) + hooks (claude shape) + notify (codex shape) |

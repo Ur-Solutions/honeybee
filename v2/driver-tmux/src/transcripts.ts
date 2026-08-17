@@ -144,6 +144,12 @@ export const grokTranscriptParser: TranscriptParser = {
     const message = row.message as { role?: unknown; content?: unknown } | undefined;
     const role = typeof message?.role === "string" ? message.role : row.type;
     const content = message?.content ?? row.content;
+    // Live-file finding (2026-08-17 tmux smoke prep): grok appends SYNTHETIC
+    // user rows (`synthetic_reason: "system_reminder" | "task_completed" | …`)
+    // for injected context — real user text shape, but not a prompt. They can
+    // arrive while idle with no response following, so treating them as turn
+    // starts would open a turn that never ends (quiescence needs output).
+    if (role === "user" && row.synthetic_reason != null) return [];
     if (role === "user" && hasUserText(content)) return [{ kind: "turn_started" }];
     if (role === "assistant") return [{ kind: "output" }];
     return [];

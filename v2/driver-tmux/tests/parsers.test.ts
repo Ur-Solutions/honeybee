@@ -84,6 +84,21 @@ test("parsers.grok: chat_history rows (v1 fixture shapes) — user starts, assis
   assert.deepEqual(p.parseLine(j({ message: { role: "user", content: "hello" } })), [{ kind: "turn_started" }]);
   assert.deepEqual(p.parseLine(j({ message: { role: "assistant", content: "x" } })), [{ kind: "output" }]);
   assert.deepEqual(p.parseLine(j({ type: "system", content: "boot" })), []);
+  // Live-file shapes (2026-08-17): synthetic user rows (injected reminders /
+  // task notifications) must NOT start a turn — they can arrive while idle
+  // with no response following, which would open a turn that never ends.
+  assert.deepEqual(
+    p.parseLine(
+      j({ type: "user", content: [{ type: "text", text: "<system-reminder>…</system-reminder>" }], synthetic_reason: "system_reminder" }),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    p.parseLine(j({ type: "user", content: [{ type: "text", text: "task done" }], synthetic_reason: "task_completed" })),
+    [],
+  );
+  // reasoning rows (live shape) are neither user nor assistant — ignored.
+  assert.deepEqual(p.parseLine(j({ type: "reasoning", summary: [{ type: "summary_text", text: "…" }] })), []);
 });
 
 test("parsers.events-file: claude-hook, codex-notify and generic shapes normalize identically", () => {
