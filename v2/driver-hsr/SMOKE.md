@@ -124,3 +124,4 @@ Result log (tmux smokes):
 | 2026-08-17 | stub | (runner proof) | ALL 27 PASS | 3 phases: transcript (grok fmt) + hooks (claude shape) + notify (codex shape) |
 | 2026-08-17 | codex (tmux) | trmd | ALL 18 PASS | echo-verified delivery; transcript+notify phases 12-13s |
 | 2026-08-17 | grok (tmux) | trmd | ALL 9 PASS | FIRST LIVE VALIDATION of the fixture-derived parser; typed delivery |
+| 2026-08-17 | claude (tmux) | trmd | ALL 18 PASS | trust-dialog fix verified; transcript 14.7s, hooks 11.0s; events contract 2/2 |
