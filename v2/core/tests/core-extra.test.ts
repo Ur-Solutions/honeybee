@@ -269,3 +269,29 @@ test("claim skips commands whose backoff is still in the future", (t) => {
   assert.equal(store.claimNextCommand()?.id, later.id); // delayed one doesn't block the queue
   store.close();
 });
+
+test("pid at spawn: a mid-boot runtime survives daemon restart via re-adoption (WP2 finding)", (t) => {
+  const h = harness();
+  t.after(() => h.cleanup());
+  let store = h.open();
+  const input = { agent: "codex", substrate: "hsr", cwd: "/tmp" } as const;
+  const withProc = store.createBee({ ...input, name: "early-pid", proc: { pid: 900, pidStartedAt: 7 } });
+  const withoutProc = store.createBee({ ...input, name: "no-pid" });
+  assert.equal(withProc.runtime.pid, 900);
+  assert.equal(withoutProc.runtime.pid, null);
+  store.close();
+
+  // Daemon restart while both are still booting; the spawned process 900 is alive.
+  store = h.open();
+  const result = store.reconcileAtBoot([{ pid: 900, startedAt: 7 }]);
+  assert.deepEqual(result.adopted, [{ beeId: withProc.bee.id, generation: 1, pid: 900 }]);
+  assert.equal(store.currentRuntime(withProc.bee.id)?.state, "booting"); // re-adopted mid-boot
+  const orphaned = store.currentRuntime(withoutProc.bee.id);
+  assert.equal(orphaned?.state, "stopped"); // pid-less booting row cannot be adopted
+  assert.equal(orphaned?.exitCause, "machine_restart");
+
+  // revive can also carry early process identity
+  const gen2 = store.reviveBee(withoutProc.bee.id, { proc: { pid: 901, pidStartedAt: 9 } });
+  assert.equal(gen2.pid, 901);
+  store.close();
+});
