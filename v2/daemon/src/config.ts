@@ -19,8 +19,27 @@ export interface AgentSpecConfig {
   env?: Record<string, string>;
 }
 
+/** Node kinds (core contract §1): decides the cell-sandbox default (A4). */
+export type NodeKind = "workstation" | "satellite" | "cloud";
+
+export const NODE_KINDS: readonly NodeKind[] = ["workstation", "satellite", "cloud"];
+
+/** Cell substrate settings (WP5, spec 05) — deliberately minimal. */
+export interface CellsConfig {
+  /** Cells root directory. Default `<dataDir>/cells`. */
+  root?: string;
+  /** Node-wide sandbox override; absent = node-kind default (A4). */
+  sandbox?: boolean;
+  /** Per-repo warm-cell artifact dirs (A5, opt-in), keyed by origin repo path. */
+  warm?: Record<string, string[]>;
+}
+
 /** The raw (all-optional) shape of config.json. */
 export interface NodeConfigFile {
+  /** Node kind (workstation | satellite | cloud). Default workstation. */
+  nodeKind?: NodeKind;
+  /** Cell substrate settings (WP5). */
+  cells?: CellsConfig;
   /** Scale-to-zero idle window (behavior 3). Default 60 min; 0/negative disables. */
   idleWindowMs?: number;
   /** Hang policy: stop a runtime stuck in `booting` past this. */
@@ -60,6 +79,12 @@ export interface NodeConfigFile {
 export interface ResolvedNodeConfig {
   dataDir: string;
   configPath: string;
+  nodeKind: NodeKind;
+  cellsRoot: string;
+  /** Node-wide cell-sandbox override; null = node-kind default (A4). */
+  cellSandbox: boolean | null;
+  /** Per-repo warm-cell artifact dirs (A5). */
+  cellWarm: Record<string, string[]>;
   idleWindowMs: number;
   bootHangTimeoutMs: number;
   turnHangTimeoutMs: number;
@@ -143,6 +168,50 @@ function str(raw: Record<string, unknown>, key: string, fallback: string): strin
   return v;
 }
 
+function nodeKindOf(raw: Record<string, unknown>): NodeKind {
+  const v = raw.nodeKind;
+  if (v === undefined) return "workstation";
+  if (typeof v !== "string" || !(NODE_KINDS as readonly string[]).includes(v)) {
+    throw new ConfigError(`config: nodeKind must be one of ${NODE_KINDS.join("|")}, got ${JSON.stringify(v)}`);
+  }
+  return v as NodeKind;
+}
+
+function cellsOf(raw: Record<string, unknown>): { root?: string; sandbox: boolean | null; warm: Record<string, string[]> } {
+  const v = raw.cells;
+  if (v === undefined) return { sandbox: null, warm: {} };
+  if (v === null || typeof v !== "object" || Array.isArray(v)) {
+    throw new ConfigError("config: cells must be an object of {root?, sandbox?, warm?}");
+  }
+  const c = v as Record<string, unknown>;
+  const out: { root?: string; sandbox: boolean | null; warm: Record<string, string[]> } = {
+    sandbox: null,
+    warm: {},
+  };
+  if (c.root !== undefined) {
+    if (typeof c.root !== "string" || c.root.length === 0) {
+      throw new ConfigError("config: cells.root must be a non-empty string");
+    }
+    out.root = c.root;
+  }
+  if (c.sandbox !== undefined) {
+    if (typeof c.sandbox !== "boolean") throw new ConfigError("config: cells.sandbox must be a boolean");
+    out.sandbox = c.sandbox;
+  }
+  if (c.warm !== undefined) {
+    if (c.warm === null || typeof c.warm !== "object" || Array.isArray(c.warm)) {
+      throw new ConfigError("config: cells.warm must be an object of {repoPath: [artifactDirs]}");
+    }
+    for (const [repo, dirs] of Object.entries(c.warm as Record<string, unknown>)) {
+      if (!Array.isArray(dirs) || dirs.some((d) => typeof d !== "string" || d.length === 0)) {
+        throw new ConfigError(`config: cells.warm['${repo}'] must be an array of non-empty strings`);
+      }
+      out.warm[repo] = dirs as string[];
+    }
+  }
+  return out;
+}
+
 function agentsOf(raw: Record<string, unknown>): Record<string, AgentSpecConfig> {
   const v = raw.agents;
   if (v === undefined) return {};
@@ -222,9 +291,14 @@ export function loadNodeConfig(dataDir: string, configPath?: string): ResolvedNo
   const i1FloorMs = Math.max(bootHangTimeoutMs, turnHangTimeoutMs) + bootAllowanceMs + turnAllowanceMs;
   const i1DeadlineMs = Math.max(num(raw, "i1DeadlineMs", i1FloorMs), i1FloorMs);
 
+  const cells = cellsOf(raw);
   return {
     dataDir,
     configPath: path,
+    nodeKind: nodeKindOf(raw),
+    cellsRoot: cells.root ?? join(dataDir, "cells"),
+    cellSandbox: cells.sandbox,
+    cellWarm: cells.warm,
     idleWindowMs: num(raw, "idleWindowMs", DEFAULTS.idleWindowMs),
     bootHangTimeoutMs,
     turnHangTimeoutMs,

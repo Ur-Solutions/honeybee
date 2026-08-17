@@ -104,3 +104,42 @@ test("config.6: HIVE_V2_DATA_DIR overrides the default data dir (test isolation 
   assert.equal(defaultDataDir({ HIVE_V2_DATA_DIR: "/tmp/x" }), "/tmp/x");
   assert.ok(defaultDataDir({}).endsWith(join(".hive", "v2")));
 });
+
+test("config.7: nodeKind (WP5) defaults to workstation and validates the closed list", () => {
+  withDir((dir) => {
+    assert.equal(loadNodeConfig(dir).nodeKind, "workstation");
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ nodeKind: "satellite" }));
+    assert.equal(loadNodeConfig(dir).nodeKind, "satellite");
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ nodeKind: "mainframe" }));
+    assert.throws(() => loadNodeConfig(dir), ConfigError);
+  });
+});
+
+test("config.8: cells (WP5) — root default, sandbox override tri-state, warm map validation", () => {
+  withDir((dir) => {
+    const bare = loadNodeConfig(dir);
+    assert.equal(bare.cellsRoot, join(dir, "cells"));
+    assert.equal(bare.cellSandbox, null); // null = node-kind default (A4)
+    assert.deepEqual(bare.cellWarm, {});
+
+    writeFileSync(
+      join(dir, "config.json"),
+      JSON.stringify({
+        cells: {
+          root: "/data/cells",
+          sandbox: false,
+          warm: { "/repos/app": ["node_modules", ".turbo"] },
+        },
+      }),
+    );
+    const cfg = loadNodeConfig(dir);
+    assert.equal(cfg.cellsRoot, "/data/cells");
+    assert.equal(cfg.cellSandbox, false);
+    assert.deepEqual(cfg.cellWarm, { "/repos/app": ["node_modules", ".turbo"] });
+
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ cells: { warm: { "/r": [1] } } }));
+    assert.throws(() => loadNodeConfig(dir), ConfigError);
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ cells: { sandbox: "yes" } }));
+    assert.throws(() => loadNodeConfig(dir), ConfigError);
+  });
+});
