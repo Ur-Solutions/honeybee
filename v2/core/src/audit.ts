@@ -1,0 +1,166 @@
+/**
+ * Audit replay — the audit table is a complete, ordered record of every write.
+ * `replayAudit` folds the audit rows into a StateDump that must deep-equal the
+ * store's `dumpState()` (spec test 13). Any divergence means a write path forgot
+ * or mis-recorded its audit row.
+ */
+import type {
+  AuditRow,
+  BeeRow,
+  CommandRow,
+  FlagRow,
+  MessageRow,
+  RuntimeRow,
+  StateDump,
+} from "./types.ts";
+
+export function replayAudit(rows: AuditRow[]): StateDump {
+  const bees = new Map<string, BeeRow>();
+  const runtimes = new Map<string, RuntimeRow>(); // key beeId#generation
+  const flags = new Map<number, FlagRow>();
+  const mailbox = new Map<number, MessageRow>();
+  const commands = new Map<number, CommandRow>();
+
+  const rtKey = (beeId: string, generation: number) => `${beeId}#${generation}`;
+  const mustBee = (id: string): BeeRow => {
+    const bee = bees.get(id);
+    if (!bee) throw new Error(`audit replay: unknown bee ${id}`);
+    return bee;
+  };
+  const mustCommand = (id: number): CommandRow => {
+    const command = commands.get(id);
+    if (!command) throw new Error(`audit replay: unknown command ${id}`);
+    return command;
+  };
+
+  for (const row of rows) {
+    const p = row.payload;
+    switch (row.kind) {
+      case "bee.created": {
+        const bee = p.bee as BeeRow;
+        bees.set(bee.id, { ...bee });
+        break;
+      }
+      case "bee.archived": {
+        const bee = mustBee(p.beeId as string);
+        bee.lifecycle = "archived";
+        bee.archivedAt = p.archivedAt as number;
+        break;
+      }
+      case "bee.unarchived": {
+        const bee = mustBee(p.beeId as string);
+        bee.lifecycle = "active";
+        bee.archivedAt = null;
+        break;
+      }
+      case "bee.deleted": {
+        const beeId = p.beeId as string;
+        bees.delete(beeId);
+        for (const [k, rt] of runtimes) if (rt.beeId === beeId) runtimes.delete(k);
+        for (const [k, f] of flags) if (f.beeId === beeId) flags.delete(k);
+        for (const [k, m] of mailbox) if (m.beeId === beeId) mailbox.delete(k);
+        for (const id of p.settledCommandIds as number[]) {
+          const command = mustCommand(id);
+          command.status = "done";
+          command.finishedAt = p.deletedAt as number;
+        }
+        break;
+      }
+      case "runtime.created":
+      case "runtime.updated": {
+        const rt = p.runtime as RuntimeRow;
+        runtimes.set(rtKey(rt.beeId, rt.generation), { ...rt });
+        break;
+      }
+      case "flag.set": {
+        const flag = p.flag as FlagRow;
+        flags.set(flag.id, { ...flag });
+        break;
+      }
+      case "flag.cleared": {
+        const flag = flags.get(p.flagId as number);
+        if (!flag) throw new Error(`audit replay: unknown flag ${String(p.flagId)}`);
+        flag.clearedAt = p.clearedAt as number;
+        break;
+      }
+      case "mail.enqueued": {
+        const message = p.message as MessageRow;
+        mailbox.set(message.id, { ...message });
+        break;
+      }
+      case "mail.delivered": {
+        const message = mailbox.get(p.messageId as number);
+        if (!message) throw new Error(`audit replay: unknown message ${String(p.messageId)}`);
+        message.deliveredAt = p.deliveredAt as number;
+        message.deliveredGeneration = p.deliveredGeneration as number;
+        break;
+      }
+      case "command.enqueued": {
+        const command = p.command as CommandRow;
+        commands.set(command.id, { ...command });
+        break;
+      }
+      case "command.claimed": {
+        mustCommand(p.commandId as number).status = "running";
+        break;
+      }
+      case "command.completed":
+      case "command.moot": {
+        const command = mustCommand(p.commandId as number);
+        command.status = "done";
+        command.finishedAt = p.finishedAt as number;
+        break;
+      }
+      case "command.requeued": {
+        const command = mustCommand(p.commandId as number);
+        command.status = "queued";
+        command.attempts = p.attempts as number;
+        command.nextAttemptAt = p.nextAttemptAt as number;
+        break;
+      }
+      case "command.failed": {
+        const command = mustCommand(p.commandId as number);
+        command.status = "failed";
+        command.attempts = p.attempts as number;
+        command.finishedAt = p.finishedAt as number;
+        command.failureCause = p.failureCause as CommandRow["failureCause"];
+        break;
+      }
+      case "command.boot_requeued": {
+        for (const id of p.commandIds as number[]) {
+          const command = mustCommand(id);
+          command.status = "queued";
+          command.nextAttemptAt = p.nextAttemptAt as number;
+        }
+        break;
+      }
+      case "output.recorded": {
+        mustBee(p.beeId as string).lastOutputAt = p.at as number;
+        break;
+      }
+      case "output.read": {
+        mustBee(p.beeId as string).outputReadAt = p.at as number;
+        break;
+      }
+      // Recorded no-ops and informational rows: state unchanged by definition.
+      case "runtime.stale_update":
+      case "flag.clear_noop":
+      case "mail.deliver_noop":
+      case "command.complete_noop":
+      case "boot.reconciled":
+        break;
+      default:
+        throw new Error(`audit replay: unknown audit kind ${row.kind}`);
+    }
+  }
+
+  return {
+    bees: [...bees.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    runtimes: [...runtimes.values()].sort((a, b) =>
+      a.beeId !== b.beeId ? (a.beeId < b.beeId ? -1 : 1) : a.generation - b.generation,
+    ),
+    flags: [...flags.values()].sort((a, b) => a.id - b.id),
+    mailbox: [...mailbox.values()].sort((a, b) => a.id - b.id),
+    commands: [...commands.values()].sort((a, b) => a.id - b.id),
+  };
+}
