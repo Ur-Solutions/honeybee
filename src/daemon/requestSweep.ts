@@ -36,7 +36,7 @@
 // same evidence cannot re-open anything a human or a scope change closed.
 
 import type { HsrObservation } from "../hsr/observe.js";
-import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, isEventHistoryObservationAdmissible } from "../stateMachine.js";
 import { authRequestId, needsInputRequestId, stopFailedRequestId } from "../requests/keys.js";
 import {
   cancelOpenRequests,
@@ -143,7 +143,7 @@ export function createRequestReconciler(): RequestReconciler {
       pending !== null ||
       authEvent !== undefined ||
       (cached !== undefined && cached.openIds.size > 0) ||
-      (record.status === "kill_failed" && !isPendingSessionRuntimeReplacement(record));
+      (record.status === "kill_failed" && record.eventIntegrityDoubt === undefined && !isPendingSessionRuntimeReplacement(record));
     if (!shouldTouch) return;
 
     let requests = await readBeeRequests(bee);
@@ -212,7 +212,11 @@ export function createRequestReconciler(): RequestReconciler {
       };
       if ((await openRequest(bee, input)).created) emit(input.id, "open", "auth");
     }
-    if (record.status === "kill_failed" && !isPendingSessionRuntimeReplacement(record)) {
+    // Event-history doubt is not itself a failed stop. Its exact outside
+    // receipt remains the admission fence and BeeView diagnostic; do not open
+    // and immediately cancel a generic stop-failed request for every dead,
+    // confirmed host on each daemon sweep.
+    if (record.status === "kill_failed" && record.eventIntegrityDoubt === undefined && !isPendingSessionRuntimeReplacement(record)) {
       const input: OpenRequestInput = {
         id: stopFailedRequestId(bee, generation),
         kind: "manual-action",
@@ -277,8 +281,11 @@ export function createRequestReconciler(): RequestReconciler {
     }
     for (const record of records) {
       // ADR invariant 2: an unavailable observation batch is unknown, not
-      // evidence — ZERO reads or writes for the bee this tick.
-      if (hsrUnavailable.has(record.name)) continue;
+      // evidence — ZERO reads or writes for the bee this tick. A canonical
+      // integrity marker independently quarantines the same event source, even
+      // if a caller accidentally supplied a stale observation without adding
+      // the bee to hsrUnavailable.
+      if (hsrUnavailable.has(record.name) || !isEventHistoryObservationAdmissible(record)) continue;
       try {
         await reconcileBee(record, hsrObservations.get(record.name), outcomes, cache);
       } catch (error) {

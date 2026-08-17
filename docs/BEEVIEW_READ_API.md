@@ -15,6 +15,21 @@ BeeView write. The 2026-08-11
 bounded-state extension is additive within schemaVersion 1: existing fields
 retain their spelling and meaning.
 
+### 2026-08-17 event-history integrity projection
+
+- An HSR event-history fence is independent from runtime stop ownership. An
+  exact unresolved receipt with `stopState: "confirmed"` proves the provider
+  host stopped; it therefore projects as ordinary `ready` (parked) or
+  `offline` (lost), not `stop-failed` or `crashed`.
+- The fence remains visible as `eventIntegrity` and keeps
+  `interactionState: "blocked"`. Compatibility fields deliberately retain
+  `kill_failed`, so older writers and all mutation paths continue to fail
+  closed until an operator explicitly reconciles the history.
+- A missing, mismatched, acknowledged, pending, or doubtful receipt never
+  supplies stop authority. Those cases retain the existing `stop-failed`
+  presentation. Receipt identity includes the marker's complete local or
+  remote host identity, not only its integrity id.
+
 ### 2026-08-16 runtime-replacement provenance
 
 - The crash-safe replacement path keeps its durable, non-runnable internal
@@ -314,6 +329,22 @@ export type BeeViewObservationFreshness = {
   sources: ObservationSourceFreshness[];
 };
 
+export type BeeViewEventIntegrity = {
+  integrityId: string;
+  phase: "unresolved" | "acknowledged" | "unknown";
+  stopState: "pending" | "confirmed" | "doubt" | "unknown";
+  /** Absent when no exact receipt owns the current runtime. */
+  deliveryIds?: string[];
+  deliveryScanError?: string;
+  deliveryVerdicts?: Record<string, "delivered" | "discarded">;
+  reason: string;
+  stopDetail?: string;
+  receiptReadError?: string;
+  createdAt: string;
+  updatedAt?: string;
+  evidence: BeeViewEvidence;
+};
+
 export type BeeViewVerification = {
   unverified: boolean;
   unverifiedSince?: string;
@@ -350,11 +381,14 @@ export type BeeViewV1 = {
   latestTurnResult?: BeeViewTurnResult;
   latestContractResult?: BeeViewContractResult;
   inboxSummary: BeeViewInboxSummary;
+  interactionState: "working" | "idle" | "blocked" | "archived";
   displayState: BeeDisplayState;
   /** The precedence rule that produced displayState (for `state explain`). */
   displayStateReason: string;
   observationFreshness: BeeViewObservationFreshness;
   verification: BeeViewVerification;
+  /** Present while an HSR event-history receipt remains canonically fenced. */
+  eventIntegrity?: BeeViewEventIntegrity;
   lastProjectedAt: string;
   compatibilityFields: BeeViewCompatibilityFields;
 };

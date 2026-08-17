@@ -305,7 +305,16 @@ async function writeReceipt(receipt: HsrEventIntegrityReceipt): Promise<void> {
   await atomicWriteFile(path, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
 }
 
-function receiptOwnsSession(receipt: HsrEventIntegrityReceipt, record: SessionRecord): boolean {
+/**
+ * Whether an event-integrity receipt names the exact runtime generation still
+ * carried by a canonical session row. Public read-model code uses the same
+ * proof gate as the mutation path; a matching marker alone is not successor
+ * ownership proof.
+ */
+export function hsrEventIntegrityReceiptOwnsSession(
+  receipt: HsrEventIntegrityReceipt,
+  record: SessionRecord,
+): boolean {
   if (record.name !== receipt.bee) return false;
   if (receipt.remoteAuthority) {
     return !!record.node
@@ -326,7 +335,7 @@ async function currentReceiptOwnership(
 ): Promise<"owns" | "different" | "unknown"> {
   const record = await loadSession(receipt.bee);
   if (record && !isArchivedSessionLifecycle(record)) {
-    if (receiptOwnsSession(receipt, record)) return "owns";
+    if (hsrEventIntegrityReceiptOwnsSession(receipt, record)) return "owns";
     if (receipt.remoteAuthority) {
       if (record.node && record.remoteLaunchId && record.remoteIncarnation) return "different";
     } else if (record.substrate === "hsr" && !record.node && record.runnerPid !== undefined) {
@@ -389,7 +398,7 @@ export async function fenceCanonicalHsrEventIntegrity(
     if (!head || head.integrityId !== receipt.integrityId || head.phase !== "unresolved") return false;
     const current = await loadSession(receipt.bee);
     if (!current || isArchivedSessionLifecycle(current)) return false;
-    if (!receiptOwnsSession(head, current)) return false;
+    if (!hsrEventIntegrityReceiptOwnsSession(head, current)) return false;
     const marker = canonicalMarker(head);
     if (
       current.status !== "kill_failed"
@@ -497,7 +506,7 @@ export async function persistHsrEventIntegrityFailure(input: {
         if (!ownsCurrent) throw new HsrSourceAuthorityChangedError(input.bee);
       }
       const receipt = await writeHead();
-      if (current && !isArchivedSessionLifecycle(current) && receiptOwnsSession(receipt, current)) {
+      if (current && !isArchivedSessionLifecycle(current) && hsrEventIntegrityReceiptOwnsSession(receipt, current)) {
         const marker = canonicalMarker(receipt);
         if (
           current.status !== "kill_failed"

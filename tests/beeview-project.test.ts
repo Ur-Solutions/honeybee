@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { HsrEventIntegrityReceipt } from "../src/hsr/eventIntegrity.js";
 import type { HsrEventSnapshot } from "../src/hsr/observe.js";
 import type { RunnerEvent } from "../src/hsr/types.js";
+import type { InterventionRequestRecord } from "../src/requests/store.js";
 import type { SealRecord } from "../src/seal.js";
 import { liveTargetKey, type BeeState, type StateContext } from "../src/state.js";
 import type { SessionRecord } from "../src/store.js";
@@ -48,6 +50,51 @@ function seal(over: Partial<SealRecord> = {}): SealRecord {
     type: "implementation",
     ...over,
   };
+}
+
+const INTEGRITY_HOST = {
+  hostPid: 4242,
+  startedAt: iso(NOW - 120_000),
+  hostFingerprint: { pgid: 4242, startedAt: "host-birth-4242" },
+};
+
+function integrityMarker(): NonNullable<SessionRecord["eventIntegrityDoubt"]> {
+  return {
+    version: 1,
+    integrityId: "integrity-1",
+    source: INTEGRITY_HOST,
+    createdAt: iso(NOW - 90_000),
+    fenceError: "event history incomplete",
+  };
+}
+
+function integrityReceipt(
+  over: Partial<HsrEventIntegrityReceipt> = {},
+): HsrEventIntegrityReceipt {
+  return {
+    version: 1,
+    integrityId: "integrity-1",
+    bee: "bee1",
+    host: INTEGRITY_HOST,
+    phase: "unresolved",
+    stopState: "confirmed",
+    deliveryIds: [],
+    reason: "legacy host ended without a durable stream closure",
+    createdAt: iso(NOW - 90_000),
+    updatedAt: iso(NOW - 80_000),
+    ...over,
+  };
+}
+
+function integrityFencedRecord(over: Partial<SessionRecord> = {}): SessionRecord {
+  return record({
+    status: "kill_failed",
+    substrate: "hsr",
+    runnerPid: INTEGRITY_HOST.hostPid,
+    runnerFingerprint: INTEGRITY_HOST.hostFingerprint,
+    eventIntegrityDoubt: integrityMarker(),
+    ...over,
+  });
 }
 
 function project(sources: BeeViewProjectionSources) {
@@ -233,6 +280,285 @@ test("an exited kill_failed bee stays active but non-interactive until stop proo
   const rec = record({ status: "kill_failed", lastError: "tmux kill failed" });
   const view = project({ record: rec, context: ctx() });
   assert.equal(view.displayState, "stop-failed");
+  assert.equal(view.interactionState, "blocked");
+});
+
+test("confirmed event-history warning keeps a parked bee ready without weakening its interaction fence", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const rec = integrityFencedRecord({
+    stateMachine: { ...cursor, runtime: "parked", work: "done" },
+  });
+  const view = project({
+    record: rec,
+    context: ctx(),
+    eventIntegrityReceipt: integrityReceipt(),
+  });
+
+  assert.equal(view.latestRuntime.stopFailed, undefined);
+  assert.equal(view.latestRuntime.state, "exited");
+  assert.equal(view.latestRuntime.exitClass, "stopped");
+  assert.equal(view.displayState, "ready");
+  assert.equal(view.interactionState, "blocked", "history review still closes work admission");
+  assert.equal(view.compatibilityFields.beeState, "kill_failed");
+  assert.equal(view.compatibilityFields.sessionStatus, "kill_failed");
+  assert.deepEqual(view.eventIntegrity, {
+    integrityId: "integrity-1",
+    phase: "unresolved",
+    stopState: "confirmed",
+    deliveryIds: [],
+    reason: "legacy host ended without a durable stream closure",
+    createdAt: iso(NOW - 90_000),
+    updatedAt: iso(NOW - 80_000),
+    evidence: {
+      grade: "structured",
+      source: "event-integrity-receipt",
+      observedAt: iso(NOW - 80_000),
+      detail: "exact receipt for bee1",
+    },
+  });
+});
+
+test("confirmed event-history warning projects a lost runtime offline and preserves delivery diagnostics", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const rec = integrityFencedRecord({
+    stateMachine: { ...cursor, runtime: "lost", work: "done" },
+  });
+  const view = project({
+    record: rec,
+    context: ctx(),
+    eventIntegrityReceipt: integrityReceipt({
+      deliveryIds: ["delivery-1", "delivery-2"],
+      deliveryScanError: "pending-turn store was temporarily unreadable",
+      deliveryVerdicts: { "delivery-1": "delivered" },
+      stopDetail: "exact host birth no longer exists",
+    }),
+  });
+
+  assert.equal(view.latestRuntime.stopFailed, undefined);
+  assert.equal(view.latestRuntime.exitClass, "stopped");
+  assert.equal(view.displayState, "offline");
+  assert.equal(view.interactionState, "blocked");
+  assert.deepEqual(view.eventIntegrity?.deliveryIds, ["delivery-1", "delivery-2"]);
+  assert.equal(view.eventIntegrity?.deliveryScanError, "pending-turn store was temporarily unreadable");
+  assert.deepEqual(view.eventIntegrity?.deliveryVerdicts, { "delivery-1": "delivered" });
+  assert.equal(view.eventIntegrity?.stopDetail, "exact host birth no longer exists");
+  assert.equal(view.latestRuntime.evidence.source, "event-integrity-receipt");
+  assert.equal(view.latestRuntime.evidence.detail, "exact host birth no longer exists");
+});
+
+test("event-history stop proof fails closed when its receipt is absent, stale, mismatched, or unconfirmed", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const rec = integrityFencedRecord({
+    stateMachine: { ...cursor, runtime: "parked", work: "done" },
+  });
+  const cases: Array<{ label: string; receipt?: HsrEventIntegrityReceipt | null }> = [
+    { label: "not gathered" },
+    { label: "missing", receipt: null },
+    { label: "wrong bee", receipt: integrityReceipt({ bee: "another-bee" }) },
+    { label: "wrong id", receipt: integrityReceipt({ integrityId: "integrity-2" }) },
+    {
+      label: "wrong host",
+      receipt: integrityReceipt({ host: { ...INTEGRITY_HOST, hostPid: INTEGRITY_HOST.hostPid + 1 } }),
+    },
+    { label: "pending stop", receipt: integrityReceipt({ stopState: "pending" }) },
+    { label: "doubtful stop", receipt: integrityReceipt({ stopState: "doubt" }) },
+    {
+      label: "already acknowledged but marker remains",
+      receipt: integrityReceipt({
+        phase: "acknowledged",
+        acknowledgedAt: iso(NOW - 70_000),
+      }),
+    },
+  ];
+
+  for (const row of cases) {
+    const view = project({ record: rec, context: ctx(), ...(row.receipt !== undefined ? { eventIntegrityReceipt: row.receipt } : {}) });
+    assert.equal(view.latestRuntime.stopFailed, true, row.label);
+    assert.equal(view.displayState, "stop-failed", row.label);
+    assert.equal(view.interactionState, "blocked", row.label);
+  }
+
+  const successor = project({
+    record: { ...rec, runnerPid: INTEGRITY_HOST.hostPid + 1 },
+    context: ctx(),
+    eventIntegrityReceipt: integrityReceipt(),
+  });
+  assert.equal(successor.latestRuntime.stopFailed, true, "old receipt cannot stop-proof a successor runtime");
+
+  const unreadable = project({
+    record: rec,
+    context: ctx(),
+    eventIntegrityReceipt: null,
+    eventIntegrityReceiptError: "EACCES: receipt is unreadable",
+  });
+  assert.equal(unreadable.eventIntegrity?.deliveryIds, undefined, "unknown receipt does not assert zero deliveries");
+  assert.equal(unreadable.eventIntegrity?.receiptReadError, "EACCES: receipt is unreadable");
+  assert.equal(unreadable.eventIntegrity?.reason, "event history incomplete");
+  assert.match(unreadable.eventIntegrity?.evidence.detail ?? "", /EACCES/);
+});
+
+test("remote confirmed-stop proof requires the marker and current record's exact launch authority", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const remoteAuthority = { launchId: "launch-1", incarnation: "incarnation-1" };
+  const rec = record({
+    status: "kill_failed",
+    node: "mini01",
+    remoteLaunchId: remoteAuthority.launchId,
+    remoteIncarnation: remoteAuthority.incarnation,
+    eventIntegrityDoubt: {
+      ...integrityMarker(),
+      source: {
+        ...INTEGRITY_HOST,
+        remoteLaunchId: remoteAuthority.launchId,
+        remoteIncarnation: remoteAuthority.incarnation,
+      },
+    },
+    stateMachine: { ...cursor, runtime: "parked", work: "done" },
+  });
+  const receipt = integrityReceipt({ remoteAuthority });
+
+  const exact = project({ record: rec, context: ctx(), eventIntegrityReceipt: receipt });
+  assert.equal(exact.latestRuntime.stopFailed, undefined);
+  assert.equal(exact.latestRuntime.state, "exited");
+  assert.equal(exact.displayState, "ready");
+
+  const wrongMarkerAuthority = project({
+    record: rec,
+    context: ctx(),
+    eventIntegrityReceipt: integrityReceipt({
+      remoteAuthority: { ...remoteAuthority, incarnation: "incarnation-2" },
+    }),
+  });
+  assert.equal(wrongMarkerAuthority.latestRuntime.stopFailed, true);
+
+  const successorRecord = project({
+    record: { ...rec, remoteIncarnation: "incarnation-2" },
+    context: ctx(),
+    eventIntegrityReceipt: receipt,
+  });
+  assert.equal(successorRecord.latestRuntime.stopFailed, true);
+});
+
+test("confirmed event-history stop proof dominates every stale runtime and observer axis", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const cases: Array<{
+    label: string;
+    runtime: NonNullable<SessionRecord["stateMachine"]>["runtime"];
+    work: NonNullable<SessionRecord["stateMachine"]>["work"];
+    context: StateContext;
+    display: BeeDisplayState;
+  }> = [
+    {
+      label: "live working with a stale positive HSR observation",
+      runtime: "live",
+      work: "working",
+      context: ctx({ hsrLive: new Set(["bee1"]), hsrStates: new Map([["bee1", "active"]]) }),
+      display: "offline",
+    },
+    { label: "recovering", runtime: "recovering", work: "working", context: ctx(), display: "offline" },
+    { label: "parked", runtime: "parked", work: "done", context: ctx(), display: "ready" },
+    { label: "lost", runtime: "lost", work: "done", context: ctx(), display: "offline" },
+    {
+      label: "observer says local node unreachable",
+      runtime: "live",
+      work: "done",
+      context: ctx({ unreachableNodes: new Set(["local"]) }),
+      display: "offline",
+    },
+    {
+      label: "observer batch is held",
+      runtime: "live",
+      work: "done",
+      context: ctx({ hsrUnavailable: new Set(["bee1"]) }),
+      display: "offline",
+    },
+  ];
+
+  for (const row of cases) {
+    const rec = integrityFencedRecord({
+      stateMachine: { ...cursor, runtime: row.runtime, work: row.work },
+    });
+    const view = project({
+      record: rec,
+      context: row.context,
+      eventIntegrityReceipt: integrityReceipt(),
+    });
+    assert.equal(view.latestRuntime.state, "exited", row.label);
+    assert.equal(view.latestRuntime.exitClass, "stopped", row.label);
+    assert.equal(view.latestRuntime.stopFailed, undefined, row.label);
+    assert.equal(view.latestRuntime.evidence.source, "event-integrity-receipt", row.label);
+    assert.equal(view.displayState, row.display, row.label);
+    assert.equal(view.interactionState, "blocked", row.label);
+  }
+});
+
+test("an integrity marker blocks interaction even when a stale status scalar says running", () => {
+  const rec = integrityFencedRecord({ status: "running" });
+  const view = project({ record: rec, context: ctx(), eventIntegrityReceipt: null });
+  assert.equal(view.interactionState, "blocked");
+  assert.equal(isRunnableSessionRecord(rec), false);
+});
+
+test("confirmed integrity stops the source generation while retaining stale replacement provenance", () => {
+  const at = iso(NOW - 5_000);
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const rec = integrityFencedRecord({
+    runtimeGeneration: 4,
+    stateMachine: { ...cursor, runtime: "live", work: "working" },
+    runtimeReplacement: {
+      version: 1,
+      reservationId: "replacement-interrupted-by-integrity",
+      operation: "lazy-wake",
+      sourceGeneration: 4,
+      state: "pending",
+      startedAt: at,
+      updatedAt: at,
+    },
+  });
+  const view = project({ record: rec, context: ctx(), eventIntegrityReceipt: integrityReceipt() });
+
+  assert.equal(view.latestRuntime.state, "exited");
+  assert.equal(view.latestRuntime.exitClass, "stopped");
+  assert.equal(view.latestRuntime.replacement?.state, "pending", "audit provenance remains visible");
+  assert.equal(view.displayState, "offline", "no successor generation was published");
+  assert.equal(view.interactionState, "blocked");
+});
+
+test("confirmed integrity hides only the generic stop-failed request and preserves bee-scoped delivery action", () => {
+  const cursor = lifecycleCursor("bee1", "active", iso(NOW - 20_000));
+  const rec = integrityFencedRecord({
+    runtimeGeneration: 3,
+    stateMachine: { ...cursor, runtime: "live", work: "working" },
+  });
+  const stored = (over: Partial<InterventionRequestRecord>): InterventionRequestRecord => ({
+    id: "manual:bee1:3:stop-failed",
+    bee: "bee1",
+    kind: "manual-action",
+    status: "open",
+    scope: "runtime-generation",
+    grade: "structured",
+    generation: 3,
+    openedAt: iso(NOW - 10_000),
+    updatedAt: iso(NOW - 10_000),
+    evidence: { grade: "structured", source: "session-record" },
+    ...over,
+  });
+  const view = project({
+    record: rec,
+    context: ctx({ hsrLive: new Set(["bee1"]) }),
+    eventIntegrityReceipt: integrityReceipt({ deliveryIds: ["delivery-1"] }),
+    storedRequests: [
+      stored({}),
+      stored({
+        id: "manual:bee1:delivery:delivery-1",
+        scope: "bee",
+        question: "reconcile ambiguous delivery delivery-1",
+      }),
+    ],
+  });
+
+  assert.deepEqual(view.openRequests.map((request) => request.id), ["manual:bee1:delivery:delivery-1"]);
+  assert.equal(view.displayState, "needs-action");
   assert.equal(view.interactionState, "blocked");
 });
 

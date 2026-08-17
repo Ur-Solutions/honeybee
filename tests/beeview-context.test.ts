@@ -237,6 +237,103 @@ test("HSR observation candidates obey canonical lifecycle over stale status scal
   assert.equal(context.hsrLive.has(canonicalArchived.name), false);
 });
 
+test("BeeView context quarantines fenced local and remote HSR histories without reopening their event logs", async () => {
+  const at = "2026-07-28T11:30:00.000Z";
+  const healthy = bee({
+    name: "healthy-hsr",
+    tmuxTarget: "healthy-hsr",
+    substrate: "hsr",
+  });
+  const fencedLocal = bee({
+    name: "fenced-local",
+    tmuxTarget: "fenced-local",
+    substrate: "hsr",
+    status: "kill_failed",
+    eventIntegrityDoubt: {
+      version: 1,
+      integrityId: "local-integrity",
+      source: { hostPid: 4242, startedAt: at },
+      createdAt: at,
+      fenceError: "local event history incomplete",
+    },
+  });
+  const fencedRemote = bee({
+    name: "fenced-remote",
+    tmuxTarget: "fenced-remote",
+    node: REMOTE_NODE.name,
+    status: "kill_failed",
+    remoteLaunchId: "launch-1",
+    remoteIncarnation: "incarnation-1",
+    eventIntegrityDoubt: {
+      version: 1,
+      integrityId: "remote-integrity",
+      source: {
+        hostPid: 4343,
+        startedAt: at,
+        remoteLaunchId: "launch-1",
+        remoteIncarnation: "incarnation-1",
+      },
+      createdAt: at,
+      fenceError: "remote event history incomplete",
+    },
+  });
+  const records = [healthy, fencedLocal, fencedRemote];
+  let requested: string[] = [];
+  const context = await assembleStateContext(
+    records,
+    { liveTargets: new Set(), unreachableNodes: new Set() },
+    {
+      includeEvents: true,
+      deps: {
+        ...assemblerDeps({ records, nodes: [REMOTE_NODE] }),
+        hsrObservations: async ({ bees }) => {
+          requested = [...(bees ?? [])];
+          // An over-broad/mixed-version observer response must not smuggle a
+          // quarantined event snapshot back into BeeView.
+          return new Map(records.map((record) => [
+            record.name,
+            { live: true, state: "active" as const, snapshot: `${record.name} output` },
+          ]));
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(requested, [healthy.name]);
+  assert.equal(context.hsrUnavailable.has(fencedLocal.name), true);
+  assert.equal(context.hsrUnavailable.has(fencedRemote.name), true);
+  assert.equal(context.hsrObservations.has(fencedLocal.name), false);
+  assert.equal(context.hsrObservations.has(fencedRemote.name), false);
+  assert.equal(context.hsrLive.has(fencedLocal.name), false);
+  assert.equal(context.hsrLive.has(fencedRemote.name), false);
+  assert.equal(context.hsrObservations.has(healthy.name), true);
+});
+
+test("BeeView context treats a per-Bee unavailable observation row as held evidence", async () => {
+  const record = bee({ substrate: "hsr" });
+  const context = await assembleStateContext(
+    [record],
+    { liveTargets: new Set(), unreachableNodes: new Set() },
+    {
+      deps: {
+        ...assemblerDeps({ records: [record] }),
+        hsrObservations: async () => new Map([[
+          record.name,
+          {
+            live: false,
+            snapshot: "",
+            unavailable: { kind: "storage", detail: "run dir temporarily unreadable" },
+          },
+        ]]),
+      },
+    },
+  );
+
+  assert.equal(context.hsrUnavailable.has(record.name), true);
+  assert.equal(context.hsrObservations.has(record.name), false);
+  assert.equal(context.hsrLive.has(record.name), false);
+});
+
 // ---------------------------------------------------------------------------
 // previousStates seeding and layering.
 // ---------------------------------------------------------------------------

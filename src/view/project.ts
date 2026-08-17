@@ -18,10 +18,16 @@
  */
 
 import { effectiveHiveState } from "../hiveState.js";
+import {
+  hsrEventIntegrityReceiptOwnsHost,
+  hsrEventIntegrityReceiptOwnsSession,
+  type HsrEventIntegrityReceipt,
+} from "../hsr/eventIntegrity.js";
 import { structuredStateFromEvents, type HsrEventSnapshot } from "../hsr/observe.js";
 import type { RunnerEvent } from "../hsr/types.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { isWellFormedPaneId } from "../paneId.js";
+import { stopFailedRequestId } from "../requests/keys.js";
 import type { InterventionRequestRecord } from "../requests/store.js";
 import type { SealRecord } from "../seal.js";
 import { deriveState, liveTargetKey, parseBeeState, type BeeState, type DerivedState, type StateContext } from "../state.js";
@@ -70,6 +76,10 @@ export type BeeViewProjectionSources = {
    * the store — the daemon and CLI verbs own every mutation.
    */
   storedRequests?: InterventionRequestRecord[];
+  /** Outside-store event-history authority, read only for a fenced HSR bee. */
+  eventIntegrityReceipt?: HsrEventIntegrityReceipt | null;
+  /** Preserved when the outside receipt could not be read or parsed. */
+  eventIntegrityReceiptError?: string;
   now?: number;
 };
 
@@ -85,17 +95,28 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
   const unreachable = context.unreachableNodes?.has(nodeName) === true;
   const held = context.hsrUnavailable?.has(record.name) === true;
   const hiveStateOption = sources.hiveStateOption && sources.hiveStateOption.length > 0 ? sources.hiveStateOption : undefined;
+  const matchingIntegrityReceipt = matchingEventIntegrityReceipt(sources);
+  const eventIntegrity = projectEventIntegrity(sources, matchingIntegrityReceipt);
+  const confirmedIntegrityStop = matchingIntegrityReceipt?.phase === "unresolved"
+    && matchingIntegrityReceipt.stopState === "confirmed"
+    ? matchingIntegrityReceipt
+    : undefined;
   // Once present, the proof-carrying cursor is authoritative. Legacy
   // status:done is retirement only for records with no canonical cursor; a
   // stale mixed-version scalar must not archive an explicitly active bee.
   const machine = record.stateMachine ?? legacyStateMachineSeed(record);
 
   const bee = projectBee(record, nodeName, machine.lifecycle);
-  const latestRuntime = projectRuntime(record, context, derived, machine.runtime, { generation, unreachable, held });
+  const latestRuntime = projectRuntime(record, context, derived, machine.runtime, {
+    generation,
+    unreachable,
+    held,
+    confirmedIntegrityStop,
+  });
   // Runtime-generation and turn requests close with an exited generation.
   // Bee-scoped manual actions (for example an undeliverable accepted message)
   // deliberately survive runtime exit and remain renderable until resolved.
-  const derivedRequests = bee.lifecycleState === "archived"
+  const projectedRequests = bee.lifecycleState === "archived"
     ? []
     : deriveOpenRequests({
         record,
@@ -106,6 +127,13 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
         ...(sources.storedRequests ? { storedRequests: sources.storedRequests } : {}),
         now: nowMs,
       });
+  // A matching receipt with exact provider-stop proof makes this an
+  // event-history warning, not a stop failure. Older daemon runs may already
+  // have persisted the generic stop-failed request; hide only that exact
+  // generation-scoped row while preserving delivery/manual-action requests.
+  const derivedRequests = confirmedIntegrityStop
+    ? projectedRequests.filter((request) => request.id !== stopFailedRequestId(record.name, generation))
+    : projectedRequests;
   const transitionRequest = transitionRequestFallback(record);
   const requestsWithRecovery = transitionRequest && !derivedRequests.some((request) => request.id === transitionRequest.id)
     ? [...derivedRequests, transitionRequest]
@@ -160,6 +188,7 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
     displayStateReason,
     observationFreshness: projectFreshness(sources, derived, { unreachable, held, hiveStateOption, nowMs }),
     verification: projectVerification(record),
+    ...(eventIntegrity ? { eventIntegrity } : {}),
     lastProjectedAt: new Date(nowMs).toISOString(),
     compatibilityFields: {
       beeState: derived.state,
@@ -171,6 +200,77 @@ export function projectBeeView(sources: BeeViewProjectionSources): BeeViewV1 {
         : {}),
       ...(record.lastObservedState !== undefined ? { lastObservedState: record.lastObservedState } : {}),
       ...(record.lastObservedStateAt !== undefined ? { lastObservedStateAt: record.lastObservedStateAt } : {}),
+    },
+  };
+}
+
+function matchingEventIntegrityReceipt(
+  sources: BeeViewProjectionSources,
+): HsrEventIntegrityReceipt | undefined {
+  const { record } = sources;
+  const marker = record.eventIntegrityDoubt;
+  const receipt = sources.eventIntegrityReceipt;
+  if (
+    !marker
+    || !receipt
+    || receipt.bee !== record.name
+    || receipt.integrityId !== marker.integrityId
+  ) return undefined;
+  const host = {
+    hostPid: marker.source.hostPid,
+    startedAt: marker.source.startedAt,
+    ...(marker.source.hostFingerprint ? { hostFingerprint: marker.source.hostFingerprint } : {}),
+  };
+  const remoteAuthority = marker.source.remoteLaunchId && marker.source.remoteIncarnation
+    ? { launchId: marker.source.remoteLaunchId, incarnation: marker.source.remoteIncarnation }
+    : undefined;
+  return hsrEventIntegrityReceiptOwnsHost(receipt, host, remoteAuthority)
+    && hsrEventIntegrityReceiptOwnsSession(receipt, record)
+    ? receipt
+    : undefined;
+}
+
+function projectEventIntegrity(
+  sources: BeeViewProjectionSources,
+  receipt: HsrEventIntegrityReceipt | undefined,
+): BeeViewV1["eventIntegrity"] | undefined {
+  const marker = sources.record.eventIntegrityDoubt;
+  if (!marker) return undefined;
+  if (!receipt) {
+    const readError = sources.eventIntegrityReceiptError;
+    return {
+      integrityId: marker.integrityId,
+      phase: "unknown",
+      stopState: "unknown",
+      reason: marker.fenceError,
+      ...(readError ? { receiptReadError: readError } : {}),
+      createdAt: marker.createdAt,
+      evidence: {
+        grade: "legacy",
+        source: "session-record",
+        observedAt: marker.createdAt,
+        detail: readError
+          ? `canonical event-integrity marker receipt could not be read: ${readError}`
+          : "canonical event-integrity marker has no exact matching receipt",
+      },
+    };
+  }
+  return {
+    integrityId: receipt.integrityId,
+    phase: receipt.phase,
+    stopState: receipt.stopState,
+    deliveryIds: [...receipt.deliveryIds],
+    ...(receipt.deliveryScanError ? { deliveryScanError: receipt.deliveryScanError } : {}),
+    ...(receipt.deliveryVerdicts ? { deliveryVerdicts: { ...receipt.deliveryVerdicts } } : {}),
+    reason: receipt.reason,
+    ...(receipt.stopDetail ? { stopDetail: receipt.stopDetail } : {}),
+    createdAt: receipt.createdAt,
+    updatedAt: receipt.updatedAt,
+    evidence: {
+      grade: "structured",
+      source: "event-integrity-receipt",
+      observedAt: receipt.updatedAt,
+      detail: `exact receipt for ${receipt.bee}`,
     },
   };
 }
@@ -232,7 +332,12 @@ function projectRuntime(
   context: StateContext,
   derived: DerivedState,
   runtimeState: BeeViewRuntime["runtimeState"],
-  facts: { generation: number; unreachable: boolean; held: boolean },
+  facts: {
+    generation: number;
+    unreachable: boolean;
+    held: boolean;
+    confirmedIntegrityStop?: HsrEventIntegrityReceipt;
+  },
 ): BeeViewRuntime {
   const currentReplacement = isArchivedSessionLifecycle(record)
     ? undefined
@@ -266,6 +371,24 @@ function projectRuntime(
       state: "exited",
       exitClass: "stopped",
       evidence: { grade: "legacy", source: "session-record", detail: 'record filed (status "done")' },
+    };
+  }
+  if (facts.confirmedIntegrityStop) {
+    // The exact outside-store receipt is newer and stronger than a coarse
+    // liveness batch or the bounded cursor it stopped. Preserve that cursor as
+    // diagnostic runtimeState, but never re-project its stopped generation as
+    // online, recovering, unreachable, or crashed.
+    return {
+      ...base,
+      state: "exited",
+      exitClass: "stopped",
+      evidence: {
+        grade: "structured",
+        source: "event-integrity-receipt",
+        observedAt: facts.confirmedIntegrityStop.updatedAt,
+        detail: facts.confirmedIntegrityStop.stopDetail
+          ?? `exact provider stop confirmed for event-integrity receipt ${facts.confirmedIntegrityStop.integrityId}`,
+      },
     };
   }
   // The crash-safe replacement fence deliberately reuses status=kill_failed
@@ -620,13 +743,13 @@ function chooseDisplayState(facts: {
   if (latestRuntime.stopFailed) {
     return { displayState: "stop-failed", displayStateReason: "stop-failed — the latest stop request failed (status kill_failed); the runtime may still be alive" };
   }
-  if (latestRuntime.replacement?.state === "pending") {
+  if (latestRuntime.replacement?.state === "pending" && latestRuntime.state !== "exited") {
     return {
       displayState: "recovering",
       displayStateReason: `recovering — ${latestRuntime.replacement.operation} is waking a replacement runtime`,
     };
   }
-  if (latestRuntime.runtimeState === "recovering") {
+  if (latestRuntime.runtimeState === "recovering" && latestRuntime.state !== "exited") {
     return { displayState: "recovering", displayStateReason: "recovering — probe-verified mid-turn runtime loss is being revived" };
   }
   if (latestRuntime.runtimeState === "parked") {
@@ -634,6 +757,9 @@ function chooseDisplayState(facts: {
   }
   if (latestRuntime.state === "exited" && latestRuntime.exitClass === "crashed") {
     return { displayState: "crashed", displayStateReason: "crashed — the latest generation exited without stop intent" };
+  }
+  if (latestRuntime.state === "exited" && latestRuntime.exitClass === "stopped") {
+    return { displayState: "offline", displayStateReason: "offline — the latest generation is stopped and revivable" };
   }
   if (facts.unreachable) {
     return {
@@ -677,6 +803,9 @@ function interactionStateFor(
   runtime: BeeViewRuntime,
 ): BeeViewV1["interactionState"] {
   if (isArchivedSessionLifecycle(record)) return "archived";
+  // The canonical marker is itself an admission fence, even if a stale or
+  // mixed-version status scalar says "running".
+  if (record.eventIntegrityDoubt !== undefined) return "blocked";
   // Stop doubt is orthogonal to runtime liveness. A positive probe proves
   // identity/existence, not permission to resume work after an explicit stop;
   // expose a distinct active-but-non-interactive state on every runtime axis.

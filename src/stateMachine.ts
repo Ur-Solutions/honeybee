@@ -199,6 +199,18 @@ export function isActiveSessionLifecycle(record: {
 }
 
 /**
+ * Whether event-derived observation/usage may consume this record's current
+ * history. An integrity marker means the source bytes are quarantined and
+ * cannot produce new trusted state until the exact receipt is reconciled.
+ * Stop recovery still receives the full record set through its own lane.
+ */
+export function isEventHistoryObservationAdmissible(record: {
+  eventIntegrityDoubt?: unknown;
+}): boolean {
+  return record.eventIntegrityDoubt === undefined;
+}
+
+/**
  * Whether a session may accept newly launched, recovered, or adopted work.
  * Lifecycle remains cursor-first, but `kill_failed` is an independent durable
  * stop-doubt fence: until teardown is resolved, no second runtime may be

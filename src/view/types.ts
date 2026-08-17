@@ -241,6 +241,36 @@ export type BeeViewObservationFreshness = {
   sources: ObservationSourceFreshness[];
 };
 
+/**
+ * Independent HSR event-history warning. This is deliberately orthogonal to
+ * runtime stop ownership: a provider host can be proven stopped while its
+ * durable event history is still incomplete and awaiting operator review.
+ */
+export type BeeViewEventIntegrity = {
+  integrityId: string;
+  /** `unknown` means the canonical marker had no exact matching receipt. */
+  phase: "unresolved" | "acknowledged" | "unknown";
+  /** `unknown` fails closed; it never proves that the runtime stopped. */
+  stopState: "pending" | "confirmed" | "doubt" | "unknown";
+  /**
+   * Exact ambiguous-delivery authority from the receipt. Absent means the
+   * receipt itself was missing, unreadable, or did not own this runtime; it
+   * must not be interpreted as proof that zero ambiguous deliveries exist.
+   */
+  deliveryIds?: string[];
+  deliveryScanError?: string;
+  /** Terminal operator verdicts already recorded for ambiguous deliveries. */
+  deliveryVerdicts?: Record<string, "delivered" | "discarded">;
+  /** Receipt reason, or the canonical marker's fence error when receipt proof is unavailable. */
+  reason: string;
+  stopDetail?: string;
+  /** Read failure retained separately from ordinary receipt absence/mismatch. */
+  receiptReadError?: string;
+  createdAt: string;
+  updatedAt?: string;
+  evidence: BeeViewEvidence;
+};
+
 /** Explicit uncertainty attached to every projection; missing evidence never rewrites state. */
 export type BeeViewVerification = {
   unverified: boolean;
@@ -283,6 +313,8 @@ export type BeeViewV1 = {
   displayStateReason: string;
   observationFreshness: BeeViewObservationFreshness;
   verification: BeeViewVerification;
+  /** Present while an HSR event-history receipt remains canonically fenced. */
+  eventIntegrity?: BeeViewEventIntegrity;
   lastProjectedAt: string;
   compatibilityFields: BeeViewCompatibilityFields;
 };

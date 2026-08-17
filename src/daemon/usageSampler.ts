@@ -18,7 +18,7 @@ import { readHsrMeta } from "../hsr/runDir.js";
 import { LOCAL_NODE_NAME } from "../node.js";
 import { resolveSessionTranscript } from "../sessionMetadata.js";
 import type { PaneCaptureMap } from "../state.js";
-import { isActiveSessionLifecycle } from "../stateMachine.js";
+import { isActiveSessionLifecycle, isEventHistoryObservationAdmissible } from "../stateMachine.js";
 import { appendLedger, type SessionRecord } from "../store.js";
 import { readJsonl, type TranscriptRow } from "../transcripts.js";
 import { appendUsageEvent, transcriptTokenTotals, type TokenTotals, type UsageEvent } from "../usage.js";
@@ -185,7 +185,10 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
     hsrObservations?: ReadonlyMap<string, HsrObservation>,
   ): Promise<UsageTickOutcome[]> => {
     const outcomes: UsageTickOutcome[] = [];
-    const eligible = records.filter((record) => record.accountId && isActiveSessionLifecycle(record));
+    const eligible = records.filter((record) =>
+      record.accountId &&
+      isActiveSessionLifecycle(record) &&
+      isEventHistoryObservationAdmissible(record));
     const ordered = sampleBudget === undefined
       ? eligible
       : rotateAndLimit(eligible, cursor, sampleBudget);
@@ -276,7 +279,10 @@ export function createUsageSampler(deps: UsageSamplerDeps = {}): UsageSampler {
       skippedWhileInFlight += 1;
       return report;
     }
-    const eligibleCount = records.filter((record) => record.accountId && isActiveSessionLifecycle(record)).length;
+    const eligibleCount = records.filter((record) =>
+      record.accountId &&
+      isActiveSessionLifecycle(record) &&
+      isEventHistoryObservationAdmissible(record)).length;
     const processed = sampleBudget === undefined ? eligibleCount : Math.min(eligibleCount, sampleBudget);
     startedAtMs = nowMs;
     report.push({

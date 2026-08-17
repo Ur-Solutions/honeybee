@@ -537,6 +537,140 @@ test("exact mirror keeps collecting evidence while delivery stop doubt fences wo
   });
 });
 
+test("event-history receipt import detaches an exact mirror without writing its quarantined projection", async () => {
+  await withTempStore(async () => {
+    const record = beeRecord({ name: "mirror-event-history-fence" });
+    await saveSession(record);
+    let callback: ((event: unknown) => void | Promise<void>) | undefined;
+    let listCalls = 0;
+    let publishReceipt = false;
+    const lifecycle: FakeSubstrateLifecycle = { observeCalls: 0, offCalls: 0, closeCalls: 0 };
+    const substrate = fakeRemoteSubstrate(makeNode(), new Set([record.name]), lifecycle);
+    const receipt: HsrEventIntegrityReceipt = {
+      version: 1,
+      integrityId: "remote-integrity-active-entry",
+      bee: record.name,
+      host: {
+        hostPid: 8452,
+        startedAt: "2026-08-15T20:00:00.000Z",
+        hostFingerprint: { pgid: 8452, startedAt: "remote-integrity-active-host" },
+      },
+      remoteAuthority: {
+        launchId: record.remoteLaunchId!,
+        incarnation: record.remoteIncarnation!,
+      },
+      phase: "unresolved",
+      stopState: "confirmed",
+      deliveryIds: [],
+      reason: "remote source event append failed",
+      createdAt: "2026-08-15T20:00:00.000Z",
+      updatedAt: "2026-08-15T20:00:01.000Z",
+      stopDetail: "exact remote host and child group stopped",
+    };
+    substrate.listRemoteRows = async () => {
+      listCalls += 1;
+      return publishReceipt
+        ? [{
+            bee: record.name,
+            live: false,
+            state: null,
+            tier: "stream",
+            sessionId: null,
+            status: "event_integrity",
+            controlSocket: null,
+            launchId: record.remoteLaunchId,
+            incarnation: record.remoteIncarnation,
+            eventIntegrityFailure: receipt.reason,
+            eventIntegrityId: receipt.integrityId,
+            eventIntegrityStopState: receipt.stopState,
+            eventIntegrityReceipt: receipt,
+          }]
+        : [{
+            bee: record.name,
+            live: true,
+            state: null,
+            tier: "stream",
+            sessionId: null,
+            status: "running",
+            controlSocket: null,
+            launchId: record.remoteLaunchId,
+            incarnation: record.remoteIncarnation,
+          }];
+    };
+    substrate.observe = async (_bee, onEvent, _locator, options) => {
+      callback = onEvent;
+      lifecycle.observeCalls += 1;
+      await options?.afterAuthorized?.();
+      await options?.afterSynchronized?.();
+      return () => { lifecycle.offCalls += 1; };
+    };
+    const mirror = createRemoteEventMirror({
+      loadNode: async () => makeNode(),
+      createSubstrate: () => substrate,
+    });
+
+    await mirror([record]);
+    await callback!({ type: "text", ts: 1, seq: 1, text: "before-integrity-fence" });
+    assert.equal((await readHsrMeta(record.name))?.status, "running");
+    assert.equal(lifecycle.observeCalls, 1);
+
+    publishReceipt = true;
+    await mirror([record]);
+    const fenced = (await loadSession(record.name))!;
+    assert.equal(fenced.eventIntegrityDoubt?.integrityId, receipt.integrityId);
+    assert.equal((await readHsrEventIntegrityReceipt(record.name))?.integrityId, receipt.integrityId);
+    assert.equal(lifecycle.offCalls, 1, "receipt import unsubscribes the exact in-memory relay");
+    assert.equal((await readHsrMeta(record.name))?.status, "running", "event-history stop truth does not fabricate mirror-meta exit");
+
+    const projectionPaths = [
+      hsrEventsPath(record.name),
+      hsrRingPath(record.name),
+      join(hsrRunDir(record.name), "remote-events-cursor.json"),
+      join(hsrRunDir(record.name), "remote-ring-state.json"),
+      join(hsrRunDir(record.name), "meta.json"),
+    ];
+    const before = await Promise.all(projectionPaths.map((path) => readFile(path, "utf8")));
+    await assert.rejects(
+      async () => callback!({ type: "text", ts: 2, seq: 2, text: "must-not-land" }),
+      RemoteObservationDetachedError,
+    );
+    assert.deepEqual(
+      await Promise.all(projectionPaths.map((path) => readFile(path, "utf8"))),
+      before,
+      "a delayed callback cannot mutate any quarantined mirror projection file",
+    );
+
+    await mirror([fenced]);
+    assert.equal(listCalls, 2, "an already-fenced row performs no later remote list/import read");
+    assert.equal(lifecycle.observeCalls, 1, "an already-fenced row never re-subscribes");
+    assert.equal(lifecycle.offCalls, 1, "fence teardown is idempotent");
+    assert.equal((await readHsrMeta(record.name))?.status, "running", "fenced dispatch teardown still does not mark exited");
+    await mirror.close();
+  });
+});
+
+test("generic markerless kill_failed remote rows remain exactly observable", async () => {
+  await withTempStore(async () => {
+    const record = beeRecord({
+      name: "mirror-generic-stop-doubt",
+      status: "kill_failed",
+      lastError: "session still exists after kill",
+    });
+    await saveSession(record);
+    const lifecycle: FakeSubstrateLifecycle = { observeCalls: 0, offCalls: 0, closeCalls: 0 };
+    const substrate = fakeRemoteSubstrate(makeNode(), new Set([record.name]), lifecycle);
+    const mirror = createRemoteEventMirror({
+      loadNode: async () => makeNode(),
+      createSubstrate: () => substrate,
+    });
+
+    await mirror([record]);
+    assert.equal(lifecycle.observeCalls, 1, "generic stop doubt still collects exact remote evidence");
+    assert.equal((await readHsrMeta(record.name))?.status, "running");
+    await mirror.close();
+  });
+});
+
 test("event integrity supersedes delivery doubt and cannot be reopened by its reconciliation", async () => {
   await withTempStore(async () => {
     const record = beeRecord({ name: "mirror-integrity-under-delivery-doubt" });

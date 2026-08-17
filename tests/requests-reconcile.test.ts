@@ -314,6 +314,31 @@ test("a kill_failed record without a stop-failed request gets one opened by the 
   });
 });
 
+test("an event-history fence never becomes a generic stop-failed request", async () => {
+  await withTempStore(async () => {
+    const reconcile = createRequestReconciler();
+    const record = bee("integrity-fenced", {
+      status: "kill_failed",
+      runtimeGeneration: 2,
+      eventIntegrityDoubt: {
+        version: 1,
+        integrityId: "integrity-1",
+        source: { hostPid: 4242, startedAt: iso(NOW - 120_000) },
+        createdAt: iso(NOW - 90_000),
+        fenceError: "event history incomplete",
+      },
+    });
+
+    const staleQuarantinedObservation = new Map([[record.name, obsFor(PENDING_EVENTS)]]);
+    assert.deepEqual(await reconcile(input({
+      records: [record],
+      hsrObservations: staleQuarantinedObservation,
+    })), [], "quarantined needs_input evidence cannot open a request");
+    assert.deepEqual(await reconcile(input({ records: [record] })), []);
+    assert.deepEqual(await readBeeRequests(record.name), []);
+  });
+});
+
 test("a pending lazy-wake replacement fence never opens a stop-failed request", async () => {
   await withTempStore(async () => {
     const reconcile = createRequestReconciler();

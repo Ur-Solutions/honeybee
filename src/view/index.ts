@@ -15,6 +15,7 @@
 
 import { liveTargetsAcrossNodes, resolveSession, type MultiNodeLiveProbe } from "../cli/shared.js";
 import { mapWithConcurrency } from "../concurrency.js";
+import { readHsrEventIntegrityReceipt, type HsrEventIntegrityReceipt } from "../hsr/eventIntegrity.js";
 import { listNodes, LOCAL_NODE_NAME } from "../node.js";
 import { listBeesWithRequests, readBeeRequests } from "../requests/store.js";
 import { scanLatestSeal } from "../seal.js";
@@ -59,6 +60,16 @@ async function projectRecord(
     : null;
   const hiveStateOption = probe.states.get(liveTargetKey(record.node, record.tmuxTarget)) ?? probe.states.get(record.tmuxTarget);
   const observation = context.hsrObservations.get(record.name);
+  let eventIntegrityReceipt: HsrEventIntegrityReceipt | null | undefined;
+  let eventIntegrityReceiptError: string | undefined;
+  if (record.eventIntegrityDoubt) {
+    try {
+      eventIntegrityReceipt = await readHsrEventIntegrityReceipt(record.name);
+    } catch (error) {
+      eventIntegrityReceipt = null;
+      eventIntegrityReceiptError = error instanceof Error ? error.message : String(error);
+    }
+  }
   // Durable request records: reads only (view/* never writes the store). The
   // list path gates the per-bee read behind one requests-dir readdir.
   const storedRequests = options.hasStoredRequests === false ? [] : await readBeeRequests(record.name).catch(() => []);
@@ -69,6 +80,8 @@ async function projectRecord(
     ...(observation?.eventSnapshot ? { eventSnapshot: observation.eventSnapshot } : {}),
     ...(hiveStateOption !== undefined && hiveStateOption.length > 0 ? { hiveStateOption } : {}),
     ...(storedRequests.length > 0 ? { storedRequests } : {}),
+    ...(eventIntegrityReceipt !== undefined ? { eventIntegrityReceipt } : {}),
+    ...(eventIntegrityReceiptError !== undefined ? { eventIntegrityReceiptError } : {}),
     now: context.now,
   };
   return projectBeeView(sources);

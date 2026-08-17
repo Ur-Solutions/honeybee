@@ -200,6 +200,96 @@ test("HSR sampler skips historical records and never reopens their logs or trans
   assert.equal(reads, 0);
 });
 
+test("HSR sampler excludes integrity-fenced histories but retains generic stop-doubt accounting", async () => {
+  const readNames: string[] = [];
+  const sampler = createUsageSampler({
+    readHsrUsage: async (bee) => {
+      readNames.push(bee);
+      return { totals: null };
+    },
+    readTranscriptRows: async (candidate) => {
+      readNames.push(`transcript:${candidate.name}`);
+      return null;
+    },
+    sampleIntervalMs: 0,
+  });
+  const at = "2026-07-03T00:00:00.000Z";
+  const fenced = record({
+    name: "CL.fenced",
+    status: "kill_failed",
+    stateMachine: {
+      lifecycle: "active",
+      runtime: "parked",
+      work: "done",
+      revision: 1,
+      transitionedAt: at,
+      lastEventId: "fenced",
+      lastTransition: {
+        eventId: "fenced",
+        type: "runtime.parked",
+        cause: "intentional-idle-offload",
+        at,
+        evidence: [{
+          kind: "parking",
+          parkingId: "usage-fenced-parking",
+          observedAt: at,
+          policy: "idle-grace",
+          idleSince: at,
+          graceMs: 60_000,
+          runtimeGeneration: 0,
+          work: "done",
+        }],
+      },
+    },
+    eventIntegrityDoubt: {
+      version: 1,
+      integrityId: "integrity-1",
+      source: { hostPid: 4242, startedAt: at },
+      createdAt: at,
+      fenceError: "event history incomplete",
+    },
+  });
+  const generic = record({
+    name: "CL.generic-stop-doubt",
+    status: "kill_failed",
+    stateMachine: { ...fenced.stateMachine!, lastEventId: "generic", lastTransition: { ...fenced.stateMachine!.lastTransition, eventId: "generic" } },
+  });
+  const healthy = record({ name: "CL.healthy" });
+
+  await sampler([fenced, generic, healthy], new Map(), 1_000);
+
+  assert.equal(readNames.some((name) => name.includes(fenced.name)), false);
+  assert.equal(readNames.includes(generic.name), true);
+  assert.equal(readNames.includes(healthy.name), true);
+});
+
+test("detached HSR usage diagnostics exclude integrity-fenced candidates", async () => {
+  const jobs: Array<() => Promise<void>> = [];
+  const sampler = createUsageSampler({
+    detached: true,
+    startBackground: (job) => jobs.push(job),
+    readHsrUsage: async () => ({ totals: null }),
+    sampleIntervalMs: 0,
+  });
+  const fenced = record({
+    name: "CL.fenced",
+    eventIntegrityDoubt: {
+      version: 1,
+      integrityId: "integrity-1",
+      source: { hostPid: 4242, startedAt: "2026-07-03T00:00:00.000Z" },
+      createdAt: "2026-07-03T00:00:00.000Z",
+      fenceError: "event history incomplete",
+    },
+  });
+
+  const started = await sampler([fenced, record({ name: "CL.healthy" })], new Map(), 1_000);
+
+  assert.equal(started[0]?.diagnostic, "started");
+  assert.equal(started[0]?.considered, 1);
+  assert.equal(started[0]?.processed, 1);
+  await jobs.shift()!();
+});
+
 test("HSR sampler trusts absence from a supplied observation batch instead of rescanning", async () => {
   let reads = 0;
   const sampler = createUsageSampler({

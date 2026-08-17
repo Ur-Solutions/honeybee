@@ -57,7 +57,10 @@ import {
   type RemoteHsrSubstrate,
 } from "../substrates/index.js";
 import type { SessionRecord } from "../store.js";
-import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import {
+  isArchivedSessionLifecycle,
+  isEventHistoryObservationAdmissible,
+} from "../stateMachine.js";
 import {
   RemoteObservationDetachedError,
   RemoteObservationIntegrityError,
@@ -207,15 +210,27 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
     bee: string,
     entry: MirrorEntry,
     fn: (current: SessionRecord) => Promise<T>,
+    options: { destructive?: boolean } = {},
   ): Promise<T> {
     try {
       const result = await withSessionLifecycleTransactionIfPresent(entry.record, async (lifecycle) => {
-        const current = await lifecycle.refresh();
-        if (
-          !exactMirrorGeneration(current, entry)
-          || isArchivedSessionLifecycle(current)
-        ) return { owned: false } as const;
-        return { owned: true, value: await fn(current) } as const;
+        const run = async (current: SessionRecord) => {
+          if (
+            !exactMirrorGeneration(current, entry)
+            || isArchivedSessionLifecycle(current)
+            || !isEventHistoryObservationAdmissible(current)
+          ) return { owned: false } as const;
+          return { owned: true, value: await fn(current) } as const;
+        };
+        // Event callbacks mutate an independent projection, not the canonical
+        // row. Hold the short canonical record lock across those irreversible
+        // file writes anyway: an event-integrity marker either linearizes
+        // before this check (and refuses the write) or after every byte lands.
+        // No callback that began on stale in-memory admission can append after
+        // the canonical fence has committed.
+        return options.destructive
+          ? lifecycle.destructiveCommit(run)
+          : run(await lifecycle.refresh());
       });
       if (!result || !result.owned) {
         throw new RemoteObservationDetachedError(
@@ -241,6 +256,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
         let current = await lifecycle.refresh();
         if (!exactMirrorGeneration(current, entry)) return false;
         if (isArchivedSessionLifecycle(current)) return false;
+        if (!isEventHistoryObservationAdmissible(current)) return false;
         if (current.status !== "kill_failed" || current.lastError !== detail) {
           current = await lifecycle.commit({ status: "kill_failed", lastError: detail });
         }
@@ -492,7 +508,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
       // The cursor is the final durability commit. A crash before it causes
       // exact replay; event and ring bytes are already durable at that point.
       await persistMirrorCursor(bee, entry);
-    });
+    }, { destructive: true });
   }
 
   async function onEvent(bee: string, entry: MirrorEntry, raw: unknown): Promise<void> {
@@ -692,7 +708,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
                 if (cursorPlan.persistRingAfterAuthorization) await persistMirrorRingState(bee, entry);
                 await writeHsrRing(bee, entry.ring);
                 if (cursorPlan.persistAfterAuthorization) await persistMirrorCursor(bee, entry);
-              });
+              }, { destructive: true });
             } catch (error) {
               if (error instanceof RemoteObservationDetachedError) throw error;
               throw new RemoteObservationIntegrityError(
@@ -706,7 +722,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
               await withExactMirrorOwner(bee, entry, () => writeMirrorMetaUnchecked(bee, node.name, "running", {
                 remoteLaunchId: record.remoteLaunchId,
                 remoteIncarnation: record.remoteIncarnation,
-              }));
+              }), { destructive: true });
             } catch (error) {
               if (error instanceof RemoteObservationDetachedError) throw error;
               throw new RemoteObservationIntegrityError(`local mirror activation failed for ${bee}`, { cause: error });
@@ -763,7 +779,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
       await withExactMirrorOwner(bee, existing, () => writeMirrorMetaUnchecked(bee, node.name, "exited", {
         remoteLaunchId: record.remoteLaunchId,
         remoteIncarnation: record.remoteIncarnation,
-      }));
+      }), { destructive: true });
       return;
     }
 
@@ -831,7 +847,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
         if (cursorPlan.persistRingAfterAuthorization) await persistMirrorRingState(bee, entry);
         await writeHsrRing(bee, entry.ring);
         if (cursorPlan.persistAfterAuthorization) await persistMirrorCursor(bee, entry);
-      });
+      }, { destructive: true });
       await substrate.replayTerminalEvents(
         bee,
         (event) => onEvent(bee, entry, event),
@@ -840,7 +856,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
         () => withExactMirrorOwner(bee, entry, () => writeMirrorMetaUnchecked(bee, node.name, "exited", {
           remoteLaunchId: record.remoteLaunchId,
           remoteIncarnation: record.remoteIncarnation,
-        })),
+        }), { destructive: true }),
       );
     } finally {
       if (mirrors.get(bee) === entry) mirrors.delete(bee);
@@ -863,6 +879,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
           remoteLaunchId: entry.remoteLaunchId,
           remoteIncarnation: entry.remoteIncarnation,
         }),
+        { destructive: true },
       ).catch(() => undefined);
     }
   }
@@ -881,11 +898,26 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
   }
 
   const dispatch: RemoteEventMirrorDispatcher = Object.assign(async (records: SessionRecord[]): Promise<void> => {
+    // A canonical event-history marker quarantines the exact source. Drop any
+    // in-memory relay without publishing an `exited` mirror fact: the outside
+    // receipt, not this derived cache, owns stop truth. The callback boundary
+    // independently rechecks the marker under the record lock, so a relay
+    // racing this tick cannot append after the fence.
+    const integrityFenced = new Set(
+      records
+        .filter((record) => remoteNodeName(record) && !isEventHistoryObservationAdmissible(record))
+        .map((record) => record.name),
+    );
+    for (const bee of integrityFenced) {
+      const active = mirrors.get(bee);
+      if (active) await teardown(bee, active, { markExited: false });
+    }
+
     // Group the remote-hsr records by node so we call listSessions once per node.
     const byNode = new Map<string, SessionRecord[]>();
     for (const record of records) {
       const node = remoteNodeName(record);
-      if (!node) continue;
+      if (!node || !isEventHistoryObservationAdmissible(record)) continue;
       const list = byNode.get(node);
       if (list) list.push(record);
       else byNode.set(node, [record]);
@@ -1000,7 +1032,7 @@ export function createRemoteEventMirror(deps: RemoteEventMirrorDeps = {}): Remot
             await fenceMirrorIntegrity(record.name, probe, `remote event-integrity import failed: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
           }
           const active = mirrors.get(record.name);
-          if (active) await teardown(record.name, active, { markExited: true });
+          if (active) await teardown(record.name, active, { markExited: false });
           continue;
         }
         if (exactRow?.live) {

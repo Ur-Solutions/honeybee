@@ -331,6 +331,77 @@ test("tick HSR observation eligibility obeys canonical lifecycle despite stale s
   });
 });
 
+test("tick excludes integrity-fenced histories while preserving generic stop recovery", async () => {
+  await withTempStore(async () => {
+    const at = "2026-06-03T09:59:00.000Z";
+    const healthy = bee({
+      name: "healthy-hsr",
+      tmuxTarget: "healthy-hsr",
+      substrate: "hsr",
+      stateMachine: lifecycleCursor("healthy-hsr", "active", at),
+    });
+    const genericStopDoubt = bee({
+      name: "generic-stop-doubt",
+      tmuxTarget: "generic-stop-doubt",
+      substrate: "hsr",
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("generic-stop-doubt", "active", at),
+    });
+    const integrityFenced = bee({
+      name: "integrity-fenced",
+      tmuxTarget: "integrity-fenced",
+      substrate: "hsr",
+      status: "kill_failed",
+      stateMachine: lifecycleCursor("integrity-fenced", "active", at),
+      eventIntegrityDoubt: {
+        version: 1,
+        integrityId: "integrity-1",
+        source: { hostPid: 4242, startedAt: at },
+        createdAt: at,
+        fenceError: "event history incomplete",
+      },
+    });
+    const records = [healthy, genericStopDoubt, integrityFenced];
+    const capture: Capture = { ledger: [], touches: [] };
+    const deps = buildDeps({ records, liveTargets: new Set(), capture });
+    const observedBatches: string[][] = [];
+    deps.hsrObservations = async (beeNames) => {
+      observedBatches.push([...beeNames]);
+      return new Map([
+        [healthy.name, { live: true, state: "active", snapshot: "working" }],
+        [genericStopDoubt.name, { live: false, state: "kill_failed", snapshot: "" }],
+      ]);
+    };
+    const refreshed: string[] = [];
+    deps.refreshTranscriptMetadata = async (record) => {
+      refreshed.push(record.name);
+      return record;
+    };
+    let requestUnavailable: ReadonlySet<string> | undefined;
+    deps.reconcileRequests = async ({ hsrUnavailable }) => {
+      requestUnavailable = hsrUnavailable;
+      return [];
+    };
+    let stopRecoveryNames: string[] = [];
+    deps.dispatchHsrStopRecovery = async (candidates) => {
+      stopRecoveryNames = candidates.map((record) => record.name);
+      return [];
+    };
+
+    await tick(deps, new Map([
+      [healthy.name, "active"],
+      [genericStopDoubt.name, "kill_failed"],
+      [integrityFenced.name, "kill_failed"],
+    ]), { firstTick: false });
+
+    assert.deepEqual(observedBatches, [[healthy.name, genericStopDoubt.name]]);
+    assert.equal(requestUnavailable?.has(integrityFenced.name), true);
+    assert.equal(capture.touches.some((touch) => touch.name === integrityFenced.name), false);
+    assert.equal(refreshed.includes(integrityFenced.name), false);
+    assert.deepEqual(stopRecoveryNames, records.map((record) => record.name));
+  });
+});
+
 test("tick: 1,200-record HSR fleet excludes sealed bees from the observer batch", async () => {
   await withTempStore(async () => {
     const records = Array.from({ length: 1_200 }, (_, index) => bee({

@@ -3,7 +3,13 @@ import type { NodeRecord } from "../node.js";
 import type { HsrObservation } from "../hsr/observe.js";
 import { deriveState, isTerminalState, liveTargetKey, parseBeeState, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
 import { shouldPersistObservationHeartbeat, type SessionRecord } from "../store.js";
-import { isActiveSessionLifecycle, isArchivedSessionLifecycle, isRunnableSessionRecord, type ProbeEvidence } from "../stateMachine.js";
+import {
+  isActiveSessionLifecycle,
+  isArchivedSessionLifecycle,
+  isEventHistoryObservationAdmissible,
+  isRunnableSessionRecord,
+  type ProbeEvidence,
+} from "../stateMachine.js";
 import type { AutoTitleOutcome } from "./autoTitle.js";
 import type { AuthRecoveryOutcome } from "./authRecovery.js";
 import type { RotationResumeOutcome } from "./rotationResume.js";
@@ -1087,13 +1093,15 @@ export async function tick(
   // every tick (hundreds in a busy hive), including exited bees whose events
   // can no longer affect state.
   const remoteHsrNodes = new Set(nodes.filter((node) => node.kind === "remote-hsr").map((node) => node.name));
-  const hsrBeeNames = records
+  const hsrCandidates = records
     .filter((record) => isActiveSessionLifecycle(record) && (
       record.stateMachine !== undefined ||
       (record.lastObservedState !== "done" && record.lastObservedState !== "sealed")
     ) && !seals.has(record.name) && (
       record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
-    ))
+    ));
+  const hsrBeeNames = hsrCandidates
+    .filter(isEventHistoryObservationAdmissible)
     .map((record) => record.name);
 
   // A failed observation batch is UNKNOWN, not an authoritative empty result.
@@ -1101,7 +1109,15 @@ export async function tick(
   // fabricated terminal state. This is deliberately separate from a successful
   // empty map, which really does mean the requested run dirs are gone.
   let hsrObs = new Map<string, HsrObservation>();
-  const hsrUnavailable = new Set<string>();
+  // Integrity-fenced histories are deliberately excluded from the observer
+  // child. Mark them unavailable for this tick so every downstream consumer
+  // holds state and performs zero event-derived writes. The independent stop
+  // recovery lane still receives the complete records snapshot.
+  const hsrUnavailable = new Set(
+    hsrCandidates
+      .filter((record) => !isEventHistoryObservationAdmissible(record))
+      .map((record) => record.name),
+  );
   if (hsrBeeNames.length > 0) {
     if (deps.hsrObservations) {
       try {

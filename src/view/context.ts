@@ -26,7 +26,7 @@ import { hsrObservations as hsrObservationsImpl, type HsrObservation } from "../
 import { listNodes as listNodesImpl, type NodeRecord } from "../node.js";
 import { sealedBeeNames as sealedBeeNamesImpl } from "../seal.js";
 import { liveTargetKey, parseBeeState, type BeeState, type PaneCaptureMap, type StateContext } from "../state.js";
-import { isArchivedSessionLifecycle } from "../stateMachine.js";
+import { isArchivedSessionLifecycle, isEventHistoryObservationAdmissible } from "../stateMachine.js";
 import type { SessionRecord } from "../store.js";
 import { localSubstrate, substrateFor } from "../substrates/index.js";
 
@@ -101,12 +101,11 @@ export async function capturePanesForRecords(records: SessionRecord[], liveTarge
  * events may be locally mirrored). Filed records short-circuit in deriveState
  * and their run dirs are historical.
  */
-function hsrCandidateNames(records: readonly SessionRecord[], remoteHsrNodes: ReadonlySet<string>): string[] {
+function hsrCandidateRecords(records: readonly SessionRecord[], remoteHsrNodes: ReadonlySet<string>): SessionRecord[] {
   return records
     .filter((record) => !isArchivedSessionLifecycle(record) && (
       record.substrate === "hsr" || (record.node !== undefined && remoteHsrNodes.has(record.node))
-    ))
-    .map((record) => record.name);
+    ));
 }
 
 /**
@@ -135,13 +134,23 @@ export async function assembleStateContext(
   ]);
 
   const remoteHsrNodes = new Set(nodes.filter((node) => node.kind === "remote-hsr").map((node) => node.name));
-  const candidates = hsrCandidateNames(records, remoteHsrNodes);
+  const candidateRecords = hsrCandidateRecords(records, remoteHsrNodes);
+  const candidates = candidateRecords
+    .filter(isEventHistoryObservationAdmissible)
+    .map((record) => record.name);
 
   // A failed observation batch is UNKNOWN, not an authoritative empty result:
   // mark every candidate held instead of letting absence read as death. A
   // successful empty map really does mean the requested run dirs are gone.
   let hsrObs = new Map<string, HsrObservation>();
-  const hsrUnavailable = new Set<string>();
+  // A canonical event-integrity marker quarantines its source bytes. Hold that
+  // bee without asking the observer to reopen the run dir; the outside receipt
+  // is gathered independently by view/index.ts.
+  const hsrUnavailable = new Set(
+    candidateRecords
+      .filter((record) => !isEventHistoryObservationAdmissible(record))
+      .map((record) => record.name),
+  );
   if (candidates.length > 0) {
     try {
       hsrObs = await observeHsr({ includeEvents: options.includeEvents === true, bees: candidates });
@@ -154,15 +163,22 @@ export async function assembleStateContext(
   const hsrStates = new Map<string, BeeState>();
   const hsrSnapshots = new Map<string, string>();
   const hsrMirrors = new Set<string>();
+  const trustedHsrObservations = new Map<string, HsrObservation>();
   const recordsByName = new Map(records.map((record) => [record.name, record]));
+  const requestedCandidates = new Set(candidates);
   for (const [bee, observation] of hsrObs) {
     const record = recordsByName.get(bee);
-    if (!record) continue;
+    if (!record || !requestedCandidates.has(bee) || !isEventHistoryObservationAdmissible(record)) continue;
+    if (observation.unavailable) {
+      hsrUnavailable.add(bee);
+      continue;
+    }
     // The same trust rule the daemon applies: a local-hsr record never trusts
     // a mirror row, and a mirror row only speaks for the record whose node it
     // mirrors (APIA-94).
     const trustSource = trustedHsrObservationSource(record, observation, remoteHsrNodes);
     if (!trustSource) continue;
+    trustedHsrObservations.set(bee, observation);
     if (observation.live) hsrLive.add(bee);
     if (observation.state) hsrStates.set(bee, observation.state);
     hsrSnapshots.set(bee, observation.snapshot);
@@ -192,6 +208,6 @@ export async function assembleStateContext(
     hsrMirrors,
     hsrUnavailable,
     now,
-    hsrObservations: hsrObs,
+    hsrObservations: trustedHsrObservations,
   };
 }
