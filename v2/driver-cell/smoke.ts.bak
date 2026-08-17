@@ -129,7 +129,7 @@ function harnessSpec(): SpawnSpec {
   if (harness === "claude") {
     return {
       adapter: claudeAdapter,
-      command: process.env.HIVE_SMOKE_CLAUDE_BIN ?? "claude",
+      command: "claude",
       args: [
         "-p",
         // Headless cells NEED the bypass: -p mode auto-denies every write
@@ -357,7 +357,7 @@ try {
     section("turn 1 — agent writes a file inside the cell");
     events.length = 0;
     const prompt = real
-      ? "Create a file named SMOKE_CELL.txt containing exactly CELL_OK, then reply with exactly DONE"
+      ? (process.env.HIVE_SMOKE_NOTOOL ? "Reply with exactly DONE" : "Create a file named SMOKE_CELL.txt containing exactly CELL_OK, then reply with exactly DONE")
       : "@sh printf 'CELL_OK' > SMOKE_CELL.txt";
     const d1 = await deliverRetrying(1, prompt, TURN_TIMEOUT);
     check(WRITE_CHECKS[0] as string, d1.accepted, d1.reason ?? "");
