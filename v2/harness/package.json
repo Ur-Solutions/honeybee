@@ -1,0 +1,22 @@
+{
+  "name": "@honeybee/harness-v2",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Honeybee reset WP2: invariant harness (sim driver, sim daemon, fault injector, invariant checker). Spec: docs/design/specs/reset-02-harness.md",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "node --test \"tests/*.test.ts\"",
+    "test:long": "HARNESS_PROFILE=long node --test \"tests/*.test.ts\""
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "25.7.0",
+    "typescript": "6.0.3"
+  }
+}
