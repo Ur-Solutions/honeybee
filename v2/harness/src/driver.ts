@@ -49,6 +49,12 @@ export interface DeliverOutcome {
   accepted: boolean;
   /** Why the runtime did not accept; the mailbox stays durable truth and the daemon retries. */
   reason?: "no_process" | "not_ready";
+  /**
+   * Optional machine-readable refinement of `reason` (e.g. the tmux driver's
+   * "multiline_type_mode": a typed-delivery harness cannot take a multiline
+   * body — the daemon may route it for paste delivery later).
+   */
+  detail?: string;
 }
 
 /** A live runtime process, identified for boot re-adoption by pid + start time. */

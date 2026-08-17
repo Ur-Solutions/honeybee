@@ -50,8 +50,13 @@ export interface TmuxRig {
   dir: string;
   socketPath: string;
   driver: TmuxDriver;
-  /** Per-bee style + extra env (set before start()). */
-  configure: (beeId: string, style: StubStyle, env?: Record<string, string>) => void;
+  /** Per-bee style + extra env + delivery mode (set before start()). */
+  configure: (
+    beeId: string,
+    style: StubStyle,
+    env?: Record<string, string>,
+    deliveryMode?: "paste" | "type",
+  ) => void;
   transcriptDirOf: (beeId: string) => string;
   makeSiblingDriver: () => TmuxDriver;
   cleanup: () => void;
@@ -60,7 +65,10 @@ export interface TmuxRig {
 export function makeRig(): TmuxRig {
   const dir = mkdtempSync(join(tmpdir(), "hbtmx-"));
   const socketPath = join(dir, "tmux.sock");
-  const styles = new Map<string, { style: StubStyle; env: Record<string, string> }>();
+  const styles = new Map<
+    string,
+    { style: StubStyle; env: Record<string, string>; deliveryMode?: "paste" | "type" }
+  >();
   const transcriptDirOf = (beeId: string): string => join(dir, "tx", beeId);
   const resolve = (beeId: string): TmuxSpawnSpec => {
     const cfg = styles.get(beeId) ?? { style: "transcript" as StubStyle, env: {} };
@@ -74,6 +82,7 @@ export function makeRig(): TmuxRig {
         TMUX_STUB_TURN_MS: "40",
         ...cfg.env,
       },
+      ...(cfg.deliveryMode ? { deliveryMode: cfg.deliveryMode } : {}),
       observation: observationFor(cfg.style, transcriptDirOf(beeId)),
     };
   };
@@ -90,7 +99,8 @@ export function makeRig(): TmuxRig {
     dir,
     socketPath,
     driver,
-    configure: (beeId, style, env = {}) => styles.set(beeId, { style, env }),
+    configure: (beeId, style, env = {}, deliveryMode) =>
+      styles.set(beeId, { style, env, ...(deliveryMode ? { deliveryMode } : {}) }),
     transcriptDirOf,
     makeSiblingDriver: makeDriver,
     cleanup: () => {

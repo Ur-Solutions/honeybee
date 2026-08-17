@@ -17,10 +17,18 @@
  *    expected to be needed by zero harnesses. All sources fold into one
  *    phase machine, so hooks-based, notify-based and transcript-only
  *    harnesses produce IDENTICAL automation outcomes (the spec05.eq matrix).
- *  - Deliver (point 3): paste-buffer + Enter, assume-best; the observer
- *    validates (turn start within grace); an unconfirmed delivery carries a
- *    visible retryable NOTE (observeDeliveryNotes) — never a fence, never a
- *    state.
+ *  - Deliver (point 3): VALIDATED injection, then Enter. Text goes in via
+ *    paste-buffer (default) or literal typed chunks (`deliveryMode: "type"`,
+ *    for TUIs that ignore the tmux paste buffer entirely — grok, verified
+ *    live 2026-08-17). Before Enter is ever pressed the driver captures the
+ *    pane and verifies the body's tail is actually visible (echo-verify);
+ *    on mismatch it clears the input line and reinjects once by typing (which
+ *    demonstrably lands where paste doesn't). Only verified input is
+ *    submitted — a still-mismatched injection is never Entered and surfaces
+ *    an IMMEDIATE `echo_mismatch` unconfirmed note. On top of that the
+ *    observer validates the turn itself (turn start within grace); an
+ *    unconfirmed delivery carries a visible retryable NOTE
+ *    (observeDeliveryNotes) — never a fence, never a state.
  *  - Stop/adopt (point 1): exact-pid TERM→KILL; snapshotLive() from recorded
  *    identities; after a daemon restart adopt() re-binds the surviving
  *    session by verified pid and re-attaches observers at EOF — the runtime
@@ -64,6 +72,18 @@ export interface TmuxSpawnSpec {
   args: string[];
   cwd: string;
   env?: Record<string, string>;
+  /**
+   * How message bodies are injected into the pane (spec 05 point 3):
+   *  - "paste" (default): tmux load-buffer + paste-buffer — fast and
+   *    multiline-safe.
+   *  - "type": literal send-keys chunks with keystroke pacing, for TUIs that
+   *    take NOTHING from the tmux paste buffer (grok, verified live
+   *    2026-08-17). Single-line bodies only: a literal newline would submit
+   *    mid-body, so multiline bodies are refused `not_ready` with detail
+   *    "multiline_type_mode" — the daemon can route/paste them later.
+   * Both modes echo-verify before submitting (see deliver()).
+   */
+  deliveryMode?: "paste" | "type";
   observation: ObservationSpec;
 }
 
@@ -100,6 +120,7 @@ interface TmuxRuntime {
   generation: number;
   sessionName: string;
   paneId: string;
+  deliveryMode: "paste" | "type";
   pid: number;
   pidStartedAt: number;
   spawnedAt: number;
@@ -126,6 +147,50 @@ interface TmuxRuntime {
 
 const BIND_SCAN_INTERVAL_MS = 50;
 const PANE_POLL_INTERVAL_MS = 150;
+
+// Delivery injection tuning (spec 05 point 3, live-calibrated 2026-08-17):
+// type mode pre-delays so a TUI's input handler is actually listening (grok
+// ate the first ~2 chars of an immediate send-keys burst), then sends small
+// literal chunks with keystroke pacing. Echo-verify polls the pane for the
+// body's tail before Enter is ever pressed.
+const TYPE_PRE_DELAY_MS = 300;
+const TYPE_CHUNK_CHARS = 8;
+const TYPE_CHUNK_GAP_MS = 50;
+const ECHO_TAIL_CHARS = 24;
+const ECHO_VERIFY_TIMEOUT_MS = 2_000;
+const ECHO_VERIFY_POLL_MS = 100;
+
+/** Synchronous sleep — the driver is fully synchronous (spawnSync tmux). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Normalize pane text for echo matching: drop all whitespace (TUI input
+ * boxes wrap and trim) and common box-drawing glyphs (borders can interpose
+ * where a wrapped line breaks). Applied to both haystack and needle.
+ */
+function normalizeEcho(s: string): string {
+  return s.replace(/[\s─│╭╮╰╯┌┐└┘┃━]/g, "");
+}
+
+/** The body's verification tail: last N chars of the normalized body. */
+function echoTail(body: string): string | null {
+  const norm = normalizeEcho(body);
+  if (norm.length === 0) return null;
+  return norm.slice(-ECHO_TAIL_CHARS);
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (needle.length === 0) return 0;
+  let count = 0;
+  let idx = haystack.indexOf(needle);
+  while (idx !== -1) {
+    count += 1;
+    idx = haystack.indexOf(needle, idx + 1);
+  }
+  return count;
+}
 
 function sessionNameFor(beeId: string, generation: number): string {
   const safe = beeId.replace(/[^a-zA-Z0-9_-]+/g, "-");
@@ -248,24 +313,118 @@ export class TmuxDriver implements RuntimeDriver {
     const p = this.procs.get(beeId);
     if (!p || p.generation !== generation || p.exited) return { accepted: false, reason: "no_process" };
     if (p.stopCause != null) return { accepted: false, reason: "not_ready" };
-    const buf = `hive-v2-deliver-${this.deliverSeq++}`;
+    if (p.deliveryMode === "type" && body.includes("\n")) {
+      // Typed delivery cannot carry newlines — each would submit mid-body.
+      // Typed refusal reason: the daemon can route this body for paste
+      // delivery (or split it) later; the mailbox record stays durable truth.
+      return { accepted: false, reason: "not_ready", detail: "multiline_type_mode" };
+    }
+    // Validated injection (spec point 3, hardened 2026-08-17): inject, then
+    // PROVE the text reached the input line before Enter is ever pressed.
+    // Live evidence this guards: grok takes nothing from the paste buffer
+    // and eats the first keystrokes of an unpaced burst; codex silently
+    // swallows a paste during its post-turn redraw.
+    const tail = echoTail(body);
+    const before = tail == null ? 0 : this.countTailInPane(p, tail);
     try {
-      // Paste + submit (spec point 3): load-buffer avoids send-keys key
-      // interpretation of the body; Enter submits.
-      this.server.run(["load-buffer", "-b", buf, "-"], { input: body });
-      this.server.run(["paste-buffer", "-d", "-b", buf, "-t", p.paneId]);
-      this.server.run(["send-keys", "-t", p.paneId, "Enter"]);
+      this.inject(p, body, p.deliveryMode);
     } catch {
-      this.server.try(["delete-buffer", "-b", buf]);
       return { accepted: false, reason: "no_process" };
     }
-    // Assume-best: the mailbox record is durable truth; the observer
-    // validates and an unconfirmed delivery surfaces as a visible note.
+    let verified = tail == null ? true : this.verifyEcho(p, tail, before);
+    if (!verified && tail != null) {
+      // One reinjection: clear the input line, re-send by TYPING (paced
+      // literal chunks demonstrably land where paste doesn't), verify again.
+      // Multiline bodies cannot be typed, so they re-paste.
+      this.server.try(["send-keys", "-t", p.paneId, "C-u"]);
+      const retryMode: "paste" | "type" = body.includes("\n") ? "paste" : "type";
+      const beforeRetry = this.countTailInPane(p, tail);
+      try {
+        this.inject(p, body, retryMode);
+        verified = this.verifyEcho(p, tail, beforeRetry);
+      } catch {
+        verified = false;
+      }
+    }
+    if (!verified) {
+      // Honest failure: NEVER submit unverified input. Clear the residue and
+      // surface the retryable unconfirmed note IMMEDIATELY (reason
+      // echo_mismatch) — same contract as a grace-elapsed unconfirmed
+      // delivery, without waiting for a grace the driver already knows
+      // cannot be met. The mailbox record stays durable truth; the daemon's
+      // note-driven re-deliver owns the retry.
+      this.server.try(["send-keys", "-t", p.paneId, "C-u"]);
+      this.consumed.set(messageId, generation);
+      this.notes.push({
+        beeId,
+        generation,
+        messageId,
+        kind: "unconfirmed",
+        detail: `echo_mismatch: injected text for message ${messageId} never appeared in the input line (mode ${p.deliveryMode}, one typed reinjection attempted) — not submitted; retry available`,
+        at: this.now(),
+      });
+      return { accepted: true };
+    }
+    try {
+      this.server.run(["send-keys", "-t", p.paneId, "Enter"]);
+    } catch {
+      return { accepted: false, reason: "no_process" };
+    }
+    // Echo-verify proved the INJECTION; the observer still proves the TURN.
+    // The mailbox record is durable truth; an unconfirmed turn within grace
+    // surfaces as a visible note.
     this.consumed.set(messageId, generation);
     if (p.phase === "idle") {
       p.pendingConfirms.push({ messageId, deadline: this.now() + p.deliveryGraceMs });
     }
     return { accepted: true };
+  }
+
+  /** Put `body` into the pane's input line (no submit). Throws on tmux failure. */
+  private inject(p: TmuxRuntime, body: string, mode: "paste" | "type"): void {
+    if (mode === "type") {
+      // Let the TUI's input handler catch up before the first keystroke
+      // (grok ate the first ~2 chars of an immediate burst, verified live).
+      sleepSync(TYPE_PRE_DELAY_MS);
+      for (let i = 0; i < body.length; i += TYPE_CHUNK_CHARS) {
+        if (i > 0) sleepSync(TYPE_CHUNK_GAP_MS);
+        const chunk = body.slice(i, i + TYPE_CHUNK_CHARS);
+        // `--` ends option parsing (chunks may start with "-"); a bare ";"
+        // would otherwise be tmux's command separator.
+        this.server.run(["send-keys", "-l", "-t", p.paneId, "--", chunk === ";" ? "\\;" : chunk]);
+      }
+      return;
+    }
+    const buf = `hive-v2-deliver-${this.deliverSeq++}`;
+    try {
+      // load-buffer avoids send-keys key interpretation of the body.
+      this.server.run(["load-buffer", "-b", buf, "-"], { input: body });
+      this.server.run(["paste-buffer", "-d", "-b", buf, "-t", p.paneId]);
+    } catch (err) {
+      this.server.try(["delete-buffer", "-b", buf]);
+      throw err;
+    }
+  }
+
+  private countTailInPane(p: TmuxRuntime, tail: string): number {
+    const res = this.server.try(["capture-pane", "-p", "-t", p.paneId]);
+    if (res.status !== 0) return 0;
+    return countOccurrences(normalizeEcho(res.stdout), tail);
+  }
+
+  /**
+   * Echo verification: poll the pane until the tail's occurrence count rises
+   * above the pre-injection count (count-based so re-delivering the SAME
+   * body is not false-confirmed by scrollback). Wall-clock, not cfg.now —
+   * this races a real terminal.
+   */
+  private verifyEcho(p: TmuxRuntime, tail: string, before: number): boolean {
+    const deadline = Date.now() + ECHO_VERIFY_TIMEOUT_MS;
+    for (;;) {
+      if (this.countTailInPane(p, tail) > before) return true;
+      if (Date.now() >= deadline) return false;
+      sleepSync(ECHO_VERIFY_POLL_MS);
+    }
   }
 
   stop(beeId: string, generation: number, cause: StopCause): { hadProcess: boolean } {
@@ -455,6 +614,7 @@ export class TmuxDriver implements RuntimeDriver {
       generation: init.generation,
       sessionName: init.sessionName,
       paneId: init.paneId,
+      deliveryMode: init.spec.deliveryMode ?? "paste",
       pid: init.pid,
       pidStartedAt: init.pidStartedAt,
       spawnedAt: init.spawnedAt,
