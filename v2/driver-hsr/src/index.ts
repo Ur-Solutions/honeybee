@@ -8,3 +8,4 @@ export {
   type HsrDriverConfig,
   type SpawnSpec,
 } from "./driver.ts";
+export { parseEtimeMs, pidAlive, processStartTimeMs, verifyProcessIdentity } from "./psutil.ts";

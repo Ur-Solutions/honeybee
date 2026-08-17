@@ -59,6 +59,30 @@ export { assertSingleBeeInvocation } from "./commands/run.js";
 export { resolvePromptArg } from "./commands/loop.js";
 
 async function main(argv: string[]) {
+  if (argv[0] === "v2") {
+    // Reset WP4: route `hive v2 …` into the v2 stack (v2/cli). Additive
+    // routing only — every other path is untouched. The compiled build ships
+    // the v2 CLI as the dist/v2/cli.js bundle (scripts/build-v2-artifact.mjs);
+    // running from source (tsx) falls back to the v2 TypeScript entry.
+    const candidates = [
+      new URL("./v2/cli.js", import.meta.url).href,
+      new URL("../v2/cli/src/main.ts", import.meta.url).href,
+    ];
+    let v2: { runV2Cli(args: string[]): Promise<number> } | null = null;
+    for (const spec of candidates) {
+      try {
+        v2 = (await import(spec)) as { runV2Cli(args: string[]): Promise<number> };
+        break;
+      } catch (err) {
+        if ((err as { code?: string }).code !== "ERR_MODULE_NOT_FOUND") throw err;
+      }
+    }
+    if (!v2) {
+      throw new Error("hive v2: missing v2 CLI artifact (dist/v2/cli.js) — rebuild with `npm run build`");
+    }
+    process.exitCode = await v2.runV2Cli(argv.slice(1));
+    return;
+  }
   if (argv[0] === "__complete") {
     const candidates = await getCompletions(argv.slice(1));
     for (const line of candidates) console.log(line);

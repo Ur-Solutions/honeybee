@@ -1,0 +1,556 @@
+/**
+ * DaemonCore — the daemon's loop cores (WP4 of the reset), extracted from the
+ * WP2 SimDaemon so one implementation serves both worlds:
+ *
+ *  - the invariant harness (`v2:harness`, `v2:harness:real`) drives this exact
+ *    code under a virtual clock / fault injector via the SimDaemon wrapper
+ *    (v2/harness/src/daemon.ts), so every WP2 invariant keeps proving the
+ *    production loops;
+ *  - the real daemon (daemon.ts) drives it over wall time with the HsrDriver.
+ *
+ * Responsibilities per step (spec 04 "Daemon behavior" 1, 3, 4, 5):
+ *  1. drain driver observations into the store's four-state model
+ *  2. flag policy: apply adapter condition-flag evidence (contrary-evidence
+ *     clearing per spec 03 — every setter has a clearer)
+ *  3. hang policy: stop runtimes stuck in booting/running past their timeout
+ *  4. scale-to-zero: stop(stopped_by_system) idle runtimes past the idle
+ *     window (Q4 ruling; revive-on-message undoes it)
+ *  5. degraded-runtime policy: a re-adopted runtime has no event stream or
+ *     stdin (pipes died with the previous daemon process); when mail arrives
+ *     for one, stop it so revive-on-message hands the mailbox to a fresh
+ *     generation — delivery stays bounded, I1 holds
+ *  6. execute queued commands (claim → effect via driver → settle,
+ *     generation-fenced, idempotent)
+ *  7. delivery loop: push undelivered mailbox messages into live runtimes
+ *  8. I1 telemetry: record undelivered-past-deadline messages as structured
+ *     violations (spec 04 behavior 5 — the 99.99% counter)
+ *
+ * Boot sequence (after every store reopen): reconcileAtBoot with the driver's
+ * live pids, reap orphan processes the store no longer recognizes, and sweep
+ * the mailbox for bees that need a send_wake. Crash anywhere is safe: the
+ * mailbox and command queue are durable, and every effect is idempotent.
+ */
+import {
+  CoreError,
+  RUNTIME_TRANSITIONS,
+  type CommandRow,
+  type CoreStore,
+  type RuntimeState,
+} from "../../core/src/index.ts";
+import type { DriverObservation, RuntimeDriver, StopCause } from "../../harness/src/driver.ts";
+
+/** Where the (injected) executor-crash fault hits, if it does. */
+export type ExecutorCrashPoint = "none" | "before_effect" | "after_effect";
+
+export interface DaemonPolicy {
+  /** Stop a runtime stuck in `booting` longer than this many steps (ms for the real daemon). */
+  bootHangTimeoutSteps: number;
+  /** Stop a runtime stuck in `running` longer than this many steps (ms for the real daemon). */
+  turnHangTimeoutSteps: number;
+  /** Max commands executed per step (executor loop budget). */
+  commandsPerStep: number;
+  /**
+   * Scale-to-zero (spec 04 behavior 3): stop(stopped_by_system) an idle
+   * runtime after this window. Omitted/null = disabled (the harness default —
+   * the sim proves the loops; the timer is daemon policy).
+   */
+  idleWindowSteps?: number | null;
+  /**
+   * I1 telemetry (spec 04 behavior 5): per pending mailbox position, the
+   * delivery deadline in steps/ms. Omitted/null = telemetry off. The real
+   * daemon computes this policy-aware (≥ hang timeout + boot + turn
+   * allowances — the WP2 finding).
+   */
+  i1DeadlineSteps?: number | null;
+}
+
+/** Injected fault hooks (the harness's FaultInjector; absent in production). */
+export interface FaultHooks {
+  executorCrash(): ExecutorCrashPoint;
+  driverTimeout(): boolean;
+}
+
+/**
+ * Thrown when the fault injector kills the executor mid-command. The claimed
+ * command row stays `running`; boot replay (B5) requeues and re-executes it.
+ */
+export class ExecutorCrashError extends Error {
+  readonly point: ExecutorCrashPoint;
+
+  constructor(point: ExecutorCrashPoint) {
+    super(`executor crash (${point})`);
+    this.name = "ExecutorCrashError";
+    this.point = point;
+  }
+}
+
+export interface BootReport {
+  adopted: number;
+  stoppedByReconcile: number;
+  requeuedCommands: number;
+  orphansReaped: number;
+  wakesEnqueued: number;
+}
+
+/** Condition-flag evidence, structurally matching HsrDriver's FlagEvidence. */
+export interface FlagEvidenceLike {
+  beeId: string;
+  generation: number;
+  flag: "auth_needed" | "resource_blocked" | "spawn_failed";
+  action: "set" | "clear";
+  detail: string;
+}
+
+/**
+ * Optional driver capabilities beyond the WP2 RuntimeDriver contract. All are
+ * duck-typed: the SimDriver has none of them and the loops stay byte-for-byte
+ * compatible with the WP2 harness behavior when they are absent.
+ */
+interface ExtendedDriver {
+  /** Drain adapter flag evidence (HsrDriver.observeEvidence). */
+  observeEvidence?(): FlagEvidenceLike[];
+  /** Process identity captured at spawn (HsrDriver.procOf) — the WP2 pid-at-spawn amendment. */
+  procOf?(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null;
+  /** Whether (bee, generation) is a re-adopted degraded process (no event stream). */
+  isDegraded?(beeId: string, generation: number): boolean;
+}
+
+/** One I1 deadline breach, shaped like the harness violation ledger. */
+export interface I1ViolationEvent {
+  detectedAt: number;
+  beeId: string;
+  messageId: number;
+  enqueuedAt: number;
+  deadline: number;
+  detail: string;
+}
+
+export interface DaemonCoreOptions {
+  store: CoreStore;
+  driver: RuntimeDriver;
+  policy: DaemonPolicy;
+  now: () => number;
+  log: (op: string) => void;
+  faults?: FaultHooks;
+  /** Recorder for I1 deadline breaches (the real daemon's i1_violations table). */
+  onI1Violation?: (violation: I1ViolationEvent) => void;
+  /** Q1 (spec 01): delete removes the session log file; core does no file I/O, the daemon does. */
+  removeSessionLog?: (path: string) => void;
+}
+
+const LIVE: readonly RuntimeState[] = ["booting", "running", "idle"];
+
+export class DaemonCore {
+  protected readonly store: CoreStore;
+  protected readonly driver: RuntimeDriver;
+  protected readonly policy: DaemonPolicy;
+  protected readonly now: () => number;
+  protected readonly log: (op: string) => void;
+  private readonly faults: FaultHooks | null;
+  private readonly onI1Violation: ((violation: I1ViolationEvent) => void) | null;
+  private readonly removeSessionLog: ((path: string) => void) | null;
+  /** In-memory dedup so a breach is reported once per daemon lifetime; the recorder dedups durably. */
+  private readonly reportedI1 = new Set<number>();
+
+  constructor(opts: DaemonCoreOptions) {
+    this.store = opts.store;
+    this.driver = opts.driver;
+    this.policy = opts.policy;
+    this.now = opts.now;
+    this.log = opts.log;
+    this.faults = opts.faults ?? null;
+    this.onI1Violation = opts.onI1Violation ?? null;
+    this.removeSessionLog = opts.removeSessionLog ?? null;
+  }
+
+  private get ext(): ExtendedDriver {
+    return this.driver as ExtendedDriver;
+  }
+
+  /** Boot: reconcile, reap orphans, sweep the mailbox for needed wakes (spec 04 behavior 2). */
+  boot(): BootReport {
+    const live = this.driver.snapshotLive();
+    const rec = this.store.reconcileAtBoot(
+      live.map((p) => ({ pid: p.pid, startedAt: p.pidStartedAt })),
+    );
+    let orphansReaped = 0;
+    for (const p of live) {
+      const bee = this.store.getBee(p.beeId);
+      const rt = bee ? this.store.currentRuntime(p.beeId) : null;
+      const adopted = rt != null && rt.generation === p.generation && rt.state !== "stopped";
+      if (!adopted) {
+        // The store no longer recognizes this process (e.g. it was still booting
+        // when the daemon died — no pid recorded — and reconcile stopped the row).
+        this.driver.stop(p.beeId, p.generation, "stopped_by_system");
+        orphansReaped += 1;
+        this.log(`boot.reap bee=${p.beeId} gen=${p.generation}`);
+      }
+    }
+    let wakesEnqueued = 0;
+    for (const bee of this.store.listBees()) {
+      if (this.ensureWake(bee.id)) wakesEnqueued += 1;
+    }
+    const report: BootReport = {
+      adopted: rec.adopted.length,
+      stoppedByReconcile: rec.stopped.length,
+      requeuedCommands: rec.requeuedCommandIds.length,
+      orphansReaped,
+      wakesEnqueued,
+    };
+    this.log(
+      `boot adopted=${report.adopted} stopped=${report.stoppedByReconcile} requeued=${report.requeuedCommands} reaped=${orphansReaped} wakes=${wakesEnqueued}`,
+    );
+    return report;
+  }
+
+  /** One step of daemon work. May throw ExecutorCrashError (fault injection). */
+  step(): void {
+    this.drainObservations();
+    this.applyEvidence();
+    this.hangPolicy();
+    this.scaleToZeroPolicy();
+    this.degradedMailPolicy();
+    this.executeCommands();
+    this.deliveryLoop();
+    this.i1Telemetry();
+  }
+
+  // -------------------------------------------------------------------------
+  // observations → store state
+  // -------------------------------------------------------------------------
+
+  private drainObservations(): void {
+    for (const obs of this.driver.observe()) {
+      this.applyObservation(obs);
+    }
+  }
+
+  private applyObservation(obs: DriverObservation): void {
+    if (!this.store.getBee(obs.beeId)) {
+      this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind} reason=no_bee`);
+      return;
+    }
+    const rt = this.store.currentRuntime(obs.beeId);
+    if (!rt) return;
+    const target: RuntimeState =
+      obs.kind === "exited" ? "stopped" : obs.kind === "turn_ended" ? "idle" : "running";
+    if (obs.generation !== rt.generation) {
+      // Stale-generation update: the store records the no-op (audit trail, B2).
+      this.store.updateRuntimeState(
+        obs.beeId,
+        obs.generation,
+        target,
+        target === "stopped" ? { exitCause: obs.exitCause ?? "crashed" } : {},
+      );
+      return;
+    }
+    if (rt.state === target) {
+      this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind} reason=already_${target}`);
+      return;
+    }
+    if (!RUNTIME_TRANSITIONS[rt.state].includes(target)) {
+      // Duplicate re-drain after a crash, or an event for a state the store has
+      // already moved past. The extraction layer normalizes; skipping is safe.
+      this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind} reason=${rt.state}->${target}`);
+      return;
+    }
+    if (target === "stopped") {
+      this.store.updateRuntimeState(obs.beeId, obs.generation, "stopped", {
+        exitCause: obs.exitCause ?? "crashed",
+      });
+      this.log(`obs.exited bee=${obs.beeId} gen=${obs.generation} cause=${obs.exitCause}`);
+      // A dead runtime with pending mail must be revived — no user intervention (I1).
+      this.ensureWake(obs.beeId);
+    } else if (obs.kind === "booted") {
+      this.store.updateRuntimeState(obs.beeId, obs.generation, "running", {
+        pid: obs.pid,
+        pidStartedAt: obs.pidStartedAt,
+      });
+      this.log(`obs.booted bee=${obs.beeId} gen=${obs.generation} pid=${obs.pid}`);
+    } else {
+      this.store.updateRuntimeState(obs.beeId, obs.generation, target);
+      if (obs.kind === "turn_ended") this.store.recordOutput(obs.beeId);
+      this.log(`obs.${obs.kind} bee=${obs.beeId} gen=${obs.generation}`);
+    }
+  }
+
+  /** Enqueue a send_wake iff the bee has undelivered mail and no live runtime and no pending wake. */
+  private ensureWake(beeId: string): boolean {
+    if (this.store.undeliveredMessages(beeId).length === 0) return false;
+    const rt = this.store.currentRuntime(beeId);
+    if (rt && LIVE.includes(rt.state)) return false;
+    const gen = rt?.generation ?? 0;
+    const pending = this.store
+      .listCommands({ beeId })
+      .some(
+        (c) =>
+          c.verb === "send_wake" &&
+          (c.status === "queued" || c.status === "running") &&
+          c.targetGeneration === gen,
+      );
+    if (pending) return false;
+    this.store.enqueueCommand("send_wake", beeId);
+    this.log(`wake.enqueued bee=${beeId} gen=${gen}`);
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // flag policy — adapters report evidence, the daemon enacts it (spec 03/04)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Contrary-evidence clearing (spec 03, resolving WP2 ambiguity 6): every
+   * flag-setter has a clearer in the same adapter, and this policy applies
+   * both directions verbatim. Flags are bee-scoped; evidence from a stale
+   * generation still describes this bee's provider boundary, so it applies.
+   */
+  private applyEvidence(): void {
+    if (typeof this.ext.observeEvidence !== "function") return;
+    for (const ev of this.ext.observeEvidence()) {
+      if (!this.store.getBee(ev.beeId)) {
+        this.log(`flag.skip bee=${ev.beeId} flag=${ev.flag} reason=no_bee`);
+        continue;
+      }
+      if (ev.action === "set") {
+        this.store.setFlag(ev.beeId, ev.flag, ev.detail);
+      } else {
+        this.store.clearFlag(ev.beeId, ev.flag, ev.detail);
+      }
+      this.log(`flag.${ev.action} bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // hang policy — the hook that turns hung runtimes into stopped ones
+  // -------------------------------------------------------------------------
+
+  private pendingStopExists(beeId: string, generation: number): boolean {
+    return this.store
+      .listCommands({ beeId })
+      .some(
+        (c) =>
+          c.verb === "stop" &&
+          (c.status === "queued" || c.status === "running") &&
+          c.targetGeneration === generation,
+      );
+  }
+
+  private hangPolicy(): void {
+    const now = this.now();
+    for (const bee of this.store.listBees()) {
+      const rt = this.store.currentRuntime(bee.id);
+      if (!rt) continue;
+      const overdue =
+        (rt.state === "booting" && now - rt.startedAt > this.policy.bootHangTimeoutSteps) ||
+        (rt.state === "running" && now - rt.updatedAt > this.policy.turnHangTimeoutSteps);
+      if (!overdue) continue;
+      if (this.pendingStopExists(bee.id, rt.generation)) continue;
+      this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "hang_policy" });
+      this.log(`policy.hang_stop bee=${bee.id} gen=${rt.generation} state=${rt.state}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // scale-to-zero — idle → stop(stopped_by_system) after the idle window
+  // -------------------------------------------------------------------------
+
+  private scaleToZeroPolicy(): void {
+    const window = this.policy.idleWindowSteps;
+    if (window == null) return;
+    const now = this.now();
+    for (const bee of this.store.listBees()) {
+      const rt = this.store.currentRuntime(bee.id);
+      if (!rt || rt.state !== "idle") continue;
+      if (now - rt.updatedAt <= window) continue;
+      // Pending mail means the delivery loop is about to use this runtime —
+      // stopping it now would only bounce through revive-on-message.
+      if (this.store.undeliveredMessages(bee.id).length > 0) continue;
+      if (this.pendingStopExists(bee.id, rt.generation)) continue;
+      this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "idle_window" });
+      this.log(`policy.idle_stop bee=${bee.id} gen=${rt.generation} idleFor=${now - rt.updatedAt}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // degraded-runtime policy — re-adopted processes cannot accept deliveries
+  // -------------------------------------------------------------------------
+
+  private degradedMailPolicy(): void {
+    if (typeof this.ext.isDegraded !== "function") return;
+    for (const bee of this.store.listBees()) {
+      const rt = this.store.currentRuntime(bee.id);
+      if (!rt || !LIVE.includes(rt.state)) continue;
+      if (!this.ext.isDegraded(bee.id, rt.generation)) continue;
+      if (this.store.undeliveredMessages(bee.id).length === 0) continue;
+      if (this.pendingStopExists(bee.id, rt.generation)) continue;
+      this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "degraded_runtime" });
+      this.log(`policy.degraded_stop bee=${bee.id} gen=${rt.generation}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // executor loop
+  // -------------------------------------------------------------------------
+
+  private executeCommands(): void {
+    for (let i = 0; i < this.policy.commandsPerStep; i++) {
+      const cmd = this.store.claimNextCommand();
+      if (!cmd) return;
+      const crash = this.faults?.executorCrash() ?? "none";
+      if (crash === "before_effect") {
+        this.log(`cmd.crash id=${cmd.id} verb=${cmd.verb} point=before_effect`);
+        throw new ExecutorCrashError(crash);
+      }
+      let settled: boolean;
+      try {
+        settled = this.execute(cmd);
+      } catch (err) {
+        if (!(err instanceof CoreError)) throw err;
+        // A contract rejection means the intent is moot (bee deleted, state moved
+        // on, …) — settle done, mirroring B6's no-op philosophy.
+        this.log(`cmd.moot id=${cmd.id} verb=${cmd.verb} err=${err.name}`);
+        settled = true;
+      }
+      if (crash === "after_effect") {
+        this.log(`cmd.crash id=${cmd.id} verb=${cmd.verb} point=after_effect`);
+        throw new ExecutorCrashError(crash);
+      }
+      if (settled) this.store.completeCommand(cmd.id);
+    }
+  }
+
+  /** Record pid + start-time at spawn (the WP2 amendment) when the driver can report it. */
+  private recordProcAtSpawn(beeId: string, generation: number): void {
+    if (typeof this.ext.procOf !== "function") return;
+    const proc = this.ext.procOf(beeId, generation);
+    if (proc) this.store.recordRuntimeProc(beeId, generation, proc);
+  }
+
+  /** Execute one claimed command. Returns true when the caller should settle it done. */
+  private execute(cmd: CommandRow): boolean {
+    switch (cmd.verb) {
+      case "archive": {
+        const bee = this.store.getBee(cmd.beeId);
+        if (bee?.lifecycle === "active") this.store.archiveBee(cmd.beeId);
+        this.log(`cmd.archive id=${cmd.id} bee=${cmd.beeId}`);
+        return true;
+      }
+      case "unarchive": {
+        const bee = this.store.getBee(cmd.beeId);
+        if (bee?.lifecycle === "archived") this.store.unarchiveBee(cmd.beeId);
+        this.log(`cmd.unarchive id=${cmd.id} bee=${cmd.beeId}`);
+        return true;
+      }
+      case "delete": {
+        const rt = this.store.currentRuntime(cmd.beeId);
+        const result = this.store.deleteBee(cmd.beeId); // settles this command too (pending → done)
+        if (rt && LIVE.includes(rt.state)) {
+          this.driver.stop(cmd.beeId, rt.generation, "stopped_by_system");
+        }
+        if (result.sessionLogPath && this.removeSessionLog) {
+          this.removeSessionLog(result.sessionLogPath);
+        }
+        this.log(`cmd.delete id=${cmd.id} bee=${cmd.beeId}`);
+        return true;
+      }
+      case "stop": {
+        const gen = cmd.targetGeneration;
+        const cause: StopCause =
+          cmd.args.cause === "stopped_by_user" ? "stopped_by_user" : "stopped_by_system";
+        const rt = this.store.currentRuntime(cmd.beeId);
+        if (gen == null || !rt || rt.generation !== gen || rt.state === "stopped") return true;
+        const { hadProcess } = this.driver.stop(cmd.beeId, gen, cause);
+        if (!hadProcess) {
+          // Parenthood certainty: no process exists, so the stop is a fact now.
+          this.store.updateRuntimeState(cmd.beeId, gen, "stopped", { exitCause: cause });
+          this.ensureWake(cmd.beeId);
+        }
+        this.log(`cmd.stop id=${cmd.id} bee=${cmd.beeId} gen=${gen} cause=${cause} hadProcess=${hadProcess}`);
+        return true;
+      }
+      case "spawn":
+      case "revive":
+      case "send_wake": {
+        const rt = this.store.currentRuntime(cmd.beeId);
+        if (rt && LIVE.includes(rt.state)) {
+          if (this.driver.hasProcess(cmd.beeId, rt.generation)) {
+            // Idempotent replay: the runtime is already up. Nothing to do.
+            this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} noop=live`);
+            return true;
+          }
+          if (this.faults?.driverTimeout() ?? false) {
+            this.store.reportCommandFailure(cmd.id, "spawn_failed", "sim: driver start timeout");
+            this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} timeout gen=${rt.generation}`);
+            return false;
+          }
+          this.driver.start(cmd.beeId, rt.generation);
+          this.recordProcAtSpawn(cmd.beeId, rt.generation);
+          this.store.clearFlag(cmd.beeId, "spawn_failed", "runtime started");
+          this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} start gen=${rt.generation}`);
+          return true;
+        }
+        if (this.faults?.driverTimeout() ?? false) {
+          this.store.reportCommandFailure(cmd.id, "spawn_failed", "sim: driver start timeout");
+          this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} timeout`);
+          return false;
+        }
+        const next = this.store.reviveBee(cmd.beeId);
+        this.driver.start(cmd.beeId, next.generation);
+        this.recordProcAtSpawn(cmd.beeId, next.generation);
+        this.store.clearFlag(cmd.beeId, "spawn_failed", "runtime started");
+        this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} revive gen=${next.generation}`);
+        return true;
+      }
+      default:
+        return true;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // delivery loop
+  // -------------------------------------------------------------------------
+
+  private deliveryLoop(): void {
+    for (const bee of this.store.listBees()) {
+      const rt = this.store.currentRuntime(bee.id);
+      if (!rt || rt.state === "stopped" || rt.state === "booting") continue;
+      const msg = this.store.undeliveredMessages(bee.id)[0];
+      if (!msg) continue;
+      const outcome = this.driver.deliver(bee.id, rt.generation, msg.id, msg.body);
+      if (outcome.accepted) {
+        this.store.markDelivered(msg.id, rt.generation);
+        this.log(`deliver bee=${bee.id} msg=${msg.id} gen=${rt.generation}`);
+      } else {
+        this.log(`deliver.refused bee=${bee.id} msg=${msg.id} reason=${outcome.reason}`);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // I1 telemetry — the 99.99% counter (spec 04 behavior 5)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Mirrors the harness checker's I1 shape: per-bee pending queue, position-
+   * aware deadlines, and a suspended clock while a closed-list flag is active
+   * (a visibly blocked bee is at an external boundary — I3/I6 territory).
+   */
+  private i1Telemetry(): void {
+    const bound = this.policy.i1DeadlineSteps;
+    const record = this.onI1Violation;
+    if (bound == null || record == null) return;
+    const now = this.now();
+    for (const bee of this.store.listBees()) {
+      if (this.store.activeFlags(bee.id).length > 0) continue;
+      const pending = this.store.undeliveredMessages(bee.id);
+      pending.forEach((m, pos) => {
+        const deadline = m.enqueuedAt + (pos + 1) * bound;
+        if (now <= deadline || this.reportedI1.has(m.id)) return;
+        this.reportedI1.add(m.id);
+        const detail = `message ${m.id} undelivered past deadline (enqueued=${m.enqueuedAt} pos=${pos} deadline=${deadline} now=${now})`;
+        record({ detectedAt: now, beeId: bee.id, messageId: m.id, enqueuedAt: m.enqueuedAt, deadline, detail });
+        this.log(`i1.violation bee=${bee.id} msg=${m.id} deadline=${deadline}`);
+      });
+    }
+  }
+}

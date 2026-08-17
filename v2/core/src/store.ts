@@ -39,6 +39,7 @@ import {
   type Verb,
 } from "./types.ts";
 import { SCHEMA_SQL } from "./schema.ts";
+import { deriveBeeView } from "./view.ts";
 
 export interface CoreStoreOptions {
   /** Injectable clock (epoch ms) for deterministic tests. */
@@ -500,6 +501,39 @@ export class CoreStore {
     });
   }
 
+  /**
+   * WP2 pid-at-spawn amendment (WP4 wiring): record the process identity the
+   * driver captured at spawn on the current, live runtime row — no state
+   * transition. A daemon restart at any point (even mid-boot) can then
+   * re-adopt by pid + start-time. Stale generation / stopped row: recorded
+   * no-op, mirroring B2.
+   */
+  recordRuntimeProc(
+    beeId: string,
+    generation: number,
+    proc: { pid: number; pidStartedAt: number },
+  ): { applied: boolean } {
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const current = this.currentRuntime(beeId);
+      if (!current || current.generation !== generation || current.state === "stopped") {
+        this.audit("runtime.stale_update", beeId, {
+          beeId,
+          generation,
+          currentGeneration: current?.generation ?? null,
+          requestedState: "proc_record",
+        });
+        return { applied: false };
+      }
+      this.db
+        .prepare("UPDATE runtimes SET pid = ?, pid_started_at = ? WHERE bee_id = ? AND generation = ?")
+        .run(proc.pid, proc.pidStartedAt, beeId, generation);
+      const runtime = this.currentRuntime(beeId);
+      this.audit("runtime.updated", beeId, { runtime });
+      return { applied: true };
+    });
+  }
+
   /** B2 — no transition out of stopped; revival creates generation N+1 (booting). */
   reviveBee(beeId: string, opts: { proc?: { pid: number; pidStartedAt: number } } = {}): RuntimeRow {
     return this.tx(() => {
@@ -642,6 +676,14 @@ export class CoreStore {
   undeliveredMessages(beeId: string): MessageRow[] {
     const rows = this.db
       .prepare("SELECT * FROM mailbox WHERE bee_id = ? AND delivered_at IS NULL ORDER BY id")
+      .all(beeId) as Row[];
+    return rows.map(mapMessage);
+  }
+
+  /** All messages for a bee, delivered or not, per-bee FIFO order. */
+  listMessages(beeId: string): MessageRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM mailbox WHERE bee_id = ? ORDER BY id")
       .all(beeId) as Row[];
     return rows.map(mapMessage);
   }
@@ -932,44 +974,13 @@ export class CoreStore {
 
   view(beeId: string, opts: { readCursor?: number } = {}): BeeView {
     const bee = this.getBee(beeId);
-    if (!bee) {
-      // Deleted (or never-existed) bee: unreachable — the one lifecycle that is.
-      return {
-        beeId,
-        exists: false,
-        lifecycle: null,
-        generation: null,
-        runtimeState: null,
-        exitCause: null,
-        working: false,
-        waitingForYou: false,
-        lastOutputAt: null,
-        reachable: false,
-        blocked: false,
-        flags: [],
-      };
-    }
-    const runtime = this.currentRuntime(beeId);
-    const flags = this.activeFlags(beeId).map((f) => f.flag);
-    const state = runtime?.state ?? null;
-    const working = state === "booting" || state === "running";
-    const unreadOutput =
-      bee.lastOutputAt != null && (opts.readCursor == null || opts.readCursor < bee.lastOutputAt);
-    const waitingForYou = state === "idle" || (state === "stopped" && unreadOutput);
-    return {
+    return deriveBeeView(
       beeId,
-      exists: true,
-      lifecycle: bee.lifecycle,
-      generation: runtime?.generation ?? null,
-      runtimeState: state,
-      exitCause: runtime?.exitCause ?? null,
-      working,
-      waitingForYou,
-      lastOutputAt: bee.lastOutputAt,
-      reachable: true, // lifecycle ≠ deleted (deleted rows do not exist). Nothing else.
-      blocked: flags.length > 0,
-      flags,
-    };
+      bee,
+      bee ? this.currentRuntime(beeId) : null,
+      bee ? this.activeFlags(beeId).map((f) => f.flag) : [],
+      opts,
+    );
   }
 
   views(): BeeView[] {
@@ -979,6 +990,12 @@ export class CoreStore {
   // -------------------------------------------------------------------------
   // Audit access & snapshots
   // -------------------------------------------------------------------------
+
+  /** Highest audit seq written so far (0 for an empty log) — the store's change version. */
+  lastAuditSeq(): number {
+    const row = this.db.prepare("SELECT MAX(seq) AS seq FROM audit").get() as Row | undefined;
+    return row?.seq == null ? 0 : Number(row.seq);
+  }
 
   auditRows(fromSeq = 0): AuditRow[] {
     const rows = this.db
