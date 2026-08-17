@@ -155,7 +155,7 @@ function fuzzRun(seed: number, ops: number): void {
     },
     () => {
       const bee = pick(store.listBees());
-      if (bee) (rnd() < 0.5 ? store.recordOutput(bee.id) : store.markOutputRead(bee.id));
+      if (bee) store.recordOutput(bee.id);
     },
     () => {
       // Crash + reboot: close without cleanup, reopen, reconcile against a random

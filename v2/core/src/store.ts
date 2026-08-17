@@ -110,7 +110,6 @@ function mapBee(r: Row): BeeRow {
     createdAt: Number(r.created_at),
     archivedAt: r.archived_at == null ? null : Number(r.archived_at),
     lastOutputAt: r.last_output_at == null ? null : Number(r.last_output_at),
-    outputReadAt: r.output_read_at == null ? null : Number(r.output_read_at),
   };
 }
 
@@ -682,7 +681,7 @@ export class CoreStore {
   }
 
   // -------------------------------------------------------------------------
-  // Derived output-read markers (feed B8 waiting_for_you on stopped bees)
+  // Output recency (a core fact; read cursors live at the client layer)
   // -------------------------------------------------------------------------
 
   recordOutput(beeId: string): void {
@@ -691,15 +690,6 @@ export class CoreStore {
       const at = this.now();
       this.db.prepare("UPDATE bees SET last_output_at = ? WHERE id = ?").run(at, beeId);
       this.audit("output.recorded", beeId, { beeId, at });
-    });
-  }
-
-  markOutputRead(beeId: string): void {
-    this.tx(() => {
-      this.mustGetBee(beeId);
-      const at = this.now();
-      this.db.prepare("UPDATE bees SET output_read_at = ? WHERE id = ?").run(at, beeId);
-      this.audit("output.read", beeId, { beeId, at });
     });
   }
 
@@ -933,7 +923,7 @@ export class CoreStore {
   // B8 — derived reads (the ONLY place these questions are answered)
   // -------------------------------------------------------------------------
 
-  view(beeId: string): BeeView {
+  view(beeId: string, opts: { readCursor?: number } = {}): BeeView {
     const bee = this.getBee(beeId);
     if (!bee) {
       // Deleted (or never-existed) bee: unreachable — the one lifecycle that is.
@@ -946,6 +936,7 @@ export class CoreStore {
         exitCause: null,
         working: false,
         waitingForYou: false,
+        lastOutputAt: null,
         reachable: false,
         blocked: false,
         flags: [],
@@ -956,7 +947,7 @@ export class CoreStore {
     const state = runtime?.state ?? null;
     const working = state === "booting" || state === "running";
     const unreadOutput =
-      bee.lastOutputAt != null && (bee.outputReadAt == null || bee.outputReadAt < bee.lastOutputAt);
+      bee.lastOutputAt != null && (opts.readCursor == null || opts.readCursor < bee.lastOutputAt);
     const waitingForYou = state === "idle" || (state === "stopped" && unreadOutput);
     return {
       beeId,
@@ -967,6 +958,7 @@ export class CoreStore {
       exitCause: runtime?.exitCause ?? null,
       working,
       waitingForYou,
+      lastOutputAt: bee.lastOutputAt,
       reachable: true, // lifecycle ≠ deleted (deleted rows do not exist). Nothing else.
       blocked: flags.length > 0,
       flags,
