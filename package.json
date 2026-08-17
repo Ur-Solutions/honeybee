@@ -49,7 +49,8 @@
     "execution:digest": "tsx scripts/update-execution-digest.mjs",
     "dev": "tsx src/cli.ts",
     "hive": "node dist/cli.js",
-    "v2:smoke": "node --experimental-strip-types v2/driver-hsr/smoke.ts"
+    "v2:smoke": "node --experimental-strip-types v2/driver-hsr/smoke.ts",
+    "v2:smoke:tmux": "node --experimental-strip-types v2/driver-tmux/smoke.ts"
   },
   "engines": {
     "node": ">=20"

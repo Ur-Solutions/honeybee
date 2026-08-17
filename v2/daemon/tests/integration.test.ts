@@ -248,6 +248,11 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
     bootHangTimeoutMs: 8000,
   });
   let daemon: DaemonHandle | null = null;
+  // Survive-stdin-close stubs outlive the daemon BY DESIGN (shutdown detaches,
+  // never kills) — so this test must kill every agent pid it minted itself, or
+  // the gen-2 survivor (60s turns + a keep-alive interval, deaf to stdin close)
+  // leaks past the test run.
+  const agentPids: number[] = [];
   try {
     daemon = await startDaemon(dir);
     let client = await daemon.client();
@@ -260,6 +265,7 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
     }, "mid-turn");
     const before = await client.request<ViewResult>("view", { beeId });
     const agentPid = before.runtime?.pid as number;
+    agentPids.push(agentPid);
     assert.ok(agentPid > 0);
 
     // SIGKILL the daemon mid-turn; the detached agent must survive.
@@ -286,6 +292,8 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
     // by generation 2 — delivery is never doomed by the restart.
     const sent2 = await client.request<SendRpcResult>("send", { beeId, body: "post-restart task" });
     const gen2 = await waitDelivered(client, beeId, sent2.messageId, "post-restart delivery", );
+    const rt2 = (await client.request<ViewResult>("view", { beeId })).runtime;
+    if (typeof rt2?.pid === "number" && rt2.pid > 0) agentPids.push(rt2.pid);
     assert.equal(gen2, 2);
     assert.equal(pidAlive(agentPid), false, "old survivor stopped by exact pid identity");
     const finalCmds = await client.request<CommandsResult>("commands", { beeId });
@@ -295,6 +303,13 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
     client.close();
   } finally {
     await daemon?.stop().catch(() => {});
+    // The after-hook the survive-stub demands: reap every agent this test
+    // spawned — pids were captured moments ago, and each stub leads its own
+    // process group, so kill the group first, the pid as fallback.
+    for (const pid of agentPids) {
+      try { process.kill(-pid, "SIGKILL"); } catch { /* no group — fall through */ }
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
     cleanup();
   }
 });
