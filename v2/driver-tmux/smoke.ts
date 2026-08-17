@@ -94,7 +94,15 @@ function prepClaudeHome(home: string, cwd: string, eventsPath: string | null): v
   writeFileSync(
     join(home, ".claude.json"),
     JSON.stringify(
-      { hasCompletedOnboarding: true, projects: { [cwd]: { hasTrustDialogAccepted: true } } },
+      {
+        hasCompletedOnboarding: true,
+        // claude looks projects up by the REALPATHED cwd (/var → /private/var,
+        // seen live in the trust dialog 2026-08-17); seed both keys.
+        projects: {
+          [cwd]: { hasTrustDialogAccepted: true },
+          [canonicalCwd(cwd)]: { hasTrustDialogAccepted: true },
+        },
+      },
       null,
       2,
     ),
@@ -396,7 +404,16 @@ async function runPhase(ctx: PhaseCtx): Promise<void> {
     if (real) console.log(`  watch live: tmux -S ${socketPath} attach -t '${sessionName}'`);
 
     const ready = await waitPaneReady(sessionName, READY_TIMEOUT);
-    const paneNow = paneContent(sessionName) ?? "";
+    let paneNow = paneContent(sessionName) ?? "";
+    if (/trust this folder|Quick safety check/i.test(paneNow)) {
+      // Trust dialog despite the seeded keys (isolated home only — accepting
+      // writes trust into the TEMP .claude.json, never the real one).
+      console.log(`  [${phase}] folder-trust dialog detected — accepting (isolated home)`);
+      server.try(["send-keys", "-t", exactPaneTarget(sessionName), "Enter"]);
+      await sleep(2_000);
+      await waitPaneReady(sessionName, 15_000);
+      paneNow = paneContent(sessionName) ?? "";
+    }
     const loggedOut = /Not logged in|Run \/login/i.test(paneNow);
     check(
       phase,
