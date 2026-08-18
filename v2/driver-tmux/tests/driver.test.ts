@@ -165,3 +165,33 @@ test("tmux.session-hygiene: dead panes are reaped from the private server", asyn
     rig.cleanup();
   }
 });
+
+test("tmux.interrupt (v6): idle → no-op; a hung turn is ended by C-c to the exact pane (turn_ended observed), the runtime stays live and takes the next message; gone → no_process", async () => {
+  const rig = makeRig();
+  try {
+    rig.configure("bee-1", "hooks");
+    rig.driver.start("bee-1", 1);
+    const boot = await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_ended"));
+    const pid = boot.find((x) => x.kind === "booted")?.pid as number;
+    assert.deepEqual(rig.driver.interrupt("bee-1", 1), { interrupted: false, reason: "idle" });
+
+    assert.equal(rig.driver.deliver("bee-1", 1, 1, "please @hang").accepted, true);
+    await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_started"));
+    await sleep(300);
+    assert.deepEqual(kinds(rig.driver.observe()).filter((k) => k === "turn_ended"), [], "hung: no turn_ended");
+
+    assert.deepEqual(rig.driver.interrupt("bee-1", 1), { interrupted: true });
+    const ended = await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_ended"), 6000);
+    assert.equal(ended.some((x) => x.kind === "exited"), false, "C-c ends the turn, not the process");
+    assert.ok(rig.driver.hasProcess("bee-1", 1));
+    assert.ok(pidAlive(pid));
+
+    assert.equal(rig.driver.deliver("bee-1", 1, 2, "after").accepted, true);
+    const next = await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_ended"), 6000);
+    assert.equal(next.some((x) => x.kind === "exited"), false);
+    assert.deepEqual(rig.driver.interrupt("bee-1", 2), { interrupted: false, reason: "no_process" });
+    assert.deepEqual(rig.driver.interrupt("nobody", 1), { interrupted: false, reason: "no_process" });
+  } finally {
+    rig.cleanup();
+  }
+});

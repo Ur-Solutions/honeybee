@@ -51,6 +51,7 @@ import { join } from "node:path";
 import type {
   DeliverOutcome,
   DriverObservation,
+  InterruptOutcome,
   LiveProcess,
   RuntimeDriver,
   StopCause,
@@ -113,6 +114,8 @@ interface ManagedProcess {
   /** Driver-side accept-point phase; the store's state is derived downstream. */
   phase: "booting" | "running" | "idle";
   sessionId: string | null;
+  /** v6: the harness-native id of the turn in flight (codex turn/started), for turn/interrupt. */
+  turnId: string | null;
   /** First requested stop cause; fixes the exit cause of a signaled process. */
   stopCause: StopCause | null;
   killTimer: NodeJS.Timeout | null;
@@ -192,6 +195,7 @@ export class HsrDriver implements RuntimeDriver {
       degraded: false,
       phase: "booting",
       sessionId: null,
+      turnId: null,
       stopCause: null,
       killTimer: null,
       stdoutRest: "",
@@ -303,6 +307,30 @@ export class HsrDriver implements RuntimeDriver {
     return { hadProcess: true };
   }
 
+  /**
+   * v6 interrupt: hand the harness's in-band "stop the current turn" line to
+   * a live, mid-turn runtime's stdin (claude control_request interrupt, codex
+   * turn/interrupt, stub {"type":"interrupt"}). The turn_ended that follows
+   * is observed like any other; the process stays live. Idle / booting /
+   * dying / degraded / no channel: a reasoned no-op, never an error. SIGINT
+   * is never used — it kills a headless child outright.
+   */
+  interrupt(beeId: string, generation: number): InterruptOutcome {
+    const p = this.procs.get(beeId);
+    if (!p || p.generation !== generation || p.exited) return { interrupted: false, reason: "no_process" };
+    if (p.degraded || p.adapter == null) return { interrupted: false, reason: "not_ready" };
+    if (p.phase === "booting" || p.stopCause != null) return { interrupted: false, reason: "not_ready" };
+    if (p.phase === "idle") return { interrupted: false, reason: "idle" };
+    if (typeof p.adapter.encodeInterrupt !== "function") return { interrupted: false, reason: "unsupported" };
+    const encoded = p.adapter.encodeInterrupt({ sessionId: p.sessionId, turnId: p.turnId });
+    if (encoded == null) return { interrupted: false, reason: "not_ready" };
+    if (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable) {
+      return { interrupted: false, reason: "no_process" };
+    }
+    this.writeLine(p, encoded);
+    return { interrupted: true };
+  }
+
   observe(): DriverObservation[] {
     // Adopted (degraded) processes have no exit callback — their death is a
     // fact recovered by polling the exact pid (cheap signal-0 probe).
@@ -357,6 +385,7 @@ export class HsrDriver implements RuntimeDriver {
       // observed for it anyway.
       phase: "running",
       sessionId: null,
+      turnId: null,
       stopCause: null,
       killTimer: null,
       stdoutRest: "",
@@ -558,12 +587,16 @@ export class HsrDriver implements RuntimeDriver {
         return;
       }
       case "turn_started": {
+        // The harness-native turn id (codex) is learned even when the driver
+        // already opened the turn at deliver() — interrupt needs it.
+        if (signal.turnId) p.turnId = signal.turnId;
         if (p.phase !== "idle") return; // driver already opened this turn (deliver)
         p.phase = "running";
         this.events.push({ beeId: p.beeId, generation: p.generation, kind: "turn_started" });
         return;
       }
       case "turn_ended": {
+        p.turnId = null;
         if (p.phase !== "running") return;
         p.phase = "idle";
         this.events.push({ beeId: p.beeId, generation: p.generation, kind: "turn_ended" });

@@ -10,7 +10,9 @@ import type {
   CommandRow,
   FlagRow,
   MessageRow,
+  QuestionRow,
   RuntimeRow,
+  SealRow,
   StateDump,
   TemplateRow,
   TrackRow,
@@ -24,6 +26,8 @@ export function replayAudit(rows: AuditRow[]): StateDump {
   const commands = new Map<number, CommandRow>();
   const templates = new Map<string, TemplateRow>();
   const tracks = new Map<string, TrackRow>();
+  const questions = new Map<string, QuestionRow>();
+  const seals = new Map<string, SealRow>();
 
   const rtKey = (beeId: string, generation: number) => `${beeId}#${generation}`;
   const mustBee = (id: string): BeeRow => {
@@ -58,7 +62,10 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         break;
       }
       case "bee.provider_session": {
-        mustBee(p.beeId as string).providerSessionId = p.providerSessionId as string;
+        const bee = mustBee(p.beeId as string);
+        bee.providerSessionId = p.providerSessionId as string;
+        // v6: learning the fork's own id consumed the one-shot fork seed.
+        bee.forkSeed = null;
         break;
       }
       case "bee.spawn_failures": {
@@ -70,12 +77,26 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         mustBee(p.beeId as string).args = args === null ? null : [...args];
         break;
       }
+      case "bee.renamed": {
+        mustBee(p.beeId as string).name = p.name as string;
+        break;
+      }
+      case "bee.tagged": {
+        mustBee(p.beeId as string).tags = [...(p.tags as string[])];
+        break;
+      }
+      case "bee.orphaned": {
+        mustBee(p.beeId as string).parentId = null;
+        break;
+      }
       case "bee.deleted": {
         const beeId = p.beeId as string;
         bees.delete(beeId);
         for (const [k, rt] of runtimes) if (rt.beeId === beeId) runtimes.delete(k);
         for (const [k, f] of flags) if (f.beeId === beeId) flags.delete(k);
         for (const [k, m] of mailbox) if (m.beeId === beeId) mailbox.delete(k);
+        for (const [k, q] of questions) if (q.beeId === beeId) questions.delete(k);
+        for (const [k, sl] of seals) if (sl.beeId === beeId) seals.delete(k);
         for (const id of p.settledCommandIds as number[]) {
           const command = mustCommand(id);
           command.status = "done";
@@ -173,8 +194,30 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         if (!tracks.delete(p.trackId as string)) throw new Error(`audit replay: unknown track ${String(p.trackId)}`);
         break;
       }
+      case "question.asked": {
+        const question = p.question as QuestionRow;
+        questions.set(question.id, { ...question, options: question.options === null ? null : [...question.options] });
+        break;
+      }
+      case "question.answered": {
+        const question = questions.get(p.questionId as string);
+        if (!question) throw new Error(`audit replay: unknown question ${String(p.questionId)}`);
+        question.status = "answered";
+        question.answer = p.answer as string;
+        question.answeredAt = p.answeredAt as number;
+        question.answeredBy = p.answeredBy as string;
+        question.deliveryMessageId = p.deliveryMessageId as number;
+        break;
+      }
+      case "seal.created": {
+        const seal = p.seal as SealRow;
+        seals.set(seal.id, { ...seal, refs: [...seal.refs] });
+        break;
+      }
       // Recorded no-ops and informational rows: state unchanged by definition.
       case "bee.imported":
+      case "bee.interrupted":
+      case "bee.forked":
       case "runtime.stale_update":
       case "flag.clear_noop":
       case "mail.deliver_noop":
@@ -198,5 +241,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
     commands: [...commands.values()].sort((a, b) => a.id - b.id),
     templates: [...templates.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     tracks: [...tracks.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    questions: [...questions.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    seals: [...seals.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
   };
 }

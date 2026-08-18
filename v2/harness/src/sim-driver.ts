@@ -15,6 +15,7 @@
 import type {
   DeliverOutcome,
   DriverObservation,
+  InterruptOutcome,
   LiveProcess,
   RuntimeDriver,
   StopCause,
@@ -109,6 +110,18 @@ export class SimDriver implements RuntimeDriver {
     this.procs.delete(beeId);
     this.events.push({ beeId, generation, kind: "exited", exitCause: cause });
     return { hadProcess: true };
+  }
+
+  /** A virtual interrupt ends the turn immediately (turn_ended), un-hanging a hung turn. */
+  interrupt(beeId: string, generation: number): InterruptOutcome {
+    const p = this.procs.get(beeId);
+    if (!p || p.generation !== generation) return { interrupted: false, reason: "no_process" };
+    if (p.phase === "booting") return { interrupted: false, reason: "not_ready" };
+    if (p.phase === "idle") return { interrupted: false, reason: "idle" };
+    p.phase = "idle";
+    p.hungTurn = false;
+    this.events.push({ beeId, generation, kind: "turn_ended" });
+    return { interrupted: true };
   }
 
   observe(): DriverObservation[] {

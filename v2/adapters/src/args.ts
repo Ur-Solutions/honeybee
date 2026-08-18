@@ -164,7 +164,7 @@ export const claudeArgGrammar: ArgGrammar = {
     "--json-schema",
     "--betas",
   ]),
-  booleanFlags: new Set(["-p", "--print", "--verbose", "--dangerously-skip-permissions", "--continue", "-c", "--include-partial-messages", "--replay-user-messages"]),
+  booleanFlags: new Set(["-p", "--print", "--verbose", "--dangerously-skip-permissions", "--continue", "-c", "--include-partial-messages", "--replay-user-messages", "--fork-session"]),
   keyedFlags: new Set(),
   aliases: { "-r": "--resume", "-c": "--continue" },
 };

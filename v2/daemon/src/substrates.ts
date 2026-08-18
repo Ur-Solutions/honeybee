@@ -16,6 +16,7 @@
 import type {
   DeliverOutcome,
   DriverObservation,
+  InterruptOutcome,
   LiveProcess,
   RuntimeDriver,
   StopCause,
@@ -68,6 +69,10 @@ export class SubstrateRouter implements RuntimeDriver {
 
   stop(beeId: string, generation: number, cause: StopCause): { hadProcess: boolean } {
     return this.driverFor(beeId, generation).stop(beeId, generation, cause);
+  }
+
+  interrupt(beeId: string, generation: number): InterruptOutcome {
+    return this.driverFor(beeId, generation).interrupt(beeId, generation);
   }
 
   observe(): DriverObservation[] {

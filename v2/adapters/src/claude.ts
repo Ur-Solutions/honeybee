@@ -35,6 +35,7 @@ import {
   type AdapterSignal,
   type EncodeContext,
   type HarnessAdapter,
+  type InterruptContext,
 } from "./types.ts";
 import { asObject } from "./types.ts";
 
@@ -124,6 +125,37 @@ export function claudeResumeArgs(providerSessionId: string): string[] {
   return ["--resume", providerSessionId];
 }
 
+/**
+ * v6 fork: `--resume <source> --fork-session` — claude rejoins the source
+ * conversation with full context but mints a NEW session id for the child
+ * (the init line reports it; the daemon records it on the fork). Without
+ * `--fork-session` the resumed process keeps the SAME id and source + fork
+ * would write one transcript (the old system's drivers.ts: "--fork-session
+ * forks the resumed transcript"; claude refuses `--resume <id> --session-id
+ * <new>` without it). Never combined with `--session-id` here — claude
+ * mints; the adapter records.
+ */
+export function claudeForkArgs(sourceSessionId: string): string[] {
+  return ["--resume", sourceSessionId, "--fork-session"];
+}
+
+/**
+ * v6 interrupt — the stream-json control protocol (the OLD system's verified
+ * shape, src/hsr/adapters/claude.ts encodeClaudeInterrupt): claude ends the
+ * current turn (emitting its `result` line → turn_ended) and keeps the
+ * session alive — unlike SIGINT, which kills the headless child. The
+ * `control_response` ack parses to [] (unknown type) in parseClaudeLine.
+ */
+let interruptCounter = 0;
+export function encodeClaudeInterrupt(): string {
+  interruptCounter += 1;
+  return JSON.stringify({
+    type: "control_request",
+    request_id: `hive-interrupt-${interruptCounter}`,
+    request: { subtype: "interrupt" },
+  });
+}
+
 export const claudeAdapter: HarnessAdapter = {
   harness: "claude",
   // Claude Code accepts additional stream-json user messages mid-turn and
@@ -139,4 +171,8 @@ export const claudeAdapter: HarnessAdapter = {
     return encodeClaudeMessage(body);
   },
   resumeArgs: claudeResumeArgs,
+  forkArgs: claudeForkArgs,
+  encodeInterrupt(_ctx: InterruptContext): string | null {
+    return encodeClaudeInterrupt();
+  },
 };

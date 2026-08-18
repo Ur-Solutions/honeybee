@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { DriverObservation, LiveProcess, RuntimeDriver, StopCause } from "../../harness/src/driver.ts";
+import type { DriverObservation, InterruptOutcome, LiveProcess, RuntimeDriver, StopCause } from "../../harness/src/driver.ts";
 import type { FlagEvidenceLike, SessionEvidenceLike } from "../src/loops.ts";
 import type { NodeConfigFile } from "../src/config.ts";
 import { RpcClient } from "../../cli/src/client.ts";
@@ -108,6 +108,17 @@ export class FakeDriver implements RuntimeDriver {
     this.procs.delete(beeId);
     this.events.push({ beeId, generation, kind: "exited", exitCause: cause });
     return { hadProcess: true };
+  }
+
+  /** Every interrupt() call, in order. */
+  readonly interrupts: Array<{ beeId: string; generation: number }> = [];
+
+  interrupt(beeId: string, generation: number): InterruptOutcome {
+    const p = this.procs.get(beeId);
+    if (!p || p.generation !== generation) return { interrupted: false, reason: "no_process" };
+    this.interrupts.push({ beeId, generation });
+    this.events.push({ beeId, generation, kind: "turn_ended" });
+    return { interrupted: true };
   }
 
   observe(): DriverObservation[] {

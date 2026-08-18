@@ -41,6 +41,12 @@
  * Message directives (same vocabulary as the HSR stub):
  *   "@crash"  turn starts, process exits 9 mid-turn
  *   "@exit"   turn completes, then exits 0 (clean)
+ *   "@hang"   turn starts, never completes — until Ctrl-C (v6 interrupt)
+ *
+ * Ctrl-C (SIGINT via the pty, what `send-keys C-c` produces): like the real
+ * TUIs (claude / codex / grok cancel the in-flight turn and stay at the
+ * input box) — an in-flight turn ends now with an "[interrupted]" row and
+ * the completion evidence; idle: ignored (never exits).
  */
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -137,8 +143,21 @@ function completion() {
 
 const queue = [];
 let busy = false;
+let turnTimer = null;
 /** Armed after each turn when TMUX_STUB_SWALLOW_PASTE_AFTER_TURN=1. */
 let swallowNextPaste = false;
+
+// v6: Ctrl-C ends the in-flight turn (a real TUI's interrupt), never the process.
+process.on("SIGINT", () => {
+  if (!busy) return;
+  if (turnTimer) clearTimeout(turnTimer);
+  turnTimer = null;
+  console.log("[interrupted]");
+  assistantRow("[interrupted]");
+  completion();
+  busy = false;
+  workNext();
+});
 
 function workNext() {
   if (busy) return;
@@ -147,7 +166,9 @@ function workNext() {
   busy = true;
   userRow(body);
   if (style === "hooks") hookEvent({ hook_event_name: "UserPromptSubmit", session_id: sessionId });
-  setTimeout(() => {
+  if (body.includes("@hang")) return; // never completes until Ctrl-C
+  turnTimer = setTimeout(() => {
+    turnTimer = null;
     if (body.includes("@crash")) process.exit(9);
     console.log(`echo:${body}`);
     assistantRow(`echo:${body}`);

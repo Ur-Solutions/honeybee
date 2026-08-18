@@ -524,3 +524,72 @@ test("session evidence (spec 07 §F): the booted session id is drained via obser
     rig.cleanup();
   }
 });
+
+test("v6 interrupt: idle → reasoned no-op; mid-turn (hung) → in-band interrupt ends the turn (turn_ended), process stays live, next delivery works; booting/gone → not_ready/no_process", async () => {
+  const rig = makeRig();
+  try {
+    rig.agentEnv.set("bee-i", { STUB_BOOT_DELAY_MS: "150" });
+    rig.driver.start("bee-i", 1);
+    assert.deepEqual(rig.driver.interrupt("bee-i", 1), { interrupted: false, reason: "not_ready" }, "booting: no channel yet");
+    await drainUntil(rig.driver, (e) => ofKind(e, "turn_ended").length >= 1); // booted → idle
+    const proc = rig.driver.procOf("bee-i", 1)!;
+    assert.deepEqual(rig.driver.interrupt("bee-i", 1), { interrupted: false, reason: "idle" });
+
+    // a hung turn: never ends on its own
+    assert.deepEqual(rig.driver.deliver("bee-i", 1, 21, "@hang"), { accepted: true });
+    await drainUntil(rig.driver, (e) => ofKind(e, "turn_started").length >= 1);
+    await sleep(80);
+    assert.deepEqual(rig.driver.observe().filter((e) => e.kind === "turn_ended"), [], "hung: no turn_ended");
+
+    // interrupt → the stub ends the turn now; the process is NOT killed
+    assert.deepEqual(rig.driver.interrupt("bee-i", 1), { interrupted: true });
+    const ended = await drainUntil(rig.driver, (e) => ofKind(e, "turn_ended").length >= 1);
+    assert.equal(ofKind(ended, "exited").length, 0, "runtime still live");
+    assert.ok(rig.driver.hasProcess("bee-i", 1));
+    assert.ok(pidAlive(proc.pid));
+    const log = readFileSync(rig.driver.sessionLogPath("bee-i"), "utf8");
+    assert.match(log, /"turn_ended","messageId":21,"ok":true,"interrupted":true/);
+
+    // the runtime is idle again and takes the next message
+    assert.deepEqual(rig.driver.deliver("bee-i", 1, 22, "after"), { accepted: true });
+    const next = await drainUntil(rig.driver, (e) => ofKind(e, "turn_ended").length >= 1);
+    assert.equal(ofKind(next, "exited").length, 0);
+    assert.match(readFileSync(rig.driver.sessionLogPath("bee-i"), "utf8"), /echo:after/);
+
+    // gone / stale generation
+    assert.deepEqual(rig.driver.interrupt("bee-i", 2), { interrupted: false, reason: "no_process" });
+    assert.deepEqual(rig.driver.interrupt("nobody", 1), { interrupted: false, reason: "no_process" });
+    // dying (stop requested) → not_ready
+    rig.driver.stop("bee-i", 1, "stopped_by_user");
+    assert.deepEqual(rig.driver.interrupt("bee-i", 1), { interrupted: false, reason: "not_ready" });
+    await drainUntil(rig.driver, (e) => ofKind(e, "exited").length >= 1);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("v6 interrupt: a harness without an in-band interrupt answers unsupported (never SIGINT)", async () => {
+  const rig = makeRig();
+  try {
+    const noInterrupt = { ...stubAdapter };
+    delete (noInterrupt as { encodeInterrupt?: unknown }).encodeInterrupt;
+    const dir = rig.dir;
+    const driver = new HsrDriver({
+      sessionLogDir: join(dir, "logs2"),
+      stopKillGraceMs: 400,
+      resolve: () => ({ adapter: noInterrupt, command: process.execPath, args: [AGENT_PATH], cwd: dir, env: { ...process.env, STUB_TURN_MS: "5" } }),
+    });
+    try {
+      driver.start("bee-u", 1);
+      await drainUntil(driver, (e) => ofKind(e, "turn_ended").length >= 1);
+      assert.deepEqual(driver.deliver("bee-u", 1, 31, "@hang"), { accepted: true });
+      await drainUntil(driver, (e) => ofKind(e, "turn_started").length >= 1);
+      assert.deepEqual(driver.interrupt("bee-u", 1), { interrupted: false, reason: "unsupported" });
+      assert.ok(driver.hasProcess("bee-u", 1));
+    } finally {
+      driver.disposeAll();
+    }
+  } finally {
+    rig.cleanup();
+  }
+});

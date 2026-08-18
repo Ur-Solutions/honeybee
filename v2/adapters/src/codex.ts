@@ -45,11 +45,14 @@ import {
   type AdapterSignal,
   type EncodeContext,
   type HarnessAdapter,
+  type InterruptContext,
 } from "./types.ts";
 import { asObject } from "./types.ts";
 
 const INITIALIZE_ID = 1;
 const THREAD_START_ID = 2;
+/** v6 `turn/interrupt` request id (one interrupt in flight per turn; the ack response parses to []). */
+const TURN_INTERRUPT_ID = 3;
 /** Delivered-message request ids: offset by the mailbox message id (globally unique). */
 const TURN_REQUEST_ID_BASE = 1000;
 
@@ -65,6 +68,18 @@ export interface CodexAdapterOptions {
    * process must run with the CODEX_HOME the rollout lives under (bee env).
    */
   resumeThreadId?: string;
+  /**
+   * v6 fork (`bee.fork`): when set (and no resumeThreadId), the handshake
+   * sends `thread/fork {threadId}` — the app-server copies the source rollout
+   * into a NEW thread (present in codex-cli ≥ 0.147: `thread/fork` /
+   * ThreadForkParams / ThreadForkResponse{thread}) — and the response's
+   * `thread.id` (the NEW id) lands as `booted`, so the daemon records the
+   * fork's own thread id. Plain `thread/resume` of the source id would make
+   * source and fork share one thread. An app-server without `thread/fork`
+   * answers method-not-found: no booted; the daemon's boot-hang policy
+   * stops it and the spawn budget makes the failure visible.
+   */
+  forkThreadId?: string;
 }
 
 /**
@@ -106,16 +121,16 @@ function errorSignals(message: string): AdapterSignal[] {
 const SERVER_REQUEST_REFUSAL_CODE = -32601;
 
 /** The thread request params (shape taken from the old adapter's buildCodexThreadRequestParams). */
-export function codexThreadRequest(opts: CodexAdapterOptions): { method: "thread/start" | "thread/resume"; params: Record<string, unknown> } {
+export function codexThreadRequest(opts: CodexAdapterOptions): { method: "thread/start" | "thread/resume" | "thread/fork"; params: Record<string, unknown> } {
   const base = {
     ...(opts.model ? { model: opts.model } : {}),
     cwd: opts.cwd,
     approvalPolicy: "never",
     sandbox: "danger-full-access",
   };
-  return opts.resumeThreadId
-    ? { method: "thread/resume", params: { threadId: opts.resumeThreadId, ...base } }
-    : { method: "thread/start", params: base };
+  if (opts.resumeThreadId) return { method: "thread/resume", params: { threadId: opts.resumeThreadId, ...base } };
+  if (opts.forkThreadId) return { method: "thread/fork", params: { threadId: opts.forkThreadId, ...base } };
+  return { method: "thread/start", params: base };
 }
 
 export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
@@ -183,8 +198,11 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
     }
 
     switch (msg.method) {
-      case "turn/started":
-        return [{ kind: "turn_started" }];
+      case "turn/started": {
+        // `turn.id` is what turn/interrupt needs (v6 bee.interrupt).
+        const turnId = asObject(params.turn)?.id;
+        return [typeof turnId === "string" && turnId.length > 0 ? { kind: "turn_started", turnId } : { kind: "turn_started" }];
+      }
       case "turn/completed":
         return [...successfulTurnClears(), { kind: "turn_ended" }];
       case "error": {
@@ -223,6 +241,18 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
         id: TURN_REQUEST_ID_BASE + ctx.messageId,
         method: "turn/start",
         params: { threadId: ctx.sessionId, input: [{ type: "text", text: body, text_elements: [] }] },
+      });
+    },
+    // v6 interrupt: `turn/interrupt {threadId, turnId}` (the OLD adapter's
+    // verified call, src/hsr/adapters/codex.ts). Needs the turn id from
+    // turn/started; before that there is nothing to interrupt yet.
+    encodeInterrupt(ctx: InterruptContext): string | null {
+      if (!ctx.sessionId || !ctx.turnId) return null;
+      return JSON.stringify({
+        jsonrpc: "2.0",
+        id: TURN_INTERRUPT_ID,
+        method: "turn/interrupt",
+        params: { threadId: ctx.sessionId, turnId: ctx.turnId },
       });
     },
   };

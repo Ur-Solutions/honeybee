@@ -32,8 +32,15 @@
  *        importer fills it from the old record's launch argv so a resumed
  *        old-world bee keeps its model/effort/permission flags). Additive;
  *        migration = ALTER TABLE ADD COLUMN ×1.
+ *   v6 — pre-flip verb set (parenting, fork, questions, seals): adds
+ *        `bees.parent_id` (nullable soft ref to the spawning bee),
+ *        `bees.forked_from` (provenance: the bee this one was forked from)
+ *        and `bees.fork_seed` (the source's provider session id the FIRST
+ *        runtime forks from; consumed when the fork reports its own id),
+ *        plus the `questions` and `seals` tables. Additive; migration =
+ *        ALTER TABLE ADD COLUMN ×3 + CREATE TABLE IF NOT EXISTS ×2.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -74,7 +81,16 @@ CREATE TABLE IF NOT EXISTS bees (
   -- v5: per-bee harness CLI args (json array of strings, or NULL = none),
   -- composed over the agent spec's args at spawn (daemon resolveSpawnSpec:
   -- spec args < spec defaultArgs < bee args < resume args; later wins per flag).
-  args             TEXT
+  args             TEXT,
+  -- v6: the bee that spawned this one (soft reference — no FK, so a parent
+  -- may be deleted; delete ORPHANS children by nulling this, never cascades).
+  parent_id        TEXT,
+  -- v6: provenance — the bee this one was forked from (soft reference).
+  forked_from      TEXT,
+  -- v6: one-shot fork seed — the SOURCE's provider session id the first
+  -- runtime forks from (claude --resume <seed> --fork-session, codex
+  -- thread/fork); cleared once the fork's own session id is recorded.
+  fork_seed        TEXT
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
@@ -152,6 +168,38 @@ CREATE TABLE IF NOT EXISTS rpc_idempotency (
   created_at INTEGER NOT NULL
 ) STRICT;
 
+-- v6: a bee's question to the operator (spec: pre-flip verbs). Open until
+-- answered; the answer is ALSO delivered to the bee as an ordinary mailbox
+-- message (delivery_message_id) so the bee learns it through the one channel.
+CREATE TABLE IF NOT EXISTS questions (
+  id                  TEXT PRIMARY KEY,
+  bee_id              TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE,
+  generation          INTEGER,
+  text                TEXT NOT NULL,
+  options             TEXT,
+  status              TEXT NOT NULL CHECK (status IN ('open','answered')),
+  answer              TEXT,
+  asked_at            INTEGER NOT NULL,
+  answered_at         INTEGER,
+  answered_by         TEXT,
+  delivery_message_id INTEGER,
+  CHECK ((status = 'answered') = (answered_at IS NOT NULL))
+) STRICT;
+CREATE INDEX IF NOT EXISTS questions_open ON questions(bee_id, asked_at) WHERE status = 'open';
+
+-- v6: seals — a bee's structured "here is what I did" record (metadata only:
+-- title/body/refs), tied to the generation that sealed.
+CREATE TABLE IF NOT EXISTS seals (
+  id         TEXT PRIMARY KEY,
+  bee_id     TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE,
+  generation INTEGER,
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  refs       TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS seals_bee ON seals(bee_id, created_at);
+
 CREATE TABLE IF NOT EXISTS audit (
   seq     INTEGER PRIMARY KEY AUTOINCREMENT,
   ts      INTEGER NOT NULL,
@@ -210,7 +258,7 @@ CREATE TABLE IF NOT EXISTS tracks (
 /**
  * Additive columns on `bees` since v2 — name → ADD COLUMN clause (migration =
  * add iff missing). v3: provider_session_id, env, imported_from; v4:
- * spawn_failures; v5: args.
+ * spawn_failures; v5: args; v6: parent_id, forked_from, fork_seed.
  */
 export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["provider_session_id", "provider_session_id TEXT"],
@@ -218,6 +266,9 @@ export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: s
   ["imported_from", "imported_from TEXT"],
   ["spawn_failures", "spawn_failures INTEGER NOT NULL DEFAULT 0"],
   ["args", "args TEXT"],
+  ["parent_id", "parent_id TEXT"],
+  ["forked_from", "forked_from TEXT"],
+  ["fork_seed", "fork_seed TEXT"],
 ];
 
 export const IDEMPOTENCY_INDEX_SQL = `

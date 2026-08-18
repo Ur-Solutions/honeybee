@@ -17,6 +17,7 @@
  *   {"event":"turn_ended","messageId":n,"ok":true|false}
  * (us → agent stdin):
  *   {"type":"message","id":n,"body":"..."}
+ *   {"type":"interrupt"}                                 v6: end the current turn now
  */
 import {
   bootedToIdle,
@@ -28,6 +29,7 @@ import {
   type AdapterSignal,
   type EncodeContext,
   type HarnessAdapter,
+  type InterruptContext,
 } from "./types.ts";
 
 export function parseStubLine(line: string): AdapterSignal[] {
@@ -85,5 +87,8 @@ export const stubAdapter: HarnessAdapter = {
   parseLine: parseStubLine,
   encodeMessage(body: string, ctx: EncodeContext): string | null {
     return JSON.stringify({ type: "message", id: ctx.messageId, body });
+  },
+  encodeInterrupt(_ctx: InterruptContext): string | null {
+    return JSON.stringify({ type: "interrupt" });
   },
 };

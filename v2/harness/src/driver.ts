@@ -57,6 +57,20 @@ export interface DeliverOutcome {
   detail?: string;
 }
 
+/**
+ * Outcome of an interrupt request (v6 `bee.interrupt`): stop the CURRENT
+ * TURN without ending the runtime. `interrupted: true` = an in-band interrupt
+ * was handed to a live, mid-turn runtime; the `turn_ended` that follows is an
+ * ordinary observation. Anything else is a no-op with a reason — never an
+ * error: `idle` (nothing to interrupt), `no_process`, `not_ready` (booting /
+ * dying / degraded: no channel), `unsupported` (the harness has no in-band
+ * interrupt).
+ */
+export interface InterruptOutcome {
+  interrupted: boolean;
+  reason?: "idle" | "no_process" | "not_ready" | "unsupported";
+}
+
 /** A live runtime process, identified for boot re-adoption by pid + start time. */
 export interface LiveProcess {
   beeId: string;
@@ -87,6 +101,15 @@ export interface RuntimeDriver {
    * existed, `hadProcess` is false and the caller may record the stop itself.
    */
   stop(beeId: string, generation: number, cause: StopCause): { hadProcess: boolean };
+
+  /**
+   * v6 — interrupt the CURRENT TURN of (bee, generation) without ending the
+   * runtime (claude stream-json control_request interrupt, codex
+   * turn/interrupt, tmux C-c). Never blocks, never throws for a missing or
+   * idle runtime: the outcome says what happened. A successful interrupt is
+   * confirmed by the ordinary `turn_ended` observation that follows.
+   */
+  interrupt(beeId: string, generation: number): InterruptOutcome;
 
   /** Drain observations accumulated since the last drain, in event order. */
   observe(): DriverObservation[];

@@ -25,6 +25,8 @@ import type {
   FrozenImportReport,
   LocalConfigImportReport,
   MessageRow,
+  MirrorQuestionRow,
+  MirrorSealRow,
   MirrorTemplateRow,
   MirrorTrackRow,
   RuntimeRow,
@@ -52,6 +54,9 @@ export const RPC_ERROR_CODES = [
   "name_conflict",
   /** A package document failed header/field validation. */
   "invalid_package",
+  /** v6 (additive): question / seal lookups. */
+  "question_not_found",
+  "seal_not_found",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -95,6 +100,19 @@ export const RPC_VERBS = [
   // WP6 §5 cell exit path (spec 05 points 4 + 6): the WP5 driver primitives as verbs
   "cell.capture",
   "cell.remove",
+  // v6 pre-flip verb set (additive to v2/1): rename, tag, interrupt, fork,
+  // parenting read, questions, seals. `spawn` also takes `parentId?`.
+  "bee.rename",
+  "bee.tag",
+  "bee.interrupt",
+  "bee.fork",
+  "bee.children",
+  "question.ask",
+  "question.answer",
+  "question.list",
+  "seal.create",
+  "seal.list",
+  "seal.get",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -139,10 +157,132 @@ export interface SpawnResult extends DedupMarkers {
   commandId: number;
 }
 
+// ---------------------------------------------------------------------------
+// v6 pre-flip verbs — shapes. All mutations take the optional idempotencyKey.
+// ---------------------------------------------------------------------------
+
+/**
+ * `bee.rename {beeId, name}` — names follow createBee's rules (non-empty,
+ * NOT unique: the id is the identity). `applied:false` = already that name.
+ * Audit `bee.renamed`.
+ */
+export interface RenameResult extends DedupMarkers {
+  bee: BeeRow;
+  applied: boolean;
+}
+
+/**
+ * `bee.tag {beeId, add?: string[], remove?: string[]}` — remove first, then
+ * add; order preserved; duplicates collapse. Apiary uses `apiary:workspace=…`
+ * tags for workspace membership, so tag-after-spawn = moving a bee between
+ * workspaces. Audit `bee.tagged` (payload carries the full new list).
+ */
+export interface TagResult extends DedupMarkers {
+  bee: BeeRow;
+  applied: boolean;
+  added: string[];
+  removed: string[];
+}
+
+/**
+ * `bee.interrupt {beeId}` — stop the CURRENT TURN without ending the runtime
+ * (claude stream-json control_request interrupt; codex turn/interrupt; tmux
+ * C-c). `interrupted:false` + `reason` is a RESULT, never an error: `idle`
+ * (nothing to interrupt), `no_process` (no live runtime), `not_ready`
+ * (booting / dying / re-adopted without a channel), `unsupported` (harness
+ * has no in-band interrupt). The turn_ended that follows a successful
+ * interrupt is an ordinary observation. Audit `bee.interrupted` (informational).
+ */
+export interface InterruptResult extends DedupMarkers {
+  beeId: string;
+  generation: number | null;
+  interrupted: boolean;
+  reason?: "idle" | "no_process" | "not_ready" | "unsupported";
+}
+
+/**
+ * `bee.fork {beeId, name?, prompt?, id?}` — a NEW bee with the source's
+ * agent / substrate / cwd / args / env / title / tags, `parentId` = source,
+ * `forkedFrom` = source, and provider-session continuity: the fork's FIRST
+ * runtime forks the source's conversation (`forkSeed` = the source's provider
+ * session id → claude `--resume <seed> --fork-session`, codex `thread/fork`)
+ * into a NEW session of its own, which the daemon records on the fork when
+ * its runtime reports it (the seed is consumed then). A `spawn` command is
+ * enqueued (`commandId`); `prompt` is enqueued as the fork's first mailbox
+ * message (`messageId`). Cell-substrate bees cannot be forked
+ * (`invalid_request` — the cell checkout is single-tenant). Audit:
+ * `bee.created` (+ `bee.forked`, informational).
+ */
+export interface ForkResult extends DedupMarkers {
+  beeId: string;
+  commandId: number;
+  forkedFrom: string;
+  /** The source's provider session id the fork will fork from; null when the source had none (fork boots fresh). */
+  forkSeed: string | null;
+  messageId: number | null;
+  bee: BeeRow;
+}
+
+/** `bee.children {beeId}` — bees whose parentId is this bee (any lifecycle), as view results. */
+export interface ChildrenResult {
+  beeId: string;
+  children: ViewResult[];
+}
+
+/**
+ * `question.ask {beeId, text, options?}` — a bee asks the operator (called
+ * from the bee's runtime: `hive v2 ask "…"` reads HIVE_BEE_ID). Row is open
+ * until `question.answer`. Audit `question.asked`.
+ */
+export interface QuestionAskResult extends DedupMarkers {
+  question: MirrorQuestionRow;
+}
+
+/**
+ * `question.answer {questionId, answer, answeredBy?}` — marks answered AND
+ * delivers the answer to the bee as an ordinary mailbox message prefixed
+ * `[answer to question <id>]` (send()'s wake/unarchive rules apply). A
+ * non-open question is `invalid_request`. Audit `question.answered`.
+ */
+export interface QuestionAnswerResult extends DedupMarkers {
+  question: MirrorQuestionRow;
+  messageId: number;
+  /** The send_wake enqueued for the delivery, when one was needed. */
+  commandId: number | null;
+  unarchived: boolean;
+}
+
+/** `question.list {beeId?, open?}` */
+export interface QuestionListResult {
+  questions: MirrorQuestionRow[];
+}
+
+/**
+ * `seal.create {beeId, title, body, refs?}` — metadata only, tied to the
+ * bee's current generation. Audit `seal.created`.
+ */
+export interface SealCreateResult extends DedupMarkers {
+  seal: MirrorSealRow;
+}
+
+/** `seal.list {beeId?}` */
+export interface SealListResult {
+  seals: MirrorSealRow[];
+}
+
+/** `seal.get {sealId}` — `seal_not_found` when absent. */
+export interface SealGetResult {
+  seal: MirrorSealRow;
+}
+
 /**
  * The substrates the daemon can spawn onto (contract §1: tmux | hsr | cell;
  * tmux is not wired into the daemon yet). `spawn` takes `substrate?`
  * (default `hsr`) and, for `cell`, a `cell` object (SpawnCellParams).
+ * v6: `spawn` also takes `parentId?` — the calling bee (the CLI fills it from
+ * HIVE_BEE_ID; apiary passes it explicitly). The parent must exist
+ * (`bee_not_found` otherwise); the child's runtime env is stamped
+ * HIVE_BEE / HIVE_BEE_ID / HIVE_PARENT.
  */
 export const SPAWN_SUBSTRATES = ["hsr", "cell"] as const;
 export type SpawnSubstrate = (typeof SPAWN_SUBSTRATES)[number];
@@ -242,6 +382,9 @@ export interface SnapshotResult {
   /** Mirror-shaped registry rows (WP6a): store rows verbatim, snapshot-consistent with `seq`. */
   templates: MirrorTemplateRow[];
   tracks: MirrorTrackRow[];
+  /** v6 (additive): questions + seals, store rows verbatim, snapshot-consistent with `seq`. */
+  questions: MirrorQuestionRow[];
+  seals: MirrorSealRow[];
 }
 
 // ---------------------------------------------------------------------------

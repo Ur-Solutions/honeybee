@@ -24,16 +24,27 @@ import {
 import { readFileSync, writeFileSync } from "node:fs";
 import {
   RpcError,
+  type ChildrenResult,
+  type ForkResult,
   type HealthResult,
+  type InterruptResult,
   type ListResult,
   type MailboxResult,
   type CommandsResult,
   type CellCaptureResult,
   type CellRemoveResult,
+  type QuestionAnswerResult,
+  type QuestionAskResult,
+  type QuestionListResult,
+  type RenameResult,
+  type SealCreateResult,
+  type SealGetResult,
+  type SealListResult,
   type SendRpcResult,
   type SnapshotResult,
   type SetArgsResult,
   type SpawnResult,
+  type TagResult,
   type ImportFromFrozenResult,
   type ImportLocalConfigResult,
   type TemplateDeleteResult,
@@ -73,9 +84,14 @@ interface Parsed {
   tags: string[];
   /** `--arg <x>` (repeatable): per-bee spawn args. */
   args: string[];
+  /** Other repeatable value flags (v6): --add, --remove, --option, --ref. */
+  lists: Map<string, string[]>;
   /** Everything after a bare `--`, verbatim (bee set-args). Null when no `--` was given. */
   rest: string[] | null;
 }
+
+/** Repeatable value flags collected into `lists` (v6 verbs). */
+const LIST_FLAGS = new Set(["--add", "--remove", "--option", "--ref"]);
 
 const VALUE_FLAGS = new Set([
   "--agent",
@@ -103,6 +119,13 @@ const VALUE_FLAGS = new Set([
   "--sha",
   "--warm",
   "--onto",
+  // v6
+  "--parent",
+  "--name",
+  "--prompt",
+  "--body",
+  "--by",
+  ...LIST_FLAGS,
 ]);
 
 function parseArgs(argv: string[]): Parsed {
@@ -110,6 +133,7 @@ function parseArgs(argv: string[]): Parsed {
   const flags = new Map<string, string | true>();
   const tags: string[] = [];
   const args: string[] = [];
+  const lists = new Map<string, string[]>();
   let rest: string[] | null = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
@@ -126,12 +150,23 @@ function parseArgs(argv: string[]): Parsed {
       if (v === undefined) throw new Error(`${a} requires a value`);
       if (a === "--tag") tags.push(v);
       else if (a === "--arg") args.push(v);
+      else if (LIST_FLAGS.has(a)) lists.set(a, [...(lists.get(a) ?? []), v]);
       else flags.set(a, v);
     } else {
       flags.set(a, true);
     }
   }
-  return { positional, flags, tags, args, rest };
+  return { positional, flags, tags, args, lists, rest };
+}
+
+/**
+ * v6 — the bee the CURRENT process runs inside, when it is a bee: the
+ * HIVE_BEE_ID stamp the daemon puts on every runtime env. `hive v2 ask` /
+ * `seal` default their bee to it; `spawn` fills `parentId` from it.
+ */
+function selfBeeId(env: Record<string, string | undefined> = process.env): string | null {
+  const id = env.HIVE_BEE_ID;
+  return typeof id === "string" && id.length > 0 ? id : null;
 }
 
 interface CliContext {
@@ -178,7 +213,9 @@ function viewLine(v: ViewResult, stale: boolean): string {
   const derived = v.view.working ? "working" : v.view.waitingForYou ? "waiting-for-you" : "quiet";
   const prefix = stale ? "stale: " : "";
   const args = bee?.args && bee.args.length > 0 ? `  args=${JSON.stringify(bee.args)}` : "";
-  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}${args}`;
+  const parent = bee?.parentId ? `  parent=${bee.parentId}` : "";
+  const tags = bee?.tags && bee.tags.length > 0 ? `  tags=${bee.tags.join(",")}` : "";
+  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}${args}${parent}${tags}`;
 }
 
 function emit(ctx: CliContext, human: string[], jsonValue: unknown, stale: boolean): void {
@@ -235,7 +272,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 // ---------------------------------------------------------------------------
 
 const SPAWN_USAGE =
-  "usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]\n" +
+  "usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
   "       hive v2 spawn <name> --agent <agent> --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]";
 
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -260,8 +297,23 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
   } else if (parsed.flags.has("--origin") || parsed.flags.has("--sha")) {
     throw new Error(`${SPAWN_USAGE}\n(--origin/--sha only apply to --substrate cell)`);
   }
-  const result = await withClient(ctx, (c) =>
-    c.request<SpawnResult>("spawn", {
+  const result = await withClient(ctx, async (c) => {
+    // v6 parenting: an explicit --parent (id or unique name) is strict; the
+    // ambient HIVE_BEE_ID (this process IS a bee) is used iff that bee exists
+    // on this node — a stamp from another node/world is dropped, not an error.
+    const explicitParent = parsed.flags.get("--parent") as string | undefined;
+    let parentId: string | undefined;
+    if (explicitParent) {
+      const list = await c.request<ListResult>("list");
+      parentId = resolveBeeIn(list.views, explicitParent);
+    } else if (parsed.flags.get("--no-parent") !== true) {
+      const self = selfBeeId();
+      if (self) {
+        const list = await c.request<ListResult>("list");
+        if (list.views.some((v) => v.bee?.id === self)) parentId = self;
+      }
+    }
+    return c.request<SpawnResult>("spawn", {
       name,
       agent,
       cwd,
@@ -270,9 +322,10 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
       ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
+      ...(parentId ? { parentId } : {}),
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
-    }),
-  );
+    });
+  });
   emit(
     ctx,
     [`${result.deduped ? "deduped: already " : ""}spawned ${result.beeId} (command ${result.commandId}${result.status ? ` ${result.status}` : ""})`],
@@ -280,6 +333,240 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
     false,
   );
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// v6 pre-flip verbs: rename, tag, interrupt, fork, children, ask/question, seal
+// ---------------------------------------------------------------------------
+
+async function cmdRename(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const [, needle, name] = parsed.positional;
+  if (!needle || !name) throw new Error("usage: hive v2 rename <bee> <new-name> [--idempotency-key k]");
+  return withClient(ctx, async (c) => {
+    const list = await c.request<ListResult>("list");
+    const beeId = resolveBeeIn(list.views, needle);
+    const r = await c.request<RenameResult>("bee.rename", { beeId, name, idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined });
+    emit(ctx, [`${r.deduped ? "deduped: " : ""}${r.applied ? "renamed" : "unchanged"} ${beeId} → ${JSON.stringify(r.bee.name)}`], r, false);
+    return 0;
+  });
+}
+
+async function cmdTag(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  const add = parsed.lists.get("--add") ?? [];
+  const remove = parsed.lists.get("--remove") ?? [];
+  if (!needle || (add.length === 0 && remove.length === 0)) {
+    throw new Error("usage: hive v2 tag <bee> [--add t]... [--remove t]... [--idempotency-key k]");
+  }
+  return withClient(ctx, async (c) => {
+    const list = await c.request<ListResult>("list");
+    const beeId = resolveBeeIn(list.views, needle);
+    const r = await c.request<TagResult>("bee.tag", {
+      beeId,
+      ...(add.length > 0 ? { add } : {}),
+      ...(remove.length > 0 ? { remove } : {}),
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    });
+    emit(ctx, [`${r.deduped ? "deduped: " : ""}${r.applied ? "tagged" : "unchanged"} ${beeId}: ${JSON.stringify(r.bee.tags)}${r.added.length > 0 ? ` +${r.added.join(",")}` : ""}${r.removed.length > 0 ? ` -${r.removed.join(",")}` : ""}`], r, false);
+    return 0;
+  });
+}
+
+async function cmdInterrupt(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 interrupt <bee> [--idempotency-key k]");
+  return withClient(ctx, async (c) => {
+    const list = await c.request<ListResult>("list");
+    const beeId = resolveBeeIn(list.views, needle);
+    const r = await c.request<InterruptResult>("bee.interrupt", { beeId, idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined });
+    emit(ctx, [`${r.deduped ? "deduped: " : ""}${r.interrupted ? `interrupt sent to ${beeId} (generation ${r.generation})` : `no interrupt for ${beeId}: ${r.reason}`}`], r, false);
+    return 0;
+  });
+}
+
+async function cmdFork(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const [, needle, ...promptParts] = parsed.positional;
+  if (!needle) throw new Error("usage: hive v2 fork <bee> [--name n] [--prompt p | prompt…] [--idempotency-key k]");
+  const prompt = (parsed.flags.get("--prompt") as string | undefined) ?? (promptParts.length > 0 ? promptParts.join(" ") : undefined);
+  return withClient(ctx, async (c) => {
+    const list = await c.request<ListResult>("list");
+    const beeId = resolveBeeIn(list.views, needle);
+    const r = await c.request<ForkResult>("bee.fork", {
+      beeId,
+      ...(parsed.flags.has("--name") ? { name: parsed.flags.get("--name") as string } : {}),
+      ...(prompt !== undefined ? { prompt } : {}),
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    });
+    emit(
+      ctx,
+      [`${r.deduped ? "deduped: already " : ""}forked ${beeId} → ${r.beeId} (${r.bee.name}; command ${r.commandId}${r.status ? ` ${r.status}` : ""}${r.forkSeed ? `; forks session ${r.forkSeed}` : "; source had no session — boots fresh"}${r.messageId != null ? `; prompt message ${r.messageId}` : ""})`],
+      r,
+      false,
+    );
+    return 0;
+  });
+}
+
+async function cmdChildren(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 children <bee>");
+  const { result, stale } = await readPath(
+    ctx,
+    async (c) => {
+      const list = await c.request<ListResult>("list");
+      return c.request<ChildrenResult>("bee.children", { beeId: resolveBeeIn(list.views, needle) });
+    },
+    (store) => {
+      const beeId = resolveBeeIn(store.list(null), needle);
+      return { beeId, children: store.children(beeId) };
+    },
+  );
+  const lines = result.children.length === 0 ? [`${stale ? "stale: " : ""}no children`] : result.children.map((v) => viewLine(v, stale));
+  emit(ctx, lines, result, stale);
+  return 0;
+}
+
+/** The bee a bee-side verb (ask/seal) targets: --bee, else HIVE_BEE_ID. */
+async function targetBee(c: RpcClient, parsed: Parsed, verb: string): Promise<string> {
+  const flag = parsed.flags.get("--bee") as string | undefined;
+  if (flag) {
+    const list = await c.request<ListResult>("list");
+    return resolveBeeIn(list.views, flag);
+  }
+  const self = selfBeeId();
+  if (!self) throw new Error(`hive v2 ${verb}: not running inside a bee (HIVE_BEE_ID unset) — pass --bee <bee>`);
+  return self;
+}
+
+async function cmdAsk(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const text = parsed.positional.slice(1).join(" ");
+  if (text.length === 0) throw new Error("usage: hive v2 ask <question…> [--option o]... [--bee b] [--idempotency-key k]");
+  const options = parsed.lists.get("--option");
+  return withClient(ctx, async (c) => {
+    const beeId = await targetBee(c, parsed, "ask");
+    const r = await c.request<QuestionAskResult>("question.ask", {
+      beeId,
+      text,
+      ...(options && options.length > 0 ? { options } : {}),
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    });
+    emit(ctx, [`${r.deduped ? "deduped: " : ""}asked question ${r.question.id} (the answer arrives in your mailbox as "[answer to question ${r.question.id}] …")`], r, false);
+    return 0;
+  });
+}
+
+function questionLine(q: QuestionListResult["questions"][number], stale: boolean): string {
+  const prefix = stale ? "stale: " : "";
+  const opts = q.options && q.options.length > 0 ? ` options=${JSON.stringify(q.options)}` : "";
+  const ans = q.status === "answered" ? `  answered by ${q.answeredBy}: ${q.answer}` : "";
+  return `${prefix}${q.id}  bee=${q.beeId}  ${q.status}${opts}  ${q.text}${ans}`;
+}
+
+async function cmdQuestion(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  const usage = "usage: hive v2 question list [--bee b] [--open] | question answer <question-id> <answer…> [--by who]";
+  switch (sub) {
+    case "list": {
+      const open = parsed.flags.get("--open") === true ? true : undefined;
+      const beeFlag = parsed.flags.get("--bee") as string | undefined;
+      const { result, stale } = await readPath(
+        ctx,
+        async (c) => {
+          const beeId = beeFlag ? resolveBeeIn((await c.request<ListResult>("list")).views, beeFlag) : undefined;
+          return c.request<QuestionListResult>("question.list", { ...(beeId ? { beeId } : {}), ...(open !== undefined ? { open } : {}) });
+        },
+        (store) => {
+          const beeId = beeFlag ? resolveBeeIn(store.list(null), beeFlag) : undefined;
+          return { questions: store.questions({ ...(beeId ? { beeId } : {}), ...(open !== undefined ? { open } : {}) }) };
+        },
+      );
+      const lines = result.questions.length === 0 ? [`${stale ? "stale: " : ""}no questions`] : result.questions.map((q) => questionLine(q, stale));
+      emit(ctx, lines, result, stale);
+      return 0;
+    }
+    case "answer":
+      return cmdAnswer(ctx, { ...parsed, positional: parsed.positional.slice(1) });
+    default:
+      throw new Error(usage);
+  }
+}
+
+async function cmdAnswer(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const [, questionId, ...answerParts] = parsed.positional;
+  const answer = answerParts.join(" ");
+  if (!questionId || answer.length === 0) throw new Error("usage: hive v2 answer <question-id> <answer…> [--by who] [--idempotency-key k]");
+  return withClient(ctx, async (c) => {
+    const r = await c.request<QuestionAnswerResult>("question.answer", {
+      questionId,
+      answer,
+      ...(parsed.flags.has("--by") ? { answeredBy: parsed.flags.get("--by") as string } : {}),
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    });
+    emit(ctx, [`${r.deduped ? "deduped: " : ""}answered question ${questionId} → delivered to ${r.question.beeId} as message ${r.messageId}${r.commandId != null ? ` (wake command ${r.commandId})` : ""}`], r, false);
+    return 0;
+  });
+}
+
+function sealLine(sl: SealListResult["seals"][number], stale: boolean): string {
+  const refs = sl.refs.length > 0 ? ` refs=${JSON.stringify(sl.refs)}` : "";
+  return `${stale ? "stale: " : ""}${sl.id}  bee=${sl.beeId}  gen=${sl.generation ?? "-"}  ${sl.title}${refs}`;
+}
+
+/**
+ * `hive v2 seal "<title>" --body <text> [--ref r]... [--bee b]` (create; the
+ * bee defaults to HIVE_BEE_ID) · `seal list [--bee b]` · `seal get <id>`.
+ */
+async function cmdSeal(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  const usage = "usage: hive v2 seal <title> [--body text] [--ref r]... [--bee b] | seal list [--bee b] | seal get <seal-id>";
+  if (!sub) throw new Error(usage);
+  if (sub === "list") {
+    const beeFlag = parsed.flags.get("--bee") as string | undefined;
+    const { result, stale } = await readPath(
+      ctx,
+      async (c) => {
+        const beeId = beeFlag ? resolveBeeIn((await c.request<ListResult>("list")).views, beeFlag) : undefined;
+        return c.request<SealListResult>("seal.list", beeId ? { beeId } : {});
+      },
+      (store) => {
+        const beeId = beeFlag ? resolveBeeIn(store.list(null), beeFlag) : undefined;
+        return { seals: store.seals(beeId ? { beeId } : {}) };
+      },
+    );
+    const lines = result.seals.length === 0 ? [`${stale ? "stale: " : ""}no seals`] : result.seals.map((sl) => sealLine(sl, stale));
+    emit(ctx, lines, result, stale);
+    return 0;
+  }
+  if (sub === "get") {
+    const id = parsed.positional[2];
+    if (!id) throw new Error(usage);
+    const { result, stale } = await readPath(
+      ctx,
+      (c) => c.request<SealGetResult>("seal.get", { sealId: id }),
+      (store) => {
+        const seal = store.seal(id);
+        if (!seal) throw new RpcError("seal_not_found", `seal not found: ${id}`);
+        return { seal };
+      },
+    );
+    emit(ctx, [sealLine(result.seal, stale), ...result.seal.body.split("\n").map((l) => `${stale ? "stale: " : ""}  ${l}`)], result, stale);
+    return 0;
+  }
+  const title = sub;
+  const body = (parsed.flags.get("--body") as string | undefined) ?? (parsed.rest ? parsed.rest.join(" ") : "");
+  const refs = parsed.lists.get("--ref") ?? [];
+  return withClient(ctx, async (c) => {
+    const beeId = await targetBee(c, parsed, "seal");
+    const r = await c.request<SealCreateResult>("seal.create", {
+      beeId,
+      title,
+      body,
+      ...(refs.length > 0 ? { refs } : {}),
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    });
+    emit(ctx, [`${r.deduped ? "deduped: " : ""}sealed ${r.seal.id} for ${beeId} (generation ${r.seal.generation ?? "-"}): ${r.seal.title}`], r, false);
+    return 0;
+  });
 }
 
 async function cmdSend(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -1079,11 +1366,21 @@ Mutations (RPC, daemon must be running):
   revive <bee> [--arg a]... | [-- <args…>]   (revive with replacement per-bee args)
   bee set-args <bee> -- <args…> | --clear    per-bee harness args (--model, --effort, …);
   bee args <bee>                             layered over the agent spec on the NEXT runtime
+  rename <bee> <new-name>                    rename (names are labels; the id is the identity)
+  tag <bee> [--add t]... [--remove t]...     edit tags (apiary:workspace=… moves a bee between workspaces)
+  interrupt <bee>                            stop the current TURN, keep the runtime (idle = no-op)
+  fork <bee> [--name n] [--prompt p|prompt…] new bee, same shape, continues the source's conversation
+                                             in a NEW session; parentId = forkedFrom = source
+  spawn … [--parent <bee>|--no-parent]       parenting: filled from HIVE_BEE_ID when spawning from a bee
+  ask <question…> [--option o]... [--bee b]  (from inside a bee) ask the operator; the answer comes back as mail
+  answer <question-id> <answer…> [--by who]  answer an open question (also: question answer …)
+  seal <title> [--body t] [--ref r]... [--bee b]   record a seal for this bee (metadata; current generation)
   (--idempotency-key: spec 06 §4.2 one-key rule — a replayed key returns the
    original outcome, marked deduped, instead of executing twice)
 
 Reads (RPC; read-only store fallback labeled STALE when daemon is down):
   view <bee> · list [--all|--archived] · mailbox <bee> · commands <bee>
+  children <bee> · question list [--bee b] [--open] · seal list [--bee b] · seal get <id>
   deploy-info · health
 
 Templates + tracks + packages (spec 06 §1.4.1 — rows are truth, files are packages):
@@ -1131,6 +1428,24 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdMutation(ctx, parsed, command);
       case "bee":
         return await cmdBee(ctx, parsed);
+      case "rename":
+        return await cmdRename(ctx, parsed);
+      case "tag":
+        return await cmdTag(ctx, parsed);
+      case "interrupt":
+        return await cmdInterrupt(ctx, parsed);
+      case "fork":
+        return await cmdFork(ctx, parsed);
+      case "children":
+        return await cmdChildren(ctx, parsed);
+      case "ask":
+        return await cmdAsk(ctx, parsed);
+      case "question":
+        return await cmdQuestion(ctx, parsed);
+      case "answer":
+        return await cmdAnswer(ctx, parsed);
+      case "seal":
+        return await cmdSeal(ctx, parsed);
       case "cell":
         return await cmdCell(ctx, parsed);
       case "view":

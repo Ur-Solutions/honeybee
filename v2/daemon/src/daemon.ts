@@ -17,6 +17,7 @@
  *  - behavior 7 (config)           → config.ts
  */
 import { existsSync, mkdirSync, rmSync } from "node:fs";
+import type { InterruptOutcome } from "../../harness/src/driver.ts";
 import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -74,12 +75,23 @@ import {
   type CellCaptureMode,
   type CellCaptureResult,
   type CellRemoveResult,
+  type ChildrenResult,
   type DeployInfoResult,
+  type ForkResult,
   type HealthResult,
+  type InterruptResult,
   type ListResult,
   type MutationResult,
+  type QuestionAnswerResult,
+  type QuestionAskResult,
+  type QuestionListResult,
+  type RenameResult,
   type RpcVerb,
+  type SealCreateResult,
+  type SealGetResult,
+  type SealListResult,
   type SetArgsResult,
+  type TagResult,
   type ImportFromFrozenResult,
   type ImportLocalConfigResult,
   type SendRpcResult,
@@ -110,14 +122,20 @@ const ADAPTER_NAMES = ["claude", "codex", "stub"] as const;
  * resolveSpawnSpec), codex via its handshake (`thread/resume`). The stub has
  * no resume path — a revived stub restarts fresh, like any harness without one.
  * `model` (codex only) is the `-m/--model` lifted off the composed argv into
- * the thread request — the app-server ignores TUI flags.
+ * the thread request — the app-server ignores TUI flags. `forkSeed` (v6, a
+ * fork's first runtime, no session of its own yet) selects the fork path
+ * instead: codex `thread/fork {threadId: seed}`; claude via `forkArgs`.
  */
-function adapterFor(name: string, cwd: string, providerSessionId: string | null, model?: string): HarnessAdapter | null {
+function adapterFor(name: string, cwd: string, providerSessionId: string | null, model?: string, forkSeed?: string | null): HarnessAdapter | null {
   switch (name) {
     case "claude":
       return claudeAdapter;
     case "codex":
-      return codexAdapter({ cwd, ...(providerSessionId ? { resumeThreadId: providerSessionId } : {}), ...(model ? { model } : {}) });
+      return codexAdapter({
+        cwd,
+        ...(providerSessionId ? { resumeThreadId: providerSessionId } : forkSeed ? { forkThreadId: forkSeed } : {}),
+        ...(model ? { model } : {}),
+      });
     case "stub":
       return stubAdapter;
     default:
@@ -150,17 +168,42 @@ function grammarFor(adapterName: string): ArgGrammar {
 export function composeSpawn(
   spec: AgentSpecConfig,
   adapterName: string,
-  bee: { cwd: string; args: string[] | null; providerSessionId: string | null },
+  bee: { cwd: string; args: string[] | null; providerSessionId: string | null; forkSeed?: string | null },
 ): { adapter: HarnessAdapter | null; args: string[]; model: string | undefined } {
   const grammar = grammarFor(adapterName);
-  const base = adapterFor(adapterName, bee.cwd, bee.providerSessionId);
-  const resume = bee.providerSessionId && base?.resumeArgs ? base.resumeArgs(bee.providerSessionId) : [];
+  // v6 fork: a fork with no session of its own yet forks the SOURCE's
+  // conversation (`--resume <seed> --fork-session` / thread/fork) into a new
+  // one; once its own id is recorded the seed is consumed and plain resume
+  // takes over. A recorded session always wins over a stale seed.
+  const forkSeed = bee.providerSessionId ? null : (bee.forkSeed ?? null);
+  const base = adapterFor(adapterName, bee.cwd, bee.providerSessionId, undefined, forkSeed);
+  const resume = bee.providerSessionId && base?.resumeArgs
+    ? base.resumeArgs(bee.providerSessionId)
+    : forkSeed && base?.forkArgs
+      ? base.forkArgs(forkSeed)
+      : [];
   const composed = composeArgv(grammar, [spec.args, spec.defaultArgs, bee.args, resume]);
   if (adapterName === "codex") {
     const plan = codexSpawnPlan(composed);
-    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, plan.model), args: plan.argv, model: plan.model };
+    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, plan.model, forkSeed), args: plan.argv, model: plan.model };
   }
   return { adapter: base, args: composed, model: undefined };
+}
+
+/**
+ * v6 — the honeybee-owned identity env every runtime is stamped with, AFTER
+ * every other env source (agent spec, per-bee env) so nothing can override
+ * it. HIVE_BEE / HIVE_BEE_ID are what agents' skills read (`hive v2 ask`,
+ * `hive v2 seal`, `hive v2 spawn` fill their bee/parent from them);
+ * HIVE_PARENT is set iff the bee was spawned by another bee — the child's
+ * "you were spawned by <parent>; report back to it" fact.
+ */
+export function beeIdentityEnv(bee: { id: string; name: string; parentId: string | null }): Record<string, string> {
+  return {
+    HIVE_BEE: bee.name,
+    HIVE_BEE_ID: bee.id,
+    ...(bee.parentId ? { HIVE_PARENT: bee.parentId } : {}),
+  };
 }
 
 const OP_LOG_TAIL = 40;
@@ -330,7 +373,7 @@ export class HiveDaemon {
       command: spec.command,
       args,
       cwd: bee.cwd,
-      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env },
+      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...beeIdentityEnv(bee) },
     };
   }
 
@@ -432,6 +475,28 @@ export class HiveDaemon {
         return this.withIdempotency(verb, params, () => this.rpcCellCapture(params));
       case "cell.remove":
         return this.withIdempotency(verb, params, () => this.rpcCellRemove(params));
+      case "bee.rename":
+        return this.withIdempotency(verb, params, () => this.rpcRename(params));
+      case "bee.tag":
+        return this.withIdempotency(verb, params, () => this.rpcTag(params));
+      case "bee.interrupt":
+        return this.withIdempotency(verb, params, () => this.rpcInterrupt(params));
+      case "bee.fork":
+        return this.withIdempotency(verb, params, () => this.rpcFork(params));
+      case "bee.children":
+        return this.rpcChildren(params);
+      case "question.ask":
+        return this.withIdempotency(verb, params, () => this.rpcQuestionAsk(params));
+      case "question.answer":
+        return this.withIdempotency(verb, params, () => this.rpcQuestionAnswer(params));
+      case "question.list":
+        return this.rpcQuestionList(params);
+      case "seal.create":
+        return this.withIdempotency(verb, params, () => this.rpcSealCreate(params));
+      case "seal.list":
+        return this.rpcSealList(params);
+      case "seal.get":
+        return { seal: this.mustStore().mustGetSeal(this.param(params, "sealId")) } satisfies SealGetResult;
       case "archive":
         return this.withIdempotency(verb, params, () =>
           this.rpcEnqueue("archive", this.param(params, "beeId"), {}, params),
@@ -614,6 +679,7 @@ export class HiveDaemon {
     const tags = Array.isArray(params.tags) && params.tags.every((t) => typeof t === "string")
       ? (params.tags as string[])
       : [];
+    const parentId = this.parentParam(params);
     const id = typeof params.id === "string" && params.id.length > 0 ? params.id : randomUUID();
     const driver = this.driver;
     // Cell substrate: the cell owns the cwd (the space checkout). The seed
@@ -631,6 +697,7 @@ export class HiveDaemon {
       tags,
       sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
       args: params.args === undefined ? undefined : this.argsParam(params, "spawn", false),
+      parentId,
     });
     if (cell) {
       reserveCell(this.cfg.cellsRoot, cell.reserve);
@@ -812,6 +879,190 @@ export class HiveDaemon {
     return result;
   }
 
+  // -------------------------------------------------------------------------
+  // v6 — pre-flip verb set: rename, tag, interrupt, fork, parenting, questions, seals
+  // -------------------------------------------------------------------------
+
+  /** `parentId?` — the calling bee; must exist (soft ref, but never a dangling one at spawn). */
+  private parentParam(params: Record<string, unknown>): string | null {
+    const v = params.parentId;
+    if (v === undefined || v === null) return null;
+    if (typeof v !== "string" || v.length === 0) throw new RpcError("invalid_request", "parentId must be a non-empty string when given");
+    if (!this.mustStore().getBee(v)) throw new RpcError("bee_not_found", `parent bee not found: ${v}`);
+    return v;
+  }
+
+  private stringListParam(params: Record<string, unknown>, key: string, verb: string): string[] | undefined {
+    const v = params[key];
+    if (v === undefined || v === null) return undefined;
+    if (!Array.isArray(v) || v.some((t) => typeof t !== "string")) {
+      throw new RpcError("invalid_request", `${verb}: ${key} must be an array of strings`);
+    }
+    return v as string[];
+  }
+
+  private rpcRename(params: Record<string, unknown>): RenameResult {
+    const beeId = this.requireBee(params);
+    const name = this.param(params, "name");
+    const res = this.mustStore().renameBee(beeId, name);
+    this.log(`bee.rename bee=${beeId} applied=${res.applied} name=${JSON.stringify(name)}`);
+    return { bee: res.bee, applied: res.applied };
+  }
+
+  private rpcTag(params: Record<string, unknown>): TagResult {
+    const beeId = this.requireBee(params);
+    const add = this.stringListParam(params, "add", "bee.tag");
+    const remove = this.stringListParam(params, "remove", "bee.tag");
+    if (add === undefined && remove === undefined) throw new RpcError("invalid_request", "bee.tag: give add and/or remove");
+    const res = this.mustStore().tagBee(beeId, { add, remove });
+    this.log(`bee.tag bee=${beeId} applied=${res.applied} added=${JSON.stringify(res.added)} removed=${JSON.stringify(res.removed)}`);
+    return { bee: res.bee, applied: res.applied, added: res.added, removed: res.removed };
+  }
+
+  /**
+   * `bee.interrupt`: the driver's in-band turn interrupt against the bee's
+   * CURRENT live generation. Idle / no runtime = a reasoned no-op result.
+   * The runtime stays live; the turn_ended is observed by the loops.
+   */
+  private rpcInterrupt(params: Record<string, unknown>): InterruptResult {
+    const store = this.mustStore();
+    const beeId = this.requireBee(params);
+    const rt = store.currentRuntime(beeId);
+    const driver = this.driver;
+    let outcome: InterruptOutcome;
+    if (!rt || rt.state === "stopped" || !driver) outcome = { interrupted: false, reason: "no_process" };
+    else if (rt.state === "idle") outcome = { interrupted: false, reason: "idle" };
+    else if (rt.state === "booting") outcome = { interrupted: false, reason: "not_ready" };
+    else outcome = driver.interrupt(beeId, rt.generation);
+    store.recordInterrupt(beeId, rt?.generation ?? null, outcome);
+    this.log(`bee.interrupt bee=${beeId} gen=${rt?.generation ?? "-"} interrupted=${outcome.interrupted}${outcome.reason ? ` reason=${outcome.reason}` : ""}`);
+    return {
+      beeId,
+      generation: rt?.generation ?? null,
+      interrupted: outcome.interrupted,
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+    };
+  }
+
+  /**
+   * `bee.fork`: a new bee cloned from the source's spawn shape with
+   * `parentId` = `forkedFrom` = source and the one-shot fork seed (the
+   * source's provider session id) so its first runtime forks the
+   * conversation into a new session of its own. Same transaction: create,
+   * fork provenance, spawn command, optional first message.
+   */
+  private rpcFork(params: Record<string, unknown>): ForkResult {
+    const store = this.mustStore();
+    const key = this.idempotencyKeyOf(params);
+    if (key != null) {
+      const original = store.getCommandByIdempotencyKey(key);
+      if (original) {
+        const bee = store.getBee(original.beeId);
+        if (bee) {
+          return { beeId: bee.id, commandId: original.id, forkedFrom: bee.forkedFrom ?? "", forkSeed: bee.forkSeed, messageId: null, bee, status: original.status, deduped: true };
+        }
+      }
+    }
+    const sourceId = this.requireBee(params);
+    const source = store.getBee(sourceId);
+    if (!source) throw new RpcError("bee_not_found", `bee not found: ${sourceId}`);
+    if (source.substrate === "cell") {
+      throw new RpcError("invalid_request", `bee ${sourceId} runs in a cell (single-tenant checkout); spawn a new cell bee instead of forking`);
+    }
+    const name = params.name === undefined ? `${source.name}-fork` : this.param(params, "name");
+    const prompt = params.prompt === undefined || params.prompt === null ? null : this.param(params, "prompt");
+    const id = typeof params.id === "string" && params.id.length > 0 ? params.id : randomUUID();
+    const forkSeed = source.providerSessionId;
+    const driver = this.driver;
+    const { bee } = store.createBee({
+      id,
+      name,
+      agent: source.agent,
+      substrate: source.substrate,
+      cwd: source.cwd,
+      title: source.title ?? undefined,
+      tags: [...source.tags],
+      sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
+      env: { ...source.env },
+      args: source.args,
+      parentId: source.id,
+      forkedFrom: source.id,
+      forkSeed,
+    });
+    store.recordFork(id, source.id, forkSeed);
+    const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
+    const sent = prompt == null ? null : store.send(id, prompt, { sender: "operator" });
+    this.log(`bee.fork source=${source.id} fork=${id} seed=${forkSeed ?? "-"} cmd=${cmd.id}${sent ? ` msg=${sent.message.id}` : ""}`);
+    return { beeId: id, commandId: cmd.id, forkedFrom: source.id, forkSeed, messageId: sent?.message.id ?? null, bee };
+  }
+
+  private rpcChildren(params: Record<string, unknown>): ChildrenResult {
+    const store = this.mustStore();
+    const beeId = this.requireBee(params);
+    return { beeId, children: store.listChildren(beeId).map((b) => this.viewOf(store, b.id)) };
+  }
+
+  private rpcQuestionAsk(params: Record<string, unknown>): QuestionAskResult {
+    const beeId = this.requireBee(params);
+    const text = this.param(params, "text");
+    const options = this.stringListParam(params, "options", "question.ask");
+    const question = this.mustStore().askQuestion(beeId, {
+      ...(typeof params.id === "string" && params.id.length > 0 ? { id: params.id } : {}),
+      text,
+      options: options ?? null,
+    });
+    this.log(`question.ask bee=${beeId} question=${question.id}`);
+    return { question };
+  }
+
+  private rpcQuestionAnswer(params: Record<string, unknown>): QuestionAnswerResult {
+    const store = this.mustStore();
+    const questionId = this.param(params, "questionId");
+    const answer = this.param(params, "answer");
+    if (!store.getQuestion(questionId)) throw new RpcError("question_not_found", `question not found: ${questionId}`);
+    const answeredBy = typeof params.answeredBy === "string" && params.answeredBy.length > 0 ? params.answeredBy : "operator";
+    const res = store.answerQuestion(questionId, answer, { answeredBy });
+    this.log(`question.answer question=${questionId} bee=${res.question.beeId} msg=${res.send.message.id}${res.send.wakeCommand ? ` wake=${res.send.wakeCommand.id}` : ""}`);
+    return {
+      question: res.question,
+      messageId: res.send.message.id,
+      commandId: res.send.wakeCommand?.id ?? null,
+      unarchived: res.send.unarchived,
+    };
+  }
+
+  private rpcQuestionList(params: Record<string, unknown>): QuestionListResult {
+    const store = this.mustStore();
+    const beeId = params.beeId === undefined || params.beeId === null ? undefined : this.requireBee(params);
+    if (params.open !== undefined && params.open !== null && typeof params.open !== "boolean") {
+      throw new RpcError("invalid_request", "question.list: open must be a boolean when given");
+    }
+    const open = typeof params.open === "boolean" ? params.open : undefined;
+    return { questions: store.listQuestions({ ...(beeId ? { beeId } : {}), ...(open !== undefined ? { open } : {}) }) };
+  }
+
+  private rpcSealCreate(params: Record<string, unknown>): SealCreateResult {
+    const beeId = this.requireBee(params);
+    const title = this.param(params, "title");
+    const body = params.body === undefined || params.body === null ? "" : params.body;
+    if (typeof body !== "string") throw new RpcError("invalid_request", "seal.create: body must be a string");
+    const refs = this.stringListParam(params, "refs", "seal.create");
+    const seal = this.mustStore().createSeal(beeId, {
+      ...(typeof params.id === "string" && params.id.length > 0 ? { id: params.id } : {}),
+      title,
+      body,
+      refs,
+    });
+    this.log(`seal.create bee=${beeId} seal=${seal.id}`);
+    return { seal };
+  }
+
+  private rpcSealList(params: Record<string, unknown>): SealListResult {
+    const store = this.mustStore();
+    const beeId = params.beeId === undefined || params.beeId === null ? undefined : this.requireBee(params);
+    return { seals: store.listSeals(beeId ? { beeId } : {}) };
+  }
+
   private rpcSend(params: Record<string, unknown>): SendRpcResult {
     const store = this.mustStore();
     const beeId = this.param(params, "beeId");
@@ -900,6 +1151,8 @@ export class HiveDaemon {
       views: store.listBees().map((b) => this.viewOf(store, b.id)),
       templates: store.listTemplates(),
       tracks: store.listTracks(),
+      questions: store.listQuestions(),
+      seals: store.listSeals(),
     };
   }
 

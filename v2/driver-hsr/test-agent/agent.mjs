@@ -22,6 +22,10 @@
  *     "@exit"      turn completes, then process exits 0 (clean exit)
  *     "@authfail"  turn emits a login-required auth error, ends ok:false
  *     "@ratelimit" turn emits a rejected rate-limit event, ends ok:false
+ *     "@slow:<ms>" turn takes <ms> instead of STUB_TURN_MS (interrupt tests)
+ *   {"type":"interrupt"} (v6): ends the CURRENT turn now — emits
+ *     {"event":"turn_ended","messageId":n,"ok":true,"interrupted":true},
+ *     un-hangs a "@hang" turn, and keeps working the queue. Idle: ignored.
  *
  * Messages arriving mid-turn are queued and worked FIFO (the accept point).
  */
@@ -49,6 +53,19 @@ if (env.STUB_EXIT_BEFORE_READY === "1") {
 const queue = [];
 let busy = false;
 let hung = false;
+let currentId = null;
+let turnTimer = null;
+
+function interruptTurn() {
+  if (!busy) return; // idle: nothing to interrupt
+  if (turnTimer) clearTimeout(turnTimer);
+  turnTimer = null;
+  hung = false;
+  busy = false;
+  emit({ event: "turn_ended", messageId: currentId, ok: true, interrupted: true });
+  currentId = null;
+  workNext();
+}
 
 function workNext() {
   if (busy || hung) return;
@@ -56,13 +73,17 @@ function workNext() {
   if (!msg) return;
   busy = true;
   const id = msg.id;
+  currentId = id;
   const body = typeof msg.body === "string" ? msg.body : "";
   emit({ event: "turn_started", messageId: id });
   if (body.includes("@hang")) {
-    hung = true; // never ends; never picks up further work
+    hung = true; // never ends; never picks up further work (until interrupted)
     return;
   }
-  setTimeout(() => {
+  const slow = /@slow:(\d+)/.exec(body);
+  const thisTurnMs = slow ? Number(slow[1]) : turnMs;
+  turnTimer = setTimeout(() => {
+    turnTimer = null;
     if (body.includes("@crash")) {
       // turn_started was written a full turn ago (pipe flushed); die mid-turn.
       process.exit(9);
@@ -78,13 +99,14 @@ function workNext() {
       emit({ event: "turn_ended", messageId: id, ok: true });
     }
     busy = false;
+    currentId = null;
     if (body.includes("@exit")) {
       // Give the pipe a beat to flush turn_ended before the clean exit.
       setTimeout(() => process.exit(0), 15);
       return;
     }
     workNext();
-  }, turnMs);
+  }, thisTurnMs);
 }
 
 const rl = createInterface({ input: process.stdin });
@@ -100,6 +122,8 @@ rl.on("line", (raw) => {
   if (msg && msg.type === "message") {
     queue.push(msg);
     workNext();
+  } else if (msg && msg.type === "interrupt") {
+    interruptTurn();
   }
 });
 

@@ -116,3 +116,16 @@ test("claude: resumeArgs (spec 07 §F) — `--resume <id>`; init after resume ec
   assert.equal(signals[0]?.kind, "booted");
   if (signals[0]?.kind === "booted") assert.equal(signals[0].sessionId, "9aa1f08d-1446-4d78-981f-bbec462ba87b");
 });
+
+test("claude v6: forkArgs = `--resume <src> --fork-session` (never --session-id); encodeInterrupt = control_request interrupt with unique request ids; the ack parses to []", () => {
+  assert.deepEqual(claudeAdapter.forkArgs?.("src-1"), ["--resume", "src-1", "--fork-session"]);
+  const a = JSON.parse(claudeAdapter.encodeInterrupt!({ sessionId: "s", turnId: null })!) as Record<string, unknown>;
+  const b = JSON.parse(claudeAdapter.encodeInterrupt!({ sessionId: null, turnId: null })!) as Record<string, unknown>;
+  assert.equal(a.type, "control_request");
+  assert.deepEqual(a.request, { subtype: "interrupt" });
+  assert.ok(String(a.request_id).startsWith("hive-interrupt-"));
+  assert.notEqual(a.request_id, b.request_id, "request ids are unique per interrupt");
+  assert.deepEqual(parseClaudeLine(JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: a.request_id } })), []);
+  // the interrupted turn still ends with a result line → turn_ended (the ordinary edge)
+  assert.ok(parseClaudeLine(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "[interrupted]" })).some((s) => s.kind === "turn_ended"));
+});

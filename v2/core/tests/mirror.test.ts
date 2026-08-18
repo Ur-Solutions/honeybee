@@ -10,7 +10,11 @@ import {
   MIRROR_BEE_RECORD_KEYS,
   MIRROR_BEE_ROW_KEYS,
   MIRROR_BEE_VIEW_KEYS,
+  MIRROR_QUESTION_AUDIT_KINDS,
+  MIRROR_QUESTION_KEYS,
   MIRROR_RUNTIME_KEYS,
+  MIRROR_SEAL_AUDIT_KINDS,
+  MIRROR_SEAL_KEYS,
   MIRROR_TEMPLATE_AUDIT_KINDS,
   MIRROR_TEMPLATE_KEYS,
   MIRROR_TRACK_AUDIT_KINDS,
@@ -54,6 +58,14 @@ test("mirror.1: live rows carry exactly the declared keys — bees (view/bee/run
     }).track;
     assert.deepEqual(keysOf(track), [...MIRROR_TRACK_KEYS].sort());
     assert.deepEqual(keysOf(track.steps[0] as object), [...MIRROR_TRACK_STEP_KEYS].sort());
+
+    // v6: questions + seals mirror as store rows, verbatim.
+    const question = store.askQuestion(bee.id, { text: "which branch?", options: ["main", "dev"] });
+    assert.deepEqual(keysOf(question), [...MIRROR_QUESTION_KEYS].sort());
+    const answered = store.answerQuestion(question.id, "main").question;
+    assert.deepEqual(keysOf(answered), [...MIRROR_QUESTION_KEYS].sort());
+    const seal = store.createSeal(bee.id, { title: "done", body: "all green", refs: ["abc123"] });
+    assert.deepEqual(keysOf(seal), [...MIRROR_SEAL_KEYS].sort());
     store.close();
   } finally {
     h.cleanup();
@@ -80,18 +92,23 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         steps: [{ id: "s1", name: "Build", kind: "action", templateId: "tpl-1", instruction: "go", note: null, status: "pending" }],
       },
     }).track;
+    const question = store.askQuestion(bee.id, { id: "q-1", text: "ship it?", options: ["yes", "no"] });
+    store.answerQuestion(question.id, "yes", { answeredBy: "operator" });
+    const seal = store.createSeal(bee.id, { id: "seal-1", title: "shipped", body: "landed on main", refs: ["main@abc"] });
     const snapshot: MirrorSnapshot = {
       seq: store.lastAuditSeq(),
       bees: [{ view: store.view(bee.id), bee: store.getBee(bee.id), runtime: store.currentRuntime(bee.id) }],
       templates: [template],
       tracks: [track],
+      questions: [store.getQuestion(question.id)!],
+      seals: [seal],
     };
     // Neutralize the one nondeterministic value (bee uuid) then freeze.
     const text = JSON.stringify(snapshot, null, 2).replaceAll(bee.id, "BEE_ID");
     assert.equal(
       text,
       `{
-  "seq": 4,
+  "seq": 8,
   "bees": [
     {
       "view": {
@@ -125,7 +142,10 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "env": {},
         "importedFrom": null,
         "spawnFailures": 0,
-        "args": null
+        "args": null,
+        "parentId": null,
+        "forkedFrom": null,
+        "forkSeed": null
       },
       "runtime": {
         "beeId": "BEE_ID",
@@ -190,6 +210,37 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       "createdAt": 1007000,
       "updatedAt": 1007000
     }
+  ],
+  "questions": [
+    {
+      "id": "q-1",
+      "beeId": "BEE_ID",
+      "generation": 1,
+      "text": "ship it?",
+      "options": [
+        "yes",
+        "no"
+      ],
+      "status": "answered",
+      "answer": "yes",
+      "askedAt": 1009000,
+      "answeredAt": 1013000,
+      "answeredBy": "operator",
+      "deliveryMessageId": 1
+    }
+  ],
+  "seals": [
+    {
+      "id": "seal-1",
+      "beeId": "BEE_ID",
+      "generation": 1,
+      "title": "shipped",
+      "body": "landed on main",
+      "refs": [
+        "main@abc"
+      ],
+      "createdAt": 1015000
+    }
   ]
 }`,
     );
@@ -217,6 +268,17 @@ test("mirror.3: template/track audit kinds are exactly the declared mirror kinds
       const known = [...MIRROR_TEMPLATE_AUDIT_KINDS, ...MIRROR_TRACK_AUDIT_KINDS] as string[];
       assert.ok(known.includes(r.kind));
     }
+    // v6: question/seal audit kinds + payload shapes (the mirror's delta contract).
+    const { bee } = makeBee(store, "asker");
+    const q = store.askQuestion(bee.id, { text: "which?" });
+    store.answerQuestion(q.id, "this");
+    store.createSeal(bee.id, { title: "t", body: "b" });
+    const v6 = store.auditRows().filter((r) => r.kind.startsWith("question.") || r.kind.startsWith("seal."));
+    assert.deepEqual(v6.map((r) => r.kind), ["question.asked", "question.answered", "seal.created"]);
+    for (const r of v6) assert.ok(([...MIRROR_QUESTION_AUDIT_KINDS, ...MIRROR_SEAL_AUDIT_KINDS] as string[]).includes(r.kind));
+    assert.deepEqual(keysOf(v6[0]!.payload), ["question"]);
+    assert.deepEqual(keysOf(v6[1]!.payload), ["answer", "answeredAt", "answeredBy", "beeId", "deliveryMessageId", "questionId"]);
+    assert.deepEqual(keysOf(v6[2]!.payload), ["seal"]);
     const [putA, putB, delA, putK, delK] = rows;
     assert.deepEqual(keysOf((putA?.payload ?? {}) as object), ["outcome", "template"]);
     assert.equal(putA?.payload.outcome, "created");
