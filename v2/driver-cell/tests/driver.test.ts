@@ -13,7 +13,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stubAdapter } from "../../adapters/src/index.ts";
 import type { DriverObservation } from "../../harness/src/driver.ts";
-import { CellDriver } from "../src/driver.ts";
+import { CellDriver, CellRuntimeLiveError } from "../src/driver.ts";
+import { reserveCell } from "../src/provision.ts";
 import { defaultScratchPaths } from "../src/sandbox.ts";
 import { commitInCell, makeRig, type CellTestRig } from "./helpers.ts";
 
@@ -147,6 +148,42 @@ test("cell-driver.restart-hydration: a fresh driver re-hydrates cells from cell.
     const report = driver2.capture("bee-1", { targetBranch: "bee/late", mode: "merge", opId: "cmd-r" });
     assert.equal(report.status, "landed");
     assert.equal(driver2.removeCell("bee-1").deleted, true);
+  } finally {
+    driver.disposeAll();
+    await sleep(50);
+    rig.cleanup();
+  }
+});
+
+test("cell-driver.reserved-only: a cell reserved (seed ledger) but never started removes outright; sessions delegate; typed live-runtime refusal", async () => {
+  const rig = makeRig();
+  const driver = makeDriver(rig);
+  try {
+    // Reserve for bee-2 exactly the way the daemon does at spawn.
+    const reserved = reserveCell(rig.cellsRoot, {
+      beeId: "bee-2",
+      originRepo: rig.origin.repo,
+      sha: rig.origin.sha,
+      wrapper: "bee-2",
+      repoName: "fixture",
+      cellId: "c2",
+    });
+    assert.equal(driver.cellOf("bee-2"), null, "reserved ≠ provisioned");
+    const res = driver.removeCell("bee-2");
+    assert.deepEqual(res, { deleted: true, forced: false, report: null });
+    assert.equal(existsSync(reserved.paths.wrapperDir), false, "seed-only wrapper removed outright");
+    assert.deepEqual(driver.removeCell("bee-2"), { deleted: false, forced: false, report: null }, "gone → absent");
+
+    // A started bee: the live-runtime refusal is typed, and its session id flows through the cell driver.
+    driver.start("bee-1", 1);
+    await drainUntil(driver, (e) => e.some((x) => x.kind === "booted"));
+    assert.throws(() => driver.removeCell("bee-1"), (err: Error) => err instanceof CellRuntimeLiveError);
+    const sessions = driver.observeSessions();
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0]?.beeId, "bee-1");
+    assert.ok(sessions[0]?.sessionId.startsWith("stub-"), "stub reports stub-<pid>");
+    driver.stop("bee-1", 1, "stopped_by_user");
+    await drainUntil(driver, (e) => e.some((x) => x.kind === "exited"));
   } finally {
     driver.disposeAll();
     await sleep(50);

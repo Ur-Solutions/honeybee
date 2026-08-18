@@ -26,7 +26,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { cowCopy, cowPlatform, probeCow, type CowPlatform } from "./cow.ts";
 import { git } from "./git.ts";
-import { cellPaths, type CellPaths } from "./layout.ts";
+import { cellPaths, parseSpaceName, type CellPaths } from "./layout.ts";
 import {
   isProvisioned,
   newLedger,
@@ -104,6 +104,73 @@ function scrubCowGitDir(gitDir: string): void {
   }
 }
 
+/** What the daemon reserves for a bee at spawn, before the first start. */
+export interface ReserveRequest extends ProvisionRequest {
+  /** Per-cell sandbox override (A4); null/absent = node-kind default. */
+  sandbox?: boolean | null;
+}
+
+/**
+ * Reserve a cell for a bee WITHOUT provisioning it: writes the seed ledger
+ * (`box/cell.json`, no operations yet) so the allocation — origin, sha,
+ * layout, warm/sandbox choices — is durable from the moment the bee row
+ * exists. The daemon calls this from `spawn`; the first `start()` finds the
+ * ledger and provisions against it (`provisionCell` seeds identically when
+ * no ledger exists, so a cell reserved here and one provisioned cold are
+ * indistinguishable). Idempotent: an existing ledger for the same bee + sha
+ * is left untouched; a ledger for a different bee/sha is a refusal — never
+ * silently overwritten.
+ */
+export function reserveCell(
+  cellsRoot: string,
+  req: ReserveRequest,
+  opts: { now?: () => number } = {},
+): { paths: CellPaths; ledger: CellLedger; created: boolean } {
+  const now = opts.now ?? Date.now;
+  const paths = cellPaths(cellsRoot, req.wrapper, req.repoName, req.cellId);
+  const existing = readLedger(paths.ledgerPath);
+  if (existing != null) {
+    if (existing.beeId !== req.beeId || existing.sha !== req.sha) {
+      throw new Error(
+        `cell ${paths.wrapperDir}: ledger is for bee=${existing.beeId} sha=${existing.sha}, ` +
+          `refusing to reserve bee=${req.beeId} sha=${req.sha} into it`,
+      );
+    }
+    return { paths, ledger: existing, created: false };
+  }
+  const ledger = newLedger({
+    beeId: req.beeId,
+    origin: req.originRepo,
+    sha: req.sha,
+    wrapper: req.wrapper,
+    spaceName: paths.spaceName,
+    now: now(),
+    sandbox: req.sandbox ?? null,
+    warm: req.warmArtifacts,
+  });
+  writeLedger(paths.ledgerPath, ledger);
+  return { paths, ledger, created: true };
+}
+
+/**
+ * The provisioning request a ledger describes — the inverse of the seed
+ * written by `reserveCell`/`provisionCell`. Null when the ledger's space
+ * name is not cell-shaped (a hand-edited or foreign file).
+ */
+export function provisionRequestOf(ledger: CellLedger): ProvisionRequest | null {
+  const parsed = parseSpaceName(ledger.spaceName);
+  if (parsed == null) return null;
+  return {
+    beeId: ledger.beeId,
+    originRepo: ledger.origin,
+    sha: ledger.sha,
+    wrapper: ledger.wrapper,
+    repoName: parsed.repoName,
+    cellId: parsed.cellId,
+    ...(ledger.warm && ledger.warm.length > 0 ? { warmArtifacts: [...ledger.warm] } : {}),
+  };
+}
+
 /**
  * Provision (or replay-provision) a cell, keyed by an explicit operation
  * (command) id. Idempotent per the ledger: a completed provisioning
@@ -129,6 +196,7 @@ export function provisionCell(
       wrapper: req.wrapper,
       spaceName: paths.spaceName,
       now: now(),
+      warm: req.warmArtifacts,
     });
     writeLedger(paths.ledgerPath, ledger);
   }

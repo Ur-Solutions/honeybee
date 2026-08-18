@@ -8,9 +8,9 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { provisionCell } from "../src/provision.ts";
-import { readLedger, writeLedger, newLedger } from "../src/ledger.ts";
-import { cellPaths } from "../src/layout.ts";
+import { provisionCell, provisionRequestOf, reserveCell } from "../src/provision.ts";
+import { isProvisioned, readLedger, writeLedger, newLedger } from "../src/ledger.ts";
+import { cellPaths, parseSpaceName } from "../src/layout.ts";
 import { probeCow } from "../src/cow.ts";
 import { fingerprintOrigin, g, makeRig } from "./helpers.ts";
 
@@ -212,6 +212,56 @@ test("provision.warm: nothing listed → cold(none_listed), default off", () => 
     const cell = provisionCell(rig.cellsRoot, req(rig), "cmd-1", { disableCow: true });
     assert.equal(cell.warm.mode, "cold");
     assert.equal(cell.warm.reason, "none_listed");
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("provision.reserve: reserveCell writes the seed ledger (origin/sha/warm/sandbox, no operations); provisionCell then provisions against it; the inverse (provisionRequestOf) round-trips; mismatches refuse", () => {
+  const rig = makeRig();
+  try {
+    const request = { ...req(rig, { warmArtifacts: ["node_modules"], sandbox: false }) };
+    const reserved = reserveCell(rig.cellsRoot, request);
+    assert.equal(reserved.created, true);
+    assert.ok(existsSync(reserved.paths.ledgerPath), "seed ledger written");
+    assert.equal(existsSync(reserved.paths.spaceDir), false, "no checkout yet");
+    const seed = readLedger(reserved.paths.ledgerPath)!;
+    assert.equal(seed.beeId, "bee-1");
+    assert.equal(seed.origin, rig.origin.repo);
+    assert.equal(seed.sha, rig.origin.sha);
+    assert.deepEqual(seed.warm, ["node_modules"]);
+    assert.equal(seed.sandbox, false);
+    assert.deepEqual(seed.operations, {});
+    assert.equal(isProvisioned(seed), false);
+
+    // Inverse: the ledger describes the request (minus the sandbox, which lives beside it).
+    const back = provisionRequestOf(seed)!;
+    assert.deepEqual(back, {
+      beeId: "bee-1",
+      originRepo: rig.origin.repo,
+      sha: rig.origin.sha,
+      wrapper: "bee-1",
+      repoName: "fixture",
+      cellId: "c1",
+      warmArtifacts: ["node_modules"],
+    });
+    assert.deepEqual(parseSpaceName("my-space-repo-space-abc123"), { repoName: "my-space-repo", cellId: "abc123" });
+    assert.equal(parseSpaceName("not-a-space"), null);
+
+    // Idempotent for the same bee+sha; refuses another bee or sha.
+    assert.equal(reserveCell(rig.cellsRoot, request).created, false);
+    assert.throws(() => reserveCell(rig.cellsRoot, { ...request, beeId: "bee-2" }), /refusing to reserve/);
+    assert.throws(() => reserveCell(rig.cellsRoot, { ...request, sha: "0".repeat(40) }), /refusing to reserve/);
+
+    // First provisioning finds the seed and completes it in place (same ledger file, warm carried).
+    const cell = provisionCell(rig.cellsRoot, back, "cmd-1", { disableCow: true });
+    assert.equal(cell.replayed, false);
+    assert.equal(cell.paths.ledgerPath, reserved.paths.ledgerPath);
+    assert.ok(existsSync(join(cell.paths.spaceDir, ".git")));
+    const done = readLedger(reserved.paths.ledgerPath)!;
+    assert.equal(isProvisioned(done), true);
+    assert.equal(done.sandbox, false, "seed fields survive provisioning");
+    assert.deepEqual(done.warm, ["node_modules"]);
   } finally {
     rig.cleanup();
   }

@@ -5,13 +5,14 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
 import { runV2Cli, serviceExecArgs, serviceLabel, type CliIo } from "../src/main.ts";
 import { claudeHsrRecord, makeFrozenFixture } from "../../core/tests/frozen-fixture.ts";
+import { commitInCell, g, makeOrigin } from "../../driver-cell/tests/helpers.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
   const out: string[] = [];
@@ -259,6 +260,104 @@ test("cli.4c: per-bee args — `spawn --arg` (repeatable), `bee set-args <bee> -
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();
+  }
+});
+
+test("cli.4d: cells — `spawn --substrate cell --origin`, `cell capture --onto` (landed / refused as results), `cell remove` (refused-dirty exit 2, --force)", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hb-v2-cli-cells-"));
+  const origin = makeOrigin(root);
+  const { dir, cleanup } = makeDaemonDir({ cells: { root: join(root, "cells") } });
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+
+    // --origin alone implies --substrate cell; --sha pins the checkout.
+    const s = capture();
+    assert.equal(
+      await runV2Cli(["spawn", "celly", "--agent", "stub", "--origin", origin.repo, "--sha", origin.sha, "--data-dir", dir, "--json"], s.io),
+      0,
+    );
+    const spawned = JSON.parse(s.out[0] ?? "{}") as { beeId: string };
+    // Usage errors are loud: cell without origin; origin with an explicit non-cell substrate.
+    const u1 = capture();
+    assert.equal(await runV2Cli(["spawn", "x", "--agent", "stub", "--substrate", "cell", "--data-dir", dir], u1.io), 1);
+    assert.ok(u1.err[0]?.includes("--origin"), u1.err[0]);
+    const u2 = capture();
+    assert.equal(await runV2Cli(["spawn", "x", "--agent", "stub", "--substrate", "hsr", "--origin", origin.repo, "--data-dir", dir], u2.io), 1);
+
+    let cwd = "";
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["view", "celly", "--data-dir", dir, "--json"], l.io);
+      const v = JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string }; bee?: { substrate: string; cwd: string } };
+      cwd = v.bee?.cwd ?? "";
+      return v.view?.runtimeState === "idle" && v.bee?.substrate === "cell";
+    }, "cell bee idle", 15_000);
+    assert.ok(/-space-/.test(cwd), `cwd is the space dir: ${cwd}`);
+    // list shows the substrate in the human row? (view line carries agent/state; substrate lives on the row json)
+    const lj = capture();
+    assert.equal(await runV2Cli(["list", "--data-dir", dir, "--json"], lj.io), 0);
+    const listed = JSON.parse(lj.out[0] ?? "{}") as { views: Array<{ bee: { substrate: string } }> };
+    assert.equal(listed.views[0]?.bee.substrate, "cell");
+
+    // capture onto the checked-out branch → refused (a RESULT): human exit 2, json exit 0.
+    const r1 = capture();
+    assert.equal(await runV2Cli(["cell", "capture", "celly", "--onto", "main", "--data-dir", dir], r1.io), 2);
+    assert.ok(r1.out[0]?.includes("refused (target_checked_out)"), r1.out[0]);
+    assert.ok(r1.out[0]?.includes("was not modified"));
+    const r1j = capture();
+    assert.equal(await runV2Cli(["cell", "capture", "celly", "--onto", "main", "--data-dir", dir, "--json"], r1j.io), 0);
+    assert.equal((JSON.parse(r1j.out[0] ?? "{}") as { status: string }).status, "refused");
+
+    // Work in the cell (from the test — the plain stub does not run shell), then land onto a new branch.
+    commitInCell(cwd, "cli.txt", "hi\n", "cli work");
+    const r2 = capture();
+    assert.equal(
+      await runV2Cli(["cell", "capture", "celly", "--onto", "throwaway/cli", "--rebase", "--idempotency-key", "cli-cap-1", "--data-dir", dir, "--json"], r2.io),
+      0,
+    );
+    const landed = JSON.parse(r2.out[0] ?? "{}") as { status: string; mode: string; resultSha: string; beeId: string };
+    assert.equal(landed.status, "landed");
+    assert.equal(landed.mode, "rebase");
+    assert.equal(landed.beeId, spawned.beeId);
+    assert.equal(g(origin.repo, ["rev-parse", "throwaway/cli"]), landed.resultSha);
+    // Replay: deduped, printed as such.
+    const r2b = capture();
+    assert.equal(await runV2Cli(["cell", "capture", "celly", "--onto", "throwaway/cli", "--rebase", "--idempotency-key", "cli-cap-1", "--data-dir", dir], r2b.io), 0);
+    assert.ok(r2b.out[0]?.startsWith("deduped: landed"), r2b.out[0]);
+
+    // remove while live → typed runtime_refused, exit 1.
+    const rm0 = capture();
+    assert.equal(await runV2Cli(["cell", "remove", "celly", "--data-dir", dir], rm0.io), 1);
+    assert.ok(rm0.err[0]?.includes("runtime_refused"), rm0.err[0]);
+    // stop, dirty the cell, remove → refused (exit 2) with the causes; --force deletes.
+    assert.equal(await runV2Cli(["stop", "celly", "--data-dir", dir], capture().io), 0);
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["view", "celly", "--data-dir", dir, "--json"], l.io);
+      return (JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string } }).view?.runtimeState === "stopped";
+    }, "stopped", 15_000);
+    writeFileSync(join(cwd, "wip.txt"), "wip\n");
+    const rm1 = capture();
+    assert.equal(await runV2Cli(["cell", "remove", "celly", "--data-dir", dir], rm1.io), 2);
+    assert.ok(rm1.out[0]?.includes("uncommitted changes"), rm1.out[0]);
+    assert.ok(existsSync(cwd), "refused: nothing removed");
+    const rm2 = capture();
+    assert.equal(await runV2Cli(["cell", "remove", "celly", "--force", "--data-dir", dir, "--json"], rm2.io), 0);
+    const removed = JSON.parse(rm2.out[0] ?? "{}") as { status: string; forced: boolean; commandId: number };
+    assert.equal(removed.status, "deleted");
+    assert.equal(removed.forced, true);
+    assert.ok(removed.commandId > 0);
+    assert.equal(existsSync(cwd), false, "cell gone");
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["list", "--data-dir", dir, "--json"], l.io);
+      return (JSON.parse(l.out[0] ?? "{}") as { views: unknown[] }).views.length === 0;
+    }, "bee deleted", 10_000);
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
