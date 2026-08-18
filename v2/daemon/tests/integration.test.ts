@@ -15,6 +15,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { pidAlive } from "../../driver-hsr/src/psutil.ts";
 import type {
@@ -366,6 +367,87 @@ test("int.6: induced I1 breach — a boot-hanging agent leaves mail undelivered 
     await sleep(500);
     const still = await client.request<HealthResult>("health");
     assert.equal(still.i1Violations, 1, "re-detection never double-counts");
+    client.close();
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
+test("int.7: immediate-exit agent → bounded revives on backoff, spawn_failed at the budget; the counter survives a daemon SIGKILL; operator revive recovers once the agent is fixed", async () => {
+  // The WP7 importer hazard, end to end over the real daemon: an agent that
+  // exits before it ever boots (missing cwd/binary shape) used to revive at
+  // tick speed forever because every send_wake was a fresh B5 command.
+  const { dir, cleanup } = makeDaemonDir({
+    stubEnv: { STUB_EXIT_BEFORE_READY: "1" },
+    retry: { maxAttempts: 4, backoffBaseMs: 60 },
+    tickMs: 20,
+  });
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    let client = await daemon.client();
+    const spawned = await client.request<SpawnResult>("spawn", { name: "doomed", agent: "stub", cwd: "/tmp" });
+    const beeId = spawned.beeId;
+    const sent = await client.request<SendRpcResult>("send", { beeId, body: "hello?" });
+
+    // Two boot failures in, SIGKILL the daemon mid-budget.
+    await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId });
+      return (v.bee?.spawnFailures ?? 0) >= 2 && v.view.runtimeState === "stopped" ? v : null;
+    }, "two boot failures counted", 12_000);
+    client.close();
+    await daemon.kill();
+
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+    const afterRestart = await client.request<ViewResult>("view", { beeId });
+    assert.ok((afterRestart.bee?.spawnFailures ?? 0) >= 2, "spawn-failure counter survived the SIGKILL restart");
+    // The restart itself never mints a failed state or a flag (B7).
+    assert.deepEqual(afterRestart.view.flags, [], `restart raised a flag: ${JSON.stringify(afterRestart.view.flags)}`);
+
+    // The budget (4) is reached across the restart — flag set, revives stop.
+    const flagged = await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId });
+      return v.view.flags.includes("spawn_failed") ? v : null;
+    }, "spawn_failed at the budget", 12_000);
+    assert.equal(flagged.bee?.spawnFailures, 4);
+    assert.equal(flagged.view.blocked, true);
+    assert.equal(flagged.view.reachable, true);
+    const genAtFlag = flagged.view.generation as number;
+    // Bounded: 4 boot failures = at most 4 generations plus one machine_restart
+    // row if the kill landed mid-boot — nowhere near "hundreds per second".
+    assert.ok(genAtFlag <= 5, `generations at the flag: ${genAtFlag}`);
+    await sleep(600); // ≫ every backoff step (60,120,240ms): a loop would show
+    const later = await client.request<ViewResult>("view", { beeId });
+    assert.equal(later.view.generation, genAtFlag, "no revive while spawn_failed is set");
+    const cmds = await client.request<CommandsResult>("commands", { beeId });
+    assert.equal(cmds.commands.filter((c) => c.status === "queued" || c.status === "running").length, 0, "no wake pending");
+    // More mail: durable, no wake.
+    const sent2 = await client.request<SendRpcResult>("send", { beeId, body: "still there?" });
+    assert.equal(sent2.commandId, null, "send enqueues no wake while spawn_failed is set");
+    const mail = await client.request<MailboxResult>("mailbox", { beeId });
+    assert.equal(mail.messages.filter((m) => m.deliveredAt == null).length, 2, "mail stays durable");
+    client.close();
+
+    // Fix the agent (config change → daemon restart), then an operator revive
+    // retries regardless of the flag; booted clears it and the mail lands.
+    await daemon.stop();
+    const configPath = `${dir}/config.json`;
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as { agents: { stub: { env: Record<string, string> } } };
+    delete config.agents.stub.env.STUB_EXIT_BEFORE_READY;
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+    const stillFlagged = await client.request<ViewResult>("view", { beeId });
+    assert.deepEqual(stillFlagged.view.flags, ["spawn_failed"], "a restart is not contrary evidence");
+    await client.request("revive", { beeId });
+    await waitDelivered(client, beeId, sent.messageId, "first message delivered after the operator revive");
+    await waitDelivered(client, beeId, sent2.messageId, "second message delivered too");
+    const recovered = await client.request<ViewResult>("view", { beeId });
+    assert.deepEqual(recovered.view.flags, [], "booted cleared spawn_failed");
+    assert.equal(recovered.bee?.spawnFailures, 0, "counter reset");
+    assert.equal(recovered.view.generation, genAtFlag + 1, "exactly one revive");
     client.close();
   } finally {
     await daemon?.stop().catch(() => {});

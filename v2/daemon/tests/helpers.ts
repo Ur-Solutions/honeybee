@@ -56,6 +56,14 @@ export class FakeDriver implements RuntimeDriver {
   acceptDeliveries = true;
   /** When true, start immediately queues booted + turn_ended (idle runtime). */
   autoBoot = true;
+  /**
+   * When true, start spawns a process that dies before it ever boots: the
+   * exited(crashed) observation is queued and the process is gone (the
+   * immediate-exit stub / missing-cwd shape). Wins over autoBoot.
+   */
+  bootCrash = false;
+  /** Every start() call, in order (bee, generation) — how many revives happened. */
+  readonly starts: Array<{ beeId: string; generation: number }> = [];
   private nextPid = 100;
   private readonly now: () => number;
 
@@ -65,9 +73,15 @@ export class FakeDriver implements RuntimeDriver {
 
   start(beeId: string, generation: number): void {
     if (this.procs.has(beeId)) throw new Error(`fake driver: ${beeId} already live`);
+    this.starts.push({ beeId, generation });
     const pid = this.nextPid++;
     const proc: FakeProc = { generation, pid, pidStartedAt: this.now(), degraded: false };
     this.procs.set(beeId, proc);
+    if (this.bootCrash) {
+      this.procs.delete(beeId);
+      this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
     if (this.autoBoot) {
       this.events.push({ beeId, generation, kind: "booted", pid, pidStartedAt: proc.pidStartedAt });
       this.events.push({ beeId, generation, kind: "turn_ended" });

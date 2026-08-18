@@ -90,6 +90,18 @@ export interface BeeRow {
   env: Record<string, string>;
   /** v3 — provenance: null for v2-born bees; "frozen" for old-world imports. */
   importedFrom: string | null;
+  /**
+   * v4 — consecutive runtimes that exited (crashed/clean) while still
+   * `booting`: the spawn-retry budget (contract §4.2 `spawn_failed`, B5) is
+   * ONE budget per bee across wake-driven revives, so a runtime that dies
+   * the instant it spawns cannot loop crash → wake → revive unboundedly. The
+   * next wake is scheduled on the B5 backoff table (base × 2^(n-1)); at
+   * `maxAttempts` the `spawn_failed` flag is set and wakes are suppressed
+   * until contrary evidence — a successful boot (booting → running) or an
+   * operator `revive` — resets it to 0. A crash AFTER running/idle is not a
+   * spawn failure and never counts.
+   */
+  spawnFailures: number;
 }
 
 export interface RuntimeRow {

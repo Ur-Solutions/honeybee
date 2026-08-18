@@ -22,8 +22,13 @@
  *        imported bee's session lives in) and `bees.imported_from`
  *        (provenance: null | "frozen"). Additive; migration = ALTER TABLE
  *        ADD COLUMN ×3.
+ *   v4 — spawn-failure budget (contract §4.2 `spawn_failed`, spec 01 B5):
+ *        adds `bees.spawn_failures`, the count of consecutive runtimes that
+ *        exited during `booting`. One budget per bee across wake-driven
+ *        revives; exhaustion sets `spawn_failed` and suppresses further
+ *        wakes. Additive; migration = ALTER TABLE ADD COLUMN.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -55,7 +60,12 @@ CREATE TABLE IF NOT EXISTS bees (
   env              TEXT NOT NULL DEFAULT '{}',
   -- v3: provenance — null for bees born in v2, "frozen" for records imported
   -- from the frozen old-world store (id preserved; details in the audit row).
-  imported_from    TEXT
+  imported_from    TEXT,
+  -- v4: consecutive boot failures — runtimes that exited (crashed/clean)
+  -- while still booting. Reset to 0 by a successful boot (booting →
+  -- running) or an operator revive. The wake path applies the B5 backoff
+  -- table to it and stops reviving at the budget (spawn_failed flag).
+  spawn_failures   INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
@@ -114,8 +124,8 @@ CREATE INDEX IF NOT EXISTS commands_ready ON commands(status, next_attempt_at, i
 -- IDEMPOTENCY_INDEX_SQL below: it can only be created once the column exists,
 -- which on a migrated v1 store happens in the constructor's migration step.
 
--- v3 additive columns on bees, applied by the constructor's migration step to
--- stores created before v3 (CREATE TABLE IF NOT EXISTS leaves an existing
+-- v3/v4 additive columns on bees, applied by the constructor's migration step
+-- to stores created before them (CREATE TABLE IF NOT EXISTS leaves an existing
 -- table's shape alone). Order matters for nothing; each is added iff missing.
 
 -- Spec 06 §4.2 one-key idempotency: RPC mutation results recorded by key so a
@@ -188,11 +198,16 @@ CREATE TABLE IF NOT EXISTS tracks (
  * the column stays nullable: internal enqueues (send_wake, loop policy stops)
  * carry no key.
  */
-/** v3 columns on `bees` — name → ADD COLUMN clause (migration = add iff missing). */
-export const BEES_V3_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
+/**
+ * Additive columns on `bees` since v2 — name → ADD COLUMN clause (migration =
+ * add iff missing). v3: provider_session_id, env, imported_from; v4:
+ * spawn_failures.
+ */
+export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["provider_session_id", "provider_session_id TEXT"],
   ["env", "env TEXT NOT NULL DEFAULT '{}'"],
   ["imported_from", "imported_from TEXT"],
+  ["spawn_failures", "spawn_failures INTEGER NOT NULL DEFAULT 0"],
 ];
 
 export const IDEMPOTENCY_INDEX_SQL = `

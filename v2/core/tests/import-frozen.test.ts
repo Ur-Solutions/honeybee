@@ -420,13 +420,14 @@ test("import.9: store v3 — recordProviderSessionId is bee-scoped, idempotent, 
     assert.equal(old?.providerSessionId, null);
     assert.deepEqual(old?.env, {});
     assert.equal(old?.importedFrom, null);
+    assert.equal(old?.spawnFailures, 0); // v4 column, defaulted by the migration
     store.recordProviderSessionId("old-1", "after-migration");
     store.close();
     const check = new DatabaseSync(h2.path, { readOnly: true });
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 3);
+      assert.equal(SCHEMA_VERSION, 4);
     } finally {
       check.close();
     }

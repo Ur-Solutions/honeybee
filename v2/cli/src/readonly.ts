@@ -40,6 +40,7 @@ function mapBee(r: Row): BeeRow {
     providerSessionId: (r.provider_session_id as string | null | undefined) ?? null,
     env: JSON.parse((r.env as string | null | undefined) ?? "{}") as Record<string, string>,
     importedFrom: (r.imported_from as string | null | undefined) ?? null,
+    spawnFailures: Number((r.spawn_failures as number | null | undefined) ?? 0),
   };
 }
 
