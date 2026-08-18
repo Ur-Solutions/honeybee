@@ -90,6 +90,8 @@ export const RPC_VERBS = [
   "packages.importLocalConfig",
   // WP7 (spec 07 B4): import the operator's active old-world bees from a frozen store
   "import.fromFrozen",
+  // schema v5: replace a bee's per-bee spawn args (takes effect on the next runtime)
+  "bee.setArgs",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -132,6 +134,18 @@ export interface DedupMarkers {
 export interface SpawnResult extends DedupMarkers {
   beeId: string;
   commandId: number;
+}
+
+/**
+ * `bee.setArgs` (schema v5). Params: `{ beeId, args: string[] | null }` —
+ * null clears. Bee-scoped; the CURRENT runtime is untouched (stop/revive to
+ * apply). `applied:false` = the value was already exactly that.
+ * `spawn` also accepts `args?: string[]` (the bee's initial per-bee args) and
+ * `revive` accepts `args?: string[] | null` (replace them as the revive runs).
+ */
+export interface SetArgsResult extends DedupMarkers {
+  bee: BeeRow;
+  applied: boolean;
 }
 
 export interface SendRpcResult extends DedupMarkers {

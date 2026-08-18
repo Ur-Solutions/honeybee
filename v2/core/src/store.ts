@@ -94,6 +94,8 @@ export interface CreateBeeInput {
   env?: Record<string, string>;
   /** v3 — provenance marker; null/absent for v2-born bees. */
   importedFrom?: string;
+  /** v5 — per-bee harness CLI args layered over the agent spec at spawn; null/absent = none. */
+  args?: string[] | null;
   /**
    * Creation timestamp override (epoch ms) — importers preserve the original
    * record's creation time. Defaults to the store clock.
@@ -212,7 +214,29 @@ function mapBee(r: Row): BeeRow {
     env: JSON.parse((r.env as string | null) ?? "{}") as Record<string, string>,
     importedFrom: (r.imported_from as string | null) ?? null,
     spawnFailures: Number(r.spawn_failures ?? 0),
+    args: parseArgsColumn(r.args),
   };
+}
+
+/** v5 `bees.args`: NULL → null; otherwise a json array of strings. */
+function parseArgsColumn(raw: unknown): string[] | null {
+  if (raw == null) return null;
+  const parsed = JSON.parse(String(raw)) as unknown;
+  return Array.isArray(parsed) ? (parsed as string[]) : null;
+}
+
+/** Validate a per-bee args value: null (none) or an array of strings. */
+function normalizeBeeArgs(args: unknown, where: string): string[] | null {
+  if (args === undefined || args === null) return null;
+  if (!Array.isArray(args) || args.some((a) => typeof a !== "string")) {
+    throw new CoreError(`${where}: args must be an array of strings or null`);
+  }
+  return [...(args as string[])];
+}
+
+function sameArgs(a: string[] | null, b: string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 function mapRuntime(r: Row): RuntimeRow {
@@ -447,8 +471,9 @@ export class CoreStore {
         this.db.exec("ALTER TABLE commands ADD COLUMN idempotency_key TEXT");
       }
       // v2 → v3: additive bee columns (provider_session_id, env, imported_from);
-      // v3 → v4: spawn_failures. Same discipline: add iff missing, so fresh
-      // and v1 stores (whose bees table was just created in full) are untouched.
+      // v3 → v4: spawn_failures; v4 → v5: args. Same discipline: add iff
+      // missing, so fresh and v1 stores (whose bees table was just created in
+      // full) are untouched.
       const beeCols = new Set(
         (this.db.prepare("SELECT name FROM pragma_table_info('bees')").all() as Row[]).map((c) => String(c.name)),
       );
@@ -506,11 +531,12 @@ export class CoreStore {
       const at = this.now();
       const createdAt = input.createdAt ?? at;
       if (!Number.isFinite(createdAt)) throw new CoreError("createBee: createdAt must be a finite epoch-ms number");
+      const args = normalizeBeeArgs(input.args, "createBee");
       this.db
         .prepare(
           `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at,
-                            provider_session_id, env, imported_from)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+                            provider_session_id, env, imported_from, args)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -525,6 +551,7 @@ export class CoreStore {
           input.providerSessionId ?? null,
           JSON.stringify(input.env ?? {}),
           input.importedFrom ?? null,
+          args === null ? null : JSON.stringify(args),
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });
@@ -867,8 +894,13 @@ export class CoreStore {
     });
   }
 
-  /** B2 — no transition out of stopped; revival creates generation N+1 (booting). */
-  reviveBee(beeId: string, opts: { proc?: { pid: number; pidStartedAt: number } } = {}): RuntimeRow {
+  /**
+   * B2 — no transition out of stopped; revival creates generation N+1 (booting).
+   * v5: `args` (when given, including null) replaces the bee's per-bee spawn
+   * args in the same transaction, before the new generation is minted — so the
+   * revived runtime is resolved with them.
+   */
+  reviveBee(beeId: string, opts: { proc?: { pid: number; pidStartedAt: number }; args?: string[] | null } = {}): RuntimeRow {
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       if (bee.lifecycle === "archived") this.applyUnarchive(beeId); // Q3 spirit: revival implies active
@@ -878,9 +910,33 @@ export class CoreStore {
           `bee ${beeId}: cannot revive while generation ${current.generation} is ${current.state}`,
         );
       }
+      if (opts.args !== undefined) this.applyArgs(beeId, normalizeBeeArgs(opts.args, "reviveBee"));
       const generation = (current?.generation ?? 0) + 1;
       return this.insertRuntime(beeId, generation, this.now(), opts.proc);
     });
+  }
+
+  /**
+   * v5 — replace a bee's per-bee spawn args (`null` clears them). Bee-scoped;
+   * takes effect on the NEXT runtime (the current process is untouched — stop
+   * or revive to apply). An identical value is a silent no-op; a change is
+   * audited as `bee.args_set` and replayable.
+   */
+  updateBeeArgs(beeId: string, args: string[] | null): { bee: BeeRow; applied: boolean } {
+    const next = normalizeBeeArgs(args, "updateBeeArgs");
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const applied = this.applyArgs(beeId, next);
+      return { bee: this.mustGetBee(beeId), applied };
+    });
+  }
+
+  private applyArgs(beeId: string, next: string[] | null): boolean {
+    const bee = this.mustGetBee(beeId);
+    if (sameArgs(bee.args, next)) return false;
+    this.db.prepare("UPDATE bees SET args = ? WHERE id = ?").run(next === null ? null : JSON.stringify(next), beeId);
+    this.audit("bee.args_set", beeId, { beeId, args: next, previous: bee.args });
+    return true;
   }
 
   /**

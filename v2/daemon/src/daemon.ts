@@ -37,9 +37,19 @@ import {
 } from "../../core/src/index.ts";
 import { realPreflightProbes } from "./import-probes.ts";
 import { HsrDriver, type SpawnSpec } from "../../driver-hsr/src/index.ts";
-import { claudeAdapter, codexAdapter, stubAdapter, type HarnessAdapter } from "../../adapters/src/index.ts";
+import {
+  claudeAdapter,
+  claudeArgGrammar,
+  codexAdapter,
+  codexArgGrammar,
+  codexSpawnPlan,
+  composeArgv,
+  stubAdapter,
+  type ArgGrammar,
+  type HarnessAdapter,
+} from "../../adapters/src/index.ts";
 import { DaemonCore, type BootReport, type I1ViolationEvent } from "./loops.ts";
-import type { ResolvedNodeConfig } from "./config.ts";
+import type { AgentSpecConfig, ResolvedNodeConfig } from "./config.ts";
 import { TelemetryStore, formatI1Violation } from "./telemetry.ts";
 import { RpcServer, type RpcConn } from "./rpc.ts";
 import {
@@ -51,6 +61,7 @@ import {
   type ListResult,
   type MutationResult,
   type RpcVerb,
+  type SetArgsResult,
   type ImportFromFrozenResult,
   type ImportLocalConfigResult,
   type SendRpcResult,
@@ -78,18 +89,58 @@ const ADAPTER_NAMES = ["claude", "codex", "stub"] as const;
  * harness-native resume path: claude via argv (`resumeArgs`, applied by
  * resolveSpawnSpec), codex via its handshake (`thread/resume`). The stub has
  * no resume path — a revived stub restarts fresh, like any harness without one.
+ * `model` (codex only) is the `-m/--model` lifted off the composed argv into
+ * the thread request — the app-server ignores TUI flags.
  */
-function adapterFor(name: string, cwd: string, providerSessionId: string | null): HarnessAdapter | null {
+function adapterFor(name: string, cwd: string, providerSessionId: string | null, model?: string): HarnessAdapter | null {
   switch (name) {
     case "claude":
       return claudeAdapter;
     case "codex":
-      return codexAdapter({ cwd, ...(providerSessionId ? { resumeThreadId: providerSessionId } : {}) });
+      return codexAdapter({ cwd, ...(providerSessionId ? { resumeThreadId: providerSessionId } : {}), ...(model ? { model } : {}) });
     case "stub":
       return stubAdapter;
     default:
       return null;
   }
+}
+
+/** The argv grammar an adapter's CLI speaks (unknown adapters: no de-dup, verbatim concat). */
+const NO_GRAMMAR: ArgGrammar = { valueFlags: new Set(), booleanFlags: new Set(), keyedFlags: new Set(), aliases: {} };
+function grammarFor(adapterName: string): ArgGrammar {
+  switch (adapterName) {
+    case "claude":
+      return claudeArgGrammar;
+    case "codex":
+      return codexArgGrammar;
+    default:
+      return NO_GRAMMAR;
+  }
+}
+
+/**
+ * The composed argv + adapter for a bee's next runtime — pure, exported for
+ * tests. Precedence (adapters/args.ts): spec.args (harness plumbing) <
+ * spec.defaultArgs (node per-agent defaults) < bee.args (per bee, schema v5)
+ * < resume args (`--resume <id>`, claude). Repeated valued flags: later wins;
+ * boolean flags idempotent; unknown tokens/positionals verbatim in place.
+ * codex: `-m/--model` and the approval/sandbox flags are lifted off argv into
+ * the thread request (the app-server ignores TUI flags); `-c k=v` stays.
+ */
+export function composeSpawn(
+  spec: AgentSpecConfig,
+  adapterName: string,
+  bee: { cwd: string; args: string[] | null; providerSessionId: string | null },
+): { adapter: HarnessAdapter | null; args: string[]; model: string | undefined } {
+  const grammar = grammarFor(adapterName);
+  const base = adapterFor(adapterName, bee.cwd, bee.providerSessionId);
+  const resume = bee.providerSessionId && base?.resumeArgs ? base.resumeArgs(bee.providerSessionId) : [];
+  const composed = composeArgv(grammar, [spec.args, spec.defaultArgs, bee.args, resume]);
+  if (adapterName === "codex") {
+    const plan = codexSpawnPlan(composed);
+    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, plan.model), args: plan.argv, model: plan.model };
+  }
+  return { adapter: base, args: composed, model: undefined };
 }
 
 const OP_LOG_TAIL = 40;
@@ -223,7 +274,9 @@ export class HiveDaemon {
    * gets `thread/resume` in its handshake — so generation N+1 (revive after a
    * stop, scale-to-zero, crash, or an old-world import) continues the same
    * conversation. Per-bee env (the harness config home an imported session
-   * lives under) layers over the agent spec env.
+   * lives under) layers over the agent spec env. Per-bee args (schema v5)
+   * layer between the agent spec's args and the resume selector — see
+   * composeSpawn for the precedence.
    */
   private resolveSpawnSpec(beeId: string): SpawnSpec {
     const store = this.mustStore();
@@ -231,13 +284,12 @@ export class HiveDaemon {
     if (!bee) throw new Error(`resolve: bee ${beeId} not found`);
     const spec = this.cfg.agents[bee.agent];
     if (!spec) throw new Error(`resolve: no agent spec for '${bee.agent}'`);
-    const adapter = adapterFor(spec.adapter ?? bee.agent, bee.cwd, bee.providerSessionId);
+    const { adapter, args } = composeSpawn(spec, spec.adapter ?? bee.agent, bee);
     if (!adapter) throw new Error(`resolve: no adapter for agent '${bee.agent}'`);
-    const resume = bee.providerSessionId && adapter.resumeArgs ? adapter.resumeArgs(bee.providerSessionId) : [];
     return {
       adapter,
       command: spec.command,
-      args: [...(spec.args ?? []), ...resume],
+      args,
       cwd: bee.cwd,
       env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env },
     };
@@ -301,8 +353,15 @@ export class HiveDaemon {
         );
       case "revive":
         return this.withIdempotency(verb, params, () =>
-          this.rpcEnqueue("revive", this.param(params, "beeId"), {}, params),
+          this.rpcEnqueue(
+            "revive",
+            this.param(params, "beeId"),
+            params.args === undefined ? {} : { args: this.argsParam(params, "revive", true) },
+            params,
+          ),
         );
+      case "bee.setArgs":
+        return this.withIdempotency(verb, params, () => this.rpcSetArgs(params));
       case "archive":
         return this.withIdempotency(verb, params, () =>
           this.rpcEnqueue("archive", this.param(params, "beeId"), {}, params),
@@ -389,6 +448,24 @@ export class HiveDaemon {
     }
   }
 
+  /** `args` param: string[] (spawn), or string[] | null when `nullable` (setArgs/revive: null clears). */
+  private argsParam(params: Record<string, unknown>, verb: string, nullable: boolean): string[] | null {
+    const v = params.args;
+    if (v === null && nullable) return null;
+    if (!Array.isArray(v) || v.some((a) => typeof a !== "string")) {
+      throw new RpcError("invalid_request", `${verb}: args must be an array of strings${nullable ? " (or null to clear)" : ""}`);
+    }
+    return v as string[];
+  }
+
+  private rpcSetArgs(params: Record<string, unknown>): SetArgsResult {
+    const beeId = this.requireBee(params);
+    const args = this.argsParam(params, "bee.setArgs", true);
+    const res = this.mustStore().updateBeeArgs(beeId, args);
+    this.log(`bee.setArgs bee=${beeId} applied=${res.applied} args=${JSON.stringify(args)}`);
+    return { bee: res.bee, applied: res.applied };
+  }
+
   private requireBee(params: Record<string, unknown>): string {
     const beeId = this.param(params, "beeId");
     if (!this.mustStore().getBee(beeId)) throw new RpcError("bee_not_found", `bee not found: ${beeId}`);
@@ -473,6 +550,7 @@ export class HiveDaemon {
       title: typeof params.title === "string" ? params.title : undefined,
       tags,
       sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
+      args: params.args === undefined ? undefined : this.argsParam(params, "spawn", false),
     });
     const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
     return { beeId: id, commandId: cmd.id };

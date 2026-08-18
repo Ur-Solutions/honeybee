@@ -65,6 +65,11 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         mustBee(p.beeId as string).spawnFailures = p.spawnFailures as number;
         break;
       }
+      case "bee.args_set": {
+        const args = p.args as string[] | null;
+        mustBee(p.beeId as string).args = args === null ? null : [...args];
+        break;
+      }
       case "bee.deleted": {
         const beeId = p.beeId as string;
         bees.delete(beeId);

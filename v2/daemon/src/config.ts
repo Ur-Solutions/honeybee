@@ -13,7 +13,15 @@ import { join } from "node:path";
 /** How to spawn one agent CLI (keyed by the bee's `agent` field). */
 export interface AgentSpecConfig {
   command: string;
+  /** Base args — the harness plumbing (`-p --input-format stream-json …`). */
   args?: string[];
+  /**
+   * Node-wide per-agent DEFAULT args (e.g. `["--model", "opus"]`), layered
+   * over `args` and under each bee's own `bees.args` at spawn (daemon
+   * resolveSpawnSpec: args < defaultArgs < bee.args < resume args; a later
+   * valued flag overrides an earlier one, boolean flags are idempotent).
+   */
+  defaultArgs?: string[];
   /** Adapter name: claude | codex | stub. Defaults to the agent key itself. */
   adapter?: string;
   env?: Record<string, string>;
@@ -233,6 +241,12 @@ function agentsOf(raw: Record<string, unknown>): Record<string, AgentSpecConfig>
         throw new ConfigError(`config: agents.${name}.args must be a string array`);
       }
       entry.args = s.args as string[];
+    }
+    if (s.defaultArgs !== undefined) {
+      if (!Array.isArray(s.defaultArgs) || s.defaultArgs.some((a) => typeof a !== "string")) {
+        throw new ConfigError(`config: agents.${name}.defaultArgs must be a string array`);
+      }
+      entry.defaultArgs = s.defaultArgs as string[];
     }
     if (s.adapter !== undefined) {
       if (typeof s.adapter !== "string") throw new ConfigError(`config: agents.${name}.adapter must be a string`);

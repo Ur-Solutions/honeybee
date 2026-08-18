@@ -41,6 +41,8 @@ function mapBee(r: Row): BeeRow {
     env: JSON.parse((r.env as string | null | undefined) ?? "{}") as Record<string, string>,
     importedFrom: (r.imported_from as string | null | undefined) ?? null,
     spawnFailures: Number((r.spawn_failures as number | null | undefined) ?? 0),
+    // v5 column; same tolerance.
+    args: r.args == null ? null : (JSON.parse(String(r.args)) as string[]),
   };
 }
 

@@ -27,8 +27,13 @@
  *        exited during `booting`. One budget per bee across wake-driven
  *        revives; exhaustion sets `spawn_failed` and suppresses further
  *        wakes. Additive; migration = ALTER TABLE ADD COLUMN.
+ *   v5 — per-bee spawn args: adds `bees.args` (nullable json array of
+ *        harness CLI args layered over the agent spec at spawn; the frozen
+ *        importer fills it from the old record's launch argv so a resumed
+ *        old-world bee keeps its model/effort/permission flags). Additive;
+ *        migration = ALTER TABLE ADD COLUMN ×1.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -65,7 +70,11 @@ CREATE TABLE IF NOT EXISTS bees (
   -- while still booting. Reset to 0 by a successful boot (booting →
   -- running) or an operator revive. The wake path applies the B5 backoff
   -- table to it and stops reviving at the budget (spawn_failed flag).
-  spawn_failures   INTEGER NOT NULL DEFAULT 0
+  spawn_failures   INTEGER NOT NULL DEFAULT 0,
+  -- v5: per-bee harness CLI args (json array of strings, or NULL = none),
+  -- composed over the agent spec's args at spawn (daemon resolveSpawnSpec:
+  -- spec args < spec defaultArgs < bee args < resume args; later wins per flag).
+  args             TEXT
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
@@ -201,13 +210,14 @@ CREATE TABLE IF NOT EXISTS tracks (
 /**
  * Additive columns on `bees` since v2 — name → ADD COLUMN clause (migration =
  * add iff missing). v3: provider_session_id, env, imported_from; v4:
- * spawn_failures.
+ * spawn_failures; v5: args.
  */
 export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["provider_session_id", "provider_session_id TEXT"],
   ["env", "env TEXT NOT NULL DEFAULT '{}'"],
   ["imported_from", "imported_from TEXT"],
   ["spawn_failures", "spawn_failures INTEGER NOT NULL DEFAULT 0"],
+  ["args", "args TEXT"],
 ];
 
 export const IDEMPOTENCY_INDEX_SQL = `

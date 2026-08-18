@@ -6,3 +6,13 @@ export * from "./types.ts";
 export { claudeAdapter, claudeResumeArgs, parseClaudeLine, encodeClaudeMessage } from "./claude.ts";
 export { codexAdapter, codexRateLimitSignals, codexThreadRequest, type CodexAdapterOptions } from "./codex.ts";
 export { stubAdapter, parseStubLine } from "./stub.ts";
+export {
+  composeArgv,
+  parseArgUnits,
+  dedupeUnits,
+  claudeArgGrammar,
+  codexArgGrammar,
+  codexSpawnPlan,
+  type ArgGrammar,
+  type ArgUnit,
+} from "./args.ts";

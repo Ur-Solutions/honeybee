@@ -525,6 +525,10 @@ export class DaemonCore {
           const { applied } = this.store.resetSpawnFailures(cmd.beeId, `operator revive (command ${cmd.id})`);
           if (applied) this.log(`spawn.budget_reset bee=${cmd.beeId} by=revive cmd=${cmd.id}`);
         }
+        // revive may carry replacement per-bee args (schema v5): applied
+        // before the driver resolves the spawn (same transaction as the new
+        // generation on the mint path), so the started runtime sees them.
+        const reviveArgs = cmd.verb === "revive" && cmd.args.args !== undefined ? (cmd.args.args as string[] | null) : undefined;
         const rt = this.store.currentRuntime(cmd.beeId);
         if (rt && LIVE.includes(rt.state)) {
           if (this.driver.hasProcess(cmd.beeId, rt.generation)) {
@@ -537,6 +541,7 @@ export class DaemonCore {
             this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} timeout gen=${rt.generation}`);
             return false;
           }
+          if (reviveArgs !== undefined) this.store.updateBeeArgs(cmd.beeId, reviveArgs);
           this.driver.start(cmd.beeId, rt.generation);
           this.recordProcAtSpawn(cmd.beeId, rt.generation);
           this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} start gen=${rt.generation}`);
@@ -547,7 +552,7 @@ export class DaemonCore {
           this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} timeout`);
           return false;
         }
-        const next = this.store.reviveBee(cmd.beeId);
+        const next = this.store.reviveBee(cmd.beeId, reviveArgs === undefined ? {} : { args: reviveArgs });
         this.driver.start(cmd.beeId, next.generation);
         this.recordProcAtSpawn(cmd.beeId, next.generation);
         this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} revive gen=${next.generation}`);

@@ -10,9 +10,16 @@
  *     harness WITH the resume selector: fake claude sees `--resume <that id>`
  *     and CLAUDE_CONFIG_DIR = the old home; fake codex sees `thread/resume
  *     {threadId: <that id>}` and CODEX_HOME = the old home; the new generation
- *     reports the SAME session id, which the daemon records unchanged
+ *     reports the SAME session id, which the daemon records unchanged — AND
+ *     with the per-bee args the importer kept from the old launch argv
+ *     (schema v5): fake claude sees `--model fable --effort high
+ *     --dangerously-skip-permissions --resume <id>`; fake codex sees
+ *     `-c model_reasoning_effort="ultra"` on argv and `model: gpt-5.6-sol`
+ *     in thread/resume (lifted off argv), never the dropped old plumbing
  *  4. the same continuity for a v2-born bee: first boot mints a session id →
- *     recorded → stop → message → generation 2 resumes it (scale-to-zero pause)
+ *     recorded → stop → message → generation 2 resumes it (scale-to-zero pause);
+ *     spawned with `args`, then `bee.setArgs` before the stop → generation 2
+ *     runs with the replaced args + the resume selector
  *
  * SAFETY: temp dirs only; the "agents" are fake-claude.mjs / fake-codex.mjs
  * (v2/driver-hsr/test-agent) — no real CLI, no tokens; the frozen fixture's
@@ -24,7 +31,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ImportFromFrozenResult, ListResult, MailboxResult, SendRpcResult, SpawnResult, ViewResult } from "../src/protocol.ts";
+import type { ImportFromFrozenResult, ListResult, MailboxResult, SendRpcResult, SetArgsResult, SpawnResult, ViewResult } from "../src/protocol.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "./helpers.ts";
 import {
   CLAUDE_HSR_SESSION_ID,
@@ -91,6 +98,12 @@ test("import.int: frozen import over RPC → revive resumes claude (--resume) an
     assert.deepEqual(claudeView.bee?.env, { CLAUDE_CONFIG_DIR: claudeHome });
     assert.equal(claudeView.bee?.importedFrom, "frozen");
     assert.equal(claudeView.bee?.name, "apiary-waggle-msx67afb-1");
+    assert.deepEqual(claudeView.bee?.args, ["--dangerously-skip-permissions", "--model", "fable", "--effort", "high"], "per-bee args kept from the old launch argv (schema v5)");
+    const codexView = await client.request<ViewResult>("view", { beeId: "CO.3ae1" });
+    assert.deepEqual(codexView.bee?.args, ["--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="ultra"']);
+    // list carries args too (mirror row shape)
+    const listed = await client.request<ListResult>("list", {});
+    assert.deepEqual(listed.views.find((v) => v.bee?.id === "CL.fe6f")?.bee?.args, claudeView.bee?.args);
 
     // idempotent re-run over RPC: no dupes
     const again = await client.request<ImportFromFrozenResult>("import.fromFrozen", { root: fx.root });
@@ -114,6 +127,14 @@ test("import.int: frozen import over RPC → revive resumes claude (--resume) an
     const boot = claudeBoots[0]!;
     assert.deepEqual(boot.argv.slice(-2), ["--resume", CLAUDE_HSR_SESSION_ID], `spawned with --resume <imported id>: ${JSON.stringify(boot.argv)}`);
     assert.ok(boot.argv.includes("--output-format"), "the agent spec's own args are kept ahead of the resume selector");
+    // schema v5: the imported per-bee args ride between the spec's args and the resume selector
+    assert.deepEqual(
+      boot.argv.slice(boot.argv.indexOf("--verbose") + 1),
+      ["--dangerously-skip-permissions", "--model", "fable", "--effort", "high", "--resume", CLAUDE_HSR_SESSION_ID],
+      `spec args < bee args < resume: ${JSON.stringify(boot.argv)}`,
+    );
+    assert.equal(boot.argv.includes("--session-id"), false, "old --session-id dropped (never combined with --resume)");
+    assert.equal(boot.argv.includes("--append-system-prompt"), false, "old system-prompt plumbing dropped");
     assert.equal(boot.env.CLAUDE_CONFIG_DIR, claudeHome, "runs under the imported home (the session lives there)");
     assert.equal(boot.resumed, CLAUDE_HSR_SESSION_ID);
     // the new generation reported the same session id; the daemon recorded it unchanged
@@ -143,9 +164,18 @@ test("import.int: frozen import over RPC → revive resumes claude (--resume) an
     assert.equal(turn?.params?.threadId, CODEX_HSR_THREAD_ID, "the delivered turn targets the resumed thread");
     const afterCodex = await client.request<ViewResult>("view", { beeId: "CO.3ae1" });
     assert.equal(afterCodex.bee?.providerSessionId, CODEX_HSR_THREAD_ID);
+    // schema v5, codex mapping: `-c model_reasoning_effort` reaches the app-server child's argv;
+    // `--model` is lifted into thread/resume; the approval flag is absorbed by the adapter's policy
+    const codexArgv = (resume as unknown as { argv: string[] }).argv;
+    assert.deepEqual(codexArgv.slice(codexArgv.indexOf("app-server")), ["app-server", "-c", 'model_reasoning_effort="ultra"'], `codex child argv: ${JSON.stringify(codexArgv)}`);
+    assert.equal(resume.params?.model, "gpt-5.6-sol", "-m lifted into the thread request");
+    assert.equal(resume.params?.approvalPolicy, "never");
+    assert.equal(resume.params?.sandbox, "danger-full-access");
+    assert.equal(codexArgv.some((a) => a.includes("service_tier") || a.includes("fast_mode")), false, "old service_tier/fast_mode plumbing dropped");
 
     // --- continuity for a v2-born bee (scale-to-zero pause shape) --------------
-    const born = await client.request<SpawnResult>("spawn", { name: "fresh", agent: "claude", cwd: fx.root });
+    const born = await client.request<SpawnResult>("spawn", { name: "fresh", agent: "claude", cwd: fx.root, args: ["--model", "opus"] });
+    assert.deepEqual((await client.request<ViewResult>("view", { beeId: born.beeId })).bee?.args, ["--model", "opus"], "spawn args land on the row");
     const first = await client.request<SendRpcResult>("send", { beeId: born.beeId, body: "first" });
     await waitFor(async () => {
       const { messages } = await client.request<MailboxResult>("mailbox", { beeId: born.beeId });
@@ -153,6 +183,11 @@ test("import.int: frozen import over RPC → revive resumes claude (--resume) an
     }, "fresh bee first delivery", 12_000);
     const minted = await waitFor(async () => (await client.request<ViewResult>("view", { beeId: born.beeId })).bee?.providerSessionId, "fresh bee's session id recorded", 12_000);
     assert.notEqual(minted, CLAUDE_HSR_SESSION_ID);
+    // bee.setArgs before the stop: generation 2 must run with the replaced args
+    const setArgs = await client.request<SetArgsResult>("bee.setArgs", { beeId: born.beeId, args: ["--model", "fable", "--dangerously-skip-permissions"] });
+    assert.equal(setArgs.applied, true);
+    assert.deepEqual(setArgs.bee.args, ["--model", "fable", "--dangerously-skip-permissions"]);
+    assert.equal((await client.request<SetArgsResult>("bee.setArgs", { beeId: born.beeId, args: ["--model", "fable", "--dangerously-skip-permissions"] })).applied, false, "identical = no-op");
     await client.request("stop", { beeId: born.beeId });
     await waitFor(async () => (await client.request<ViewResult>("view", { beeId: born.beeId })).view.runtimeState === "stopped", "fresh bee stopped", 12_000);
     const second = await client.request<SendRpcResult>("send", { beeId: born.beeId, body: "second" });
@@ -167,7 +202,10 @@ test("import.int: frozen import over RPC → revive resumes claude (--resume) an
     assert.equal(bornBoots.length, 2, "fresh bee: two spawns (gen 1 fresh, gen 2 resumed)");
     assert.equal(bornBoots[0]?.resumed, null, "generation 1 had nothing to resume");
     assert.equal(bornBoots[0]?.sessionId, minted);
+    assert.deepEqual(bornBoots[0]?.argv.slice(-2), ["--model", "opus"], "generation 1 ran with the spawn args");
     assert.equal(bornBoots[1]?.resumed, minted, "generation 2 resumes the id generation 1 minted");
+    assert.deepEqual(bornBoots[1]?.argv.slice(-5), ["--model", "fable", "--dangerously-skip-permissions", "--resume", minted], `generation 2 ran with the replaced args + resume: ${JSON.stringify(bornBoots[1]?.argv)}`);
+    assert.equal(bornBoots[1]?.argv.filter((a) => a === "--model").length, 1, "one --model after de-dup");
     // no per-bee env for a v2-born bee: it inherits whatever the daemon process had (possibly a CLAUDE_CONFIG_DIR of its own), never the imported home
     assert.equal(bornBoots[1]?.env.CLAUDE_CONFIG_DIR, process.env.CLAUDE_CONFIG_DIR ?? null);
     assert.notEqual(bornBoots[1]?.env.CLAUDE_CONFIG_DIR, claudeHome);

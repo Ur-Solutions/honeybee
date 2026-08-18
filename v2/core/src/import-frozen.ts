@@ -99,7 +99,14 @@ export interface FrozenRecord {
   createdAt: number | null;
   updatedAt: number | null;
   node: string | null;
+  /** Old `hive set-model` first-class model — overrides the launch argv's model flag. */
   model: string | null;
+  /** Old `hive set-model … -- <flags>` extra harness flags (one shell-words line). */
+  modelExtraArgs: string | null;
+  /** The old runner's launch argv (`launchArgv`, program first) — the source of per-bee args. */
+  launchArgv: string[] | null;
+  /** The old shell command line (`command`; env prefix + program + args) — fallback when launchArgv is absent. */
+  command: string | null;
   runtimeGeneration: number | null;
   /** Old-world process identities (HSR runner host / tmux launcher) for the preflight. */
   runnerPid: number | null;
@@ -141,6 +148,8 @@ export interface FrozenBeeInput {
   sessionLogPath: string | undefined;
   providerSessionId: string | undefined;
   env: Record<string, string>;
+  /** Per-bee spawn args (schema v5) kept from the old launch argv; null when nothing harness-meaningful survived. */
+  args: string[] | null;
   createdAt: number | undefined;
   provenance: Record<string, unknown>;
 }
@@ -268,6 +277,12 @@ export function parseFrozenRecord(path: string, raw: unknown): ParsedFrozenRecor
       updatedAt: isoMs(r.updatedAt),
       node: str(r.node),
       model: str(r.model),
+      modelExtraArgs: str(r.modelExtraArgs),
+      launchArgv:
+        Array.isArray(r.launchArgv) && r.launchArgv.length > 0 && r.launchArgv.every((a) => typeof a === "string")
+          ? [...(r.launchArgv as string[])]
+          : null,
+      command: str(r.command),
       runtimeGeneration: num(r.runtimeGeneration),
       runnerPid: num(r.runnerPid),
       runnerStartedAt: fingerprintMs(r.runnerFingerprint),
@@ -346,6 +361,254 @@ export function readOldDaemonLock(frozenRoot: string): { pid: number; startedAt:
 }
 
 // ---------------------------------------------------------------------------
+// per-bee args from the old launch argv (schema v5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal POSIX-ish shell-words split for the old `command` string /
+ * `modelExtraArgs` line: single quotes literal, double quotes with `\` escapes,
+ * backslash escapes outside quotes, whitespace separates. Enough for the
+ * shapes the old system wrote (`-c 'model_reasoning_effort="high"'`).
+ */
+export function shellWords(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let has = false;
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i] as string;
+    if (ch === "'") {
+      const end = line.indexOf("'", i + 1);
+      cur += line.slice(i + 1, end < 0 ? line.length : end);
+      has = true;
+      i = end < 0 ? line.length : end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      i += 1;
+      while (i < line.length && line[i] !== '"') {
+        if (line[i] === "\\" && i + 1 < line.length && '"\\$`'.includes(line[i + 1] as string)) i += 1;
+        cur += line[i];
+        i += 1;
+      }
+      i += 1;
+      has = true;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < line.length) {
+      cur += line[i + 1];
+      has = true;
+      i += 2;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\n") {
+      if (has) out.push(cur);
+      cur = "";
+      has = false;
+      i += 1;
+      continue;
+    }
+    cur += ch;
+    has = true;
+    i += 1;
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+/**
+ * The old record's argv AFTER the program token: `launchArgv` (program first)
+ * when present, else the `command` string with its leading `KEY=value` env
+ * assignments and the program stripped. Null when neither is usable.
+ */
+export function oldLaunchArgs(record: Pick<FrozenRecord, "launchArgv" | "command">): { args: string[]; source: "launchArgv" | "command" } | null {
+  if (record.launchArgv && record.launchArgv.length > 0) return { args: record.launchArgv.slice(1), source: "launchArgv" };
+  if (record.command) {
+    const words = shellWords(record.command);
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i] as string)) i += 1; // env prefix
+    if (i < words.length) return { args: words.slice(i + 1), source: "command" };
+  }
+  return null;
+}
+
+/**
+ * The importer's keep/drop table — which old launch flags become per-bee
+ * args (schema v5) and which are old-system plumbing the v2 daemon/adapters
+ * supply themselves (or that would break the v2 spawn shape). Anything not
+ * listed is DROPPED (recorded in the provenance payload as `droppedArgs`);
+ * the table is an allow-list, so an unknown flag never leaks into a v2 spawn.
+ *
+ *   claude   keep  --model <m>                     (also --model=<m>)
+ *            keep  --effort <e>                    (also --effort=<e>)
+ *            keep  --dangerously-skip-permissions
+ *            drop  --session-id <id>               (v2 resumes with --resume <providerSessionId>)
+ *            drop  --resume <id> / -r <id>         (same — the bee row carries the id)
+ *            drop  --append-system-prompt <text>   (old hive-session preamble; v2 has its own delivery)
+ *            drop  --system-prompt <text>
+ *            drop  -p / --print / --input-format <f> / --output-format <f> / --verbose
+ *                                                  (the v2 agent spec's base args)
+ *            drop  --permission-mode <m>, --continue/-c, everything else
+ *
+ *   codex    keep  -m <m> / --model <m> / --model=<m>   → canonical `--model <m>`
+ *            keep  -c model_reasoning_effort=…      → canonical `-c model_reasoning_effort=…`
+ *                  (--config …, -c=…, --config=… spellings fold onto `-c`)
+ *            keep  --dangerously-bypass-approvals-and-sandbox
+ *                                                  (→ v2 codex adapter approvalPolicy "never"
+ *                                                   + sandbox "danger-full-access"; lifted off
+ *                                                   argv by the daemon, see adapters/args.ts)
+ *            drop  -c service_tier=…               (old-system tier plumbing)
+ *            drop  -c features.fast_mode=…          (old-system fast-mode plumbing)
+ *            drop  -c sandbox_workspace_write.*     (old cell-network plumbing)
+ *            drop  -c <anything else>
+ *            drop  app-server, --full-auto, -a/--ask-for-approval <p>, -s/--sandbox <p>,
+ *                  -p/--profile <p>, -C/--cd <d>, -i/--image <f>, everything else
+ *
+ *   other    drop everything (no v2 adapter takes per-bee args for them)
+ *
+ * The record's first-class `model` (old `hive set-model`) overrides the argv's
+ * model flag; `modelExtraArgs` (old `set-model … -- <flags>`) is shell-split
+ * and run through the same table AFTER the argv, so it layers on top. The
+ * result is canonical + de-duplicated (later wins per flag).
+ */
+export const IMPORT_ARGS_TABLE = {
+  claude: {
+    keepValue: ["--model", "--effort"],
+    keepBoolean: ["--dangerously-skip-permissions"],
+    dropValue: ["--session-id", "--resume", "-r", "--append-system-prompt", "--system-prompt", "--input-format", "--output-format", "--permission-mode", "--max-turns", "--fallback-model", "--agent", "--settings", "--mcp-config", "--allowedTools", "--disallowedTools", "--add-dir", "--max-budget-usd", "--json-schema", "--betas"],
+    dropBoolean: ["-p", "--print", "--verbose", "--continue", "-c", "--include-partial-messages", "--replay-user-messages"],
+    keepConfigKeys: [] as string[],
+  },
+  codex: {
+    keepValue: ["-m", "--model"],
+    keepBoolean: ["--dangerously-bypass-approvals-and-sandbox"],
+    dropValue: ["-a", "--ask-for-approval", "-s", "--sandbox", "-p", "--profile", "-C", "--cd", "-i", "--image"],
+    dropBoolean: ["--full-auto", "--search", "--oss"],
+    keepConfigKeys: ["model_reasoning_effort"],
+  },
+} as const;
+
+export type ImportArgsHarness = keyof typeof IMPORT_ARGS_TABLE;
+
+const CODEX_MODEL_ALIASES = new Set(["-m", "--model"]);
+const CODEX_CONFIG_ALIASES = new Set(["-c", "--config"]);
+
+export interface ExtractedArgs {
+  /** Canonical, de-duplicated per-bee args; null when nothing survived. */
+  args: string[] | null;
+  /** Dropped units, each rendered as the tokens it consisted of. */
+  dropped: string[][];
+}
+
+/** Apply the keep/drop table to one old argv (program already stripped). Pure. */
+export function extractBeeArgs(harness: string, argv: readonly string[]): ExtractedArgs {
+  const table = (IMPORT_ARGS_TABLE as Record<string, (typeof IMPORT_ARGS_TABLE)[ImportArgsHarness]>)[harness];
+  const dropped: string[][] = [];
+  if (!table) {
+    for (const t of argv) dropped.push([t]);
+    return { args: null, dropped };
+  }
+  // units: [identity, tokens]; identity null = keep-as-is (never happens for
+  // an allow-list — every kept unit is identified)
+  const kept: Array<{ identity: string; kind: "value" | "boolean"; tokens: string[] }> = [];
+  const isCodex = harness === "codex";
+  for (let i = 0; i < argv.length; i += 1) {
+    const tok = argv[i] as string;
+    const eq = tok.startsWith("-") ? tok.indexOf("=") : -1;
+    const flag = eq > 0 ? tok.slice(0, eq) : tok;
+    const inline = eq > 0 ? tok.slice(eq + 1) : null;
+    const takeValue = (): string | null => {
+      if (inline !== null) return inline;
+      const v = argv[i + 1];
+      if (v === undefined) return null;
+      i += 1;
+      return v;
+    };
+    if (isCodex && CODEX_CONFIG_ALIASES.has(flag)) {
+      const value = takeValue();
+      if (value === null) {
+        dropped.push([tok]);
+        continue;
+      }
+      const key = value.split("=")[0] ?? value;
+      if ((table.keepConfigKeys as readonly string[]).includes(key)) kept.push({ identity: `-c:${key}`, kind: "value", tokens: ["-c", value] });
+      else dropped.push(inline !== null ? [tok] : [tok, value]);
+      continue;
+    }
+    if ((table.keepValue as readonly string[]).includes(flag)) {
+      const value = takeValue();
+      if (value === null) {
+        dropped.push([tok]);
+        continue;
+      }
+      const canonical = isCodex && CODEX_MODEL_ALIASES.has(flag) ? "--model" : flag;
+      kept.push({ identity: canonical, kind: "value", tokens: [canonical, value] });
+      continue;
+    }
+    if ((table.keepBoolean as readonly string[]).includes(flag) && inline === null) {
+      kept.push({ identity: flag, kind: "boolean", tokens: [flag] });
+      continue;
+    }
+    if ((table.dropValue as readonly string[]).includes(flag)) {
+      const value = takeValue();
+      dropped.push(value === null || inline !== null ? [tok] : [tok, value]);
+      continue;
+    }
+    // dropBoolean, unknown flags, positionals: dropped one token at a time
+    dropped.push([tok]);
+  }
+  // de-dup: valued → last wins (its position); boolean → first wins
+  const first = new Map<string, number>();
+  const last = new Map<string, number>();
+  kept.forEach((u, i) => {
+    if (!first.has(u.identity)) first.set(u.identity, i);
+    last.set(u.identity, i);
+  });
+  const args = kept
+    .filter((u, i) => (u.kind === "boolean" ? first.get(u.identity) === i : last.get(u.identity) === i))
+    .flatMap((u) => u.tokens);
+  return { args: args.length > 0 ? args : null, dropped };
+}
+
+/**
+ * The per-bee args for one old record: launch argv (or command) through the
+ * keep/drop table, then the first-class `model` override, then
+ * `modelExtraArgs`. Returns the args plus what the provenance payload records.
+ */
+export function beeArgsFromRecord(record: FrozenRecord): {
+  args: string[] | null;
+  provenance: { argsSource: "launchArgv" | "command" | null; keptArgs: string[] | null; droppedArgs: string[][]; modelOverride: string | null; modelExtraArgs: string | null };
+} {
+  const launch = oldLaunchArgs(record);
+  const layers: string[] = [];
+  const dropped: string[][] = [];
+  if (launch) {
+    const ex = extractBeeArgs(record.agent, launch.args);
+    if (ex.args) layers.push(...ex.args);
+    dropped.push(...ex.dropped);
+  }
+  const modelOverride = record.model && (record.agent === "claude" || record.agent === "codex") ? record.model : null;
+  if (modelOverride) layers.push("--model", modelOverride);
+  if (record.modelExtraArgs) {
+    const ex = extractBeeArgs(record.agent, shellWords(record.modelExtraArgs));
+    if (ex.args) layers.push(...ex.args);
+    dropped.push(...ex.dropped);
+  }
+  // one more pass folds the layers (override + extras) onto the argv args
+  const final = layers.length > 0 ? extractBeeArgs(record.agent, layers).args : null;
+  return {
+    args: final,
+    provenance: {
+      argsSource: launch?.source ?? null,
+      keptArgs: final,
+      droppedArgs: dropped,
+      modelOverride,
+      modelExtraArgs: record.modelExtraArgs,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // planning (pure)
 // ---------------------------------------------------------------------------
 
@@ -382,6 +645,11 @@ export function mapFrozenRecord(record: FrozenRecord, frozenRoot: string, meta: 
   if (record.agent === "claude" && substrate === "tmux" && providerSessionId) {
     notes.push("claude interactive (tmux) session → headless resume is unverified (old finding: the two claude session stores are disjoint)");
   }
+  const extracted = beeArgsFromRecord(record);
+  if (extracted.args) notes.push(`args ${extracted.args.join(" ")}`);
+  if (extracted.provenance.droppedArgs.length > 0) {
+    notes.push(`dropped ${extracted.provenance.droppedArgs.length} old launch flag(s): ${extracted.provenance.droppedArgs.map((d) => d[0]).join(" ")}`);
+  }
   const bee: FrozenBeeInput = {
     id: record.id,
     name: record.name,
@@ -393,6 +661,7 @@ export function mapFrozenRecord(record: FrozenRecord, frozenRoot: string, meta: 
     sessionLogPath: record.transcriptPath ?? undefined,
     providerSessionId: providerSessionId ?? undefined,
     env,
+    args: extracted.args,
     createdAt: record.createdAt ?? undefined,
     provenance: {
       imported_from: "frozen",
@@ -414,6 +683,8 @@ export function mapFrozenRecord(record: FrozenRecord, frozenRoot: string, meta: 
       runtimeGeneration: record.runtimeGeneration,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
+      // schema v5: what the keep/drop table did to the old launch argv
+      ...extracted.provenance,
     },
   };
   return { bee, notes };
@@ -663,6 +934,7 @@ export function importFromFrozen(store: CoreStore, frozenRoot: string, opts: Fro
         sessionLogPath: b.sessionLogPath,
         providerSessionId: b.providerSessionId,
         env: b.env,
+        args: b.args,
         importedFrom: "frozen",
         createdAt: b.createdAt,
       });

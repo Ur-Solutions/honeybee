@@ -15,6 +15,15 @@ export const CLAUDE_HSR_SESSION_ID = "9aa1f08d-1446-4d78-981f-bbec462ba87b";
 export const CODEX_HSR_THREAD_ID = "01a00e69-6ee4-7cd1-955c-befcbe8d9540";
 export const CODEX_TMUX_THREAD_ID = "01a00e41-1009-7450-9831-137890213c02";
 
+/** The old hive-session preamble the launcher appended (scrubbed, shortened). */
+export const OLD_SYSTEM_PROMPT = '<hive-session>\nYou are a Honeybee bee: id CL.fe6f, name "apiary-waggle-msx67afb-1". Message another bee: `hive buz send <bee> …`.\n</hive-session>';
+
+/** Real claude HSR launch argv shape (program first; harness flags + old plumbing). */
+export const CLAUDE_HSR_LAUNCH_ARGV = ["claude", "--dangerously-skip-permissions", "--model", "fable", "--effort", "high", "--session-id", CLAUDE_HSR_SESSION_ID, "--append-system-prompt", OLD_SYSTEM_PROMPT];
+
+/** Real codex HSR launch argv shape. */
+export const CODEX_HSR_LAUNCH_ARGV = ["codex", "-c", "service_tier=default", "--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="ultra"', "-c", "features.fast_mode=false"];
+
 /** Real claude HSR record shape (CL.fe6f, scrubbed). */
 export function claudeHsrRecord(root: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const home = join(root, "homes", "claude-fixture-account");
@@ -25,6 +34,8 @@ export function claudeHsrRecord(root: string, overrides: Record<string, unknown>
     cwd: join(root, "cwd-apiary"),
     tags: ["apiary:workspace=ws-a33e3761-4c6d-4f37-a8f5-b0562e07662e"],
     title: "Optimize Apiary core performance",
+    command: `CLAUDE_CONFIG_DIR=${home} claude --dangerously-skip-permissions --model fable --effort high --session-id ${CLAUDE_HSR_SESSION_ID} --append-system-prompt '<hive-session>…</hive-session>'`,
+    launchArgv: CLAUDE_HSR_LAUNCH_ARGV,
     providerSessionId: CLAUDE_HSR_SESSION_ID,
     transcriptPath: join(home, "projects", "-tmp-fixture-apiary", `${CLAUDE_HSR_SESSION_ID}.jsonl`),
     homePath: home,
@@ -60,6 +71,8 @@ export function codexHsrRecord(root: string, overrides: Record<string, unknown> 
     cwd: join(root, "cwd-cells", "digitech-next-space"),
     tags: ["apiary:workspace=ws-cc64dd8f-c81a-4fc4-a449-e146d3ad24a5", "apiary:workspace=ws-d80b1dc7-b656-4ce7-9898-8ff46a2719bd"],
     title: "Order Module Cleanup",
+    command: `CODEX_HOME=${home} HIVE_BEE=CO.3ae1 codex -c service_tier=default --dangerously-bypass-approvals-and-sandbox -m gpt-5.6-sol -c 'model_reasoning_effort="ultra"' -c features.fast_mode=false`,
+    launchArgv: CODEX_HSR_LAUNCH_ARGV,
     providerSessionId: CODEX_HSR_THREAD_ID,
     transcriptPath: join(home, "sessions", "2026", "08", "17", `rollout-2026-08-17T08-29-45-${CODEX_HSR_THREAD_ID}.jsonl`),
     homePath: home,
@@ -93,6 +106,8 @@ export function codexTmuxRecord(root: string, overrides: Record<string, unknown>
     agent: "codex",
     cwd: join(root, "cwd-honeybee"),
     title: "Clean Up Stale Worktrees",
+    command: `CODEX_HOME=${home} codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.6-sol -c 'model_reasoning_effort="medium"'`,
+    launchArgv: ["codex", "--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="medium"'],
     providerSessionId: CODEX_TMUX_THREAD_ID,
     transcriptPath: join(home, "sessions", "2026", "08", "17", `rollout-2026-08-17T07-45-40-${CODEX_TMUX_THREAD_ID}.jsonl`),
     homePath: home,

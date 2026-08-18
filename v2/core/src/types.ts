@@ -102,6 +102,12 @@ export interface BeeRow {
    * spawn failure and never counts.
    */
   spawnFailures: number;
+  /**
+   * v5 — per-bee harness CLI args (e.g. `--model fable --effort high`),
+   * layered over the agent spec's args at spawn (daemon resolveSpawnSpec).
+   * Null = none. The frozen importer fills it from the old launch argv.
+   */
+  args: string[] | null;
 }
 
 export interface RuntimeRow {

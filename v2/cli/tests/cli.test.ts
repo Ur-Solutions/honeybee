@@ -184,6 +184,84 @@ test("cli.4b: --idempotency-key passes through on spawn and send — replays ded
   }
 });
 
+test("cli.4c: per-bee args — `spawn --arg` (repeatable), `bee set-args <bee> -- <args…>` / --clear, `bee args`, `revive --arg`, view/list carry args; stale read shows them too", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const s = capture();
+    assert.equal(await runV2Cli(["spawn", "argsy", "--agent", "stub", "--cwd", "/tmp", "--arg", "--model", "--arg", "fable", "--data-dir", dir, "--json"], s.io), 0);
+    const spawned = JSON.parse(s.out[0] ?? "{}") as { beeId: string };
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["view", "argsy", "--data-dir", dir, "--json"], l.io);
+      return (JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string } }).view?.runtimeState === "idle";
+    }, "argsy idle", 10_000);
+    const v = capture();
+    assert.equal(await runV2Cli(["view", "argsy", "--data-dir", dir], v.io), 0);
+    assert.ok(v.out[0]?.includes('args=["--model","fable"]'), `human view shows args: ${v.out[0]}`);
+    const a1 = capture();
+    assert.equal(await runV2Cli(["bee", "args", "argsy", "--data-dir", dir, "--json"], a1.io), 0);
+    assert.deepEqual(JSON.parse(a1.out[0] ?? "{}"), { beeId: spawned.beeId, args: ["--model", "fable"] });
+
+    // set-args with `--`: everything after is verbatim (even tokens that look like our own flags)
+    const set = capture();
+    assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir, "--json", "--", "--model", "opus", "--effort", "high", "--dangerously-skip-permissions"], set.io), 0);
+    const setRes = JSON.parse(set.out[0] ?? "{}") as { applied: boolean; bee: { args: string[] | null } };
+    assert.equal(setRes.applied, true);
+    assert.deepEqual(setRes.bee.args, ["--model", "opus", "--effort", "high", "--dangerously-skip-permissions"]);
+    // human, unchanged
+    const same = capture();
+    assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir, "--", "--model", "opus", "--effort", "high", "--dangerously-skip-permissions"], same.io), 0);
+    assert.ok(same.out[0]?.startsWith("unchanged args for"), same.out[0]);
+    // usage errors: no args and no --clear
+    const bad = capture();
+    assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir], bad.io), 1);
+    assert.ok(bad.err[0]?.includes("usage: hive v2 bee set-args"));
+    const bad2 = capture();
+    assert.equal(await runV2Cli(["bee", "frob", "--data-dir", dir], bad2.io), 1);
+    // --clear
+    const clr = capture();
+    assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--clear", "--data-dir", dir, "--json"], clr.io), 0);
+    assert.equal((JSON.parse(clr.out[0] ?? "{}") as { bee: { args: unknown } }).bee.args, null);
+
+    // revive --arg: stop, then revive with replacement args → row updated, generation 2
+    const st = capture();
+    assert.equal(await runV2Cli(["stop", "argsy", "--data-dir", dir], st.io), 0);
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["view", "argsy", "--data-dir", dir, "--json"], l.io);
+      return (JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string } }).view?.runtimeState === "stopped";
+    }, "argsy stopped", 10_000);
+    const rv = capture();
+    assert.equal(await runV2Cli(["revive", "argsy", "--arg", "--effort", "--arg", "max", "--data-dir", dir], rv.io), 0);
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["view", "argsy", "--data-dir", dir, "--json"], l.io);
+      const parsed = JSON.parse(l.out[0] ?? "{}") as { view?: { generation: number; runtimeState: string }; bee?: { args: string[] | null } };
+      return parsed.view?.generation === 2 && parsed.view.runtimeState === "idle" ? parsed : null;
+    }, "argsy gen 2 idle", 10_000);
+    const after = capture();
+    await runV2Cli(["list", "--data-dir", dir, "--json"], after.io);
+    const listed = JSON.parse(after.out[0] ?? "{}") as { views: Array<{ bee: { name: string; args: string[] | null } }> };
+    assert.deepEqual(listed.views.find((x) => x.bee.name === "argsy")?.bee.args, ["--effort", "max"]);
+
+    // daemon down: the read-only fallback still shows args (stale)
+    await daemon.stop();
+    daemon = null;
+    const stale = capture();
+    assert.equal(await runV2Cli(["bee", "args", "argsy", "--data-dir", dir, "--json"], stale.io), 0);
+    assert.deepEqual(JSON.parse(stale.out[0] ?? "{}"), { stale: true, beeId: spawned.beeId, args: ["--effort", "max"] });
+    // set-args is a mutation: never falls back
+    const down = capture();
+    assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir, "--", "--x"], down.io), 1);
+    assert.ok(down.err[0]?.includes("daemon"), down.err[0]);
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
 test("cli.5: daemon status when nothing runs and no service is installed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-cli-"));
   try {
