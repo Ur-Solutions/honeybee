@@ -165,6 +165,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
       case "flag.clear_noop":
       case "mail.deliver_noop":
       case "command.complete_noop":
+      case "command.dedup":
       case "boot.reconciled":
         break;
       default:

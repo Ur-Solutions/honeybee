@@ -127,6 +127,62 @@ test("cli.4: against a live daemon — spawn, list (not stale), send --wait bloc
   }
 });
 
+test("cli.4b: --idempotency-key passes through on spawn and send — replays dedup to the original", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+
+    const a = capture();
+    assert.equal(
+      await runV2Cli(
+        ["spawn", "worker", "--agent", "stub", "--cwd", "/tmp", "--idempotency-key", "cli-spawn-1", "--data-dir", dir, "--json"],
+        a.io,
+      ),
+      0,
+    );
+    const first = JSON.parse(a.out[0] ?? "{}") as { beeId: string; commandId: number; deduped?: boolean };
+    assert.ok(first.beeId.length > 0);
+    assert.notEqual(first.deduped, true);
+
+    const b = capture();
+    assert.equal(
+      await runV2Cli(
+        ["spawn", "worker", "--agent", "stub", "--cwd", "/tmp", "--idempotency-key", "cli-spawn-1", "--data-dir", dir, "--json"],
+        b.io,
+      ),
+      0,
+    );
+    const replay = JSON.parse(b.out[0] ?? "{}") as { beeId: string; commandId: number; deduped?: boolean };
+    assert.equal(replay.deduped, true, "second spawn with the same key is a dedup");
+    assert.equal(replay.beeId, first.beeId);
+    assert.equal(replay.commandId, first.commandId);
+
+    // Only one bee exists.
+    const l = capture();
+    assert.equal(await runV2Cli(["list", "--all", "--data-dir", dir, "--json"], l.io), 0);
+    assert.equal((JSON.parse(l.out[0] ?? "{}") as { views: unknown[] }).views.length, 1);
+
+    // send: same key → same message id, marked deduped in human output too.
+    const s1 = capture();
+    assert.equal(
+      await runV2Cli(["send", "worker", "ping", "--idempotency-key", "cli-send-1", "--data-dir", dir, "--json"], s1.io),
+      0,
+    );
+    const sent = JSON.parse(s1.out[0] ?? "{}") as { messageId: number };
+    const s2 = capture();
+    assert.equal(
+      await runV2Cli(["send", "worker", "ping", "--idempotency-key", "cli-send-1", "--data-dir", dir], s2.io),
+      0,
+    );
+    assert.ok(s2.out[0]?.startsWith("deduped: already sent message"), s2.out[0]);
+    assert.ok(s2.out[0]?.includes(`message ${sent.messageId} `), "same message id on replay");
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
 test("cli.5: daemon status when nothing runs and no service is installed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-cli-"));
   try {

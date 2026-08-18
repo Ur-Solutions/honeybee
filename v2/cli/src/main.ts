@@ -84,6 +84,7 @@ const VALUE_FLAGS = new Set([
   "--out",
   "--dir",
   "--id",
+  "--idempotency-key",
 ]);
 
 function parseArgs(argv: string[]): Parsed {
@@ -206,7 +207,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
   const name = parsed.positional[1];
-  if (!name) throw new Error("usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]...");
+  if (!name) throw new Error("usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--idempotency-key k]");
   const agent = (parsed.flags.get("--agent") as string | undefined) ?? "claude";
   const cwd = resolve((parsed.flags.get("--cwd") as string | undefined) ?? process.cwd());
   const result = await withClient(ctx, (c) =>
@@ -216,9 +217,15 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
       cwd,
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     }),
   );
-  emit(ctx, [`spawned ${result.beeId} (command ${result.commandId})`], result, false);
+  emit(
+    ctx,
+    [`${result.deduped ? "deduped: already " : ""}spawned ${result.beeId} (command ${result.commandId}${result.status ? ` ${result.status}` : ""})`],
+    result,
+    false,
+  );
   return 0;
 }
 
@@ -226,7 +233,7 @@ async function cmdSend(ctx: CliContext, parsed: Parsed): Promise<number> {
   const [, needle, ...bodyParts] = parsed.positional;
   const body = bodyParts.join(" ");
   if (!needle || body.length === 0) {
-    throw new Error("usage: hive v2 send <bee> <message…> [--sender s] [--wait] [--timeout ms]");
+    throw new Error("usage: hive v2 send <bee> <message…> [--sender s] [--wait] [--timeout ms] [--idempotency-key k]");
   }
   return withClient(ctx, async (c) => {
     const list = await c.request<ListResult>("list");
@@ -235,11 +242,12 @@ async function cmdSend(ctx: CliContext, parsed: Parsed): Promise<number> {
       beeId,
       body,
       sender: parsed.flags.get("--sender") as string | undefined,
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
     if (parsed.flags.get("--wait") !== true) {
       emit(
         ctx,
-        [`sent message ${result.messageId} to ${beeId}${result.commandId != null ? ` (wake command ${result.commandId})` : ""}`],
+        [`${result.deduped ? "deduped: already " : ""}sent message ${result.messageId} to ${beeId}${result.commandId != null ? ` (wake command ${result.commandId})` : ""}`],
         result,
         false,
       );
@@ -777,9 +785,11 @@ const HELP = `hive v2 — Honeybee reset stack (WP4)
 Usage: hive v2 <command> [args] [--data-dir d] [--socket s] [--json]
 
 Mutations (RPC, daemon must be running):
-  spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]...
-  send <bee> <message…> [--sender s] [--wait] [--timeout ms]
+  spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]... [--idempotency-key k]
+  send <bee> <message…> [--sender s] [--wait] [--timeout ms] [--idempotency-key k]
   stop | revive | archive | unarchive | delete <bee>
+  (--idempotency-key: spec 06 §4.2 one-key rule — a replayed key returns the
+   original outcome, marked deduped, instead of executing twice)
 
 Reads (RPC; read-only store fallback labeled STALE when daemon is down):
   view <bee> · list [--all|--archived] · mailbox <bee> · commands <bee>

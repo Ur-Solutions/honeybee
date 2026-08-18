@@ -40,10 +40,11 @@ import {
   type TrackRow,
   type Verb,
   NameConflictError,
+  SchemaVersionError,
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
-import { SCHEMA_SQL } from "./schema.ts";
+import { IDEMPOTENCY_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -61,6 +62,12 @@ export interface CoreStoreOptions {
   maxAttempts?: number;
   /** B5 backoff base: next_attempt_at = now + base * 2^(attempts-1). Default 30s. */
   backoffBaseMs?: number;
+  /**
+   * Retention bound for the rpc_idempotency table (spec 06 §4.2): the newest N
+   * recorded mutation results are kept; the oldest beyond N are evicted on
+   * insert. Default 10 000.
+   */
+  maxRpcIdempotencyRows?: number;
 }
 
 export interface CreateBeeInput {
@@ -110,6 +117,27 @@ export interface LivePid {
 
 /** Outcome of an idempotent put/import: one row, created / updated / left alone. */
 export type PutOutcome = "created" | "updated" | "unchanged";
+
+/**
+ * enqueueCommand's result (spec 06 §4.2): the command row itself, plus whether
+ * the caller-supplied idempotencyKey matched an EXISTING row (`deduped: true`
+ * = the returned row is the original command at its CURRENT status — queued,
+ * running, or already settled — and nothing new was enqueued).
+ */
+export interface EnqueuedCommand extends CommandRow {
+  deduped: boolean;
+}
+
+/** A recorded RPC mutation result (the rpc_idempotency table). */
+export interface RpcIdempotencyRecord {
+  key: string;
+  verb: string;
+  /** The command the mutation enqueued, when it enqueued one. */
+  commandId: number | null;
+  /** The result exactly as first returned (JSON round-tripped). */
+  result: unknown;
+  createdAt: number;
+}
 
 export interface PutTemplateInput extends NormalizeOptions {
   /** Stable id to match/create; absent = match by (scope, name), else mint one. */
@@ -194,6 +222,7 @@ function mapCommand(r: Row): CommandRow {
     enqueuedAt: Number(r.enqueued_at),
     finishedAt: r.finished_at == null ? null : Number(r.finished_at),
     failureCause: (r.failure_cause as FailureCause | null) ?? null,
+    idempotencyKey: (r.idempotency_key as string | null) ?? null,
   };
 }
 
@@ -264,6 +293,7 @@ export class CoreStore {
   private readonly now: () => number;
   private readonly maxAttempts: number;
   private readonly backoffBaseMs: number;
+  private readonly maxRpcIdempotencyRows: number;
   private txDepth = 0;
   private closed = false;
   /** Commands requeued running→queued by open() (B5 boot replay); reported by reconcileAtBoot. */
@@ -274,6 +304,7 @@ export class CoreStore {
     this.now = opts.now ?? Date.now;
     this.maxAttempts = opts.maxAttempts ?? 5;
     this.backoffBaseMs = opts.backoffBaseMs ?? 30_000;
+    this.maxRpcIdempotencyRows = opts.maxRpcIdempotencyRows ?? 10_000;
     this.db = new DatabaseSync(path);
     try {
       // Fail immediately (no waiting) if another writer holds the lock.
@@ -286,6 +317,9 @@ export class CoreStore {
       this.db.exec("PRAGMA foreign_keys = ON");
       this.db.exec(SCHEMA_SQL);
       this.tx(() => {
+        // Version gate + explicit migrations FIRST (before any other write
+        // touches possibly-old tables), atomically with the stamp.
+        this.ensureSchemaVersion();
         // Guaranteed write on open: takes the exclusive lock now, not lazily.
         this.db
           .prepare("INSERT INTO meta(key, value) VALUES('opened_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
@@ -339,6 +373,45 @@ export class CoreStore {
     } finally {
       this.txDepth = 0;
     }
+  }
+
+  /**
+   * Schema-version discipline (spec 06 §6, mirrored by apiaryd): the store is
+   * stamped with SCHEMA_VERSION; a NEWER stamp is a downgrade and is refused
+   * with a typed error; an OLDER (or pre-stamp v1) store is migrated here by
+   * explicit code — no silent bumps. Runs inside the open() transaction so
+   * migration + stamp commit atomically.
+   */
+  private ensureSchemaVersion(): void {
+    const row = this.db
+      .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+      .get() as Row | undefined;
+    const stored = row === undefined ? 1 : Number(row.value); // pre-stamp stores are v1
+    if (stored > SCHEMA_VERSION) {
+      throw new SchemaVersionError(
+        "schema_newer",
+        `core store at ${this.path} is schema v${stored}; this build speaks v${SCHEMA_VERSION} — ` +
+          "refusing to open a newer store (downgrade). Update the daemon or roll the store back.",
+      );
+    }
+    if (stored < SCHEMA_VERSION) {
+      // v1 → v2: additive idempotency_key column on commands. A FRESH database
+      // already has the column from SCHEMA_SQL (also unstamped, so it takes
+      // this path too) — the pragma check makes the ALTER apply only to real
+      // v1 stores.
+      const cols = this.db.prepare("SELECT name FROM pragma_table_info('commands')").all() as Row[];
+      if (!cols.some((c) => c.name === "idempotency_key")) {
+        this.db.exec("ALTER TABLE commands ADD COLUMN idempotency_key TEXT");
+      }
+    }
+    // The partial UNIQUE index needs the column, so it is created here — after
+    // the migration — not in SCHEMA_SQL.
+    this.db.exec(IDEMPOTENCY_INDEX_SQL);
+    this.db
+      .prepare(
+        "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      )
+      .run(String(SCHEMA_VERSION));
   }
 
   private audit(kind: string, beeId: string | null, payload: Record<string, unknown>): void {
@@ -825,14 +898,50 @@ export class CoreStore {
   // B5 / B6 — command queue with generation fencing
   // -------------------------------------------------------------------------
 
-  enqueueCommand(verb: string, beeId: string, args: Record<string, unknown> = {}): CommandRow {
+  /**
+   * Enqueue a command. With `opts.idempotencyKey` (spec 06 §4.2 one-key rule)
+   * a key that matches an EXISTING command — queued, running, or settled —
+   * returns that original row at its current status with `deduped: true`
+   * instead of enqueueing again. The dedup lookup runs before the bee-exists
+   * check so replaying a settled `delete` returns the settled outcome rather
+   * than BeeNotFoundError.
+   */
+  enqueueCommand(
+    verb: string,
+    beeId: string,
+    args: Record<string, unknown> = {},
+    opts: { idempotencyKey?: string } = {},
+  ): EnqueuedCommand {
     if (!(VERBS as readonly string[]).includes(verb)) throw new UnknownVerbError(verb);
+    const key = opts.idempotencyKey;
+    if (key !== undefined && (typeof key !== "string" || key.length === 0)) {
+      throw new CoreError("idempotencyKey must be a non-empty string when given");
+    }
     return this.tx(() => {
+      if (key !== undefined) {
+        const original = this.getCommandByIdempotencyKey(key);
+        if (original) {
+          this.audit("command.dedup", original.beeId, {
+            commandId: original.id,
+            idempotencyKey: key,
+            verb,
+            status: original.status,
+          });
+          return { ...original, deduped: true };
+        }
+      }
       this.mustGetBee(beeId);
       const isRuntimeVerb = RUNTIME_VERBS.includes(verb as Verb);
       const targetGeneration = isRuntimeVerb ? (this.currentRuntime(beeId)?.generation ?? 0) : null;
-      return this.applyEnqueue(verb as Verb, beeId, args, targetGeneration);
+      return { ...this.applyEnqueue(verb as Verb, beeId, args, targetGeneration, key ?? null), deduped: false };
     });
+  }
+
+  getCommandByIdempotencyKey(key: string): CommandRow | null {
+    const row = this.db
+      .prepare("SELECT * FROM commands WHERE idempotency_key = ?")
+      .get(key) as Row | undefined;
+    return row ? mapCommand(row) : null;
   }
 
   private applyEnqueue(
@@ -840,14 +949,15 @@ export class CoreStore {
     beeId: string,
     args: Record<string, unknown>,
     targetGeneration: number | null,
+    idempotencyKey: string | null = null,
   ): CommandRow {
     const at = this.now();
     const res = this.db
       .prepare(
-        `INSERT INTO commands(verb, bee_id, args, target_generation, status, attempts, next_attempt_at, enqueued_at)
-         VALUES(?, ?, ?, ?, 'queued', 0, ?, ?)`,
+        `INSERT INTO commands(verb, bee_id, args, target_generation, status, attempts, next_attempt_at, enqueued_at, idempotency_key)
+         VALUES(?, ?, ?, ?, 'queued', 0, ?, ?, ?)`,
       )
-      .run(verb, beeId, JSON.stringify(args), targetGeneration, at, at);
+      .run(verb, beeId, JSON.stringify(args), targetGeneration, at, at, idempotencyKey);
     const command: CommandRow = {
       id: Number(res.lastInsertRowid),
       verb,
@@ -860,6 +970,7 @@ export class CoreStore {
       enqueuedAt: at,
       finishedAt: null,
       failureCause: null,
+      idempotencyKey,
     };
     this.audit("command.enqueued", beeId, { command });
     return command;
@@ -997,6 +1108,60 @@ export class CoreStore {
         detail: detail ?? null,
       });
       return { status: "queued" as const, attempts, nextAttemptAt };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Spec 06 §4.2 — RPC mutation idempotency records
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run several store writes in ONE transaction (nested calls join it). Used
+   * by the daemon to make a keyed RPC mutation — lookup, the mutation itself,
+   * and the result record — atomic, so a crash can never leave the mutation
+   * applied but unrecorded (which would let a replay double-execute).
+   */
+  transact<T>(fn: () => T): T {
+    return this.tx(fn);
+  }
+
+  /** The recorded result for a caller-supplied RPC idempotency key, if any. */
+  lookupRpcResult(key: string): RpcIdempotencyRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM rpc_idempotency WHERE key = ?")
+      .get(key) as Row | undefined;
+    if (!row) return null;
+    return {
+      key: row.key as string,
+      verb: row.verb as string,
+      commandId: row.command_id == null ? null : Number(row.command_id),
+      result: JSON.parse(row.result as string) as unknown,
+      createdAt: Number(row.created_at),
+    };
+  }
+
+  /**
+   * Record a keyed RPC mutation's result. Retention: the newest
+   * maxRpcIdempotencyRows records are kept; the oldest beyond that are
+   * evicted here (bounded queue — same philosophy as B5). NOT audited and NOT
+   * in StateDump: dedup records are infrastructure, like meta.
+   */
+  recordRpcResult(key: string, verb: string, commandId: number | null, result: unknown): void {
+    this.tx(() => {
+      this.db
+        .prepare("INSERT INTO rpc_idempotency(key, verb, command_id, result, created_at) VALUES(?, ?, ?, ?, ?)")
+        .run(key, verb, commandId, JSON.stringify(result ?? null), this.now());
+      const count = Number(
+        (this.db.prepare("SELECT COUNT(*) AS n FROM rpc_idempotency").get() as Row).n,
+      );
+      const excess = count - this.maxRpcIdempotencyRows;
+      if (excess > 0) {
+        this.db
+          .prepare(
+            "DELETE FROM rpc_idempotency WHERE key IN (SELECT key FROM rpc_idempotency ORDER BY created_at, rowid LIMIT ?)",
+          )
+          .run(excess);
+      }
     });
   }
 

@@ -29,6 +29,7 @@ import {
   importTrack,
   openCoreStore,
   serializePackage,
+  type CommandRow,
   type CoreStore,
   type RowSource,
   type Scope,
@@ -46,6 +47,7 @@ import {
   type DeployInfoResult,
   type HealthResult,
   type ListResult,
+  type MutationResult,
   type RpcVerb,
   type ImportLocalConfigResult,
   type SendRpcResult,
@@ -271,19 +273,29 @@ export class HiveDaemon {
   private dispatch(verb: RpcVerb, params: Record<string, unknown>, conn: RpcConn): unknown {
     switch (verb) {
       case "spawn":
-        return this.rpcSpawn(params);
+        return this.withIdempotency(verb, params, () => this.rpcSpawn(params));
       case "send":
-        return this.rpcSend(params);
+        return this.withIdempotency(verb, params, () => this.rpcSend(params));
       case "stop":
-        return this.rpcEnqueue("stop", this.param(params, "beeId"), { cause: "stopped_by_user" });
+        return this.withIdempotency(verb, params, () =>
+          this.rpcEnqueue("stop", this.param(params, "beeId"), { cause: "stopped_by_user" }, params),
+        );
       case "revive":
-        return this.rpcEnqueue("revive", this.param(params, "beeId"), {});
+        return this.withIdempotency(verb, params, () =>
+          this.rpcEnqueue("revive", this.param(params, "beeId"), {}, params),
+        );
       case "archive":
-        return this.rpcEnqueue("archive", this.param(params, "beeId"), {});
+        return this.withIdempotency(verb, params, () =>
+          this.rpcEnqueue("archive", this.param(params, "beeId"), {}, params),
+        );
       case "unarchive":
-        return this.rpcEnqueue("unarchive", this.param(params, "beeId"), {});
+        return this.withIdempotency(verb, params, () =>
+          this.rpcEnqueue("unarchive", this.param(params, "beeId"), {}, params),
+        );
       case "delete":
-        return this.rpcEnqueue("delete", this.param(params, "beeId"), {});
+        return this.withIdempotency(verb, params, () =>
+          this.rpcEnqueue("delete", this.param(params, "beeId"), {}, params),
+        );
       case "view":
         return this.viewOf(this.mustStore(), this.param(params, "beeId"));
       case "list":
@@ -301,35 +313,45 @@ export class HiveDaemon {
       case "template.get":
         return { template: this.requireTemplate(params) } satisfies TemplateGetResult;
       case "template.put":
-        return this.rpcTemplatePut(params);
+        return this.withIdempotency(verb, params, () => this.rpcTemplatePut(params));
       case "template.delete":
-        return { template: this.mustStore().deleteTemplate(this.param(params, "id")) } satisfies TemplateDeleteResult;
+        return this.withIdempotency(
+          verb,
+          params,
+          () => ({ template: this.mustStore().deleteTemplate(this.param(params, "id")) }) satisfies TemplateDeleteResult,
+        );
       case "template.export": {
         const doc = exportTemplate(this.requireTemplate(params));
         return { package: doc, text: serializePackage(doc) } satisfies TemplateExportResult;
       }
-      case "template.import": {
-        const res = importTemplate(this.mustStore(), params.package, this.importOptions(params));
-        return { template: res.row, outcome: res.outcome } satisfies TemplateImportResult;
-      }
+      case "template.import":
+        return this.withIdempotency(verb, params, () => {
+          const res = importTemplate(this.mustStore(), params.package, this.importOptions(params));
+          return { template: res.row, outcome: res.outcome } satisfies TemplateImportResult;
+        });
       case "track.list":
         return this.rpcTrackList(params);
       case "track.get":
         return { track: this.requireTrack(params) } satisfies TrackGetResult;
       case "track.put":
-        return this.rpcTrackPut(params);
+        return this.withIdempotency(verb, params, () => this.rpcTrackPut(params));
       case "track.delete":
-        return { track: this.mustStore().deleteTrack(this.param(params, "id")) } satisfies TrackDeleteResult;
+        return this.withIdempotency(
+          verb,
+          params,
+          () => ({ track: this.mustStore().deleteTrack(this.param(params, "id")) }) satisfies TrackDeleteResult,
+        );
       case "track.export": {
         const doc = exportTrack(this.requireTrack(params));
         return { package: doc, text: serializePackage(doc) } satisfies TrackExportResult;
       }
-      case "track.import": {
-        const res = importTrack(this.mustStore(), params.package, this.importOptions(params));
-        return { track: res.row, outcome: res.outcome } satisfies TrackImportResult;
-      }
+      case "track.import":
+        return this.withIdempotency(verb, params, () => {
+          const res = importTrack(this.mustStore(), params.package, this.importOptions(params));
+          return { track: res.row, outcome: res.outcome } satisfies TrackImportResult;
+        });
       case "packages.importLocalConfig":
-        return this.rpcImportLocalConfig(params);
+        return this.withIdempotency(verb, params, () => this.rpcImportLocalConfig(params));
       case "snapshot": {
         const snap = this.snapshot();
         conn.alignWatch(snap.seq);
@@ -352,8 +374,62 @@ export class HiveDaemon {
     return beeId;
   }
 
+  /** The optional caller-supplied idempotency key (spec 06 §4.2 one-key rule). */
+  private idempotencyKeyOf(params: Record<string, unknown>): string | null {
+    const key = params.idempotencyKey;
+    if (key === undefined || key === null) return null;
+    if (typeof key !== "string" || key.length === 0) {
+      throw new RpcError("invalid_request", "idempotencyKey must be a non-empty string when given");
+    }
+    return key;
+  }
+
+  /**
+   * One-key idempotency around a mutation verb (spec 06 §4.2). With a key:
+   * the whole mutation — dedup lookup, the mutation itself, and the result
+   * record — runs in ONE store transaction, so a replayed key always answers
+   * with the ORIGINAL recorded result (`deduped: true`; command-backed
+   * results also carry the command's CURRENT status, so replay after settle
+   * returns the settled outcome). A failed mutation records nothing: the
+   * caller may retry with the same key. Keyless calls are untouched.
+   */
+  private withIdempotency<T extends object>(
+    verb: RpcVerb,
+    params: Record<string, unknown>,
+    fn: () => T,
+  ): T | (T & { deduped: true; status?: CommandRow["status"] }) {
+    const key = this.idempotencyKeyOf(params);
+    if (key == null) return fn();
+    const store = this.mustStore();
+    return store.transact(() => {
+      const hit = store.lookupRpcResult(key);
+      if (hit) {
+        this.log(`rpc.dedup verb=${verb} key=${key}`);
+        const replay = { ...(hit.result as T), deduped: true as const };
+        if (hit.commandId != null) {
+          const cmd = store.getCommand(hit.commandId);
+          if (cmd) return { ...replay, status: cmd.status };
+        }
+        return replay;
+      }
+      const result = fn();
+      const commandId = (result as { commandId?: unknown }).commandId;
+      store.recordRpcResult(key, verb, typeof commandId === "number" ? commandId : null, result);
+      return result;
+    });
+  }
+
   private rpcSpawn(params: Record<string, unknown>): SpawnResult {
     const store = this.mustStore();
+    const key = this.idempotencyKeyOf(params);
+    // Belt-and-braces guard for a key already stamped on a command at the
+    // CORE level (e.g. by a library caller): answer with the original spawn
+    // instead of minting a second bee. Normally the rpc_idempotency record in
+    // withIdempotency answers first.
+    if (key != null) {
+      const original = store.getCommandByIdempotencyKey(key);
+      if (original) return { beeId: original.beeId, commandId: original.id, status: original.status, deduped: true };
+    }
     const name = this.param(params, "name");
     const agent = this.param(params, "agent");
     const cwd = this.param(params, "cwd");
@@ -377,7 +453,7 @@ export class HiveDaemon {
       tags,
       sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
     });
-    const cmd = store.enqueueCommand("spawn", id);
+    const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
     return { beeId: id, commandId: cmd.id };
   }
 
@@ -390,9 +466,18 @@ export class HiveDaemon {
     return { messageId: res.message.id, commandId: res.wakeCommand?.id ?? null, unarchived: res.unarchived };
   }
 
-  private rpcEnqueue(verb: string, beeId: string, args: Record<string, unknown>): { commandId: number } {
+  private rpcEnqueue(
+    verb: string,
+    beeId: string,
+    args: Record<string, unknown>,
+    params: Record<string, unknown>,
+  ): MutationResult {
     const store = this.mustStore();
-    const cmd = store.enqueueCommand(verb, beeId, args);
+    const key = this.idempotencyKeyOf(params);
+    const cmd = store.enqueueCommand(verb, beeId, args, key == null ? {} : { idempotencyKey: key });
+    // Core-level dedup (the UNIQUE key column) can answer even before the
+    // rpc_idempotency record exists — surface it the same way.
+    if (cmd.deduped) return { commandId: cmd.id, status: cmd.status, deduped: true };
     return { commandId: cmd.id };
   }
 

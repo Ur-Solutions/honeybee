@@ -78,6 +78,7 @@ function mapCommand(r: Row): CommandRow {
     enqueuedAt: Number(r.enqueued_at),
     finishedAt: r.finished_at == null ? null : Number(r.finished_at),
     failureCause: (r.failure_cause as CommandRow["failureCause"]) ?? null,
+    idempotencyKey: (r.idempotency_key as string | null) ?? null,
   };
 }
 

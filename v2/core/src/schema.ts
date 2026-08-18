@@ -3,6 +3,22 @@
  * Session logs / runtime event streams stay as append-only files OUTSIDE the DB;
  * only their path is recorded on the bee.
  */
+
+/**
+ * Stamped into meta('schema_version') on open. Bump when the schema changes
+ * shape. Open refuses a NEWER store (downgrade — typed SchemaVersionError,
+ * same failure mode as apiaryd's interface store, spec 06 §6); an OLDER (or
+ * pre-stamp v1) store is migrated by explicit code in the store constructor —
+ * never silently.
+ *
+ * History:
+ *   v1 — WP1..WP6a shape (unstamped; stores without the meta key are v1).
+ *   v2 — spec 06 §4.2 one-key idempotency: adds the nullable UNIQUE
+ *        `commands.idempotency_key` column and the `rpc_idempotency` results
+ *        table (additive; migration = ALTER TABLE ADD COLUMN).
+ */
+export const SCHEMA_VERSION = 2;
+
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -72,9 +88,28 @@ CREATE TABLE IF NOT EXISTS commands (
   next_attempt_at   INTEGER NOT NULL,
   enqueued_at       INTEGER NOT NULL,
   finished_at       INTEGER,
-  failure_cause     TEXT CHECK (failure_cause IN ('auth_needed','resource_blocked','spawn_failed','node_unreachable'))
+  failure_cause     TEXT CHECK (failure_cause IN ('auth_needed','resource_blocked','spawn_failed','node_unreachable')),
+  idempotency_key   TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS commands_ready ON commands(status, next_attempt_at, id);
+-- The UNIQUE (partial) index on commands.idempotency_key lives in
+-- IDEMPOTENCY_INDEX_SQL below: it can only be created once the column exists,
+-- which on a migrated v1 store happens in the constructor's migration step.
+
+-- Spec 06 §4.2 one-key idempotency: RPC mutation results recorded by key so a
+-- replayed mutation (same caller-supplied idempotencyKey) answers with the
+-- ORIGINAL outcome instead of executing twice. Not part of StateDump/audit
+-- replay (infrastructure, like meta). Bounded: the store keeps the newest
+-- maxRpcIdempotencyRows rows (default 10 000) and evicts the oldest beyond
+-- that — v2 never prunes command rows today, so this table (not command-row
+-- retention) is the dedup memory that outlives any future pruning.
+CREATE TABLE IF NOT EXISTS rpc_idempotency (
+  key        TEXT PRIMARY KEY,
+  verb       TEXT NOT NULL,
+  command_id INTEGER,
+  result     TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS audit (
   seq     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,4 +159,14 @@ CREATE TABLE IF NOT EXISTS tracks (
   updated_at  INTEGER NOT NULL,
   UNIQUE (scope, name)
 ) STRICT;
+`;
+
+/**
+ * One key = one command, enforced by the database (spec 06 §4.2). Partial so
+ * the column stays nullable: internal enqueues (send_wake, loop policy stops)
+ * carry no key.
+ */
+export const IDEMPOTENCY_INDEX_SQL = `
+CREATE UNIQUE INDEX IF NOT EXISTS commands_idempotency_key
+  ON commands(idempotency_key) WHERE idempotency_key IS NOT NULL;
 `;

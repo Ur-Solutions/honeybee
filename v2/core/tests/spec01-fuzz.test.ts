@@ -63,7 +63,13 @@ function checkInvariants(dump: StateDump): void {
     assert.ok(beeIds.has(msg.beeId));
     assert.equal(msg.deliveredAt != null, msg.deliveredGeneration != null);
   }
+  const seenKeys = new Set<string>();
   for (const cmd of dump.commands) {
+    // Spec 06 §4.2 one-key rule: a key never lands on two commands.
+    if (cmd.idempotencyKey != null) {
+      assert.ok(!seenKeys.has(cmd.idempotencyKey), `duplicate idempotency key ${cmd.idempotencyKey}`);
+      seenKeys.add(cmd.idempotencyKey);
+    }
     assert.ok((VERBS as readonly string[]).includes(cmd.verb));
     assert.ok((COMMAND_STATUSES as readonly string[]).includes(cmd.status));
     assert.ok(cmd.attempts <= MAX_ATTEMPTS);
@@ -136,6 +142,12 @@ function fuzzRun(seed: number, ops: number): void {
     () => {
       const bee = pick(store.listBees());
       if (bee) store.enqueueCommand(pick(VERBS), bee.id);
+    },
+    () => {
+      // Keyed enqueue from a small pool: collisions dedup to the ORIGINAL
+      // command (spec 06 §4.2) and must keep replay/state equality intact.
+      const bee = pick(store.listBees());
+      if (bee) store.enqueueCommand(pick(VERBS), bee.id, {}, { idempotencyKey: `fz-key-${Math.floor(rnd() * 8)}` });
     },
     () => {
       store.claimNextCommand();
