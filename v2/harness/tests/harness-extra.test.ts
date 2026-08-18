@@ -153,3 +153,27 @@ test("retry exhaustion under permanent driver timeouts surfaces spawn_failed, ne
     dirs.cleanup();
   }
 });
+
+test("sim driver v6: interrupt — booting not_ready, idle no-op, mid-turn ends the turn early (turn_ended, process live), gone no_process", () => {
+  const clock = new SimClock();
+  const cfg: SimDriverConfig = { bootDelay: [1, 1], turnDuration: [1000, 1000], crashProbability: 0, hangProbability: 0, exitProbability: 0 };
+  const driver = new SimDriver(cfg, new Prng(3), clock.now);
+  driver.start("b", 1);
+  assert.deepEqual(driver.interrupt("b", 1), { interrupted: false, reason: "not_ready" });
+  clock.advance(1);
+  driver.tick();
+  assert.deepEqual(driver.observe().map((o) => o.kind), ["booted"]);
+  // a 1000-step initial turn: 50 ticks in, still running (no turn_ended)
+  for (let i = 0; i < 50; i++) {
+    clock.advance(1);
+    driver.tick();
+  }
+  assert.deepEqual(driver.observe(), []);
+  assert.deepEqual(driver.interrupt("b", 1), { interrupted: true });
+  assert.deepEqual(driver.observe().map((o) => o.kind), ["turn_ended"]);
+  assert.ok(driver.hasProcess("b", 1), "interrupt never ends the runtime");
+  assert.deepEqual(driver.interrupt("b", 1), { interrupted: false, reason: "idle" });
+  assert.equal(driver.deliver("b", 1, 5, "next").accepted, true, "idle again: takes the next message");
+  assert.deepEqual(driver.interrupt("b", 2), { interrupted: false, reason: "no_process" });
+  assert.deepEqual(driver.interrupt("nobody", 1), { interrupted: false, reason: "no_process" });
+});

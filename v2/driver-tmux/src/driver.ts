@@ -40,6 +40,7 @@ import { createHash } from "node:crypto";
 import type {
   DeliverOutcome,
   DriverObservation,
+  InterruptOutcome,
   LiveProcess,
   RuntimeDriver,
   StopCause,
@@ -445,6 +446,24 @@ export class TmuxDriver implements RuntimeDriver {
       p.killTimer.unref();
     }
     return { hadProcess: true };
+  }
+
+  /**
+   * v6 interrupt: `send-keys C-c` to the exact pane of a live, mid-turn
+   * runtime (the operator-chosen interactive-TUI interrupt: claude, codex and
+   * grok all cancel the in-flight turn on a single Ctrl-C and stay at their
+   * input box). No echo-verify applies (a control key has no echo); the
+   * observer stack confirms the outcome as the ordinary turn_ended. Idle /
+   * dying / gone: a reasoned no-op, never an error.
+   */
+  interrupt(beeId: string, generation: number): InterruptOutcome {
+    const p = this.procs.get(beeId);
+    if (!p || p.generation !== generation || p.exited) return { interrupted: false, reason: "no_process" };
+    if (p.stopCause != null) return { interrupted: false, reason: "not_ready" };
+    if (p.phase === "idle") return { interrupted: false, reason: "idle" };
+    const res = this.server.try(["send-keys", "-t", p.paneId, "C-c"]);
+    if (res.status !== 0) return { interrupted: false, reason: "no_process" };
+    return { interrupted: true };
   }
 
   observe(): DriverObservation[] {

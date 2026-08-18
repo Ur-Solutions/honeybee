@@ -35,7 +35,8 @@ export type AdapterSignal =
    * immediately followed by `turn_ended`, landing the store on `idle`.
    */
   | { kind: "booted"; sessionId?: string }
-  | { kind: "turn_started" }
+  /** `turnId`: the harness-native turn id when the stream carries one (codex turn/started) — needed to interrupt it. */
+  | { kind: "turn_started"; turnId?: string }
   | { kind: "turn_ended" }
   /** Condition-flag evidence. The adapter reports; the daemon decides. */
   | { kind: "flag"; flag: AdapterFlag; action: "set" | "clear"; detail: string }
@@ -51,6 +52,13 @@ export interface EncodeContext {
   sessionId: string | null;
   /** The mailbox message id being delivered (stable across retries). */
   messageId: number;
+}
+
+/** Context the driver supplies when encoding a turn interrupt (v6 `bee.interrupt`). */
+export interface InterruptContext {
+  sessionId: string | null;
+  /** The harness-native id of the turn in flight, when the stream reported one (codex). */
+  turnId: string | null;
 }
 
 export interface HarnessAdapter {
@@ -91,6 +99,25 @@ export interface HarnessAdapter {
    * (the runtime restarts fresh on the same session log).
    */
   resumeArgs?(providerSessionId: string): string[];
+  /**
+   * v6 fork (`bee.fork`): extra CLI args that make a NEW process continue the
+   * conversation identified by `sourceSessionId` under a NEW session of its
+   * own (claude: `--resume <id> --fork-session` — plain `--resume` would keep
+   * the SAME id and make source and fork share one transcript). Absent when
+   * the harness forks through its protocol (codex `thread/fork` — see
+   * `codexAdapter({ forkThreadId })`) or cannot fork (the fork boots fresh;
+   * provenance is still recorded).
+   */
+  forkArgs?(sourceSessionId: string): string[];
+  /**
+   * v6 interrupt: encode an in-band "stop the current turn" line for the
+   * runtime's stdin (claude `control_request {subtype:"interrupt"}`, codex
+   * `turn/interrupt`). Returns null when it cannot be encoded yet (codex
+   * before the turn id is known). Absent = the harness has no in-band
+   * interrupt (the driver answers `unsupported`; SIGINT would kill a headless
+   * child outright, so it is never used as a fallback).
+   */
+  encodeInterrupt?(ctx: InterruptContext): string | null;
 }
 
 // ---------------------------------------------------------------------------

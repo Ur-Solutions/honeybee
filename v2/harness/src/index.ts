@@ -9,6 +9,7 @@ export { Prng } from "./prng.ts";
 export {
   type DeliverOutcome,
   type DriverObservation,
+  type InterruptOutcome,
   type LiveProcess,
   type ObservedExitCause,
   type RuntimeDriver,

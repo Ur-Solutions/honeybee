@@ -64,3 +64,9 @@ test("stub: encodeMessage carries the mailbox message id verbatim", () => {
   assert.equal(stubAdapter.acceptsMidTurn, true);
   assert.deepEqual(stubAdapter.bootLines(), []);
 });
+
+test("stub v6: encodeInterrupt is the {type:\"interrupt\"} line; an interrupted turn_ended is a normal successful turn end", () => {
+  assert.deepEqual(JSON.parse(stubAdapter.encodeInterrupt!({ sessionId: "s", turnId: null })!), { type: "interrupt" });
+  const ended = parseStubLine(JSON.stringify({ event: "turn_ended", messageId: 1, ok: true, interrupted: true }));
+  assert.ok(ended.some((s) => s.kind === "turn_ended"));
+});

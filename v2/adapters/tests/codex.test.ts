@@ -11,7 +11,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { codexAdapter, codexRateLimitSignals } from "../src/codex.ts";
+import { codexAdapter, codexRateLimitSignals, codexThreadRequest } from "../src/codex.ts";
 import type { AdapterSignal } from "../src/types.ts";
 
 const adapter = codexAdapter({ cwd: "/tmp/work", model: "gpt-5.2" });
@@ -59,7 +59,7 @@ test("codex: thread/start response → booted(threadId) + spawn_failed clear + t
 test("codex: turn/started → turn_started; turn/completed → clears + turn_ended", () => {
   assert.deepEqual(
     adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t", turn: { id: "turn-1" } } })),
-    [{ kind: "turn_started" }],
+    [{ kind: "turn_started", turnId: "turn-1" }], // v6: the turn id rides along (turn/interrupt needs it)
   );
   assert.deepEqual(
     adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "t", turn: { id: "turn-1" } } })),
@@ -204,4 +204,36 @@ test("codex: resumeThreadId (spec 07 §F) — handshake sends thread/resume {thr
   // resume error (rollout gone / wrong CODEX_HOME) → no booted; error evidence surfaces only when classifiable
   const err = resumed.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, error: { code: -32000, message: "thread not found" } }));
   assert.equal(err.length, 0);
+});
+
+test("codex v6: turn/started carries the turn id; encodeInterrupt = turn/interrupt {threadId, turnId} (null before a turn id is known); the ack parses to []", () => {
+  const started = adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t-1", turn: { id: "turn-9" } } }));
+  assert.deepEqual(started, [{ kind: "turn_started", turnId: "turn-9" }]);
+  assert.deepEqual(adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t-1" } })), [{ kind: "turn_started" }]);
+  assert.equal(adapter.encodeInterrupt!({ sessionId: "t-1", turnId: null }), null);
+  assert.equal(adapter.encodeInterrupt!({ sessionId: null, turnId: "turn-9" }), null);
+  const req = JSON.parse(adapter.encodeInterrupt!({ sessionId: "t-1", turnId: "turn-9" })!) as Record<string, unknown>;
+  assert.equal(req.method, "turn/interrupt");
+  assert.deepEqual(req.params, { threadId: "t-1", turnId: "turn-9" });
+  assert.equal(typeof req.id, "number");
+  assert.deepEqual(adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: {} })), []);
+  // the interrupted turn completes like any turn (turn/completed → turn_ended)
+  assert.ok(adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "t-1", turn: { id: "turn-9" } } })).some((s) => s.kind === "turn_ended"));
+});
+
+test("codex v6: forkThreadId → the handshake sends thread/fork {threadId: source}; the response's NEW thread.id lands as booted; resume wins over fork", () => {
+  const forked = codexAdapter({ cwd: "/tmp/w", forkThreadId: "src-thread" });
+  const lines = onlyRespond(forked.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { userAgent: "codex" } })));
+  const req = JSON.parse(lines[1]!) as { method: string; params: Record<string, unknown> };
+  assert.equal(req.method, "thread/fork");
+  assert.equal(req.params.threadId, "src-thread");
+  assert.equal(req.params.cwd, "/tmp/w");
+  const booted = forked.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { thread: { id: "new-thread" } } }));
+  assert.deepEqual(booted[0], { kind: "booted", sessionId: "new-thread" });
+  // no fallback to the source id when the fork response carries no thread (we must never adopt the source's id)
+  assert.deepEqual(forked.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: {} })), []);
+  // a method-not-found error (older app-server) surfaces no booted
+  assert.deepEqual(forked.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, error: { code: -32601, message: "method not found: thread/fork" } })), []);
+  const both = codexThreadRequest({ cwd: "/tmp/w", resumeThreadId: "own", forkThreadId: "src" });
+  assert.equal(both.method, "thread/resume", "a recorded session always wins over a fork seed");
 });

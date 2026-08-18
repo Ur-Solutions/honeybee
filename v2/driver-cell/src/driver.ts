@@ -21,6 +21,7 @@ import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type {
   DeliverOutcome,
   DriverObservation,
+  InterruptOutcome,
   LiveProcess,
   RuntimeDriver,
   StopCause,
@@ -107,6 +108,10 @@ export class CellDriver implements RuntimeDriver {
 
   stop(beeId: string, generation: number, cause: StopCause): { hadProcess: boolean } {
     return this.inner.stop(beeId, generation, cause);
+  }
+
+  interrupt(beeId: string, generation: number): InterruptOutcome {
+    return this.inner.interrupt(beeId, generation);
   }
 
   observe(): DriverObservation[] {

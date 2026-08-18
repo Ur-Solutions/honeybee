@@ -33,14 +33,19 @@ import {
   type Flag,
   type FlagRow,
   type MessageRow,
+  type QuestionRow,
   type RuntimeRow,
   type RuntimeState,
+  type SealRow,
   type StateDump,
   type TemplateRow,
   type TrackRow,
   type Verb,
   NameConflictError,
+  QuestionNotFoundError,
+  QuestionNotOpenError,
   SchemaVersionError,
+  SealNotFoundError,
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
@@ -96,11 +101,46 @@ export interface CreateBeeInput {
   importedFrom?: string;
   /** v5 — per-bee harness CLI args layered over the agent spec at spawn; null/absent = none. */
   args?: string[] | null;
+  /** v6 — the spawning bee (soft reference); absent = operator/apiary-spawned root. */
+  parentId?: string | null;
+  /** v6 — fork provenance: the source bee id. */
+  forkedFrom?: string | null;
+  /** v6 — one-shot fork seed: the source's provider session id to fork from on the first runtime. */
+  forkSeed?: string | null;
   /**
    * Creation timestamp override (epoch ms) — importers preserve the original
    * record's creation time. Defaults to the store clock.
    */
   createdAt?: number;
+}
+
+/** `tagBee` outcome: the row after the edit plus what actually changed. */
+export interface TagResult {
+  bee: BeeRow;
+  applied: boolean;
+  added: string[];
+  removed: string[];
+}
+
+/** `askQuestion` input. */
+export interface AskQuestionInput {
+  id?: string;
+  text: string;
+  options?: string[] | null;
+}
+
+/** `answerQuestion` outcome: the answered row + the mailbox delivery it produced. */
+export interface AnswerResult {
+  question: QuestionRow;
+  send: SendResult;
+}
+
+/** `createSeal` input. */
+export interface CreateSealInput {
+  id?: string;
+  title: string;
+  body: string;
+  refs?: string[];
 }
 
 export interface SendResult {
@@ -140,6 +180,8 @@ export interface DeleteResult {
   livePid: number | null;
   /** Pending (queued/running) commands settled as moot by the delete. */
   settledCommandIds: number[];
+  /** v6 — children whose parent_id was nulled (orphaned, never cascaded). */
+  orphanedChildIds: string[];
 }
 
 export interface ReconcileResult {
@@ -215,7 +257,52 @@ function mapBee(r: Row): BeeRow {
     importedFrom: (r.imported_from as string | null) ?? null,
     spawnFailures: Number(r.spawn_failures ?? 0),
     args: parseArgsColumn(r.args),
+    parentId: (r.parent_id as string | null) ?? null,
+    forkedFrom: (r.forked_from as string | null) ?? null,
+    forkSeed: (r.fork_seed as string | null) ?? null,
   };
+}
+
+function mapQuestion(r: Row): QuestionRow {
+  return {
+    id: r.id as string,
+    beeId: r.bee_id as string,
+    generation: r.generation == null ? null : Number(r.generation),
+    text: r.text as string,
+    options: r.options == null ? null : (JSON.parse(r.options as string) as string[]),
+    status: r.status as QuestionRow["status"],
+    answer: (r.answer as string | null) ?? null,
+    askedAt: Number(r.asked_at),
+    answeredAt: r.answered_at == null ? null : Number(r.answered_at),
+    answeredBy: (r.answered_by as string | null) ?? null,
+    deliveryMessageId: r.delivery_message_id == null ? null : Number(r.delivery_message_id),
+  };
+}
+
+function mapSeal(r: Row): SealRow {
+  return {
+    id: r.id as string,
+    beeId: r.bee_id as string,
+    generation: r.generation == null ? null : Number(r.generation),
+    title: r.title as string,
+    body: r.body as string,
+    refs: JSON.parse(r.refs as string) as string[],
+    createdAt: Number(r.created_at),
+  };
+}
+
+/** Validate an optional list of non-empty strings (tags, options, refs). */
+function normalizeStringList(value: unknown, where: string): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
+    throw new CoreError(`${where}: expected an array of strings`);
+  }
+  return [...(value as string[])];
+}
+
+function requireNonEmpty(value: unknown, where: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new CoreError(`${where}: expected a non-empty string`);
+  return value;
 }
 
 /** v5 `bees.args`: NULL → null; otherwise a json array of strings. */
@@ -532,11 +619,12 @@ export class CoreStore {
       const createdAt = input.createdAt ?? at;
       if (!Number.isFinite(createdAt)) throw new CoreError("createBee: createdAt must be a finite epoch-ms number");
       const args = normalizeBeeArgs(input.args, "createBee");
+      requireNonEmpty(input.name, "createBee: name");
       this.db
         .prepare(
           `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at,
-                            provider_session_id, env, imported_from, args)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -552,6 +640,9 @@ export class CoreStore {
           JSON.stringify(input.env ?? {}),
           input.importedFrom ?? null,
           args === null ? null : JSON.stringify(args),
+          input.parentId ?? null,
+          input.forkedFrom ?? null,
+          input.forkSeed ?? null,
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });
@@ -567,6 +658,55 @@ export class CoreStore {
 
   listBees(): BeeRow[] {
     const rows = this.db.prepare("SELECT * FROM bees ORDER BY id").all() as Row[];
+    return rows.map(mapBee);
+  }
+
+  /**
+   * v6 — rename. Names follow createBee's rules (non-empty; NOT unique — the
+   * id is the identity, names are labels; the CLI resolves ambiguous names by
+   * refusing). An identical name is a silent no-op; a change is audited as
+   * `bee.renamed` and replayable.
+   */
+  renameBee(beeId: string, name: string): { bee: BeeRow; applied: boolean } {
+    requireNonEmpty(name, "renameBee: name");
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      if (bee.name === name) return { bee, applied: false };
+      this.db.prepare("UPDATE bees SET name = ? WHERE id = ?").run(name, beeId);
+      this.audit("bee.renamed", beeId, { beeId, name, previous: bee.name });
+      return { bee: this.mustGetBee(beeId), applied: true };
+    });
+  }
+
+  /**
+   * v6 — tag edit: `remove` first, then `add` (so add-then-remove of the same
+   * tag removes). Order is preserved: surviving tags keep their position, new
+   * tags append in `add` order, duplicates collapse. Unchanged = silent no-op;
+   * a change is audited as `bee.tagged` (payload carries the full new list —
+   * the mirror row is `tags` verbatim).
+   */
+  tagBee(beeId: string, edit: { add?: string[]; remove?: string[] }): TagResult {
+    const add = normalizeStringList(edit.add, "tagBee: add");
+    const remove = normalizeStringList(edit.remove, "tagBee: remove");
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      const removeSet = new Set(remove);
+      const next: string[] = [];
+      for (const t of bee.tags) if (!removeSet.has(t) && !next.includes(t)) next.push(t);
+      for (const t of add) if (!next.includes(t)) next.push(t);
+      const removed = bee.tags.filter((t) => !next.includes(t));
+      const added = next.filter((t) => !bee.tags.includes(t));
+      const applied = next.length !== bee.tags.length || next.some((t, i) => bee.tags[i] !== t);
+      if (!applied) return { bee, applied: false, added: [], removed: [] };
+      this.db.prepare("UPDATE bees SET tags = ? WHERE id = ?").run(JSON.stringify(next), beeId);
+      this.audit("bee.tagged", beeId, { beeId, tags: next, previous: bee.tags, added, removed });
+      return { bee: this.mustGetBee(beeId), applied: true, added, removed };
+    });
+  }
+
+  /** v6 — the bees whose parent_id is this bee (any lifecycle), by id. */
+  listChildren(beeId: string): BeeRow[] {
+    const rows = this.db.prepare("SELECT * FROM bees WHERE parent_id = ? ORDER BY id").all(beeId) as Row[];
     return rows.map(mapBee);
   }
 
@@ -629,7 +769,14 @@ export class CoreStore {
           .prepare("UPDATE commands SET status = 'done', finished_at = ? WHERE bee_id = ? AND status IN ('queued','running')")
           .run(at, beeId);
       }
-      // ON DELETE CASCADE removes runtimes, flags, mailbox.
+      // v6 parenting policy: delete ORPHANS children (parent_id → null,
+      // audited per child), never cascades. Archive touches no child at all.
+      const orphanedChildIds = this.listChildren(beeId).map((c) => c.id);
+      for (const childId of orphanedChildIds) {
+        this.db.prepare("UPDATE bees SET parent_id = NULL WHERE id = ?").run(childId);
+        this.audit("bee.orphaned", childId, { beeId: childId, parentId: beeId, reason: "parent_deleted" });
+      }
+      // ON DELETE CASCADE removes runtimes, flags, mailbox, questions, seals.
       this.db.prepare("DELETE FROM bees WHERE id = ?").run(beeId);
       this.audit("bee.deleted", beeId, {
         beeId,
@@ -637,7 +784,7 @@ export class CoreStore {
         sessionLogPath: bee.sessionLogPath,
         settledCommandIds,
       });
-      return { beeId, sessionLogPath: bee.sessionLogPath, livePid, settledCommandIds };
+      return { beeId, sessionLogPath: bee.sessionLogPath, livePid, settledCommandIds, orphanedChildIds };
     });
   }
 
@@ -952,13 +1099,44 @@ export class CoreStore {
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       if (bee.providerSessionId === providerSessionId) return { applied: false };
-      this.db.prepare("UPDATE bees SET provider_session_id = ? WHERE id = ?").run(providerSessionId, beeId);
+      // v6: learning the fork's OWN session id consumes the one-shot fork
+      // seed — from here on the bee resumes its own conversation.
+      this.db
+        .prepare("UPDATE bees SET provider_session_id = ?, fork_seed = NULL WHERE id = ?")
+        .run(providerSessionId, beeId);
       this.audit("bee.provider_session", beeId, {
         beeId,
         providerSessionId,
         previous: bee.providerSessionId,
+        ...(bee.forkSeed != null ? { forkSeedConsumed: bee.forkSeed } : {}),
       });
       return { applied: true };
+    });
+  }
+
+  /**
+   * v6 — informational record of an operator interrupt request against a
+   * runtime (the outcome the driver reported). No row changes: the
+   * turn_ended that follows a successful interrupt is observed like any
+   * other. Replay: no-op.
+   */
+  recordInterrupt(beeId: string, generation: number | null, outcome: { interrupted: boolean; reason?: string }): void {
+    this.tx(() => {
+      this.mustGetBee(beeId);
+      this.audit("bee.interrupted", beeId, {
+        beeId,
+        generation,
+        interrupted: outcome.interrupted,
+        reason: outcome.reason ?? null,
+      });
+    });
+  }
+
+  /** v6 — informational fork provenance row (the bee row already carries forkedFrom/forkSeed). Replay: no-op. */
+  recordFork(beeId: string, forkedFrom: string, forkSeed: string | null): void {
+    this.tx(() => {
+      this.mustGetBee(beeId);
+      this.audit("bee.forked", beeId, { beeId, forkedFrom, forkSeed });
     });
   }
 
@@ -1670,6 +1848,128 @@ export class CoreStore {
   }
 
   // -------------------------------------------------------------------------
+  // v6 — questions (a bee asks the operator; the answer comes back as mail)
+  // -------------------------------------------------------------------------
+
+  askQuestion(beeId: string, input: AskQuestionInput): QuestionRow {
+    const text = requireNonEmpty(input.text, "askQuestion: text");
+    const options = input.options === undefined || input.options === null ? null : normalizeStringList(input.options, "askQuestion: options");
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const id = input.id ?? randomUUID();
+      if (this.getQuestion(id)) throw new CoreError(`question already exists: ${id}`);
+      const at = this.now();
+      const generation = this.currentRuntime(beeId)?.generation ?? null;
+      this.db
+        .prepare(
+          `INSERT INTO questions(id, bee_id, generation, text, options, status, answer, asked_at, answered_at, answered_by, delivery_message_id)
+           VALUES(?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, NULL)`,
+        )
+        .run(id, beeId, generation, text, options === null ? null : JSON.stringify(options), at);
+      const question = this.getQuestion(id) as QuestionRow;
+      this.audit("question.asked", beeId, { question });
+      return question;
+    });
+  }
+
+  /**
+   * Answer an open question: the row is marked answered AND the answer is
+   * delivered to the bee as an ordinary mailbox message (clearly prefixed),
+   * in the same transaction — send()'s wake/unarchive rules apply verbatim.
+   * Answering a non-open question is a QuestionNotOpenError.
+   */
+  answerQuestion(questionId: string, answer: string, opts: { answeredBy?: string } = {}): AnswerResult {
+    const text = requireNonEmpty(answer, "answerQuestion: answer");
+    return this.tx(() => {
+      const question = this.getQuestion(questionId);
+      if (!question) throw new QuestionNotFoundError(questionId);
+      if (question.status !== "open") {
+        throw new QuestionNotOpenError(`question ${questionId} is already ${question.status} (answered at ${question.answeredAt})`);
+      }
+      const answeredBy = opts.answeredBy ?? "operator";
+      const body = `[answer to question ${questionId}] ${text}\n\n(question was: ${question.text})`;
+      const send = this.send(question.beeId, body, { sender: answeredBy });
+      const at = this.now();
+      this.db
+        .prepare(
+          "UPDATE questions SET status = 'answered', answer = ?, answered_at = ?, answered_by = ?, delivery_message_id = ? WHERE id = ?",
+        )
+        .run(text, at, answeredBy, send.message.id, questionId);
+      const updated = this.getQuestion(questionId) as QuestionRow;
+      this.audit("question.answered", question.beeId, {
+        questionId,
+        beeId: question.beeId,
+        answer: text,
+        answeredAt: at,
+        answeredBy,
+        deliveryMessageId: send.message.id,
+      });
+      return { question: updated, send };
+    });
+  }
+
+  getQuestion(id: string): QuestionRow | null {
+    const row = this.db.prepare("SELECT * FROM questions WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapQuestion(row) : null;
+  }
+
+  listQuestions(filter: { beeId?: string; open?: boolean } = {}): QuestionRow[] {
+    const where: string[] = [];
+    const params: string[] = [];
+    if (filter.beeId !== undefined) {
+      where.push("bee_id = ?");
+      params.push(filter.beeId);
+    }
+    if (filter.open === true) where.push("status = 'open'");
+    else if (filter.open === false) where.push("status = 'answered'");
+    const sql = `SELECT * FROM questions${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY asked_at, rowid`;
+    return (this.db.prepare(sql).all(...params) as Row[]).map(mapQuestion);
+  }
+
+  // -------------------------------------------------------------------------
+  // v6 — seals
+  // -------------------------------------------------------------------------
+
+  createSeal(beeId: string, input: CreateSealInput): SealRow {
+    const title = requireNonEmpty(input.title, "createSeal: title");
+    if (typeof input.body !== "string") throw new CoreError("createSeal: body must be a string");
+    const refs = normalizeStringList(input.refs, "createSeal: refs");
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const id = input.id ?? randomUUID();
+      if (this.getSeal(id)) throw new CoreError(`seal already exists: ${id}`);
+      const at = this.now();
+      const generation = this.currentRuntime(beeId)?.generation ?? null;
+      this.db
+        .prepare("INSERT INTO seals(id, bee_id, generation, title, body, refs, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
+        .run(id, beeId, generation, title, input.body, JSON.stringify(refs), at);
+      const seal = this.getSeal(id) as SealRow;
+      this.audit("seal.created", beeId, { seal });
+      return seal;
+    });
+  }
+
+  getSeal(id: string): SealRow | null {
+    const row = this.db.prepare("SELECT * FROM seals WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapSeal(row) : null;
+  }
+
+  mustGetSeal(id: string): SealRow {
+    const seal = this.getSeal(id);
+    if (!seal) throw new SealNotFoundError(id);
+    return seal;
+  }
+
+  listSeals(filter: { beeId?: string } = {}): SealRow[] {
+    const rows = (
+      filter.beeId !== undefined
+        ? this.db.prepare("SELECT * FROM seals WHERE bee_id = ? ORDER BY created_at, rowid").all(filter.beeId)
+        : this.db.prepare("SELECT * FROM seals ORDER BY created_at, rowid").all()
+    ) as Row[];
+    return rows.map(mapSeal);
+  }
+
+  // -------------------------------------------------------------------------
   // Audit access & snapshots
   // -------------------------------------------------------------------------
 
@@ -1698,6 +1998,8 @@ export class CoreStore {
       commands: (this.db.prepare("SELECT * FROM commands ORDER BY id").all() as Row[]).map(mapCommand),
       templates: this.listTemplates(),
       tracks: this.listTracks(),
+      questions: (this.db.prepare("SELECT * FROM questions ORDER BY id").all() as Row[]).map(mapQuestion),
+      seals: (this.db.prepare("SELECT * FROM seals ORDER BY id").all() as Row[]).map(mapSeal),
     };
   }
 }

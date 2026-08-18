@@ -9,7 +9,15 @@
  * Like the real CLI in stream-json mode it emits NOTHING until the first user
  * message arrives on stdin (the readyAtSpawn finding).
  *
- * env FAKE_CLAUDE_ARGV_LOG   append {argv, cwd, env:{CLAUDE_CONFIG_DIR}, sessionId} per boot
+ * `--resume <id> --fork-session` (v6 bee.fork) is honored like the real CLI:
+ * the conversation is rejoined but the process mints a NEW session id (init
+ * reports it), so source and fork never share a transcript. `--resume <id>
+ * --session-id <new>` WITHOUT --fork-session is refused like the real CLI.
+ * A `control_request {subtype:"interrupt"}` line (v6 bee.interrupt) ends the
+ * in-flight turn with a result line, like the real CLI. `@slow:<ms>` in a
+ * message makes the turn take that long.
+ *
+ * env FAKE_CLAUDE_ARGV_LOG   append {argv, cwd, env:{CLAUDE_CONFIG_DIR, HIVE_BEE, HIVE_BEE_ID, HIVE_PARENT}, sessionId, resumed, forked} per boot
  * env FAKE_CLAUDE_FAIL_RESUME=1  exit 1 on --resume ("No conversation found") — the failure shape
  */
 import { appendFileSync } from "node:fs";
@@ -19,12 +27,20 @@ import { createInterface } from "node:readline";
 const argv = process.argv.slice(2);
 const resumeAt = argv.indexOf("--resume");
 const resumed = resumeAt >= 0 ? argv[resumeAt + 1] : undefined;
-const sessionId = resumed ?? randomUUID();
+const forked = argv.includes("--fork-session");
+const pinAt = argv.indexOf("--session-id");
+const pinned = pinAt >= 0 ? argv[pinAt + 1] : undefined;
+if (resumed && pinned && !forked) {
+  process.stderr.write("--session-id can only be used with --continue or --resume if --fork-session is also specified\n");
+  process.exit(1);
+}
+// resume keeps the id; fork mints a new one (or takes the pin); fresh mints.
+const sessionId = resumed && !forked ? resumed : (pinned ?? randomUUID());
 
 if (process.env.FAKE_CLAUDE_ARGV_LOG) {
   appendFileSync(
     process.env.FAKE_CLAUDE_ARGV_LOG,
-    `${JSON.stringify({ argv, cwd: process.cwd(), env: { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? null }, sessionId, resumed: resumed ?? null })}\n`,
+    `${JSON.stringify({ argv, cwd: process.cwd(), env: { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? null, HIVE_BEE: process.env.HIVE_BEE ?? null, HIVE_BEE_ID: process.env.HIVE_BEE_ID ?? null, HIVE_PARENT: process.env.HIVE_PARENT ?? null }, sessionId, resumed: resumed ?? null, forked })}\n`,
   );
 }
 
@@ -38,6 +54,7 @@ function emit(obj) {
 }
 
 let initSent = false;
+let turnTimer = null;
 const rl = createInterface({ input: process.stdin });
 rl.on("line", (raw) => {
   const line = String(raw).trim();
@@ -48,15 +65,28 @@ rl.on("line", (raw) => {
   } catch {
     return;
   }
+  if (msg && msg.type === "control_request" && msg.request?.subtype === "interrupt") {
+    // Like the real CLI: ack the control request; an in-flight turn ends now
+    // with its result line (the session stays alive).
+    emit({ type: "control_response", response: { subtype: "success", request_id: msg.request_id } });
+    if (turnTimer) {
+      clearTimeout(turnTimer);
+      turnTimer = null;
+      emit({ type: "result", subtype: "success", is_error: false, result: "[interrupted]", session_id: sessionId });
+    }
+    return;
+  }
   if (!msg || msg.type !== "user") return;
   const text = msg.message?.content?.[0]?.text ?? "";
   if (!initSent) {
     initSent = true;
     emit({ type: "system", subtype: "init", session_id: sessionId, cwd: process.cwd(), model: "fake", claude_code_version: "0.0.0-fake" });
   }
-  setTimeout(() => {
+  const slow = /@slow:(\d+)/.exec(text);
+  turnTimer = setTimeout(() => {
+    turnTimer = null;
     emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo:${text}` }] }, session_id: sessionId });
     emit({ type: "result", subtype: "success", is_error: false, result: `echo:${text}`, session_id: sessionId });
-  }, 10);
+  }, slow ? Number(slow[1]) : 10);
 });
 rl.on("close", () => process.exit(0));

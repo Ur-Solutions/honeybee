@@ -63,6 +63,17 @@ function checkInvariants(dump: StateDump): void {
     assert.ok(beeIds.has(msg.beeId));
     assert.equal(msg.deliveredAt != null, msg.deliveredGeneration != null);
   }
+  // v6: questions/seals belong to live bees; answered iff answer facts present;
+  // a bee's parent edge points at a live bee or is null (orphaned on delete).
+  for (const q of dump.questions) {
+    assert.ok(beeIds.has(q.beeId));
+    assert.equal(q.status === "answered", q.answeredAt != null);
+    assert.equal(q.status === "answered", q.answer != null);
+    assert.equal(q.status === "answered", q.deliveryMessageId != null);
+    if (q.deliveryMessageId != null) assert.ok(dump.mailbox.some((m) => m.id === q.deliveryMessageId && m.beeId === q.beeId));
+  }
+  for (const sl of dump.seals) assert.ok(beeIds.has(sl.beeId));
+  for (const bee of dump.bees) if (bee.parentId != null) assert.ok(beeIds.has(bee.parentId), `dangling parent ${bee.parentId}`);
   const seenKeys = new Set<string>();
   for (const cmd of dump.commands) {
     // Spec 06 §4.2 one-key rule: a key never lands on two commands.
@@ -93,7 +104,40 @@ function fuzzRun(seed: number, ops: number): void {
     () => {
       if (store.listBees().length >= 6) return;
       beeCounter += 1;
-      store.createBee({ name: `fz-${beeCounter}`, agent: "claude", substrate: "hsr", cwd: "/tmp" });
+      // v6: sometimes a child of an existing bee, sometimes a fork with a seed
+      const parent = rnd() < 0.5 ? pick(store.listBees()) : undefined;
+      store.createBee({
+        name: `fz-${beeCounter}`,
+        agent: "claude",
+        substrate: "hsr",
+        cwd: "/tmp",
+        ...(parent ? { parentId: parent.id } : {}),
+        ...(parent && rnd() < 0.5 ? { forkedFrom: parent.id, forkSeed: parent.providerSessionId ?? `seed-${beeCounter}` } : {}),
+      });
+    },
+    () => {
+      const bee = pick(store.listBees());
+      if (bee) store.renameBee(bee.id, `fz-r${Math.floor(rnd() * 5)}`);
+    },
+    () => {
+      const bee = pick(store.listBees());
+      if (bee) store.tagBee(bee.id, { add: [`t${Math.floor(rnd() * 4)}`], remove: [`t${Math.floor(rnd() * 4)}`] });
+    },
+    () => {
+      const bee = pick(store.listBees());
+      if (bee) store.recordProviderSessionId(bee.id, `sid-${Math.floor(rnd() * 4)}`);
+    },
+    () => {
+      const bee = pick(store.listBees());
+      if (bee) store.askQuestion(bee.id, { text: `q${Math.floor(rnd() * 100)}`, options: rnd() < 0.5 ? ["a", "b"] : null });
+    },
+    () => {
+      const q = pick(store.listQuestions());
+      if (q) store.answerQuestion(q.id, `a${Math.floor(rnd() * 100)}`);
+    },
+    () => {
+      const bee = pick(store.listBees());
+      if (bee) store.createSeal(bee.id, { title: `s${Math.floor(rnd() * 100)}`, body: "b", refs: rnd() < 0.5 ? ["r"] : [] });
     },
     () => {
       const bee = pick(store.listBees());

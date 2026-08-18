@@ -19,6 +19,10 @@ export {
   type PutTrackInput,
   type EnqueuedCommand,
   type RpcIdempotencyRecord,
+  type TagResult,
+  type AskQuestionInput,
+  type AnswerResult,
+  type CreateSealInput,
 } from "./store.ts";
 export {
   normalizeTemplate,

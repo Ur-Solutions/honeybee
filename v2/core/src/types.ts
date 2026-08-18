@@ -108,6 +108,24 @@ export interface BeeRow {
    * Null = none. The frozen importer fills it from the old launch argv.
    */
   args: string[] | null;
+  /**
+   * v6 — the bee that spawned this one (the RPC caller identified itself as
+   * a bee: `spawn {parentId}` / `bee.fork`). A soft reference: the parent may
+   * be archived (children unaffected) or deleted (children are ORPHANED —
+   * this becomes null, audited `bee.orphaned` — never cascaded).
+   */
+  parentId: string | null;
+  /** v6 — provenance: the bee this one was forked from (`bee.fork`); null otherwise. */
+  forkedFrom: string | null;
+  /**
+   * v6 — one-shot fork seed: the SOURCE bee's provider session id the fork's
+   * FIRST runtime forks from (claude `--resume <seed> --fork-session`, codex
+   * `thread/fork {threadId}`), so the fork continues the source's
+   * conversation under a NEW provider session of its own. Consumed (nulled)
+   * the moment the fork's runtime reports its own session id — later
+   * generations resume that id like any bee. Null for non-forks.
+   */
+  forkSeed: string | null;
 }
 
 export interface RuntimeRow {
@@ -168,6 +186,43 @@ export interface AuditRow {
   kind: string;
   beeId: string | null;
   payload: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// v6 — questions (a bee asks the operator) and seals (a bee's structured record)
+// ---------------------------------------------------------------------------
+
+export const QUESTION_STATUSES = ["open", "answered"] as const;
+export type QuestionStatus = (typeof QUESTION_STATUSES)[number];
+
+export interface QuestionRow {
+  id: string;
+  beeId: string;
+  /** The runtime generation that asked (null when the bee had no runtime row — never in practice). */
+  generation: number | null;
+  text: string;
+  /** Suggested answers, when the bee offered a closed set; null = free-form. */
+  options: string[] | null;
+  status: QuestionStatus;
+  answer: string | null;
+  askedAt: number;
+  answeredAt: number | null;
+  /** Who answered (`operator` by default; apiary passes its principal). */
+  answeredBy: string | null;
+  /** The mailbox message the answer was delivered to the bee as. */
+  deliveryMessageId: number | null;
+}
+
+export interface SealRow {
+  id: string;
+  beeId: string;
+  /** The runtime generation that sealed. */
+  generation: number | null;
+  title: string;
+  body: string;
+  /** Free-form references (branches, commits, urls, paths). */
+  refs: string[];
+  createdAt: number;
 }
 
 /** B8 — the derived read model. Computed, never stored. */
@@ -280,6 +335,9 @@ export interface StateDump {
   commands: CommandRow[];
   templates: TemplateRow[];
   tracks: TrackRow[];
+  /** v6 */
+  questions: QuestionRow[];
+  seals: SealRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +418,21 @@ export class TrackNotFoundError extends CoreError {
 
 /** A put/import would leave two rows with the same (scope, name) — names are unique per scope. */
 export class NameConflictError extends CoreError {}
+
+export class QuestionNotFoundError extends CoreError {
+  constructor(id: string) {
+    super(`question not found: ${id}`);
+  }
+}
+
+/** Answering a question that is no longer open (already answered). */
+export class QuestionNotOpenError extends CoreError {}
+
+export class SealNotFoundError extends CoreError {
+  constructor(id: string) {
+    super(`seal not found: ${id}`);
+  }
+}
 
 /** A package document (or a local config file) failed validation. */
 export class PackageError extends CoreError {}

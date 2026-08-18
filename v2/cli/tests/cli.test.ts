@@ -361,6 +361,168 @@ test("cli.4d: cells — `spawn --substrate cell --origin`, `cell capture --onto`
   }
 });
 
+test("cli.4e: v6 verbs — rename, tag, interrupt, fork, children, spawn --parent (+ ambient HIVE_BEE_ID), ask/answer/question list, seal create/list/get; stale fallbacks for the reads", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  const savedEnv = process.env.HIVE_BEE_ID;
+  try {
+    daemon = await startDaemon(dir);
+    const s = capture();
+    assert.equal(await runV2Cli(["spawn", "boss", "--agent", "stub", "--cwd", "/tmp", "--tag", "apiary:workspace=a", "--data-dir", dir, "--json"], s.io), 0);
+    const boss = (JSON.parse(s.out[0] ?? "{}") as { beeId: string }).beeId;
+    const idle = async (needle: string): Promise<void> => {
+      await waitFor(async () => {
+        const l = capture();
+        await runV2Cli(["view", needle, "--data-dir", dir, "--json"], l.io);
+        return (JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string } }).view?.runtimeState === "idle";
+      }, `${needle} idle`, 10_000);
+    };
+    await idle(boss);
+
+    // rename by name, then by id; unchanged
+    const r = capture();
+    assert.equal(await runV2Cli(["rename", "boss", "chief", "--data-dir", dir], r.io), 0);
+    assert.ok(r.out[0]?.startsWith(`renamed ${boss} → "chief"`), r.out[0]);
+    const r2 = capture();
+    assert.equal(await runV2Cli(["rename", boss, "chief", "--data-dir", dir], r2.io), 0);
+    assert.ok(r2.out[0]?.startsWith("unchanged"), r2.out[0]);
+
+    // tag: --add / --remove (repeatable)
+    const t = capture();
+    assert.equal(await runV2Cli(["tag", "chief", "--remove", "apiary:workspace=a", "--add", "apiary:workspace=b", "--add", "x", "--data-dir", dir, "--json"], t.io), 0);
+    const tagged = JSON.parse(t.out[0] ?? "{}") as { bee: { tags: string[] }; added: string[]; removed: string[] };
+    assert.deepEqual(tagged.bee.tags, ["apiary:workspace=b", "x"]);
+    assert.deepEqual(tagged.removed, ["apiary:workspace=a"]);
+    const tu = capture();
+    assert.equal(await runV2Cli(["tag", "chief", "--data-dir", dir], tu.io), 1, "no edit = usage error");
+
+    // interrupt an idle bee: reasoned no-op, exit 0
+    const i = capture();
+    assert.equal(await runV2Cli(["interrupt", "chief", "--data-dir", dir, "--json"], i.io), 0);
+    assert.deepEqual(JSON.parse(i.out[0] ?? "{}"), { beeId: boss, generation: 1, interrupted: false, reason: "idle" });
+
+    // spawn --parent (explicit, by name) and the ambient HIVE_BEE_ID stamp
+    const c1 = capture();
+    assert.equal(await runV2Cli(["spawn", "kid-1", "--agent", "stub", "--cwd", "/tmp", "--parent", "chief", "--data-dir", dir, "--json"], c1.io), 0);
+    const kid1 = (JSON.parse(c1.out[0] ?? "{}") as { beeId: string }).beeId;
+    process.env.HIVE_BEE_ID = boss; // this process "is" the boss bee
+    const c2 = capture();
+    assert.equal(await runV2Cli(["spawn", "kid-2", "--agent", "stub", "--cwd", "/tmp", "--data-dir", dir, "--json"], c2.io), 0);
+    const kid2 = (JSON.parse(c2.out[0] ?? "{}") as { beeId: string }).beeId;
+    const c3 = capture();
+    assert.equal(await runV2Cli(["spawn", "root-2", "--agent", "stub", "--cwd", "/tmp", "--no-parent", "--data-dir", dir, "--json"], c3.io), 0);
+    process.env.HIVE_BEE_ID = "not-a-bee-on-this-node";
+    const c4 = capture();
+    assert.equal(await runV2Cli(["spawn", "root-3", "--agent", "stub", "--cwd", "/tmp", "--data-dir", dir, "--json"], c4.io), 0, "an unknown ambient stamp is dropped, not an error");
+    process.env.HIVE_BEE_ID = boss;
+    const ch = capture();
+    assert.equal(await runV2Cli(["children", "chief", "--data-dir", dir, "--json"], ch.io), 0);
+    const children = JSON.parse(ch.out[0] ?? "{}") as { children: Array<{ bee: { id: string; parentId: string } }> };
+    assert.deepEqual(children.children.map((v) => v.bee.id).sort(), [kid1, kid2].sort());
+    const chh = capture();
+    assert.equal(await runV2Cli(["children", "root-2", "--data-dir", dir], chh.io), 0);
+    assert.equal(chh.out[0], "no children");
+
+    // ask from inside the boss bee (HIVE_BEE_ID) → open question; list; answer → delivered
+    const a = capture();
+    assert.equal(await runV2Cli(["ask", "merge", "or", "rebase?", "--option", "merge", "--option", "rebase", "--data-dir", dir, "--json"], a.io), 0);
+    const asked = JSON.parse(a.out[0] ?? "{}") as { question: { id: string; beeId: string; status: string; options: string[] } };
+    assert.equal(asked.question.beeId, boss);
+    assert.equal(asked.question.status, "open");
+    assert.deepEqual(asked.question.options, ["merge", "rebase"]);
+    const ql = capture();
+    assert.equal(await runV2Cli(["question", "list", "--open", "--data-dir", dir], ql.io), 0);
+    assert.ok(ql.out[0]?.includes(asked.question.id) && ql.out[0]?.includes("open"), ql.out[0]);
+    const an = capture();
+    assert.equal(await runV2Cli(["answer", asked.question.id, "rebase", "please", "--by", "tormod", "--data-dir", dir, "--json"], an.io), 0);
+    const answered = JSON.parse(an.out[0] ?? "{}") as { question: { status: string; answer: string }; messageId: number };
+    assert.equal(answered.question.status, "answered");
+    assert.equal(answered.question.answer, "rebase please");
+    await waitFor(async () => {
+      const m = capture();
+      await runV2Cli(["mailbox", "chief", "--data-dir", dir, "--json"], m.io);
+      const mail = JSON.parse(m.out[0] ?? "{}") as { messages: Array<{ id: number; deliveredAt: number | null; body: string; sender: string }> };
+      const row = mail.messages.find((x) => x.id === answered.messageId);
+      return row?.deliveredAt != null && row.body.startsWith(`[answer to question ${asked.question.id}] rebase please`) && row.sender === "tormod";
+    }, "answer delivered as mail", 10_000);
+    const an2 = capture();
+    assert.equal(await runV2Cli(["question", "answer", asked.question.id, "again", "--data-dir", dir], an2.io), 1, "already answered = typed error");
+    assert.ok(an2.err[0]?.includes("invalid_request"), an2.err[0]);
+    // ask outside a bee without --bee: loud usage error; with --bee: fine
+    delete process.env.HIVE_BEE_ID;
+    const noBee = capture();
+    assert.equal(await runV2Cli(["ask", "who am i?", "--data-dir", dir], noBee.io), 1);
+    assert.ok(noBee.err[0]?.includes("HIVE_BEE_ID"), noBee.err[0]);
+    const withBee = capture();
+    assert.equal(await runV2Cli(["ask", "who am i?", "--bee", "kid-1", "--data-dir", dir, "--json"], withBee.io), 0);
+    assert.equal((JSON.parse(withBee.out[0] ?? "{}") as { question: { beeId: string } }).question.beeId, kid1);
+
+    // seals: create (title positional, --body, --ref…) for --bee; list; get
+    const sc = capture();
+    assert.equal(await runV2Cli(["seal", "impl done", "--body", "all green", "--ref", "main@abc", "--ref", "https://ci/1", "--bee", "chief", "--data-dir", dir, "--json"], sc.io), 0);
+    const seal = (JSON.parse(sc.out[0] ?? "{}") as { seal: { id: string; beeId: string; refs: string[]; generation: number } }).seal;
+    assert.equal(seal.beeId, boss);
+    assert.deepEqual(seal.refs, ["main@abc", "https://ci/1"]);
+    process.env.HIVE_BEE_ID = kid1;
+    const sc2 = capture();
+    assert.equal(await runV2Cli(["seal", "kid seal", "--data-dir", dir, "--json"], sc2.io), 0);
+    assert.equal((JSON.parse(sc2.out[0] ?? "{}") as { seal: { beeId: string } }).seal.beeId, kid1);
+    const sl = capture();
+    assert.equal(await runV2Cli(["seal", "list", "--bee", "chief", "--data-dir", dir, "--json"], sl.io), 0);
+    assert.deepEqual((JSON.parse(sl.out[0] ?? "{}") as { seals: Array<{ id: string }> }).seals.map((x) => x.id), [seal.id]);
+    const sg = capture();
+    assert.equal(await runV2Cli(["seal", "get", seal.id, "--data-dir", dir], sg.io), 0);
+    assert.ok(sg.out[0]?.includes("impl done") && sg.out[1]?.includes("all green"), sg.out.join("|"));
+    const sgn = capture();
+    assert.equal(await runV2Cli(["seal", "get", "nope", "--data-dir", dir], sgn.io), 1);
+    assert.ok(sgn.err[0]?.includes("seal_not_found"), sgn.err[0]);
+
+    // fork (stub: no fork mechanism → boots fresh; provenance + parent recorded)
+    const f = capture();
+    assert.equal(await runV2Cli(["fork", "chief", "--name", "chief-b", "take", "over", "--data-dir", dir, "--json"], f.io), 0);
+    const forked = JSON.parse(f.out[0] ?? "{}") as { beeId: string; forkedFrom: string; messageId: number | null; bee: { name: string; parentId: string; forkedFrom: string } };
+    assert.equal(forked.forkedFrom, boss);
+    assert.equal(forked.bee.name, "chief-b");
+    assert.equal(forked.bee.parentId, boss);
+    assert.ok(forked.messageId != null, "positional prompt enqueued");
+    await idle("chief-b");
+    const chf = capture();
+    assert.equal(await runV2Cli(["children", "chief", "--data-dir", dir, "--json"], chf.io), 0);
+    assert.equal((JSON.parse(chf.out[0] ?? "{}") as { children: unknown[] }).children.length, 3);
+
+    // stale fallbacks: stop the daemon; children / question list / seal list / seal get read the store directly
+    await daemon.stop();
+    daemon = null;
+    const sch = capture();
+    assert.equal(await runV2Cli(["children", "chief", "--data-dir", dir, "--json"], sch.io), 0);
+    const staleKids = JSON.parse(sch.out[0] ?? "{}") as { stale?: boolean; children: unknown[] };
+    assert.equal(staleKids.stale, true);
+    assert.equal(staleKids.children.length, 3);
+    const sql = capture();
+    assert.equal(await runV2Cli(["question", "list", "--data-dir", dir, "--json"], sql.io), 0);
+    const staleQ = JSON.parse(sql.out[0] ?? "{}") as { stale?: boolean; questions: Array<{ status: string }> };
+    assert.equal(staleQ.stale, true);
+    assert.equal(staleQ.questions.length, 2);
+    const ssl = capture();
+    assert.equal(await runV2Cli(["seal", "list", "--data-dir", dir], ssl.io), 0);
+    assert.ok(ssl.err[0]?.startsWith("STALE"));
+    assert.equal(ssl.out.length, 2);
+    assert.ok(ssl.out[0]?.startsWith("stale: "));
+    const ssg = capture();
+    assert.equal(await runV2Cli(["seal", "get", seal.id, "--data-dir", dir, "--json"], ssg.io), 0);
+    assert.equal((JSON.parse(ssg.out[0] ?? "{}") as { stale?: boolean }).stale, true);
+    // mutations never fall back
+    const sm = capture();
+    assert.equal(await runV2Cli(["rename", "chief", "x", "--data-dir", dir], sm.io), 1);
+    assert.ok(sm.err[0]?.includes("daemon not reachable"));
+  } finally {
+    if (savedEnv === undefined) delete process.env.HIVE_BEE_ID;
+    else process.env.HIVE_BEE_ID = savedEnv;
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
 test("cli.5: daemon status when nothing runs and no service is installed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-cli-"));
   try {

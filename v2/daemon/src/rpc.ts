@@ -15,6 +15,8 @@ import {
   IllegalTransitionError,
   NameConflictError,
   PackageError,
+  QuestionNotFoundError,
+  SealNotFoundError,
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "../../core/src/index.ts";
@@ -61,6 +63,8 @@ export function toRpcError(err: unknown): { code: RpcErrorCode; message: string 
   if (err instanceof BeeNotFoundError) return { code: "bee_not_found", message: err.message };
   if (err instanceof TemplateNotFoundError) return { code: "template_not_found", message: err.message };
   if (err instanceof TrackNotFoundError) return { code: "track_not_found", message: err.message };
+  if (err instanceof QuestionNotFoundError) return { code: "question_not_found", message: err.message };
+  if (err instanceof SealNotFoundError) return { code: "seal_not_found", message: err.message };
   if (err instanceof NameConflictError) return { code: "name_conflict", message: err.message };
   if (err instanceof PackageError) return { code: "invalid_package", message: err.message };
   if (err instanceof IllegalTransitionError) {

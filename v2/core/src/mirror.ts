@@ -12,7 +12,7 @@
  * Changing anything here is a protocol change (bump PROTOCOL in the daemon).
  * The shape snapshot test (tests/mirror.test.ts) fails on any drift.
  */
-import type { AuditRow, BeeRow, BeeView, RuntimeRow, TemplateRow, TrackRow } from "./types.ts";
+import type { AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TemplateRow, TrackRow } from "./types.ts";
 
 /** One bee as apiaryd stores it: B8 view verbatim + record + current runtime. */
 export interface MirrorBeeRow {
@@ -28,15 +28,25 @@ export type MirrorTemplateRow = TemplateRow;
 /** Tracks mirror as their store rows, verbatim. */
 export type MirrorTrackRow = TrackRow;
 
+/** v6: questions mirror as their store rows, verbatim (Apiary's inbox surfaces `status = open`). */
+export type MirrorQuestionRow = QuestionRow;
+
+/** v6: seals mirror as their store rows, verbatim. */
+export type MirrorSealRow = SealRow;
+
 /**
- * The versioned snapshot: replace all three mirror tables in one transaction
- * stamped `seq`, then apply deltas with `baseSeq === seq`.
+ * The versioned snapshot: replace all mirror tables in one transaction
+ * stamped `seq`, then apply deltas with `baseSeq === seq`. `questions` and
+ * `seals` are v6 additions — additive: a v2/1 materializer that ignores
+ * unknown keys stays correct.
  */
 export interface MirrorSnapshot {
   seq: number;
   bees: MirrorBeeRow[];
   templates: MirrorTemplateRow[];
   tracks: MirrorTrackRow[];
+  questions: MirrorQuestionRow[];
+  seals: MirrorSealRow[];
 }
 
 /** A watch delta is a contiguous run of audit rows (see daemon protocol.ts WatchFrame). */
@@ -58,11 +68,26 @@ export type MirrorDelta = AuditRow;
  * not enqueued because `spawn_failed` is set; no row change).
  * v5 adds `bee.args_set` (bee row: args changed;
  * payload { beeId, args: string[] | null, previous }).
+ * v6 (pre-flip verbs) adds, all additive:
+ *   bee.renamed        → { beeId, name, previous }                     (bee row: name)
+ *   bee.tagged         → { beeId, tags, previous, added, removed }     (bee row: tags)
+ *   bee.orphaned       → { beeId, parentId, reason }                   (bee row: parentId → null)
+ *   bee.forked         → { beeId, forkedFrom, forkSeed }               (informational; row via bee.created)
+ *   bee.interrupted    → { beeId, generation, interrupted, reason }    (informational; no row change)
+ *   question.asked     → { question: QuestionRow }                     (questions table: insert)
+ *   question.answered  → { questionId, beeId, answer, answeredAt, answeredBy, deliveryMessageId }
+ *                                                                        (questions table: status/answer)
+ *   seal.created       → { seal: SealRow }                             (seals table: insert)
+ * `bee.provider_session` may now also carry `forkSeedConsumed` (bee row: forkSeed → null).
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
+export const MIRROR_QUESTION_AUDIT_KINDS = ["question.asked", "question.answered"] as const;
+export const MIRROR_SEAL_AUDIT_KINDS = ["seal.created"] as const;
 export type MirrorTemplateAuditKind = (typeof MIRROR_TEMPLATE_AUDIT_KINDS)[number];
 export type MirrorTrackAuditKind = (typeof MIRROR_TRACK_AUDIT_KINDS)[number];
+export type MirrorQuestionAuditKind = (typeof MIRROR_QUESTION_AUDIT_KINDS)[number];
+export type MirrorSealAuditKind = (typeof MIRROR_SEAL_AUDIT_KINDS)[number];
 
 /** Key lists — the shape snapshot; a materializer's column map must cover exactly these. */
 export const MIRROR_BEE_ROW_KEYS = ["view", "bee", "runtime"] as const;
@@ -101,6 +126,11 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "spawnFailures",
   // v5: additive — per-bee spawn args (string[] | null).
   "args",
+  // v6: additive — parenting (parentId), fork provenance (forkedFrom) and the
+  // one-shot fork seed (forkSeed; null once consumed).
+  "parentId",
+  "forkedFrom",
+  "forkSeed",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",
@@ -137,3 +167,17 @@ export const MIRROR_TEMPLATE_KEYS = [
 ] as const;
 export const MIRROR_TRACK_KEYS = ["id", "name", "scope", "source", "description", "steps", "tags", "createdAt", "updatedAt"] as const;
 export const MIRROR_TRACK_STEP_KEYS = ["id", "name", "kind", "templateId", "instruction", "note", "status"] as const;
+export const MIRROR_QUESTION_KEYS = [
+  "id",
+  "beeId",
+  "generation",
+  "text",
+  "options",
+  "status",
+  "answer",
+  "askedAt",
+  "answeredAt",
+  "answeredBy",
+  "deliveryMessageId",
+] as const;
+export const MIRROR_SEAL_KEYS = ["id", "beeId", "generation", "title", "body", "refs", "createdAt"] as const;

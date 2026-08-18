@@ -16,8 +16,10 @@ import {
   type ExitCause,
   type Flag,
   type MessageRow,
+  type QuestionRow,
   type RuntimeRow,
   type RuntimeState,
+  type SealRow,
 } from "../../core/src/index.ts";
 
 type Row = Record<string, unknown>;
@@ -43,6 +45,38 @@ function mapBee(r: Row): BeeRow {
     spawnFailures: Number((r.spawn_failures as number | null | undefined) ?? 0),
     // v5 column; same tolerance.
     args: r.args == null ? null : (JSON.parse(String(r.args)) as string[]),
+    // v6 columns; same tolerance.
+    parentId: (r.parent_id as string | null | undefined) ?? null,
+    forkedFrom: (r.forked_from as string | null | undefined) ?? null,
+    forkSeed: (r.fork_seed as string | null | undefined) ?? null,
+  };
+}
+
+function mapQuestionRow(r: Row): QuestionRow {
+  return {
+    id: r.id as string,
+    beeId: r.bee_id as string,
+    generation: r.generation == null ? null : Number(r.generation),
+    text: r.text as string,
+    options: r.options == null ? null : (JSON.parse(r.options as string) as string[]),
+    status: r.status as QuestionRow["status"],
+    answer: (r.answer as string | null) ?? null,
+    askedAt: Number(r.asked_at),
+    answeredAt: r.answered_at == null ? null : Number(r.answered_at),
+    answeredBy: (r.answered_by as string | null) ?? null,
+    deliveryMessageId: r.delivery_message_id == null ? null : Number(r.delivery_message_id),
+  };
+}
+
+function mapSealRow(r: Row): SealRow {
+  return {
+    id: r.id as string,
+    beeId: r.bee_id as string,
+    generation: r.generation == null ? null : Number(r.generation),
+    title: r.title as string,
+    body: r.body as string,
+    refs: JSON.parse(r.refs as string) as string[],
+    createdAt: Number(r.created_at),
   };
 }
 
@@ -211,5 +245,35 @@ export class ReadOnlyStore {
     return (this.db.prepare("SELECT * FROM commands WHERE bee_id = ? ORDER BY id").all(beeId) as Row[]).map(
       mapCommand,
     );
+  }
+
+  /** v6 — tolerate a pre-v6 store file (no table): empty. */
+  private tableExists(name: string): boolean {
+    const row = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+    return row !== undefined;
+  }
+
+  children(beeId: string): StaleViewResult[] {
+    return this.listBees().filter((b) => b.parentId === beeId).map((b) => this.view(b.id));
+  }
+
+  questions(filter: { beeId?: string; open?: boolean } = {}): QuestionRow[] {
+    if (!this.tableExists("questions")) return [];
+    return (this.db.prepare("SELECT * FROM questions ORDER BY asked_at, rowid").all() as Row[])
+      .map(mapQuestionRow)
+      .filter((q) => (filter.beeId === undefined || q.beeId === filter.beeId) && (filter.open === undefined || (q.status === "open") === filter.open));
+  }
+
+  seals(filter: { beeId?: string } = {}): SealRow[] {
+    if (!this.tableExists("seals")) return [];
+    return (this.db.prepare("SELECT * FROM seals ORDER BY created_at, rowid").all() as Row[])
+      .map(mapSealRow)
+      .filter((sl) => filter.beeId === undefined || sl.beeId === filter.beeId);
+  }
+
+  seal(id: string): SealRow | null {
+    if (!this.tableExists("seals")) return null;
+    const row = this.db.prepare("SELECT * FROM seals WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapSealRow(row) : null;
   }
 }
