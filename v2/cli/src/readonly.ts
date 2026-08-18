@@ -10,6 +10,7 @@ import {
   deriveBeeView,
   type AccountLimitsRow,
   type AccountRow,
+  type AuditRow,
   type TemplateRow,
   type TrackRow,
   type BeeRow,
@@ -333,5 +334,21 @@ export class ReadOnlyStore {
   accountLimits(): AccountLimitsRow[] {
     if (!this.tableExists("account_limits")) return [];
     return (this.db.prepare("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimitsRow);
+  }
+
+  /** Audit-log tail (`hive v2 events` stale fallback): rows with seq > afterSeq, oldest first. */
+  auditRows(afterSeq = 0, beeId?: string): AuditRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM audit WHERE seq > ? ORDER BY seq")
+      .all(afterSeq) as Row[];
+    return rows
+      .map((r) => ({
+        seq: Number(r.seq),
+        ts: Number(r.ts),
+        kind: r.kind as string,
+        beeId: (r.bee_id as string | null) ?? null,
+        payload: JSON.parse(r.payload as string) as Record<string, unknown>,
+      }))
+      .filter((r) => beeId === undefined || r.beeId === beeId);
   }
 }

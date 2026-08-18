@@ -193,7 +193,8 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-function sessionNameFor(beeId: string, generation: number): string {
+/** The driver's session-name convention — exported so `hive v2 attach` can address the recorded session. */
+export function sessionNameFor(beeId: string, generation: number): string {
   const safe = beeId.replace(/[^a-zA-Z0-9_-]+/g, "-");
   return `hive-v2-${safe}-g${generation}`;
 }

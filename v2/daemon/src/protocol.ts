@@ -88,6 +88,8 @@ export const RPC_VERBS = [
   "commands",
   "deployInfo",
   "health",
+  // CLI-alignment (additive read): tail of the audit log for `hive v2 events`
+  "audit.tail",
   // watch
   "watch",
   "snapshot",
@@ -512,6 +514,16 @@ export interface MailboxResult {
 
 export interface CommandsResult {
   commands: CommandRow[];
+}
+
+/**
+ * `audit.tail {beeId?, afterSeq?, limit?}` — a bounded read of the audit log
+ * (the same rows the watch stream pushes as deltas). `afterSeq` returns only
+ * rows with seq > afterSeq (a follow cursor); `limit` keeps the LAST n rows
+ * after filtering (default 100, capped at 1000). Kind filtering is client-side.
+ */
+export interface AuditTailResult {
+  rows: AuditRow[];
 }
 
 export interface DeployInfoResult {

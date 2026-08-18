@@ -10,9 +10,9 @@
  *   immediately by default; --wait blocks until the delivery mark.
  * - `daemon install|start|stop|status` wraps the platform service layer.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { defaultDataDir, loadNodeConfig, type ResolvedNodeConfig } from "../../daemon/src/config.ts";
 import { runDaemon } from "../../daemon/src/main.ts";
@@ -74,9 +74,23 @@ import {
 } from "../../daemon/src/protocol.ts";
 import { DaemonDownError, RpcClient } from "./client.ts";
 import { ReadOnlyStore } from "./readonly.ts";
-import { freezeRoot, type FrozenImportReport, type ImportPlanEntry } from "../../core/src/index.ts";
+import { freezeRoot, type AuditRow, type FrozenImportReport, type ImportPlanEntry } from "../../core/src/index.ts";
 import { realPreflightProbes } from "../../daemon/src/import-probes.ts";
 import { hostname } from "node:os";
+import type { AuditTailResult } from "../../daemon/src/protocol.ts";
+import {
+  lastAssistantText,
+  renderTranscriptLines,
+  type TranscriptTurn,
+} from "../../driver-tmux/src/transcripts.ts";
+import { sessionNameFor } from "../../driver-tmux/src/driver.ts";
+import {
+  claudeArgGrammar,
+  codexArgGrammar,
+  composeArgv,
+  parseArgUnits,
+  type ArgGrammar,
+} from "../../adapters/src/args.ts";
 
 export interface CliIo {
   out(line: string): void;
@@ -141,8 +155,19 @@ const VALUE_FLAGS = new Set([
   "--home",
   "--penalty",
   "--harness",
+  // CLI alignment (v1 reading/sugar verbs)
+  "--kind",
+  "--tail",
+  "--idle-ms",
   ...LIST_FLAGS,
 ]);
+
+/** Short-flag aliases (v1 ergonomics), expanded before classification. */
+const SHORT_ALIASES: Record<string, string> = {
+  "-p": "--prompt",
+  "-n": "--tail",
+  "-f": "--follow",
+};
 
 function parseArgs(argv: string[]): Parsed {
   const positional: string[] = [];
@@ -152,11 +177,12 @@ function parseArgs(argv: string[]): Parsed {
   const lists = new Map<string, string[]>();
   let rest: string[] | null = null;
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i] as string;
-    if (a === "--") {
+    const raw = argv[i] as string;
+    if (raw === "--") {
       rest = argv.slice(i + 1);
       break;
     }
+    const a = SHORT_ALIASES[raw] ?? raw;
     if (!a.startsWith("--")) {
       positional.push(a);
       continue;
@@ -291,7 +317,8 @@ const SPAWN_USAGE =
   "usage: hive v2 spawn <name> --agent <agent> [--account id|auto|none] [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
   "       hive v2 spawn <name> --agent <agent> --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]";
 
-async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
+/** The spawn RPC path (name = positional[1]) — shared by spawn and the x/run sugar. */
+async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult> {
   const name = parsed.positional[1];
   if (!name) throw new Error(SPAWN_USAGE);
   const agent = (parsed.flags.get("--agent") as string | undefined) ?? "claude";
@@ -346,6 +373,11 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
   });
+  return result;
+}
+
+async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const result = await spawnBee(ctx, parsed);
   const accountNote = result.account ? `; account ${result.account}${result.accountReason ? ` — ${result.accountReason}` : ""}` : "";
   emit(
     ctx,
@@ -1331,6 +1363,645 @@ async function cmdPackages(ctx: CliContext, parsed: Parsed): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// v1-alignment: sugar verbs (x, run, wait, here) + reading verbs
+// (transcript, tail, last, events) + set-model / usage / attach sugar
+// ---------------------------------------------------------------------------
+
+/** One bee's view+row, by id or unique name — RPC first, read-only fallback. */
+async function readBee(ctx: CliContext, needle: string): Promise<{ result: ViewResult; stale: boolean }> {
+  return readPath(
+    ctx,
+    async (c) => {
+      const list = await c.request<ListResult>("list");
+      return c.request<ViewResult>("view", { beeId: resolveBeeIn(list.views, needle) });
+    },
+    (store) => store.view(resolveBeeIn(store.list(null), needle)),
+  );
+}
+
+function numFlag(parsed: Parsed, flag: string, fallback: number): number {
+  const raw = parsed.flags.get(flag);
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`${flag} must be a number`);
+  return n;
+}
+
+/** The prompt for x/run: --prompt/-p wins, else the trailing positionals. */
+function promptOf(parsed: Parsed, fromIndex: number): string {
+  const flagged = parsed.flags.get("--prompt") as string | undefined;
+  if (flagged !== undefined) return flagged;
+  return parsed.positional.slice(fromIndex).join(" ");
+}
+
+/**
+ * `hive v2 x <name> <prompt…>` — spawn + first send, fire-and-forget (the v1
+ * `x` shape). The mailbox is durable, so the prompt needs no readiness wait:
+ * delivery lands when the bee boots. Spawn flags pass through
+ * (--agent/--account/--cwd/--tag/--arg/--parent…).
+ */
+async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const name = parsed.positional[1];
+  const prompt = promptOf(parsed, 2);
+  if (!name || prompt.length === 0) {
+    throw new Error("usage: hive v2 x <name> <prompt…> [--agent a] [--account id|auto|none] [--cwd d] [--tag t]... [--arg a]...");
+  }
+  const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] });
+  const sent = await withClient(ctx, (c) =>
+    c.request<SendRpcResult>("send", { beeId: spawned.beeId, body: prompt, sender: "operator" }),
+  );
+  emit(
+    ctx,
+    [`spawned ${spawned.beeId} (command ${spawned.commandId}); sent message ${sent.messageId} (${prompt.length} chars) — inspect with: hive v2 tail ${name} | wait ${name}`],
+    { ...spawned, messageId: sent.messageId },
+    false,
+  );
+  return 0;
+}
+
+/**
+ * Idle-wait loop: done when the runtime is idle/stopped AND no mailbox message
+ * is undelivered, sustained for `idleMs`. `requireOutputAfter` (run) also
+ * demands output evidence newer than the delivery before the short settle —
+ * a turn that produces none still completes after the long settle.
+ */
+async function waitForBeeIdle(
+  c: RpcClient,
+  beeId: string,
+  opts: { timeoutMs: number; idleMs: number; requireOutputAfter?: number },
+): Promise<{ outcome: "idle" | "timeout"; view: ViewResult }> {
+  const pollMs = 100;
+  const shortStreak = Math.max(1, Math.round(opts.idleMs / pollMs));
+  const longStreak = Math.max(shortStreak, 15); // no-output fallback: ~1.5s of quiet
+  const deadline = Date.now() + opts.timeoutMs;
+  let streak = 0;
+  for (;;) {
+    const view = await c.request<ViewResult>("view", { beeId });
+    const state = view.view.runtimeState;
+    const quiet = state === "idle" || state === "stopped";
+    let base = quiet;
+    if (base) {
+      const { messages } = await c.request<MailboxResult>("mailbox", { beeId });
+      base = messages.every((m) => m.deliveredAt != null);
+    }
+    streak = base ? streak + 1 : 0;
+    if (base) {
+      const outputSeen =
+        opts.requireOutputAfter === undefined ||
+        (view.bee?.lastOutputAt != null && view.bee.lastOutputAt >= opts.requireOutputAfter);
+      if ((outputSeen && streak >= shortStreak) || streak >= longStreak) return { outcome: "idle", view };
+    }
+    if (Date.now() > deadline) return { outcome: "timeout", view };
+    await sleep(pollMs);
+  }
+}
+
+/** `hive v2 wait <bee> [--timeout ms] [--idle-ms ms]` — block until the bee settles. */
+async function cmdWait(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 wait <bee> [--timeout ms] [--idle-ms ms]");
+  const timeoutMs = numFlag(parsed, "--timeout", 600_000);
+  const idleMs = numFlag(parsed, "--idle-ms", 300);
+  return withClient(ctx, async (c) => {
+    const list = await c.request<ListResult>("list");
+    const beeId = resolveBeeIn(list.views, needle);
+    const { outcome, view } = await waitForBeeIdle(c, beeId, { timeoutMs, idleMs });
+    if (outcome === "timeout") {
+      ctx.io.err(`timeout: ${beeId} still ${view.view.runtimeState ?? "booting"} after ${timeoutMs}ms`);
+      return 1;
+    }
+    emit(ctx, [viewLine(view, false)], view, false);
+    if (view.view.blocked) {
+      // v1 parity: a blocked bee did not finish its turn — exit non-zero so
+      // `wait && archive` chains do not file a bee stalled on a flag.
+      ctx.io.err(`blocked: ${view.view.flags.join(", ")}`);
+      return 1;
+    }
+    return 0;
+  });
+}
+
+/**
+ * `hive v2 run <name> -p <prompt>` — spawn, send, wait for the reply, print it,
+ * archive (--keep to leave the bee for inspection). The v1 one-shot shape.
+ */
+async function cmdRun(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const name = parsed.positional[1];
+  const prompt = promptOf(parsed, 2);
+  if (!name || prompt.length === 0) {
+    throw new Error("usage: hive v2 run <name> -p <prompt> [--agent a] [--account id|auto|none] [--cwd d] [--timeout ms] [--keep]");
+  }
+  const timeoutMs = numFlag(parsed, "--timeout", 600_000);
+  const keep = parsed.flags.get("--keep") === true;
+  const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] });
+  return withClient(ctx, async (c) => {
+    const sent = await c.request<SendRpcResult>("send", { beeId: spawned.beeId, body: prompt, sender: "operator" });
+    // Delivery mark first (the mailbox row is the truth), then turn completion.
+    const deadline = Date.now() + timeoutMs;
+    let deliveredAt: number | null = null;
+    while (deliveredAt == null) {
+      const { messages } = await c.request<MailboxResult>("mailbox", { beeId: spawned.beeId });
+      deliveredAt = messages.find((m) => m.id === sent.messageId)?.deliveredAt ?? null;
+      if (deliveredAt == null) {
+        if (Date.now() > deadline) {
+          ctx.io.err(`timeout: message ${sent.messageId} not delivered within ${timeoutMs}ms — kept ${spawned.beeId} (it remains queued durably)`);
+          return 1;
+        }
+        await sleep(100);
+      }
+    }
+    const { outcome, view } = await waitForBeeIdle(c, spawned.beeId, {
+      timeoutMs: Math.max(0, deadline - Date.now()),
+      idleMs: 300,
+      requireOutputAfter: deliveredAt,
+    });
+    if (outcome === "timeout") {
+      ctx.io.err(`timeout: ${spawned.beeId} did not finish within ${timeoutMs}ms — kept; inspect with: hive v2 tail ${name}`);
+      return 1;
+    }
+    const logPath = view.bee?.sessionLogPath ?? null;
+    const reply = logPath && existsSync(logPath)
+      ? lastAssistantText(renderTranscriptLines(view.bee?.agent ?? "", readSessionLogLines(logPath)))
+      : null;
+    let archiveCommandId: number | null = null;
+    if (!keep) {
+      const r = await c.request<{ commandId: number }>("archive", { beeId: spawned.beeId });
+      archiveCommandId = r.commandId;
+    }
+    if (ctx.json) {
+      emit(ctx, [], { beeId: spawned.beeId, messageId: sent.messageId, reply, archived: !keep, archiveCommandId, blocked: view.view.blocked }, false);
+    } else {
+      ctx.io.out(reply ?? "(no assistant text in the session log)");
+      ctx.io.err(keep ? `kept ${spawned.beeId}; clean up with: hive v2 archive ${name}` : `archived ${spawned.beeId} (command ${archiveCommandId})`);
+    }
+    return view.view.blocked ? 1 : 0;
+  });
+}
+
+/** `hive v2 here [--json]` — this process's own bee (the HIVE_BEE_ID stamp). */
+async function cmdHere(ctx: CliContext, _parsed: Parsed): Promise<number> {
+  const id = selfBeeId();
+  if (!id) throw new Error("hive v2 here: not running inside a bee (HIVE_BEE_ID unset)");
+  try {
+    const { result, stale } = await readBee(ctx, id);
+    const bee = result.bee;
+    emit(
+      ctx,
+      [`here ${id}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  cwd=${bee?.cwd ?? "?"}`],
+      { id, name: bee?.name ?? null, agent: bee?.agent ?? null, cwd: bee?.cwd ?? null, parentId: bee?.parentId ?? null, account: bee?.account ?? null },
+      stale,
+    );
+  } catch {
+    // The stamp is real even when this node cannot resolve it (other node / no store).
+    emit(ctx, [`here ${id}  (not resolvable on this node)`], { id, name: null }, false);
+  }
+  return 0;
+}
+
+// --- session-log reading (transcript / tail / last) ------------------------
+
+function readSessionLogLines(path: string): string[] {
+  const text = readFileSync(path, "utf8");
+  return text.split("\n").filter((l) => l.trim().length > 0);
+}
+
+/** Human rendering of readable turns: role-tagged first line, indented continuations. */
+function turnLines(turns: readonly TranscriptTurn[], prefix = ""): string[] {
+  const out: string[] = [];
+  for (const turn of turns) {
+    const body = turn.text.split("\n");
+    out.push(`${prefix}[${turn.role}] ${body[0] ?? ""}`);
+    for (const cont of body.slice(1)) out.push(`${prefix}  ${cont}`);
+  }
+  return out;
+}
+
+/** The bee's session log path, loudly absent when never written. */
+function sessionLogOf(bee: ViewResult["bee"], needle: string): string {
+  const path = bee?.sessionLogPath ?? null;
+  if (!path) throw new Error(`no session log recorded for ${bee?.id ?? needle}`);
+  if (!existsSync(path)) {
+    throw new Error(`session log for ${bee?.id ?? needle} not found at ${path} (written on the first runtime boot)`);
+  }
+  return path;
+}
+
+/**
+ * Follow a file's appended lines (tail -f): poll, read past the cursor, emit
+ * whole lines. Returns on SIGINT.
+ */
+async function followFileLines(path: string, fromBytes: number, onLine: (line: string) => void): Promise<void> {
+  let pos = fromBytes;
+  let rest = "";
+  await new Promise<void>((resolveDone) => {
+    let stopped = false;
+    const onSigint = (): void => {
+      stopped = true;
+    };
+    process.once("SIGINT", onSigint);
+    const timer = setInterval(() => {
+      if (stopped) {
+        clearInterval(timer);
+        process.removeListener("SIGINT", onSigint);
+        resolveDone();
+        return;
+      }
+      let size: number;
+      try {
+        size = statSync(path).size;
+      } catch {
+        return; // rotated/removed: keep waiting
+      }
+      if (size < pos) pos = 0; // truncated: restart from the top
+      if (size === pos) return;
+      const fd = openSync(path, "r");
+      try {
+        const buf = Buffer.alloc(size - pos);
+        const read = readSync(fd, buf, 0, buf.length, pos);
+        pos += read;
+        rest += buf.toString("utf8", 0, read);
+      } finally {
+        closeSync(fd);
+      }
+      const lines = rest.split("\n");
+      rest = lines.pop() ?? "";
+      for (const line of lines) if (line.trim().length > 0) onLine(line);
+    }, 250);
+    timer.unref?.();
+  });
+}
+
+/**
+ * `hive v2 transcript <bee> [--tail n] [--raw] [--follow]` — the bee's session
+ * log (verbatim native stream) rendered as readable turns; tool traffic is
+ * elided to one-liners. `--raw` = the jsonl verbatim. File truth: works with
+ * the daemon down (only the bee lookup is stale-labeled).
+ */
+async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 transcript <bee> [--tail n] [--raw] [--follow]");
+  const { result, stale } = await readBee(ctx, needle);
+  const bee = result.bee;
+  const path = sessionLogOf(bee, needle);
+  const harness = bee?.agent ?? "";
+  const raw = parsed.flags.get("--raw") === true;
+  const tailN = parsed.flags.has("--tail") ? numFlag(parsed, "--tail", 0) : null;
+  const lines = readSessionLogLines(path);
+  if (!ctx.json) ctx.io.err(`${stale ? "STALE: daemon not running — " : ""}# session log ${path} (${harness})`);
+  if (raw) {
+    const shown = tailN != null ? lines.slice(-tailN) : lines;
+    if (ctx.json) emit(ctx, [], { path, harness, lines: shown }, stale);
+    else for (const line of shown) ctx.io.out(line);
+  } else {
+    const turns = renderTranscriptLines(harness, lines);
+    const shown = tailN != null ? turns.slice(-tailN) : turns;
+    if (ctx.json) emit(ctx, [], { path, harness, turns: shown }, stale);
+    else for (const line of turnLines(shown)) ctx.io.out(line);
+  }
+  if (parsed.flags.get("--follow") !== true) return 0;
+  await followFileLines(path, statSync(path).size, (line) => {
+    if (raw) ctx.io.out(line);
+    else for (const l of turnLines(renderTranscriptLines(harness, [line]))) ctx.io.out(l);
+  });
+  return 0;
+}
+
+/**
+ * `hive v2 tail <bee> [-n lines] [--no-follow]` — follow the raw session log
+ * like `tail -f` (v1's tail followed the pane; v2's ground truth is the log).
+ */
+async function cmdTail(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 tail <bee> [-n lines] [--no-follow]");
+  const { result, stale } = await readBee(ctx, needle);
+  const path = sessionLogOf(result.bee, needle);
+  const backlog = numFlag(parsed, "--tail", 40);
+  if (stale) ctx.io.err(`STALE: daemon not running — read directly from ${ctx.cfg.storePath}`);
+  ctx.io.err(`# session log ${path}`);
+  for (const line of readSessionLogLines(path).slice(-backlog)) ctx.io.out(line);
+  if (parsed.flags.get("--no-follow") === true) return 0;
+  await followFileLines(path, statSync(path).size, (line) => ctx.io.out(line));
+  return 0;
+}
+
+/**
+ * `hive v2 last <bee> [--seal]` — the most recent assistant message from the
+ * session log; falls back to the latest seal (title/body) when the log has
+ * no assistant text. `--seal` skips straight to the seal (v1 shape).
+ */
+async function cmdLast(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 last <bee> [--seal]");
+  const { result, stale } = await readBee(ctx, needle);
+  const bee = result.bee;
+  if (!bee) throw new RpcError("bee_not_found", `bee not found: ${needle}`);
+
+  const latestSeal = async (): Promise<SealListResult["seals"][number] | null> => {
+    const { result: seals } = await readPath(
+      ctx,
+      (c) => c.request<SealListResult>("seal.list", { beeId: bee.id }),
+      (store) => ({ seals: store.seals({ beeId: bee.id }) }),
+    );
+    return seals.seals.length > 0 ? (seals.seals[seals.seals.length - 1] as SealListResult["seals"][number]) : null;
+  };
+
+  if (parsed.flags.get("--seal") === true) {
+    const seal = await latestSeal();
+    if (!seal) throw new Error(`no seal recorded for ${bee.id}`);
+    emit(ctx, [JSON.stringify(seal, null, 2)], { seal }, stale);
+    return 0;
+  }
+
+  const path = bee.sessionLogPath;
+  const text = path && existsSync(path)
+    ? lastAssistantText(renderTranscriptLines(bee.agent, readSessionLogLines(path)))
+    : null;
+  if (text != null) {
+    if (!ctx.json) ctx.io.err(`${stale ? "STALE: daemon not running — " : ""}# session log ${path} (${bee.agent})`);
+    emit(ctx, [text], { beeId: bee.id, source: "session_log", text }, stale);
+    return 0;
+  }
+  const seal = await latestSeal();
+  if (seal) {
+    if (!ctx.json) ctx.io.err("# no assistant text in the session log — latest seal");
+    emit(ctx, [seal.title, ...seal.body.split("\n")], { beeId: bee.id, source: "seal", seal }, stale);
+    return 0;
+  }
+  throw new Error(`no assistant output or seal recorded for ${bee.id}`);
+}
+
+// --- events (audit-row tail) ------------------------------------------------
+
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.*+?^${}()|[\]\\]/g, (ch) => (ch === "*" ? ".*" : ch === "?" ? "." : `\\${ch}`));
+  return new RegExp(`^${escaped}$`);
+}
+
+function auditLine(row: AuditRow, prefix: string): string {
+  const payload = JSON.stringify(row.payload);
+  const summary = payload.length > 160 ? `${payload.slice(0, 157)}…` : payload;
+  return `${prefix}${new Date(row.ts).toISOString()}  #${row.seq}  ${row.kind}${row.beeId ? `  bee=${row.beeId}` : ""}  ${summary}`;
+}
+
+/**
+ * `hive v2 events [--bee b] [--kind glob] [--tail n] [--follow]` — the audit
+ * log is a complete ordered record of every write; this is its tail (the v1
+ * `events` shape over the v2 ledger). Kind filtering is a client-side glob
+ * (`--kind 'bee.*'`). Works with the daemon down (stale, read-only).
+ */
+async function cmdEvents(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const kindGlob = parsed.flags.get("--kind") as string | undefined;
+  const matcher = kindGlob ? globToRegExp(kindGlob) : null;
+  const beeFlag = parsed.flags.get("--bee") as string | undefined;
+  const limit = numFlag(parsed, "--tail", 50);
+  const follow = parsed.flags.get("--follow") === true;
+
+  const readRows = (afterSeq: number, n: number): Promise<{ result: AuditTailResult; stale: boolean }> =>
+    readPath(
+      ctx,
+      async (c) => {
+        const beeId = beeFlag ? resolveBeeIn((await c.request<ListResult>("list")).views, beeFlag) : undefined;
+        return c.request<AuditTailResult>("audit.tail", { afterSeq, limit: n, ...(beeId ? { beeId } : {}) });
+      },
+      (store) => {
+        const beeId = beeFlag ? resolveBeeIn(store.list(null), beeFlag) : undefined;
+        return { rows: store.auditRows(afterSeq, beeId).slice(-n) };
+      },
+    );
+
+  const { result, stale } = await readRows(0, limit);
+  const rows = matcher ? result.rows.filter((r) => matcher.test(r.kind)) : result.rows;
+  const prefix = stale ? "stale: " : "";
+  emit(
+    ctx,
+    rows.length > 0 ? rows.map((r) => auditLine(r, prefix)) : [`${prefix}no events`],
+    { rows },
+    stale,
+  );
+  if (!follow) return 0;
+
+  // Follow: poll the cursor. Works daemon-up (RPC) and daemon-down (stale poll).
+  let lastSeq = result.rows.length > 0 ? (result.rows[result.rows.length - 1] as AuditRow).seq : 0;
+  let stopped = false;
+  const onSigint = (): void => {
+    stopped = true;
+  };
+  process.once("SIGINT", onSigint);
+  try {
+    while (!stopped) {
+      await sleep(300);
+      if (stopped) break;
+      const next = await readRows(lastSeq, 1000);
+      for (const row of next.result.rows) {
+        lastSeq = Math.max(lastSeq, row.seq);
+        if (matcher && !matcher.test(row.kind)) continue;
+        ctx.io.out(ctx.json ? JSON.stringify(row) : auditLine(row, next.stale ? "stale: " : ""));
+      }
+    }
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+  }
+  return 0;
+}
+
+// --- set-model (sugar over bee.setArgs) ------------------------------------
+
+function grammarForAgent(agent: string): ArgGrammar | null {
+  if (agent === "claude") return claudeArgGrammar;
+  if (agent === "codex") return codexArgGrammar;
+  return null;
+}
+
+/**
+ * Replace/inject the model selector in a bee's per-bee args. Known harness
+ * grammars go through the composition helpers (later valued flag wins, alias
+ * folding, `--model=x` handled); unknown harnesses get a conservative
+ * in-place replace of `--model/-m`. `model: null` strips the selector.
+ * Exported for tests.
+ */
+export function withModelArg(agent: string, args: string[] | null, model: string | null): string[] | null {
+  const grammar = grammarForAgent(agent);
+  const current = args ?? [];
+  if (model === null) {
+    const next = grammar
+      ? parseArgUnits(grammar, current)
+          .filter((u) => u.identity !== "--model")
+          .flatMap((u) => u.tokens)
+      : stripGenericModel(current);
+    return next.length === 0 ? null : next;
+  }
+  if (grammar) return composeArgv(grammar, [current, ["--model", model]]);
+  const next = [...current];
+  for (let i = 0; i < next.length; i += 1) {
+    const tok = next[i] as string;
+    if ((tok === "--model" || tok === "-m") && i + 1 < next.length) {
+      next[i + 1] = model;
+      return next;
+    }
+    if (tok.startsWith("--model=")) {
+      next[i] = `--model=${model}`;
+      return next;
+    }
+  }
+  return [...next, "--model", model];
+}
+
+function stripGenericModel(args: readonly string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const tok = args[i] as string;
+    if (tok === "--model" || tok === "-m") {
+      i += 1; // skip the value
+      continue;
+    }
+    if (tok.startsWith("--model=")) continue;
+    out.push(tok);
+  }
+  return out;
+}
+
+/**
+ * `hive v2 set-model <bee> <model> | --clear` — v1's set-model, v2-shaped:
+ * per-bee args surgery over `bee.setArgs`. Unlike v1 it does NOT relaunch in
+ * place — the daemon owns runtimes; the change applies on the NEXT runtime
+ * (stop or revive to apply now).
+ */
+async function cmdSetModel(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const usage = "usage: hive v2 set-model <bee> <model> | set-model <bee> --clear";
+  const [, needle, model] = parsed.positional;
+  const clear = parsed.flags.get("--clear") === true;
+  if (!needle || (!model && !clear)) throw new Error(usage);
+  if (model && clear) throw new Error(`set-model: pass either <model> or --clear, not both\n${usage}`);
+  return withClient(ctx, async (c) => {
+    const list = await c.request<ListResult>("list");
+    const beeId = resolveBeeIn(list.views, needle);
+    const bee = list.views.find((v) => v.bee?.id === beeId)?.bee;
+    const args = withModelArg(bee?.agent ?? "", bee?.args ?? null, clear ? null : (model as string));
+    const r = await c.request<SetArgsResult>("bee.setArgs", {
+      beeId,
+      args,
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    });
+    emit(
+      ctx,
+      [
+        `${r.applied ? "set" : "unchanged"} model for ${beeId}: ${clear ? "harness default" : model} — args ${r.bee.args ? JSON.stringify(r.bee.args) : "(none)"}` +
+          " — applies to the next runtime (stop or revive to apply)",
+      ],
+      r,
+      false,
+    );
+    return 0;
+  });
+}
+
+// --- usage (account_limits rendering, the v1 `usage` table) ----------------
+
+function usageBar(pct: number): string {
+  const width = 10;
+  const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+  return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
+function timeUntil(atMs: number | null, now: number): string {
+  if (atMs == null) return "";
+  const delta = atMs - now;
+  if (delta <= 0) return "now";
+  const minutes = Math.round(delta / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function usageWindowCell(pct: number | null, resetsAt: number | null, now: number, bar: boolean): string {
+  if (pct == null) return "-";
+  const clamped = Math.max(0, Math.min(100, pct));
+  const reset = resetsAt != null ? ` ⟳ ${timeUntil(resetsAt, now)}` : "";
+  return `${bar ? `${usageBar(clamped)} ` : ""}${String(Math.round(clamped)).padStart(3)}%${reset}`;
+}
+
+/** "live" for a fresh row, else "<age> ago". */
+function fetchedAgo(fetchedAt: number, now: number): string {
+  const ageMs = now - fetchedAt;
+  if (ageMs < 60_000) return "live";
+  return `${timeUntil(now + ageMs, now)} ago`;
+}
+
+/**
+ * `hive v2 usage [account]` — where the accounts stand against the providers'
+ * real 5h/weekly/fable windows (v1's `usage`/`limits` table). Daemon up: the
+ * rows are refreshed via `account.limits`; down: the cached snapshots, stale.
+ */
+async function cmdUsage(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const id = parsed.positional[1];
+  const { result, stale } = await readPath(
+    ctx,
+    (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}),
+    (store) => ({ limits: store.accountLimits().filter((l) => id === undefined || l.account === id) }),
+  );
+  if (result.limits.length === 0) {
+    emit(ctx, [`${stale ? "stale: " : ""}no accounts${id ? ` matching ${id}` : ""} — add one with: hive v2 account add <harness> <label>`], result, stale);
+    return 0;
+  }
+  const now = Date.now();
+  const rows = result.limits.map((l) =>
+    l.readable
+      ? [
+          l.account,
+          l.plan ?? "-",
+          usageWindowCell(l.fiveHourPct, l.fiveHourResetsAt, now, true),
+          usageWindowCell(l.weeklyPct, l.weeklyResetsAt, now, true),
+          usageWindowCell(l.fableWeeklyPct, l.fableResetsAt, now, false),
+          fetchedAgo(l.fetchedAt, now),
+        ]
+      : [l.account, "-", `unreadable: ${l.error ?? "?"}`, "", "", ""],
+  );
+  const headers = ["ACCOUNT", "PLAN", "5H", "WEEKLY", "FABLE", "AS-OF"];
+  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? "").length)));
+  const line = (cells: string[]): string =>
+    cells.map((cell, i) => cell.padEnd(widths[i] as number)).join("  ").trimEnd();
+  const prefix = stale ? "stale: " : "";
+  emit(ctx, [`${prefix}${line(headers)}`, ...rows.map((r) => `${prefix}${line(r)}`)], result, stale);
+  return 0;
+}
+
+// --- attach ----------------------------------------------------------------
+
+/**
+ * `hive v2 attach <bee> [--print]` — tmux-substrate bees only: attach the
+ * driver's recorded session (`hive-v2-<bee>-g<generation>`). hsr/cell bees
+ * are pane-less by design and are refused with the v2 way to watch them.
+ */
+async function cmdAttach(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const needle = parsed.positional[1];
+  if (!needle) throw new Error("usage: hive v2 attach <bee> [--print]");
+  const { result } = await readBee(ctx, needle);
+  const bee = result.bee;
+  if (!bee) throw new RpcError("bee_not_found", `bee not found: ${needle}`);
+  if (bee.substrate !== "tmux") {
+    const how = bee.substrate === "cell" ? "a cell bee (headless harness inside its checkout)" : `an ${bee.substrate} bee (pane-less runner)`;
+    ctx.io.err(
+      `hive v2 attach: ${bee.id} is ${how} — there is no terminal to attach.\n` +
+        `watch it with: hive v2 tail ${needle}  |  hive v2 transcript ${needle} --follow\n` +
+        `talk to it with: hive v2 send ${needle} <message…>`,
+    );
+    return 1;
+  }
+  const generation = result.view.generation;
+  if (generation == null) throw new Error(`hive v2 attach: ${bee.id} has no recorded runtime generation`);
+  const session = sessionNameFor(bee.id, generation);
+  const command = `tmux attach-session -t =${session}`;
+  if (parsed.flags.get("--print") === true || ctx.json) {
+    emit(ctx, [command], { beeId: bee.id, session, command }, false);
+    return 0;
+  }
+  const res = spawnSync("tmux", ["attach-session", "-t", `=${session}`], { stdio: "inherit" });
+  if (res.error) throw new Error(`tmux attach failed: ${res.error.message}`);
+  return res.status ?? 0;
+}
+
+// ---------------------------------------------------------------------------
 // WP7 cutover: freeze the old world, import its active bees (spec 07 B3/B4)
 // ---------------------------------------------------------------------------
 
@@ -1542,73 +2213,82 @@ async function cmdDaemon(ctx: CliContext, parsed: Parsed): Promise<number> {
 // entry
 // ---------------------------------------------------------------------------
 
-const HELP = `hive v2 — Honeybee reset stack (WP4)
+const HELP = `hive v2 — Honeybee reset stack
 
 Usage: hive v2 <command> [args] [--data-dir d] [--socket s] [--json]
+  Mutations go through the daemon (RPC). Reads fall back to the read-only
+  store when the daemon is down — that output is clearly labeled STALE.
+  (--idempotency-key on any mutation: spec 06 §4.2 one-key rule — a replayed
+   key returns the original outcome, marked deduped, instead of executing twice.)
 
-Mutations (RPC, daemon must be running):
-  spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]
+Spawn & run:
+  spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]... [--arg a]... [--account <id>|auto|none]
+  spawn … [--parent <bee>|--no-parent]        parenting: filled from HIVE_BEE_ID when spawning from a bee
   spawn <name> --agent <a> --substrate cell --origin <repo> [--sha s] [--warm [d,d]] [--sandbox|--no-sandbox]
-                                             spawn into a provisioned cell (spec 05): the bee's cwd is
-                                             the cell checkout; --sha defaults to the origin's HEAD
-  cell capture <bee> --onto <branch> [--rebase]   land the cell's commits onto an origin branch
-                                             (merge by default); refusals/conflicts are results
-  cell remove <bee> [--force]                delete the cell (dirty guard, A2) + delete the bee
-  send <bee> <message…> [--urgency now|next|idle] [--sender s] [--wait] [--timeout ms] [--idempotency-key k]
+                                              spawn into a provisioned cell (the bee's cwd is the checkout)
+  x <name> <prompt…>                          spawn + first send, fire-and-forget (--agent/--account/--cwd…)
+  run <name> -p <prompt> [--keep] [--timeout ms]   spawn, send, wait, print the reply, archive (--keep skips)
+  fork <bee> [--name n] [--prompt p|prompt…]  new bee, same shape, continues the source's conversation
+
+Message:
+  send <bee> <message…> [--urgency now|next|idle] [--sender s] [--wait] [--timeout ms]
                           urgency: now = interrupt the current turn, then deliver;
                           next = the next accept point (default); idle = wait until the turn ends
-  stop | revive | archive | unarchive | delete <bee>
-  revive <bee> [--arg a]... | [-- <args…>]   (revive with replacement per-bee args)
-  bee set-args <bee> -- <args…> | --clear    per-bee harness args (--model, --effort, …);
-  bee args <bee>                             layered over the agent spec on the NEXT runtime
-  rename <bee> <new-name>                    rename (names are labels; the id is the identity)
-  tag <bee> [--add t]... [--remove t]...     edit tags (apiary:workspace=… moves a bee between workspaces)
-  interrupt <bee>                            stop the current TURN, keep the runtime (idle = no-op)
-  fork <bee> [--name n] [--prompt p|prompt…] new bee, same shape, continues the source's conversation
-                                             in a NEW session; parentId = forkedFrom = source
-  spawn … [--parent <bee>|--no-parent]       parenting: filled from HIVE_BEE_ID when spawning from a bee
-  ask <question…> [--option o]... [--bee b]  (from inside a bee) ask the operator; the answer comes back as mail
-  answer <question-id> <answer…> [--by who]  answer an open question (also: question answer …)
-  seal <title> [--body t] [--ref r]... [--bee b]   record a seal for this bee (metadata; current generation)
-  spawn … [--account <id>|auto|none]         account binding (spec 08): auto (default) = the calibrated
-                                             least-loaded pick; an explicit id is validated
-  bee swap-account <bee> <account>           move a bee to another account of the SAME harness
-                                             (stop → rebind → revive with resume; claude gets a new session id)
-  account list [--harness h] · get <id>      accounts + latest limits (read-only fallback when the daemon is down)
-  account add <harness> <label> [--id id] [--home dir] [--penalty n]
-  account remove|pause|unpause <id> · penalty <id> <0-100>
-  account login <id>                         the login seat: a detached tmux session running the harness's
-                                             own login against the account's home; captured to the vault
-  account limits [<id>]                      refresh + show provider limits (feeds the auto pick)
-  account import [--root ~/.hive] [--dry-run] import the OLD vault registry (read-only) into rows + backfill
-  account backfill [--dry-run]               bind env-only (imported) bees to accounts by home path
-  (--idempotency-key: spec 06 §4.2 one-key rule — a replayed key returns the
-   original outcome, marked deduped, instead of executing twice)
+  ask <question…> [--option o]... [--bee b]   (from inside a bee) ask the operator; the answer returns as mail
+  answer <question-id> <answer…> [--by who]   answer an open question (also: question answer …)
+  question list [--bee b] [--open]
+  seal <title> [--body t] [--ref r]... [--bee b]   record a seal (metadata; current generation)
+  seal list [--bee b] · seal get <id>
 
-Reads (RPC; read-only store fallback labeled STALE when daemon is down):
-  view <bee> · list [--all|--archived] · mailbox <bee> · commands <bee>
-  children <bee> · question list [--bee b] [--open] · seal list [--bee b] · seal get <id>
+Observe:
+  list [--all|--archived]                     all bees with state (aliases: ls, ps)
+  view <bee> · mailbox <bee> · commands <bee> · children <bee>
+  transcript <bee> [--tail n] [--raw] [--follow]   the session log rendered as readable turns (alias: tx)
+  tail <bee> [-n lines] [--no-follow]         follow the raw session log (like tail -f)
+  last <bee> [--seal]                         the most recent assistant message (fallback: latest seal)
+  wait <bee> [--timeout ms] [--idle-ms ms]    block until the bee is idle/stopped with no queued mail
+  events [--bee b] [--kind glob] [--tail n] [--follow]   audit-row tail (the ledger of every write)
+  here [--json]                               this process's own bee (the HIVE_BEE_ID stamp)
+  usage [account]                             provider 5h/weekly/fable windows per account (alias: limits)
+  watch [--bee id]                            whole-node change stream (snapshot + seq deltas)
   deploy-info · health
 
-Templates + tracks + packages (spec 06 §1.4.1 — rows are truth, files are packages):
+Manage bees:
+  stop | revive | archive | unarchive | delete <bee>
+  revive <bee> [--arg a]... | [-- <args…>]    (revive with replacement per-bee args)
+  interrupt <bee>                             stop the current TURN, keep the runtime (idle = no-op)
+  rename <bee> <new-name>                     rename (names are labels; the id is the identity)
+  tag <bee> [--add t]... [--remove t]...      edit tags (apiary:workspace=… moves a bee between workspaces)
+  bee set-args <bee> -- <args…> | --clear     per-bee harness args (--model, --effort, …);
+  bee args <bee>                              layered over the agent spec on the NEXT runtime
+  set-model <bee> <model> | --clear           model surgery on the per-bee args (applies next runtime)
+  attach <bee> [--print]                      tmux-substrate bees only (hsr/cell are pane-less: use tail)
+  cell capture <bee> --onto <branch> [--rebase]   land the cell's commits onto an origin branch
+  cell remove <bee> [--force]                 delete the cell (dirty guard) + delete the bee
+
+Accounts:
+  account list [--harness h] · get <id>       accounts + latest limits
+  account add <harness> <label> [--id id] [--home dir] [--penalty n]
+  account remove|pause|unpause <id> · penalty <id> <0-100>
+  login <account>                             the login seat (also: account login <id>)
+  swap-account <bee> <account>                move a bee to another account of the SAME harness
+                                              (stop → rebind → revive with resume; claude gets a new session id)
+  account limits [<id>]                       refresh + show provider limits (feeds the auto pick)
+  account import [--root ~/.hive] [--dry-run] · account backfill [--dry-run]
+
+Templates & tracks (rows are truth, files are packages):
   template list [--scope s] · get|export <id|name> [--out f] · put --file f [--id id]
   template delete <id|name> · import <package.json> [--scope s] [--source label]
   track    list [--scope s] · get|export <id|name> [--out f] · put --file f [--id id]
   track    delete <id|name> · import <package.json> [--scope s] [--source label]
-  packages import-local [--dir d] [--scope s]   import ~/.hive-style local config (manual, v1)
+  packages import-local [--dir d] [--scope s]
 
-Cutover (spec 07 B3/B4 — freeze the old world, import its active bees):
+Cutover (freeze the old world, import its active bees):
   freeze [--root r] [--force]                 write <root>/FROZEN (refuses while the old daemon is alive)
   import --from-frozen [--root r] [--dry-run] [--force] [--verbose]
-                                              import active old-world bees (records + provider session
-                                              ids for harness-native resume); refuses while old
-                                              runtimes are live; idempotent; root defaults to ~/.hive
-
-Watch:
-  watch [--bee id]        whole-node change stream (snapshot + seq deltas)
 
 Daemon:
-  daemon run              run the daemon in the foreground
+  daemon run                                  run the daemon in the foreground
   daemon install|uninstall|start|stop|status`;
 
 export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<number> {
@@ -1657,9 +2337,45 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdCell(ctx, parsed);
       case "account":
         return await cmdAccount(ctx, parsed);
+      case "x":
+        return await cmdX(ctx, parsed);
+      case "run":
+        return await cmdRun(ctx, parsed);
+      case "wait":
+        return await cmdWait(ctx, parsed);
+      case "here":
+        return await cmdHere(ctx, parsed);
+      case "transcript":
+      case "tx":
+        return await cmdTranscript(ctx, parsed);
+      case "tail":
+        return await cmdTail(ctx, parsed);
+      case "last":
+        return await cmdLast(ctx, parsed);
+      case "events":
+        return await cmdEvents(ctx, parsed);
+      case "set-model":
+        return await cmdSetModel(ctx, parsed);
+      case "usage":
+      case "limits":
+        return await cmdUsage(ctx, parsed);
+      case "attach":
+        return await cmdAttach(ctx, parsed);
+      case "login": {
+        const id = parsed.positional[1];
+        if (!id) throw new Error("usage: hive v2 login <account>");
+        return await cmdAccount(ctx, { ...parsed, positional: ["account", "login", id] });
+      }
+      case "swap-account": {
+        const [, bee, account] = parsed.positional;
+        if (!bee || !account) throw new Error("usage: hive v2 swap-account <bee> <account>");
+        return await cmdBee(ctx, { ...parsed, positional: ["bee", "swap-account", bee, account] });
+      }
       case "view":
         return await cmdView(ctx, parsed);
       case "list":
+      case "ls":
+      case "ps":
         return await cmdList(ctx, parsed);
       case "mailbox":
         return await cmdMailbox(ctx, parsed);

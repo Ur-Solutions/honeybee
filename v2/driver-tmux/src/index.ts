@@ -4,6 +4,7 @@
  */
 export {
   TmuxDriver,
+  sessionNameFor,
   type DeliveryNote,
   type ObservationSpec,
   type TmuxDriverConfig,
@@ -13,13 +14,23 @@ export { TmuxServer, TmuxError, exactSession, shQuote, type TmuxServerConfig, ty
 export {
   claudeProjectKey,
   claudeTranscriptParser,
+  claudeTranscriptRenderer,
   codexTranscriptParser,
+  codexTranscriptRenderer,
   findTranscript,
   grokTranscriptParser,
+  grokTranscriptRenderer,
+  lastAssistantText,
+  renderTranscriptLines,
+  stubTranscriptRenderer,
   TRANSCRIPT_PARSERS,
+  TRANSCRIPT_RENDERERS,
   type TranscriptEvent,
   type TranscriptLocator,
   type TranscriptParser,
+  type TranscriptRenderer,
+  type TranscriptTurn,
+  type TranscriptTurnRole,
 } from "./transcripts.ts";
 export { parseEventsFileLine } from "./events-file.ts";
 export { JsonlTail } from "./tail.ts";
