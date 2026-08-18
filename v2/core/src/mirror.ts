@@ -168,6 +168,8 @@ export const MIRROR_RUNTIME_KEYS = [
   "exitCause",
   "pid",
   "pidStartedAt",
+  // v9: additive — how the runtime left booting ('synthetic' | 'real' | null).
+  "bootEvidence",
   "startedAt",
   "updatedAt",
 ] as const;

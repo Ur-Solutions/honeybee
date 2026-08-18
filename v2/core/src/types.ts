@@ -136,6 +136,16 @@ export interface BeeRow {
   account: string | null;
 }
 
+/**
+ * v9 — how a runtime left `booting` (null while it has not). 'synthetic':
+ * only a driver-minted observation moved it (the readyAtSpawn spawn-event
+ * booted) — provisional, proves nothing; a crashed/clean exit from it counts
+ * against the bee's spawn-failure budget like an exit during `booting`.
+ * 'real': the adapter parsed actual output from the process — the contrary
+ * evidence that resets the budget and clears `spawn_failed`.
+ */
+export type BootEvidence = "synthetic" | "real";
+
 export interface RuntimeRow {
   beeId: string;
   generation: number;
@@ -143,6 +153,7 @@ export interface RuntimeRow {
   exitCause: ExitCause | null;
   pid: number | null;
   pidStartedAt: number | null;
+  bootEvidence: BootEvidence | null;
   startedAt: number;
   updatedAt: number;
 }

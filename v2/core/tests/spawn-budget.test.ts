@@ -197,3 +197,77 @@ test("budget.4: the counter and the suppression survive a store close/reopen (da
   assert.equal(store.send(bee.id, "more").wakeCommand, null);
   store.close();
 });
+
+test("budget.8 (v9 synthetic boot): a synthetic booting→running never resets the budget; its crashed/clean exit counts like a booting exit; recordBootEvidence is the contrary evidence", (t) => {
+  // The 2026-08-18 soak loop: a readyAtSpawn harness (claude) spawns fine,
+  // dies instantly with zero output. The driver-minted synthetic booted moved
+  // the store to running, which — pre-fix — reset spawn_failures every
+  // generation, so the crash → wake → revive loop never converged.
+  const h = harness();
+  t.after(() => h.cleanup());
+  // Large backoff base: the helper clock advances 1s per call, so the
+  // deferral must dominate that drift to be observable.
+  const store = h.open({ maxAttempts: 3, backoffBaseMs: 60_000 });
+  const { bee } = makeBee(store);
+  store.send(bee.id, "hello");
+  assert.equal(store.currentRuntime(bee.id)?.bootEvidence, null, "no evidence while booting");
+
+  // Failure 1: plain booting exit (baseline, unchanged).
+  bootCrash(store, bee.id);
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 1);
+
+  // Failure 2: gen 2 goes running on a SYNTHETIC booted, then crashes.
+  store.reviveBee(bee.id);
+  store.updateRuntimeState(bee.id, 2, "running", { pid: 10, pidStartedAt: 1, synthetic: true });
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 1, "REGRESSION: the synthetic booted must not reset the counter");
+  assert.equal(store.currentRuntime(bee.id)?.bootEvidence, "synthetic");
+  store.updateRuntimeState(bee.id, 2, "stopped", { exitCause: "crashed" });
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 2, "a synthetic-running crash counts like a booting exit");
+  // The next wake sits on the B5 backoff table exactly like a booting exit.
+  const wake = store.enqueueWake(bee.id);
+  assert.equal(wake.outcome, "enqueued");
+  assert.ok(wake.command!.nextAttemptAt > wake.command!.enqueuedAt, "backoff applies");
+
+  // Failure 3: a CLEAN exit from synthetic-running counts too → budget → flag.
+  store.reviveBee(bee.id);
+  store.updateRuntimeState(bee.id, 3, "running", { pid: 11, pidStartedAt: 2, synthetic: true });
+  store.updateRuntimeState(bee.id, 3, "stopped", { exitCause: "clean" });
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 3);
+  assert.deepEqual(store.activeFlags(bee.id).map((f) => f.flag), ["spawn_failed"]);
+  assert.equal(store.enqueueWake(bee.id).outcome, "suppressed");
+
+  // Operator revive resets as before; then REAL evidence upgrades gen 4:
+  // the crash afterwards is an ordinary post-running crash, uncounted.
+  store.resetSpawnFailures(bee.id, "operator revive");
+  store.reviveBee(bee.id);
+  store.updateRuntimeState(bee.id, 4, "running", { pid: 12, pidStartedAt: 3, synthetic: true });
+  const ev = store.recordBootEvidence(bee.id, 4);
+  assert.equal(ev.applied, true);
+  assert.equal(store.currentRuntime(bee.id)?.bootEvidence, "real");
+  assert.deepEqual(store.recordBootEvidence(bee.id, 4), { applied: false }, "idempotent");
+  store.updateRuntimeState(bee.id, 4, "stopped", { exitCause: "crashed" });
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 0, "real evidence made this a normal post-running crash");
+  assert.deepEqual(store.activeFlags(bee.id), []);
+  const immediate = store.enqueueWake(bee.id);
+  assert.equal(immediate.command?.nextAttemptAt, immediate.command?.enqueuedAt, "no backoff after real evidence");
+  assert.deepEqual(store.recordBootEvidence(bee.id, 4), { applied: false }, "stopped runtime: silent no-op");
+  assert.deepEqual(store.recordBootEvidence(bee.id, 99), { applied: false }, "stale generation: silent no-op");
+
+  // Evidence may also land while still `booting` (a real booted parsed before
+  // the daemon applies the transition): it resets the counter right there,
+  // and spawn_failed clears with it.
+  store.reviveBee(bee.id);
+  bootCrash(store, bee.id); // failures 1
+  store.reviveBee(bee.id);
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 1);
+  const gen = store.currentRuntime(bee.id)!.generation;
+  assert.equal(store.recordBootEvidence(bee.id, gen).applied, true);
+  assert.equal(store.getBee(bee.id)?.spawnFailures, 0);
+  assert.equal(store.currentRuntime(bee.id)?.bootEvidence, "real");
+  store.updateRuntimeState(bee.id, gen, "running", { pid: 13, pidStartedAt: 4, synthetic: true });
+  assert.equal(store.currentRuntime(bee.id)?.bootEvidence, "real", "real is sticky — never downgraded to synthetic");
+
+  // Audit replay reproduces the evidence column, the counter and the flags.
+  assert.deepEqual(replayAudit(store.auditRows()), store.dumpState());
+  store.close();
+});

@@ -130,6 +130,7 @@ function mapRuntime(r: Row): RuntimeRow {
     exitCause: (r.exit_cause as ExitCause | null) ?? null,
     pid: r.pid == null ? null : Number(r.pid),
     pidStartedAt: r.pid_started_at == null ? null : Number(r.pid_started_at),
+    bootEvidence: (r.boot_evidence as RuntimeRow["bootEvidence"]) ?? null,
     startedAt: Number(r.started_at),
     updatedAt: Number(r.updated_at),
   };

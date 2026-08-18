@@ -121,6 +121,15 @@ interface ManagedProcess {
   killTimer: NodeJS.Timeout | null;
   stdoutRest: string;
   exited: boolean;
+  /**
+   * v9: whether the adapter has parsed at least one signal from this
+   * process's actual output. A readyAtSpawn runtime opens its accept point on
+   * a driver-minted synthetic booted; only real output upgrades it — the
+   * first parsed signal pushes a real `booted` observation so the daemon
+   * learns, in stream order, that the process demonstrably runs (the
+   * spawn-failure budget resets on that, never on the synthetic booted).
+   */
+  realEvidence: boolean;
 }
 
 export class HsrDriver implements RuntimeDriver {
@@ -200,6 +209,7 @@ export class HsrDriver implements RuntimeDriver {
       killTimer: null,
       stdoutRest: "",
       exited: false,
+      realEvidence: false,
     };
     this.procs.set(beeId, proc);
 
@@ -229,6 +239,11 @@ export class HsrDriver implements RuntimeDriver {
       // exited(crashed) while still booting — a boot failure that counts
       // against the bee's spawn-failure budget, not a phantom
       // running → crashed generation that revives forever.
+      // v9: the observation is marked `synthetic` — the OS confirming the
+      // spawn proves NOTHING about the agent (2026-08-18 soak: a claude that
+      // spawns fine but dies instantly looped crash → wake → revive unbounded
+      // because this booted reset the budget every generation). Only real
+      // parsed output (onSignal) is boot evidence.
       proc.phase = "idle";
       child.on("spawn", () => {
         if (proc.exited) return;
@@ -238,6 +253,7 @@ export class HsrDriver implements RuntimeDriver {
           kind: "booted",
           pid: proc.pid,
           pidStartedAt: proc.pidStartedAt,
+          synthetic: true,
         });
       });
     }
@@ -275,9 +291,11 @@ export class HsrDriver implements RuntimeDriver {
     if (p.phase === "idle") {
       // The driver owns the turn_started edge: input was injected into an
       // idle runtime (claude emits no explicit turn-start line; adapters that
-      // do emit one are deduplicated by phase in onSignal).
+      // do emit one are deduplicated by phase in onSignal). v9: synthetic —
+      // writing to stdin proves nothing about the process; only parsed
+      // output is boot evidence for the spawn-failure budget.
       p.phase = "running";
-      this.events.push({ beeId, generation, kind: "turn_started" });
+      this.events.push({ beeId, generation, kind: "turn_started", synthetic: true });
     }
     return { accepted: true };
   }
@@ -390,6 +408,10 @@ export class HsrDriver implements RuntimeDriver {
       killTimer: null,
       stdoutRest: "",
       exited: false,
+      // Degraded: no event stream, so no evidence can ever be parsed. The
+      // store's persisted boot_evidence for the row (from before the daemon
+      // restart) governs its exit accounting; this field is driver-local.
+      realEvidence: false,
     });
     return true;
   }
@@ -563,6 +585,26 @@ export class HsrDriver implements RuntimeDriver {
   }
 
   private onSignal(p: ManagedProcess, signal: ReturnType<HarnessAdapter["parseLine"]>[number]): void {
+    if (!p.realEvidence) {
+      p.realEvidence = true;
+      // v9: the first ADAPTER-PARSED signal from a process whose phase left
+      // "booting" without real output (the readyAtSpawn synthetic path) is
+      // the proof the agent actually runs. Push a real `booted` observation
+      // so the daemon learns it in stream order — downstream it is a state
+      // no-op (the store is already past booting) but it carries the boot
+      // evidence that resets the spawn-failure budget. While the phase is
+      // still "booting" the signal below drives the real booted itself, and
+      // an exit before that stays an ordinary boot failure.
+      if (p.phase !== "booting") {
+        this.events.push({
+          beeId: p.beeId,
+          generation: p.generation,
+          kind: "booted",
+          pid: p.pid,
+          pidStartedAt: p.pidStartedAt,
+        });
+      }
+    }
     switch (signal.kind) {
       case "booted": {
         if (signal.sessionId) {

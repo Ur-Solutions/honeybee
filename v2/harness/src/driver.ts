@@ -43,6 +43,18 @@ export interface DriverObservation {
   pid?: number;
   pidStartedAt?: number;
   exitCause?: ObservedExitCause;
+  /**
+   * True when the DRIVER minted this observation itself instead of deriving it
+   * from the process's own output (the readyAtSpawn synthetic `booted`; the
+   * `turn_started` the driver opens when it injects input into an idle
+   * runtime). Synthetic observations drive the state model — delivery needs
+   * the runtime out of `booting` — but they are NOT boot evidence: the
+   * spawn-failure budget resets only on an observation the adapter parsed
+   * from real process output (absent/false = real). A generation that dies
+   * having produced nothing but synthetic observations counts against the
+   * bee's spawn-failure budget exactly like an exit during `booting`.
+   */
+  synthetic?: boolean;
 }
 
 export interface DeliverOutcome {

@@ -14,7 +14,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore, type CoreStore } from "../../core/src/index.ts";
 import { DaemonCore, type DaemonPolicy, type I1ViolationEvent } from "../src/loops.ts";
-import { FakeDriver } from "./helpers.ts";
+import { HsrDriver } from "../../driver-hsr/src/index.ts";
+import { stubAdapter } from "../../adapters/src/index.ts";
+import { AGENT_PATH, FakeDriver, sleep } from "./helpers.ts";
 
 interface Rig {
   dir: string;
@@ -457,6 +459,238 @@ test("budget.7: a runtime that reached running/idle and then crashed is not a sp
     assert.deepEqual(rig.store.activeFlags("bee-1"), []);
   } finally {
     rig.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v9 synthetic-boot budget (the 2026-08-18 soak finding): a readyAtSpawn
+// harness (claude stream-json) that spawns fine but dies instantly with ZERO
+// output gets a driver-minted SYNTHETIC booted. REGRESSION: before the fix
+// that booted was indistinguishable from a real one, so every generation went
+// booting → running (budget reset!) → crashed (not counted: "post-running"),
+// and the bee looped crash → wake → revive UNBOUNDED at wake speed — the
+// exact command.enqueued → command.claimed → runtime.created → flag.clear_noop
+// → command.completed → runtime.updated audit loop the operator's first soak
+// surfaced, hundreds of times over.
+// ---------------------------------------------------------------------------
+
+test("budget.8 (soak regression): readyAtSpawn instant death — the synthetic booted must NOT reset the budget; exactly maxAttempts generations, backoff, spawn_failed, wakes suppressed", () => {
+  const rig = makeRig({ i1DeadlineSteps: 100_000 }); // generous: the flag lands first; the I1 clock then suspends
+  try {
+    rig.driver.synthBootCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "claude", substrate: "hsr", cwd: "/tmp" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    rig.store.send("bee-1", "hello?"); // pending mail is what makes revives happen
+    stepUntilQuiet(rig, 40);
+
+    // Bounded: exactly the budget's worth of generations (maxAttempts 3), not 40.
+    assert.equal(rig.driver.starts.length, 3, `starts: ${JSON.stringify(rig.driver.starts)}`);
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 3, "every synthetic-boot crash counted");
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"]);
+    const rt = rig.store.currentRuntime("bee-1");
+    assert.equal(rt?.generation, 3);
+    assert.equal(rt?.state, "stopped");
+    assert.equal(rt?.exitCause, "crashed");
+    assert.equal(rt?.bootEvidence, "synthetic", "the generation never produced real output");
+    // The wakes between generations sat on the B5 backoff table.
+    const wakes = rig.store.listCommands({ beeId: "bee-1" }).filter((c) => c.verb === "send_wake");
+    assert.equal(wakes.length, 2, "one wake per revive below the budget; none once flagged");
+    for (const w of wakes) assert.ok(w.nextAttemptAt > w.enqueuedAt, `wake ${w.id} was not deferred`);
+    // THE regression assertion: the budget was never reset by a synthetic
+    // booted (pre-fix, one bee.spawn_failures reset row appeared per
+    // generation and the loop never converged).
+    const resets = rig.store.auditRows().filter((r) => r.kind === "bee.spawn_failures" && r.payload.spawnFailures === 0);
+    assert.equal(resets.length, 0, "no budget reset without real evidence");
+    // Steady state: suppressed — more time and more mail change nothing.
+    rig.store.send("bee-1", "anyone?");
+    rig.clock.now += 100_000;
+    for (let i = 0; i < 20; i++) rig.core.step();
+    assert.equal(rig.driver.starts.length, 3, "no further generations while spawn_failed is set");
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 2, "mail stays durable, never delivered to a dying runtime");
+    assert.equal(rig.store.view("bee-1").blocked, true, "visibly blocked");
+    assert.equal(rig.violations.length, 0, "flagged bee: the I1 clock is suspended");
+
+    // Operator revive: fresh budget; with the harness fixed it boots for real
+    // (real booted = contrary evidence), the flag clears, the mail flows.
+    rig.driver.synthBootCrash = false;
+    rig.store.enqueueCommand("revive", "bee-1");
+    for (let i = 0; i < 4; i++) rig.core.step();
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 0);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.equal(rig.store.currentRuntime("bee-1")?.bootEvidence, "real");
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 0);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("budget.9 (I1): a message that never reaches a real runtime violates while the loop retries, and the spawn_failed flag is the legal terminal that suspends the clock", () => {
+  // Tight deadline: the breach is detected while the bounded retry loop is
+  // still running (pre-fix this also fired for `next` urgency — the deadline
+  // base is enqueue time — but the loop itself never terminated).
+  const rig = makeRig({ i1DeadlineSteps: 5 });
+  try {
+    rig.driver.synthBootCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "claude", substrate: "hsr", cwd: "/tmp" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    const sent = rig.store.send("bee-1", "am I alive?");
+    rig.core.step(); // spawn → synthetic booted + crash observed next step
+    rig.core.step(); // crash counted (1), wake deferred
+    rig.clock.now += 50; // far past the 5-step deadline, before the budget is exhausted
+    rig.core.step();
+    assert.equal(rig.violations.length, 1, "undelivered message past deadline must violate");
+    assert.equal(rig.violations[0]?.messageId, sent.message.id);
+    // Run the loop to exhaustion: flag set, no second report, clock suspended.
+    stepUntilQuiet(rig, 30);
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"]);
+    rig.clock.now += 100_000;
+    for (let i = 0; i < 10; i++) rig.core.step();
+    assert.equal(rig.violations.length, 1, "flagged = visibly blocked; no further I1 reports");
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 1, "the message was never marked delivered to a dying generation");
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("budget.9b (I1, idle urgency): pre-fix the churn re-based the idle clock forever — post-fix the bee lands flagged (the 'or the bee is flagged' arm)", () => {
+  // An `idle`-urgency message's I1 clock re-bases on every runtime state
+  // change (rt.updatedAt). Pre-fix the crash → revive churn bumped it each
+  // generation faster than any deadline, so the message NEVER violated and
+  // the loop ran forever silently. The budget is what guarantees the legal
+  // terminal now: spawn_failed, visibly blocked.
+  const rig = makeRig({ i1DeadlineSteps: 1_000 });
+  try {
+    rig.driver.synthBootCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "claude", substrate: "hsr", cwd: "/tmp" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    rig.store.send("bee-1", "whenever", { urgency: "idle" });
+    stepUntilQuiet(rig, 40);
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"]);
+    assert.equal(rig.driver.starts.length, 3, "bounded");
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 1);
+    assert.equal(rig.store.view("bee-1").blocked, true, "the bee is flagged — the message's fate is visible");
+    assert.equal(rig.violations.length, 0);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("budget.10: real evidence (the late init a readyAtSpawn harness emits) resets the counter — a generation that spoke and then crashed is a normal post-running crash", () => {
+  const rig = makeRig();
+  try {
+    rig.driver.synthBootEvidenceCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "claude", substrate: "hsr", cwd: "/tmp" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    rig.store.send("bee-1", "hello?");
+    // Far more cycles than the budget (3): never counted, never flagged.
+    stepUntilQuiet(rig, 40);
+    assert.ok(rig.driver.starts.length > 6, `real-evidence crashes revive unbudgeted (starts: ${rig.driver.starts.length})`);
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 0, "real evidence resets the counter every generation");
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+    // Wakes are immediate — no backoff without boot failures.
+    const wakes = rig.store.listCommands({ beeId: "bee-1" }).filter((c) => c.verb === "send_wake");
+    assert.ok(wakes.length > 0);
+    for (const w of wakes) assert.equal(w.nextAttemptAt, w.enqueuedAt, `wake ${w.id} must not back off`);
+    // Every settled generation carries the real-evidence mark.
+    const settled = rig.store.listRuntimes("bee-1").filter((r) => r.state === "stopped");
+    assert.ok(settled.length > 6);
+    for (const r of settled) assert.equal(r.bootEvidence, "real", `generation ${r.generation}`);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine, emits zero output and dies ~60ms later — bounded generations over wall time; fixed harness + operator revive recovers", async () => {
+  // The operator's first-soak audit shape: command.enqueued → command.claimed
+  // → runtime.created → … → command.completed → runtime.updated, repeating
+  // unbounded. Pre-fix the driver's spawn-event synthetic booted reset the
+  // budget every generation; this pins the bounded post-fix behavior against
+  // real OS processes and the real HsrDriver.
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-synthboot-"));
+  const ops: string[] = [];
+  const store = openCoreStore(join(dir, "core.sqlite3"), { maxAttempts: 3, backoffBaseMs: 30 });
+  let fixed = false;
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    stopKillGraceMs: 300,
+    resolve: () => ({
+      // The claude shape without claude: a readyAtSpawn adapter over a child
+      // that spawns cleanly, writes NOTHING, and exits 9 after ~60ms. The
+      // "fixed" harness is the ordinary stub agent (its ready line is real
+      // parsed output — boot evidence).
+      adapter: { ...stubAdapter, readyAtSpawn: true },
+      command: process.execPath,
+      args: fixed ? [AGENT_PATH] : ["-e", "setTimeout(() => process.exit(9), 60)"],
+      cwd: dir,
+      env: { ...process.env, STUB_TURN_MS: "5" },
+    }),
+  });
+  const core = new DaemonCore({
+    store,
+    driver,
+    policy: { bootHangTimeoutSteps: 5000, turnHangTimeoutSteps: 5000, commandsPerStep: 8 },
+    now: Date.now,
+    log: (op) => ops.push(op),
+  });
+  core.boot();
+  try {
+    store.createBee({ id: "bee-x", name: "bee-x", agent: "claude", substrate: "hsr", cwd: dir });
+    store.enqueueCommand("spawn", "bee-x");
+    store.send("bee-x", "hello?");
+    // Step slower (150ms) than the child's lifetime (60ms) so each death is
+    // observed together with its synthetic booted — the soak cadence, where
+    // delivery never reaches the doomed runtime.
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      core.step();
+      const flagged = store.activeFlags("bee-x").some((f) => f.flag === "spawn_failed");
+      if (flagged && store.currentRuntime("bee-x")?.state === "stopped") break;
+      assert.ok(Date.now() < deadline, `never reached spawn_failed; ops tail: ${ops.slice(-25).join(" | ")}`);
+      await sleep(150);
+    }
+    // Settle: nothing further may start.
+    for (let i = 0; i < 5; i++) {
+      await sleep(150);
+      core.step();
+    }
+    const runtimes = store.listRuntimes("bee-x");
+    assert.equal(
+      runtimes.length,
+      3,
+      `exactly maxAttempts generations: ${JSON.stringify(runtimes.map((r) => [r.generation, r.state, r.exitCause, r.bootEvidence]))}`,
+    );
+    for (const r of runtimes) {
+      assert.equal(r.state, "stopped");
+      assert.equal(r.exitCause, "crashed");
+      assert.equal(r.bootEvidence, "synthetic", `generation ${r.generation} never produced real output`);
+    }
+    assert.equal(store.getBee("bee-x")?.spawnFailures, 3);
+    assert.equal(store.enqueueWake("bee-x").outcome, "suppressed", "wakes suppressed while spawn_failed is set");
+    assert.equal(store.undeliveredMessages("bee-x").length, 1, "the message never reached a dying runtime");
+    assert.equal(
+      store.auditRows().filter((r) => r.kind === "bee.spawn_failures" && r.payload.spawnFailures === 0).length,
+      0,
+      "REGRESSION: no synthetic-booted budget reset, ever",
+    );
+    // Operator revive with the harness fixed: real output → evidence → flag
+    // clears, counter resets, the mail finally flows.
+    fixed = true;
+    store.enqueueCommand("revive", "bee-x");
+    const ok = Date.now() + 10_000;
+    for (;;) {
+      core.step();
+      if (store.undeliveredMessages("bee-x").length === 0 && store.currentRuntime("bee-x")?.state === "idle") break;
+      assert.ok(Date.now() < ok, `revive did not recover; ops tail: ${ops.slice(-25).join(" | ")}`);
+      await sleep(50);
+    }
+    assert.deepEqual(store.activeFlags("bee-x"), []);
+    assert.equal(store.getBee("bee-x")?.spawnFailures, 0);
+    assert.equal(store.currentRuntime("bee-x")?.bootEvidence, "real");
+  } finally {
+    driver.disposeAll();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

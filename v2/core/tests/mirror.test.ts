@@ -173,6 +173,7 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "exitCause": null,
         "pid": null,
         "pidStartedAt": null,
+        "bootEvidence": null,
         "startedAt": 1002000,
         "updatedAt": 1002000
       }
