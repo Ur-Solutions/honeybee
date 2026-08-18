@@ -124,7 +124,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "providerSessionId": null,
         "env": {},
         "importedFrom": null,
-        "spawnFailures": 0
+        "spawnFailures": 0,
+        "args": null
       },
       "runtime": {
         "beeId": "BEE_ID",

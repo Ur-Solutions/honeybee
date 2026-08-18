@@ -6,7 +6,9 @@
  * and HONORS `thread/resume {threadId}` the way the real app-server does:
  * the response carries the same `thread.id`. Never a real agent CLI.
  *
- * env FAKE_CODEX_RPC_LOG   append {method, params, env:{CODEX_HOME}} per request
+ * env FAKE_CODEX_RPC_LOG   append {method, params, argv, env:{CODEX_HOME}} per request
+ *                          (argv = the process's own args, so a test can see which
+ *                          `-c key=value` overrides reached the app-server child)
  */
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -20,7 +22,7 @@ function log(method, params) {
   if (!process.env.FAKE_CODEX_RPC_LOG) return;
   appendFileSync(
     process.env.FAKE_CODEX_RPC_LOG,
-    `${JSON.stringify({ method, params, cwd: process.cwd(), env: { CODEX_HOME: process.env.CODEX_HOME ?? null } })}\n`,
+    `${JSON.stringify({ method, params, argv: process.argv.slice(2), cwd: process.cwd(), env: { CODEX_HOME: process.env.CODEX_HOME ?? null } })}\n`,
   );
 }
 

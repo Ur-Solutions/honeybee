@@ -30,6 +30,7 @@ import {
   type CommandsResult,
   type SendRpcResult,
   type SnapshotResult,
+  type SetArgsResult,
   type SpawnResult,
   type ImportFromFrozenResult,
   type ImportLocalConfigResult,
@@ -68,6 +69,10 @@ interface Parsed {
   positional: string[];
   flags: Map<string, string | true>;
   tags: string[];
+  /** `--arg <x>` (repeatable): per-bee spawn args. */
+  args: string[];
+  /** Everything after a bare `--`, verbatim (bee set-args). Null when no `--` was given. */
+  rest: string[] | null;
 }
 
 const VALUE_FLAGS = new Set([
@@ -90,14 +95,21 @@ const VALUE_FLAGS = new Set([
   "--id",
   "--idempotency-key",
   "--root",
+  "--arg",
 ]);
 
 function parseArgs(argv: string[]): Parsed {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
   const tags: string[] = [];
+  const args: string[] = [];
+  let rest: string[] | null = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
+    if (a === "--") {
+      rest = argv.slice(i + 1);
+      break;
+    }
     if (!a.startsWith("--")) {
       positional.push(a);
       continue;
@@ -106,12 +118,13 @@ function parseArgs(argv: string[]): Parsed {
       const v = argv[++i];
       if (v === undefined) throw new Error(`${a} requires a value`);
       if (a === "--tag") tags.push(v);
+      else if (a === "--arg") args.push(v);
       else flags.set(a, v);
     } else {
       flags.set(a, true);
     }
   }
-  return { positional, flags, tags };
+  return { positional, flags, tags, args, rest };
 }
 
 interface CliContext {
@@ -157,7 +170,8 @@ function viewLine(v: ViewResult, stale: boolean): string {
       : (v.view.runtimeState ?? "no-runtime");
   const derived = v.view.working ? "working" : v.view.waitingForYou ? "waiting-for-you" : "quiet";
   const prefix = stale ? "stale: " : "";
-  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}`;
+  const args = bee?.args && bee.args.length > 0 ? `  args=${JSON.stringify(bee.args)}` : "";
+  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}${args}`;
 }
 
 function emit(ctx: CliContext, human: string[], jsonValue: unknown, stale: boolean): void {
@@ -215,7 +229,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
   const name = parsed.positional[1];
-  if (!name) throw new Error("usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--idempotency-key k]");
+  if (!name) throw new Error("usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]");
   const agent = (parsed.flags.get("--agent") as string | undefined) ?? "claude";
   const cwd = resolve((parsed.flags.get("--cwd") as string | undefined) ?? process.cwd());
   const result = await withClient(ctx, (c) =>
@@ -225,6 +239,7 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
       cwd,
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
+      ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     }),
   );
@@ -291,14 +306,70 @@ async function cmdMutation(
   verb: "stop" | "revive" | "archive" | "unarchive" | "delete",
 ): Promise<number> {
   const needle = parsed.positional[1];
-  if (!needle) throw new Error(`usage: hive v2 ${verb} <bee>`);
+  if (!needle) throw new Error(`usage: hive v2 ${verb} <bee>${verb === "revive" ? " [--arg a]... | [-- <args…>]" : ""}`);
   return withClient(ctx, async (c) => {
     const list = await c.request<ListResult>("list");
     const beeId = resolveBeeIn(list.views, needle);
-    const result = await c.request<{ commandId: number }>(verb, { beeId });
+    // revive may replace the per-bee args as it runs (`--arg` or `-- …`).
+    const reviveArgs = verb === "revive" ? (parsed.rest ?? (parsed.args.length > 0 ? parsed.args : undefined)) : undefined;
+    const result = await c.request<{ commandId: number }>(verb, { beeId, ...(reviveArgs !== undefined ? { args: reviveArgs } : {}) });
     emit(ctx, [`${verb} ${beeId} enqueued (command ${result.commandId})`], { beeId, ...result }, false);
     return 0;
   });
+}
+
+/**
+ * `hive v2 bee set-args <bee> -- <args…>` / `bee set-args <bee> --clear` /
+ * `bee args <bee>` — per-bee spawn args (schema v5). Takes effect on the
+ * bee's NEXT runtime (stop or revive to apply).
+ */
+async function cmdBee(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  const needle = parsed.positional[2];
+  const usage = "usage: hive v2 bee set-args <bee> -- <args…> | bee set-args <bee> --clear | bee args <bee>";
+  switch (sub) {
+    case "set-args": {
+      if (!needle) throw new Error(usage);
+      const clear = parsed.flags.get("--clear") === true;
+      const args = clear ? null : (parsed.rest ?? (parsed.args.length > 0 ? parsed.args : null));
+      if (!clear && (args === null || args.length === 0)) throw new Error(`${usage}\n(pass the args after \`--\`, or --clear to remove them)`);
+      return withClient(ctx, async (c) => {
+        const list = await c.request<ListResult>("list");
+        const beeId = resolveBeeIn(list.views, needle);
+        const result = await c.request<SetArgsResult>("bee.setArgs", {
+          beeId,
+          args,
+          idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+        });
+        emit(
+          ctx,
+          [
+            `${result.applied ? "set" : "unchanged"} args for ${beeId}: ${result.bee.args ? JSON.stringify(result.bee.args) : "(none)"}` +
+              " — applies to the next runtime (stop or revive)",
+          ],
+          result,
+          false,
+        );
+        return 0;
+      });
+    }
+    case "args": {
+      if (!needle) throw new Error(usage);
+      const { result, stale } = await readPath(
+        ctx,
+        async (c) => {
+          const list = await c.request<ListResult>("list");
+          return c.request<ViewResult>("view", { beeId: resolveBeeIn(list.views, needle) });
+        },
+        (store) => store.view(resolveBeeIn(store.list(null), needle)),
+      );
+      const args = result.bee?.args ?? null;
+      emit(ctx, [`${result.bee?.id ?? needle} args: ${args ? JSON.stringify(args) : "(none)"}`], { beeId: result.bee?.id ?? null, args }, stale);
+      return 0;
+    }
+    default:
+      throw new Error(usage);
+  }
 }
 
 async function cmdView(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -889,9 +960,12 @@ const HELP = `hive v2 — Honeybee reset stack (WP4)
 Usage: hive v2 <command> [args] [--data-dir d] [--socket s] [--json]
 
 Mutations (RPC, daemon must be running):
-  spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]... [--idempotency-key k]
+  spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]
   send <bee> <message…> [--sender s] [--wait] [--timeout ms] [--idempotency-key k]
   stop | revive | archive | unarchive | delete <bee>
+  revive <bee> [--arg a]... | [-- <args…>]   (revive with replacement per-bee args)
+  bee set-args <bee> -- <args…> | --clear    per-bee harness args (--model, --effort, …);
+  bee args <bee>                             layered over the agent spec on the NEXT runtime
   (--idempotency-key: spec 06 §4.2 one-key rule — a replayed key returns the
    original outcome, marked deduped, instead of executing twice)
 
@@ -942,6 +1016,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
       case "unarchive":
       case "delete":
         return await cmdMutation(ctx, parsed, command);
+      case "bee":
+        return await cmdBee(ctx, parsed);
       case "view":
         return await cmdView(ctx, parsed);
       case "list":

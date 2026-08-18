@@ -56,6 +56,8 @@ export type MirrorDelta = AuditRow;
  * preceding bee.created). v4 adds `bee.spawn_failures` (bee row:
  * spawnFailures changed) and `wake.suppressed` (informational: a wake was
  * not enqueued because `spawn_failed` is set; no row change).
+ * v5 adds `bee.args_set` (bee row: args changed;
+ * payload { beeId, args: string[] | null, previous }).
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
@@ -97,6 +99,8 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "importedFrom",
   // v4: consecutive boot failures (the spawn-retry budget); additive likewise.
   "spawnFailures",
+  // v5: additive — per-bee spawn args (string[] | null).
+  "args",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",
