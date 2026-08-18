@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DriverObservation, LiveProcess, RuntimeDriver, StopCause } from "../../harness/src/driver.ts";
-import type { FlagEvidenceLike } from "../src/loops.ts";
+import type { FlagEvidenceLike, SessionEvidenceLike } from "../src/loops.ts";
 import type { NodeConfigFile } from "../src/config.ts";
 import { RpcClient } from "../../cli/src/client.ts";
 
@@ -50,6 +50,7 @@ export class FakeDriver implements RuntimeDriver {
   readonly procs = new Map<string, FakeProc>();
   events: DriverObservation[] = [];
   evidence: FlagEvidenceLike[] = [];
+  sessions: SessionEvidenceLike[] = [];
   readonly deliveredIds: number[] = [];
   /** When false, deliver refuses not_ready (I1-breach scenarios). */
   acceptDeliveries = true;
@@ -113,6 +114,12 @@ export class FakeDriver implements RuntimeDriver {
   observeEvidence(): FlagEvidenceLike[] {
     const out = this.evidence;
     this.evidence = [];
+    return out;
+  }
+
+  observeSessions(): SessionEvidenceLike[] {
+    const out = this.sessions;
+    this.sessions = [];
     return out;
   }
 

@@ -11,7 +11,8 @@
  * Responsibilities per step (spec 04 "Daemon behavior" 1, 3, 4, 5):
  *  1. drain driver observations into the store's four-state model
  *  2. flag policy: apply adapter condition-flag evidence (contrary-evidence
- *     clearing per spec 03 — every setter has a clearer)
+ *     clearing per spec 03 — every setter has a clearer); and record the
+ *     harness session id a runtime reported (spec 07 §F: revive resumes it)
  *  3. hang policy: stop runtimes stuck in booting/running past their timeout
  *  4. scale-to-zero: stop(stopped_by_system) idle runtimes past the idle
  *     window (Q4 ruling; revive-on-message undoes it)
@@ -101,6 +102,13 @@ export interface FlagEvidenceLike {
   detail: string;
 }
 
+/** Harness session identity, structurally matching HsrDriver's SessionEvidence. */
+export interface SessionEvidenceLike {
+  beeId: string;
+  generation: number;
+  sessionId: string;
+}
+
 /**
  * Optional driver capabilities beyond the WP2 RuntimeDriver contract. All are
  * duck-typed: the SimDriver has none of them and the loops stay byte-for-byte
@@ -113,6 +121,8 @@ interface ExtendedDriver {
   procOf?(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null;
   /** Whether (bee, generation) is a re-adopted degraded process (no event stream). */
   isDegraded?(beeId: string, generation: number): boolean;
+  /** Drain harness session ids learned from booted signals (HsrDriver.observeSessions). */
+  observeSessions?(): SessionEvidenceLike[];
 }
 
 /** One I1 deadline breach, shaped like the harness violation ledger. */
@@ -207,6 +217,7 @@ export class DaemonCore {
   step(): void {
     this.drainObservations();
     this.applyEvidence();
+    this.applySessionIds();
     this.hangPolicy();
     this.scaleToZeroPolicy();
     this.degradedMailPolicy();
@@ -317,6 +328,25 @@ export class DaemonCore {
         this.store.clearFlag(ev.beeId, ev.flag, ev.detail);
       }
       this.log(`flag.${ev.action} bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
+    }
+  }
+
+  /**
+   * Continuity (spec 07 §F): the harness session/thread id a runtime reports
+   * on boot is a fact about the BEE's conversation — record it so the next
+   * generation resumes it. Only the current generation may write it: a stale
+   * generation's late init describes a conversation the bee has moved past.
+   */
+  private applySessionIds(): void {
+    if (typeof this.ext.observeSessions !== "function") return;
+    for (const ev of this.ext.observeSessions()) {
+      const rt = this.store.getBee(ev.beeId) ? this.store.currentRuntime(ev.beeId) : null;
+      if (!rt || rt.generation !== ev.generation) {
+        this.log(`session.skip bee=${ev.beeId} gen=${ev.generation} reason=${rt ? "stale_generation" : "no_bee"}`);
+        continue;
+      }
+      const { applied } = this.store.recordProviderSessionId(ev.beeId, ev.sessionId);
+      if (applied) this.log(`session.recorded bee=${ev.beeId} gen=${ev.generation} id=${ev.sessionId}`);
     }
   }
 

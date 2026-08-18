@@ -56,6 +56,15 @@ const TURN_REQUEST_ID_BASE = 1000;
 export interface CodexAdapterOptions {
   cwd: string;
   model?: string;
+  /**
+   * Harness-native resume (spec 07 §F): when set, the handshake sends
+   * `thread/resume {threadId}` instead of `thread/start`, rejoining the
+   * recorded conversation (codex has no interactive/headless store split —
+   * `codex resume <threadId>` and app-server `thread/resume` share rollouts).
+   * The response carries the same `thread.id`, which lands as `booted`. The
+   * process must run with the CODEX_HOME the rollout lives under (bee env).
+   */
+  resumeThreadId?: string;
 }
 
 /**
@@ -96,17 +105,26 @@ function errorSignals(message: string): AdapterSignal[] {
 // wedges the peer, so refuse them explicitly (JSON-RPC method-not-found).
 const SERVER_REQUEST_REFUSAL_CODE = -32601;
 
+/** The thread request params (shape taken from the old adapter's buildCodexThreadRequestParams). */
+export function codexThreadRequest(opts: CodexAdapterOptions): { method: "thread/start" | "thread/resume"; params: Record<string, unknown> } {
+  const base = {
+    ...(opts.model ? { model: opts.model } : {}),
+    cwd: opts.cwd,
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+  };
+  return opts.resumeThreadId
+    ? { method: "thread/resume", params: { threadId: opts.resumeThreadId, ...base } }
+    : { method: "thread/start", params: base };
+}
+
 export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
+  const threadRequest = codexThreadRequest(opts);
   const threadStartLine = JSON.stringify({
     jsonrpc: "2.0",
     id: THREAD_START_ID,
-    method: "thread/start",
-    params: {
-      ...(opts.model ? { model: opts.model } : {}),
-      cwd: opts.cwd,
-      approvalPolicy: "never",
-      sandbox: "danger-full-access",
-    },
+    method: threadRequest.method,
+    params: threadRequest.params,
   });
 
   function parseLine(line: string): AdapterSignal[] {
@@ -131,8 +149,13 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
         // codex boots to ready-for-input: booted lands on idle (types.ts).
         return bootedToIdle(threadId);
       }
+      if ("result" in msg && opts.resumeThreadId) {
+        // thread/resume acknowledged without echoing the thread: the old
+        // adapter fell back to the requested id (threadIdFromResponse ?? sessionId).
+        return bootedToIdle(opts.resumeThreadId);
+      }
       const err = asObject(msg.error);
-      if (err) return errorSignals(String(err.message ?? "codex thread/start failed"));
+      if (err) return errorSignals(String(err.message ?? `codex ${threadRequest.method} failed`));
       return [];
     }
     // A turn/start request error response (our TURN_REQUEST_ID_BASE+messageId

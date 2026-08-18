@@ -109,3 +109,10 @@ test("claude: adapter surface — mid-turn accept, no boot lines, stable parse i
   assert.deepEqual(claudeAdapter.parseLine(line), claudeAdapter.parseLine(line));
   assert.equal(claudeAdapter.encodeMessage("x", { sessionId: null, messageId: 1 }), encodeClaudeMessage("x"));
 });
+
+test("claude: resumeArgs (spec 07 §F) — `--resume <id>`; init after resume echoes the same session id → booted carries it", () => {
+  assert.deepEqual(claudeAdapter.resumeArgs?.("9aa1f08d-1446-4d78-981f-bbec462ba87b"), ["--resume", "9aa1f08d-1446-4d78-981f-bbec462ba87b"]);
+  const signals = claudeAdapter.parseLine(JSON.stringify({ type: "system", subtype: "init", session_id: "9aa1f08d-1446-4d78-981f-bbec462ba87b", cwd: "/w" }));
+  assert.equal(signals[0]?.kind, "booted");
+  if (signals[0]?.kind === "booted") assert.equal(signals[0].sessionId, "9aa1f08d-1446-4d78-981f-bbec462ba87b");
+});

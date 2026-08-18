@@ -31,6 +31,7 @@ import {
   type SendRpcResult,
   type SnapshotResult,
   type SpawnResult,
+  type ImportFromFrozenResult,
   type ImportLocalConfigResult,
   type TemplateDeleteResult,
   type TemplateExportResult,
@@ -49,6 +50,9 @@ import {
 } from "../../daemon/src/protocol.ts";
 import { DaemonDownError, RpcClient } from "./client.ts";
 import { ReadOnlyStore } from "./readonly.ts";
+import { freezeRoot, type FrozenImportReport, type ImportPlanEntry } from "../../core/src/index.ts";
+import { realPreflightProbes } from "../../daemon/src/import-probes.ts";
+import { hostname } from "node:os";
 
 export interface CliIo {
   out(line: string): void;
@@ -85,6 +89,7 @@ const VALUE_FLAGS = new Set([
   "--dir",
   "--id",
   "--idempotency-key",
+  "--root",
 ]);
 
 function parseArgs(argv: string[]): Parsed {
@@ -665,6 +670,102 @@ async function cmdPackages(ctx: CliContext, parsed: Parsed): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// WP7 cutover: freeze the old world, import its active bees (spec 07 B3/B4)
+// ---------------------------------------------------------------------------
+
+/** The old-world store root: --root, else HIVE_STORE_ROOT (the old CLI's own override, src/fsx.ts), else ~/.hive. */
+function frozenRootOf(parsed: Parsed): string {
+  const flag = parsed.flags.get("--root") as string | undefined;
+  return resolve(flag ?? process.env.HIVE_STORE_ROOT ?? join(homedir(), ".hive"));
+}
+
+/**
+ * `hive v2 freeze [--root r] [--force]` — B3. Local: writes `<root>/FROZEN`
+ * (the ONE write into the old root, the operator's), refusing while the old
+ * daemon's lock pid is alive. Does not need the v2 daemon.
+ */
+async function cmdFreeze(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const root = frozenRootOf(parsed);
+  const result = freezeRoot(root, {
+    probes: realPreflightProbes(),
+    force: parsed.flags.get("--force") === true,
+    by: `hive v2 freeze (host ${hostname()}, pid ${process.pid})`,
+  });
+  const lines =
+    result.outcome === "written"
+      ? [`frozen: ${result.markerPath} written — the old-world store at ${root} is now read-only by convention (remove the marker to unfreeze, spec 07 §C)`]
+      : result.outcome === "already_frozen"
+        ? [`already frozen: ${result.markerPath} exists`]
+        : [`refused: ${result.refusal}`];
+  emit(ctx, lines, result, false);
+  return result.outcome === "refused" ? 1 : 0;
+}
+
+function planEntryLine(e: ImportPlanEntry): string {
+  if (e.action === "import") {
+    const bee = e.bee;
+    const resume =
+      e.resume === "harness_native"
+        ? `resume=native(${bee?.providerSessionId ?? "?"})`
+        : e.resume === "fresh_no_session_id"
+          ? "resume=FRESH(no provider session id)"
+          : "resume=FRESH(no v2 resume path)";
+    const notes = e.notes.length > 0 ? `  [${e.notes.join("; ")}]` : "";
+    return `  import ${e.originalId}  ${e.name}  agent=${e.agent} substrate=${bee?.substrate ?? "?"}  ${resume}${notes}`;
+  }
+  const notes = e.notes.length > 0 ? `  (${e.notes.join("; ")})` : "";
+  return `  skip   ${e.originalId}  ${e.name}  agent=${e.agent}  reason=${e.reason}${notes}`;
+}
+
+function importReportLines(report: FrozenImportReport, verbose: boolean): string[] {
+  const c = report.plan.counts;
+  const lines: string[] = [];
+  lines.push(`${report.dryRun ? "dry-run: " : ""}import --from-frozen ${report.frozenRoot}`);
+  lines.push(`  marker: ${report.preflight.markerPresent ? "FROZEN present" : "FROZEN MISSING"}`);
+  lines.push(
+    `  preflight: ${report.preflight.ok ? "no live old-world runtimes" : `${report.preflight.live.length} live old-world runtime(s)`}`,
+  );
+  for (const l of report.preflight.live) lines.push(`    - ${l.detail}`);
+  lines.push(`  plan: would import ${c.import}, skip ${c.skip}`);
+  const byReason = Object.entries(c.byReason).map(([k, v]) => `${k}=${v}`).join(" ");
+  if (byReason) lines.push(`    skipped by reason: ${byReason}`);
+  const byResume = Object.entries(c.byResume).map(([k, v]) => `${k}=${v}`).join(" ");
+  if (byResume) lines.push(`    resume modes:      ${byResume}`);
+  const shown = verbose ? report.plan.entries : report.plan.entries.filter((e) => e.action === "import" || (e.reason !== "done" && e.reason !== "already_imported"));
+  for (const e of shown) lines.push(planEntryLine(e));
+  if (!verbose) {
+    const hidden = report.plan.entries.length - shown.length;
+    if (hidden > 0) lines.push(`  (… ${hidden} done/already-imported rows hidden; --verbose lists all)`);
+  }
+  if (report.refusal) lines.push(`REFUSED: ${report.refusal}`);
+  else if (report.dryRun) lines.push("dry-run: nothing written");
+  else lines.push(`imported ${report.imported.length} bee(s)`);
+  return lines;
+}
+
+/**
+ * `hive v2 import --from-frozen [--root r] [--dry-run] [--force] [--verbose]`
+ * — B4. RPC only (the daemon is the sole writer); refusals are reports, not
+ * errors, and exit 1.
+ */
+async function cmdImport(ctx: CliContext, parsed: Parsed): Promise<number> {
+  if (parsed.flags.get("--from-frozen") !== true) {
+    throw new Error("usage: hive v2 import --from-frozen [--root r] [--dry-run] [--force] [--verbose] [--idempotency-key k]");
+  }
+  const root = frozenRootOf(parsed);
+  const result = await withClient(ctx, (c) =>
+    c.request<ImportFromFrozenResult>("import.fromFrozen", {
+      root,
+      dryRun: parsed.flags.get("--dry-run") === true,
+      force: parsed.flags.get("--force") === true,
+      idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+    }),
+  );
+  emit(ctx, importReportLines(result, parsed.flags.get("--verbose") === true), result, false);
+  return result.applied || result.dryRun ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
 // daemon service subcommands
 // ---------------------------------------------------------------------------
 
@@ -802,6 +903,13 @@ Templates + tracks + packages (spec 06 §1.4.1 — rows are truth, files are pac
   track    delete <id|name> · import <package.json> [--scope s] [--source label]
   packages import-local [--dir d] [--scope s]   import ~/.hive-style local config (manual, v1)
 
+Cutover (spec 07 B3/B4 — freeze the old world, import its active bees):
+  freeze [--root r] [--force]                 write <root>/FROZEN (refuses while the old daemon is alive)
+  import --from-frozen [--root r] [--dry-run] [--force] [--verbose]
+                                              import active old-world bees (records + provider session
+                                              ids for harness-native resume); refuses while old
+                                              runtimes are live; idempotent; root defaults to ~/.hive
+
 Watch:
   watch [--bee id]        whole-node change stream (snapshot + seq deltas)
 
@@ -851,6 +959,10 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdTrack(ctx, parsed);
       case "packages":
         return await cmdPackages(ctx, parsed);
+      case "freeze":
+        return await cmdFreeze(ctx, parsed);
+      case "import":
+        return await cmdImport(ctx, parsed);
       case "daemon":
         return await cmdDaemon(ctx, parsed);
       case "help":

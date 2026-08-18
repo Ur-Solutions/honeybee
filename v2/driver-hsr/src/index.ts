@@ -5,6 +5,7 @@
 export {
   HsrDriver,
   type FlagEvidence,
+  type SessionEvidence,
   type HsrDriverConfig,
   type SpawnSpec,
 } from "./driver.ts";

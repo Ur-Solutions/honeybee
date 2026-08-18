@@ -51,6 +51,9 @@ export type MirrorDelta = AuditRow;
  * Every other kind (bee.*, runtime.*, flag.*, mail.*, command.*, output.*, boot.*)
  * touches bee mirror rows; a materializer that cannot re-derive a bee row from
  * the delta re-reads that bee (view) — or takes the snapshot path.
+ * v3 adds `bee.provider_session` (bee row: providerSessionId changed) and
+ * `bee.imported` (informational provenance; no row change beyond the
+ * preceding bee.created).
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
@@ -86,6 +89,10 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "createdAt",
   "archivedAt",
   "lastOutputAt",
+  // v3 (WP7): additive — a v2/1 materializer that ignores unknown keys stays correct.
+  "providerSessionId",
+  "env",
+  "importedFrom",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",

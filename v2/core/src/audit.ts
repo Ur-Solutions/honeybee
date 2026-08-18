@@ -57,6 +57,10 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         bee.archivedAt = null;
         break;
       }
+      case "bee.provider_session": {
+        mustBee(p.beeId as string).providerSessionId = p.providerSessionId as string;
+        break;
+      }
       case "bee.deleted": {
         const beeId = p.beeId as string;
         bees.delete(beeId);
@@ -161,6 +165,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         break;
       }
       // Recorded no-ops and informational rows: state unchanged by definition.
+      case "bee.imported":
       case "runtime.stale_update":
       case "flag.clear_noop":
       case "mail.deliver_noop":

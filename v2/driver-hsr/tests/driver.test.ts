@@ -457,3 +457,23 @@ test("late init must not close an in-flight turn (cell smoke 2026-08-17 phantom 
     driver.stop("li-1", 1, "stopped_by_system");
   }
 });
+
+test("session evidence (spec 07 §F): the booted session id is drained via observeSessions, once per value, per generation", async () => {
+  const rig = makeRig();
+  try {
+    rig.agentEnv.set("bee-s", { STUB_SESSION_ID: "sess-frozen-1" });
+    rig.driver.start("bee-s", 1);
+    await drainUntil(rig.driver, (e) => ofKind(e, "booted").length > 0);
+    const sessions = rig.driver.observeSessions();
+    assert.deepEqual(sessions, [{ beeId: "bee-s", generation: 1, sessionId: "sess-frozen-1" }]);
+    assert.deepEqual(rig.driver.observeSessions(), [], "drained");
+    // generation 2 after a stop reports again (same value → new generation, new evidence)
+    rig.driver.stop("bee-s", 1, "stopped_by_user");
+    await drainUntil(rig.driver, (e) => ofKind(e, "exited").length > 0);
+    rig.driver.start("bee-s", 2);
+    await drainUntil(rig.driver, (e) => ofKind(e, "booted").length > 0);
+    assert.deepEqual(rig.driver.observeSessions(), [{ beeId: "bee-s", generation: 2, sessionId: "sess-frozen-1" }]);
+  } finally {
+    rig.cleanup();
+  }
+});

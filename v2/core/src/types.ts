@@ -79,7 +79,17 @@ export interface BeeRow {
   archivedAt: number | null;
   /** Last time the bee's runtime produced output (canonical fact, recorded by daemon). */
   lastOutputAt: number | null;
-  /** Last time the operator read the bee's output (drives B8 waiting_for_you on stopped). */
+  /**
+   * v3 — harness-native session/thread id of the bee's conversation (claude
+   * `session_id`, codex thread id), recorded from the runtime's booted signal.
+   * Revive hands it back to the harness so generation N+1 continues the same
+   * conversation (spec 07 §F). Null until a runtime has reported one.
+   */
+  providerSessionId: string | null;
+  /** v3 — per-bee env overrides applied over the agent spec at spawn. */
+  env: Record<string, string>;
+  /** v3 — provenance: null for v2-born bees; "frozen" for old-world imports. */
+  importedFrom: string | null;
 }
 
 export interface RuntimeRow {
