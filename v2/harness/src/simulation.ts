@@ -260,9 +260,14 @@ export function runSim(
       const bee = prng.pick(s.listBees());
       if (bee) {
         msgSeq += 1;
-        const res = s.send(bee.id, `m${msgSeq}`, { sender: "sim" });
+        // v8 urgency dimension: mostly `next` (the default path), with `now`
+        // (mid-turn interrupts) and `idle` (held while running) mixed in so
+        // the fuzz exercises eligibility + the interrupt path + the
+        // suspended I1 clock under every fault schedule.
+        const urgency = prng.pick(["next", "next", "next", "now", "idle"] as const) ?? "next";
+        const res = s.send(bee.id, `m${msgSeq}`, { sender: "sim", urgency });
         stats.sends += 1;
-        log(`work.send bee=${bee.id} msg=${res.message.id} wake=${res.wakeCommand?.id ?? "none"}`);
+        log(`work.send bee=${bee.id} msg=${res.message.id} urgency=${urgency} wake=${res.wakeCommand?.id ?? "none"}`);
       }
     }
     if (prng.chance(config.workload.stopProbability)) {

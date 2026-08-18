@@ -97,6 +97,11 @@ export type MirrorDelta = AuditRow;
  *   bee.account_set      → { beeId, account, previous }                 (bee row: account)
  *   bee.env_set          → { beeId, env, previous }                     (bee row: env)
  *   bee.session_rekeyed  → { beeId, forkSeed, previousProviderSessionId } (bee row: forkSeed set, providerSessionId → null)
+ * v8 (delivery urgency, spec 01 Q2 amendment) is additive INSIDE an existing
+ * payload: `mail.enqueued`'s MessageRow gains `urgency` ('now'|'next'|'idle');
+ * pre-v8 deltas simply lack the key and mean `next`. The daemon's `mailbox`
+ * read returns the same shape. No new kinds; a materializer that ignores
+ * unknown keys stays correct.
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;

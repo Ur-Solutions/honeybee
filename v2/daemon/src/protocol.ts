@@ -477,6 +477,14 @@ export interface SetArgsResult extends DedupMarkers {
   applied: boolean;
 }
 
+/**
+ * `send {beeId, body, sender?, urgency?, idempotencyKey?}` — v8 adds
+ * `urgency?: 'now'|'next'|'idle'` (spec 01 Q2 amendment; omitted = 'next').
+ * Urgency governs when the message becomes eligible for delivery (`now`
+ * interrupts the current turn; `idle` waits for the runtime to leave
+ * `running`); it never reorders the per-bee FIFO and never affects the
+ * revive-on-message wake. An unknown urgency is `invalid_request`.
+ */
 export interface SendRpcResult extends DedupMarkers {
   messageId: number;
   /** The send_wake enqueued in the same transaction, when one was needed. */

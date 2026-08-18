@@ -142,6 +142,8 @@ function mapMessage(r: Row): MessageRow {
     sender: r.sender as string,
     body: r.body as string,
     priority: Number(r.priority),
+    // v8: a pre-migration store (daemon not yet upgraded) has no column — read as the default.
+    urgency: (r.urgency as MessageRow["urgency"] | undefined) ?? "next",
     enqueuedAt: Number(r.enqueued_at),
     deliveredAt: r.delivered_at == null ? null : Number(r.delivered_at),
     deliveredGeneration: r.delivered_generation == null ? null : Number(r.delivered_generation),

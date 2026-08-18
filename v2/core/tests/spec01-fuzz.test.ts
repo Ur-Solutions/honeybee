@@ -193,7 +193,12 @@ function fuzzRun(seed: number, ops: number): void {
     },
     () => {
       const bee = pick(store.listBees());
-      if (bee) store.send(bee.id, `msg ${Math.floor(rnd() * 1000)}`, { priority: Math.floor(rnd() * 3) });
+      if (bee)
+        store.send(bee.id, `msg ${Math.floor(rnd() * 1000)}`, {
+          priority: Math.floor(rnd() * 3),
+          // v8: fuzz the urgency dimension too (stored + audited + replayed)
+          urgency: pick(["now", "next", "idle"] as const),
+        });
     },
     () => {
       const bee = pick(store.listBees());

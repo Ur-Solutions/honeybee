@@ -46,8 +46,14 @@
  *        rotation cursor — a row, not a json file) and `bees.account`
  *        (declared intent, concrete after spawn — never 'auto'). Additive;
  *        migration = ALTER TABLE ADD COLUMN ×1 + CREATE TABLE IF NOT EXISTS ×3.
+ *   v8 — delivery urgency (spec 01 Q2 amendment 2026-08-18): adds
+ *        `mailbox.urgency` ('now'|'next'|'idle', default 'next') — the meaning
+ *        the reserved `priority` column was holding a seat for. `priority`
+ *        stays for compat but is documentation-only; urgency is the semantics
+ *        (eligibility, never FIFO reordering). Additive; migration =
+ *        ALTER TABLE ADD COLUMN ×1.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -135,7 +141,14 @@ CREATE TABLE IF NOT EXISTS mailbox (
   bee_id               TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE,
   sender               TEXT NOT NULL,
   body                 TEXT NOT NULL,
-  priority             INTEGER NOT NULL DEFAULT 0, -- Q2: reserved for future tiers; unused in ordering today
+  -- Q2: the reserved tier column. Kept for compat; its ROLE is superseded by
+  -- urgency (the 2026-08-18 amendment) and it is consulted by nothing.
+  priority             INTEGER NOT NULL DEFAULT 0,
+  -- v8: delivery urgency — governs WHEN a message becomes eligible for
+  -- delivery (now = interrupt then deliver; next = next accept point;
+  -- idle = only while the runtime is not running). Never reorders FIFO:
+  -- among ELIGIBLE messages, enqueue order (id) wins.
+  urgency              TEXT NOT NULL DEFAULT 'next' CHECK (urgency IN ('now','next','idle')),
   enqueued_at          INTEGER NOT NULL,
   delivered_at         INTEGER,
   delivered_generation INTEGER
@@ -332,6 +345,14 @@ export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: s
   ["forked_from", "forked_from TEXT"],
   ["fork_seed", "fork_seed TEXT"],
   ["account", "account TEXT"],
+];
+
+/**
+ * Additive columns on `mailbox` since v7 — same add-iff-missing discipline as
+ * BEES_ADDITIVE_COLUMNS. v8: urgency.
+ */
+export const MAILBOX_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
+  ["urgency", "urgency TEXT NOT NULL DEFAULT 'next' CHECK (urgency IN ('now','next','idle'))"],
 ];
 
 export const IDEMPOTENCY_INDEX_SQL = `

@@ -26,9 +26,15 @@
  *     against the BEE (not the wake command), the next wake sits on the B5
  *     backoff table, and at the budget `spawn_failed` is set and wakes stop —
  *     an explicit `revive` resets the budget and retries regardless
- *  7. delivery loop: push undelivered mailbox messages into live runtimes
+ *  7. delivery loop: push undelivered mailbox messages into live runtimes,
+ *     honoring per-message urgency (v8, spec 01 Q2 amendment): `next` = the
+ *     accept point (unchanged), `idle` = hold while the runtime is running,
+ *     `now` = interrupt the turn first, then deliver. Urgency governs
+ *     eligibility only; among eligible messages FIFO enqueue order wins
  *  8. I1 telemetry: record undelivered-past-deadline messages as structured
- *     violations (spec 04 behavior 5 — the 99.99% counter)
+ *     violations (spec 04 behavior 5 — the 99.99% counter). An `idle`
+ *     message's clock starts at eligibility (runtime left `running`), not at
+ *     enqueue — long turns are not false violations
  *
  * Boot sequence (after every store reopen): reconcileAtBoot with the driver's
  * live pids, reap orphan processes the store no longer recognizes, and sweep
@@ -633,19 +639,66 @@ export class DaemonCore {
   }
 
   // -------------------------------------------------------------------------
-  // delivery loop
+  // delivery loop (v8: urgency-aware — spec 01 Q2 amendment 2026-08-18)
   // -------------------------------------------------------------------------
 
+  /**
+   * `now` messages whose turn-interrupt has already been issued (per message
+   * id), so a slow-to-land turn_ended is not re-interrupted every step.
+   * In-memory on purpose: after a daemon restart a still-undelivered `now`
+   * message earns at most one fresh interrupt — idempotent and correct
+   * (the message IS still urgent).
+   */
+  private readonly interruptRequested = new Set<number>();
+
+  /**
+   * Eligibility/ordering rule (Q2 amendment): urgency governs WHEN a message
+   * becomes eligible for delivery —
+   *   next — always eligible (today's behavior: the harness's accept point);
+   *   now  — always eligible; mid-turn it additionally asks the driver to
+   *          interrupt the current turn (once), then delivers at the
+   *          resulting accept point;
+   *   idle — eligible only while the runtime is NOT `running` (a running turn
+   *          is never disturbed; revive-on-message for stopped bees is
+   *          unchanged and urgency never affects wakes).
+   * Among ELIGIBLE messages, enqueue order (per-bee FIFO, Q2) wins: an `idle`
+   * message waiting out a turn does not block a later `next`/`now` message
+   * from delivering at the next accept point.
+   */
   private deliveryLoop(): void {
     for (const bee of this.store.listBees()) {
       const rt = this.store.currentRuntime(bee.id);
       if (!rt || rt.state === "stopped" || rt.state === "booting") continue;
-      const msg = this.store.undeliveredMessages(bee.id)[0];
-      if (!msg) continue;
+      const pending = this.store.undeliveredMessages(bee.id);
+      if (pending.length === 0) continue;
+      const eligible = rt.state === "running" ? pending.filter((m) => m.urgency !== "idle") : pending;
+      if (eligible.length === 0) continue;
+      if (rt.state === "running") {
+        // Mid-turn `now`: interrupt first (the v6 verb), then deliver. One
+        // interrupt per message; an eligible `now` behind an undelivered
+        // `next` still interrupts — the accept point it creates serves the
+        // whole FIFO, which keeps delivering in enqueue order.
+        const urgent = eligible.find((m) => m.urgency === "now" && !this.interruptRequested.has(m.id));
+        if (urgent) {
+          const res = this.driver.interrupt(bee.id, rt.generation);
+          // no_process / not_ready resolve on later steps (exit observation,
+          // driver-side boot skew) — retry then. interrupted / idle /
+          // unsupported are final: the accept point exists or never will.
+          if (res.interrupted || res.reason === "idle" || res.reason === "unsupported") {
+            this.interruptRequested.add(urgent.id);
+          }
+          this.log(
+            `deliver.interrupt bee=${bee.id} msg=${urgent.id} gen=${rt.generation} interrupted=${res.interrupted}` +
+              (res.reason ? ` reason=${res.reason}` : ""),
+          );
+        }
+      }
+      const msg = eligible[0] as (typeof eligible)[number];
       const outcome = this.driver.deliver(bee.id, rt.generation, msg.id, msg.body);
       if (outcome.accepted) {
         this.store.markDelivered(msg.id, rt.generation);
-        this.log(`deliver bee=${bee.id} msg=${msg.id} gen=${rt.generation}`);
+        this.interruptRequested.delete(msg.id);
+        this.log(`deliver bee=${bee.id} msg=${msg.id} gen=${rt.generation} urgency=${msg.urgency}`);
       } else {
         this.log(`deliver.refused bee=${bee.id} msg=${msg.id} reason=${outcome.reason}`);
       }
@@ -668,12 +721,23 @@ export class DaemonCore {
     const now = this.now();
     for (const bee of this.store.listBees()) {
       if (this.store.activeFlags(bee.id).length > 0) continue;
+      const rt = this.store.currentRuntime(bee.id);
       const pending = this.store.undeliveredMessages(bee.id);
       pending.forEach((m, pos) => {
-        const deadline = m.enqueuedAt + (pos + 1) * bound;
+        // v8 (Q2 amendment): an `idle` message's deadline clock starts when it
+        // becomes ELIGIBLE (the runtime not `running`), not at enqueue — a
+        // long turn is exactly what `idle` opted into waiting for, never an
+        // I1 violation. While the runtime is running the clock is suspended;
+        // once out of `running`, the base is that transition (rt.updatedAt).
+        let base = m.enqueuedAt;
+        if (m.urgency === "idle") {
+          if (rt?.state === "running") return;
+          base = Math.max(base, rt?.updatedAt ?? m.enqueuedAt);
+        }
+        const deadline = base + (pos + 1) * bound;
         if (now <= deadline || this.reportedI1.has(m.id)) return;
         this.reportedI1.add(m.id);
-        const detail = `message ${m.id} undelivered past deadline (enqueued=${m.enqueuedAt} pos=${pos} deadline=${deadline} now=${now})`;
+        const detail = `message ${m.id} undelivered past deadline (enqueued=${m.enqueuedAt} urgency=${m.urgency} pos=${pos} deadline=${deadline} now=${now})`;
         record({ detectedAt: now, beeId: bee.id, messageId: m.id, enqueuedAt: m.enqueuedAt, deadline, detail });
         this.log(`i1.violation bee=${bee.id} msg=${m.id} deadline=${deadline}`);
       });
