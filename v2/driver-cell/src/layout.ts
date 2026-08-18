@@ -66,6 +66,19 @@ export function cellPaths(cellsRoot: string, wrapper: string, repoName: string, 
 }
 
 /**
+ * Inverse of the space-name composition: `<repo>-space-<id>` →
+ * `{ repoName, cellId }`. The id half is dash-free by construction, so the
+ * LAST `-space-` is the separator even when the repo name itself contains
+ * one. Null when the name is not space-shaped.
+ */
+export function parseSpaceName(spaceName: string): { repoName: string; cellId: string } | null {
+  if (!CELL_SPACE_DIRECTORY.test(spaceName)) return null;
+  const idx = spaceName.lastIndexOf("-space-");
+  if (idx <= 0) return null;
+  return { repoName: spaceName.slice(0, idx), cellId: spaceName.slice(idx + "-space-".length) };
+}
+
+/**
  * Shape check for destructive operations (spec 05 point 6): a path is only
  * ever deleted when it demonstrably has the cell shape — a wrapper directory
  * containing a `-space-` checkout — so a mis-wired variable can never point

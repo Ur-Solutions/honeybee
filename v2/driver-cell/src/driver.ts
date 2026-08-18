@@ -17,7 +17,7 @@
  *  - exit path: captureWork() (capture.ts) and deleteCell() (remove.ts) are
  *    exposed for the daemon/UI (WP6) — they never touch runtime driving.
  */
-import { writeFileSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type {
   DeliverOutcome,
   DriverObservation,
@@ -25,10 +25,16 @@ import type {
   RuntimeDriver,
   StopCause,
 } from "../../harness/src/driver.ts";
-import { HsrDriver, type FlagEvidence, type HsrDriverConfig, type SpawnSpec } from "../../driver-hsr/src/index.ts";
+import {
+  HsrDriver,
+  type FlagEvidence,
+  type HsrDriverConfig,
+  type SessionEvidence,
+  type SpawnSpec,
+} from "../../driver-hsr/src/index.ts";
 import { captureWork, type CaptureMode, type CaptureReport } from "./capture.ts";
-import { cellPaths } from "./layout.ts";
-import { isProvisioned, readLedger } from "./ledger.ts";
+import { cellPaths, looksLikeCellWrapper, type CellPaths } from "./layout.ts";
+import { isProvisioned, readLedger, type CellLedger } from "./ledger.ts";
 import { provisionCell, type ProvisionedCell, type ProvisionRequest } from "./provision.ts";
 import { deleteCell, type DeleteResult } from "./remove.ts";
 import {
@@ -60,6 +66,14 @@ export interface CellDriverConfig {
   sandboxWritablePaths?: string[];
   /** Tests: force the clone fallback / cold cells. */
   disableCow?: boolean;
+}
+
+/** `removeCell` refusal: the bee still has a live runtime — stop it first. */
+export class CellRuntimeLiveError extends Error {
+  constructor(beeId: string) {
+    super(`removeCell: bee ${beeId} still has a live runtime; stop it before removing its cell`);
+    this.name = "CellRuntimeLiveError";
+  }
 }
 
 export class CellDriver implements RuntimeDriver {
@@ -125,6 +139,10 @@ export class CellDriver implements RuntimeDriver {
 
   observeEvidence(): FlagEvidence[] {
     return this.inner.observeEvidence();
+  }
+
+  observeSessions(): SessionEvidence[] {
+    return this.inner.observeSessions();
   }
 
   sessionLogPath(beeId: string): string {
@@ -220,17 +238,54 @@ export class CellDriver implements RuntimeDriver {
   /**
    * Delete the bee's cell (A2 dirty guard applies). Archive is deliberately
    * NOT here: archiving keeps the cell (spec 05 point 7); retention reaping
-   * is daemon policy.
+   * is daemon policy. A cell that was only reserved (seed ledger, never
+   * provisioned) has nothing to lose and is removed outright; a
+   * half-provisioned one goes through the shape-checked dirty guard like
+   * any other. Throws CellRuntimeLiveError while a runtime is live.
    */
   removeCell(beeId: string, opts: { force?: boolean } = {}): DeleteResult {
-    const cell = this.cellOf(beeId);
-    if (!cell) return { deleted: false, forced: false, report: null };
     if (this.snapshotLive().some((p) => p.beeId === beeId)) {
-      throw new Error(`removeCell: bee ${beeId} still has a live runtime`);
+      throw new CellRuntimeLiveError(beeId);
     }
-    const result = deleteCell(cell.paths.wrapperDir, opts);
-    this.cells.delete(beeId);
-    return result;
+    const cell = this.cellOf(beeId);
+    if (cell) {
+      const result = deleteCell(cell.paths.wrapperDir, opts);
+      this.cells.delete(beeId);
+      return result;
+    }
+    const reserved = this.reservedOf(beeId);
+    if (reserved == null || !existsSync(reserved.paths.wrapperDir)) {
+      return { deleted: false, forced: false, report: null };
+    }
+    const entries = readdirSync(reserved.paths.wrapperDir);
+    if (looksLikeCellWrapper(reserved.paths.wrapperDir, entries)) {
+      // A space checkout exists (provisioning was interrupted): the A2
+      // guard decides, on shape-checked paths only.
+      return deleteCell(reserved.paths.wrapperDir, opts);
+    }
+    // Seed ledger + box only — no checkout was ever materialized.
+    rmSync(reserved.paths.wrapperDir, { recursive: true, force: true });
+    return { deleted: true, forced: false, report: null };
+  }
+
+  /** The reserved (seed) ledger + paths for a bee, provisioned or not; null when unresolvable. */
+  private reservedOf(beeId: string): { paths: CellPaths; ledger: CellLedger } | null {
+    let spec: CellSpec;
+    try {
+      spec = this.cfg.resolveCell(beeId);
+    } catch {
+      return null;
+    }
+    const p = spec.provision;
+    const paths = cellPaths(this.cfg.cellsRoot, p.wrapper, p.repoName, p.cellId);
+    let ledger: CellLedger | null;
+    try {
+      ledger = readLedger(paths.ledgerPath);
+    } catch {
+      return null;
+    }
+    if (ledger == null || ledger.beeId !== beeId) return null;
+    return { paths, ledger };
   }
 
   // -------------------------------------------------------------------------

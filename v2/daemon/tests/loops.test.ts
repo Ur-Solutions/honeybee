@@ -354,6 +354,33 @@ test("budget.5: immediate-exit runtime → bounded revives with backoff, spawn_f
   }
 });
 
+test("budget.5b: a driver that THROWS from start (cell provisioning failed) is a spawn failure on the B5 table — retried with backoff, spawn_failed at the budget, never a wedged command or a loop error", () => {
+  const rig = makeRig();
+  try {
+    rig.driver.startError = "provision: origin /gone has no .git";
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "stub", substrate: "cell", cwd: "/cells/w/repo-space-1" });
+    const cmd = rig.store.enqueueCommand("spawn", "bee-1");
+    // No step throws: the failure is reported, not propagated.
+    stepUntilQuiet(rig, 40);
+    const settled = rig.store.getCommand(cmd.id)!;
+    assert.equal(settled.status, "failed");
+    assert.equal(settled.failureCause, "spawn_failed");
+    assert.equal(settled.attempts, 3, "maxAttempts 3 in the rig: 1 attempt + 2 retries");
+    assert.equal(rig.driver.starts.length, 3, "one start per attempt");
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"]);
+    assert.ok(rig.ops.some((o) => o.includes("start_failed") && o.includes("origin /gone")), "the driver's reason is logged");
+    assert.equal(rig.store.listCommands({ beeId: "bee-1", status: "running" }).length, 0, "nothing wedged in running");
+    // Fixing the driver + an operator revive recovers (budget.6 semantics apply).
+    rig.driver.startError = null;
+    rig.store.enqueueCommand("revive", "bee-1");
+    stepUntilQuiet(rig, 20);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("budget.6: an explicit operator revive retries regardless of spawn_failed and clears it on success; the mail then flows", () => {
   const rig = makeRig();
   try {

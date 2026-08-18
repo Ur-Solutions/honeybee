@@ -16,11 +16,11 @@
  *  - behavior 6 (service mgmt)     → service.ts (wired by the CLI)
  *  - behavior 7 (config)           → config.ts
  */
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import {
   exportTemplate,
   exportTrack,
@@ -37,6 +37,20 @@ import {
 } from "../../core/src/index.ts";
 import { realPreflightProbes } from "./import-probes.ts";
 import { HsrDriver, type SpawnSpec } from "../../driver-hsr/src/index.ts";
+import {
+  CellDeleteRefused,
+  CellDriver,
+  CellRuntimeLiveError,
+  cellPaths,
+  provisionRequestOf,
+  readLedger,
+  reserveCell,
+  revParse,
+  sanitizeComponent,
+  type CellSpec,
+  type ReserveRequest,
+} from "../../driver-cell/src/index.ts";
+import { SubstrateRouter } from "./substrates.ts";
 import {
   claudeAdapter,
   claudeArgGrammar,
@@ -56,6 +70,10 @@ import {
   DAEMON_VERSION,
   PROTOCOL,
   RpcError,
+  SPAWN_SUBSTRATES,
+  type CellCaptureMode,
+  type CellCaptureResult,
+  type CellRemoveResult,
   type DeployInfoResult,
   type HealthResult,
   type ListResult,
@@ -66,7 +84,9 @@ import {
   type ImportLocalConfigResult,
   type SendRpcResult,
   type SnapshotResult,
+  type SpawnCellParams,
   type SpawnResult,
+  type SpawnSubstrate,
   type TemplateDeleteResult,
   type TemplateExportResult,
   type TemplateGetResult,
@@ -145,10 +165,14 @@ export function composeSpawn(
 
 const OP_LOG_TAIL = 40;
 
+/** Verbs whose result `status` is the verb's own report, not a command status (see withIdempotency). */
+const OWN_STATUS_VERBS: ReadonlySet<RpcVerb> = new Set<RpcVerb>(["cell.capture", "cell.remove"]);
+
 export class HiveDaemon {
   readonly cfg: ResolvedNodeConfig;
   private store: CoreStore | null = null;
-  private driver: HsrDriver | null = null;
+  /** The substrate router DaemonCore drives; `.hsr` / `.cell` are the substrate drivers. */
+  private driver: SubstrateRouter | null = null;
   private core: DaemonCore | null = null;
   private telemetry: TelemetryStore | null = null;
   private rpc: RpcServer | null = null;
@@ -182,11 +206,26 @@ export class HiveDaemon {
       backoffBaseMs: this.cfg.backoffBaseMs,
     });
     this.store = store;
-    const driver = new HsrDriver({
+    const hsrConfig = {
       sessionLogDir: this.cfg.sessionLogDir,
       stopKillGraceMs: this.cfg.stopKillGraceMs,
       adoptToleranceMs: this.cfg.adoptToleranceMs,
-      resolve: (beeId: string) => this.resolveSpawnSpec(beeId),
+    };
+    const hsr = new HsrDriver({ ...hsrConfig, resolve: (beeId: string) => this.resolveSpawnSpec(beeId) });
+    // Cell substrate (spec 05): a CellDriver composed over its own inner
+    // HsrDriver — pure delegation; the cell layer adds provisioning, cwd =
+    // the space checkout, and the A4 sandbox. Same harness resolution.
+    const cell = new CellDriver({
+      cellsRoot: this.cfg.cellsRoot,
+      nodeKind: this.cfg.nodeKind,
+      resolveHarness: (beeId: string) => this.resolveSpawnSpec(beeId),
+      resolveCell: (beeId: string) => this.resolveCellSpec(beeId),
+      hsr: hsrConfig,
+    });
+    const driver = new SubstrateRouter({
+      hsr,
+      cell,
+      substrateOf: (beeId: string) => store.getBee(beeId)?.substrate ?? null,
     });
     this.driver = driver;
     this.core = new DaemonCore({
@@ -295,7 +334,34 @@ export class HiveDaemon {
     };
   }
 
-  private adoptSurvivors(store: CoreStore, driver: HsrDriver): void {
+  /**
+   * The cell half of a cell bee's spawn (CellDriver.resolveCell). The seed
+   * ledger the daemon wrote at spawn (`<wrapper>/box/cell.json`, reached
+   * from the bee's cwd = the space dir) is the durable allocation truth:
+   * origin, sha, layout, warm and sandbox choices all come from it, so a
+   * daemon restart re-hydrates cells without any in-memory state. Node
+   * config supplies the defaults the ledger left open (sandbox override).
+   */
+  private resolveCellSpec(beeId: string): CellSpec {
+    const store = this.mustStore();
+    const bee = store.getBee(beeId);
+    if (!bee) throw new Error(`resolveCell: bee ${beeId} not found`);
+    if (bee.substrate !== "cell") throw new Error(`resolveCell: bee ${beeId} is on substrate '${bee.substrate}', not cell`);
+    const wrapperDir = dirname(bee.cwd);
+    const ledger = readLedger(join(wrapperDir, "box", "cell.json"));
+    if (!ledger) throw new Error(`resolveCell: bee ${beeId} has no cell ledger under ${wrapperDir} (cell removed?)`);
+    if (ledger.beeId !== beeId) throw new Error(`resolveCell: ledger under ${wrapperDir} belongs to bee ${ledger.beeId}, not ${beeId}`);
+    const provision = provisionRequestOf(ledger);
+    if (!provision) throw new Error(`resolveCell: ledger under ${wrapperDir} has a malformed space name '${ledger.spaceName}'`);
+    provision.wrapper = basename(wrapperDir);
+    const paths = cellPaths(this.cfg.cellsRoot, provision.wrapper, provision.repoName, provision.cellId);
+    if (paths.spaceDir !== bee.cwd) {
+      throw new Error(`resolveCell: bee ${beeId} cell ${bee.cwd} is outside cells root ${this.cfg.cellsRoot} (cells.root changed?)`);
+    }
+    return { provision, sandbox: ledger.sandbox ?? this.cfg.cellSandbox };
+  }
+
+  private adoptSurvivors(store: CoreStore, driver: SubstrateRouter): void {
     for (const bee of store.listBees()) {
       const rt = store.currentRuntime(bee.id);
       if (!rt || rt.state === "stopped" || rt.pid == null || rt.pidStartedAt == null) continue;
@@ -362,6 +428,10 @@ export class HiveDaemon {
         );
       case "bee.setArgs":
         return this.withIdempotency(verb, params, () => this.rpcSetArgs(params));
+      case "cell.capture":
+        return this.withIdempotency(verb, params, () => this.rpcCellCapture(params));
+      case "cell.remove":
+        return this.withIdempotency(verb, params, () => this.rpcCellRemove(params));
       case "archive":
         return this.withIdempotency(verb, params, () =>
           this.rpcEnqueue("archive", this.param(params, "beeId"), {}, params),
@@ -504,7 +574,10 @@ export class HiveDaemon {
       if (hit) {
         this.log(`rpc.dedup verb=${verb} key=${key}`);
         const replay = { ...(hit.result as T), deduped: true as const };
-        if (hit.commandId != null) {
+        // Command-backed results carry the command's CURRENT status on
+        // replay — except the cell verbs, whose `status` IS the report
+        // (deleted|refused|absent, landed|conflict|…) and is never clobbered.
+        if (hit.commandId != null && !OWN_STATUS_VERBS.has(verb)) {
           const cmd = store.getCommand(hit.commandId);
           if (cmd) return { ...replay, status: cmd.status };
         }
@@ -530,7 +603,9 @@ export class HiveDaemon {
     }
     const name = this.param(params, "name");
     const agent = this.param(params, "agent");
-    const cwd = this.param(params, "cwd");
+    const substrate = this.substrateParam(params);
+    // The cell owns the cwd (the space checkout): `cwd` is optional/ignored for cell spawns.
+    const cwd = substrate === "cell" ? "" : this.param(params, "cwd");
     const agentSpec = this.cfg.agents[agent];
     const adapterName = agentSpec?.adapter ?? agent;
     if (!agentSpec || !(ADAPTER_NAMES as readonly string[]).includes(adapterName)) {
@@ -541,19 +616,200 @@ export class HiveDaemon {
       : [];
     const id = typeof params.id === "string" && params.id.length > 0 ? params.id : randomUUID();
     const driver = this.driver;
+    // Cell substrate: the cell owns the cwd (the space checkout). The seed
+    // ledger is written in the same call, AFTER the row exists (createBee
+    // is the id/name gate) and before the spawn command is enqueued —
+    // inside the idempotency transaction, so a failure here leaves no bee.
+    const cell = substrate === "cell" ? this.planCell(id, name, this.cellParam(params)) : null;
     store.createBee({
       id,
       name,
       agent,
-      substrate: "hsr",
-      cwd,
+      substrate,
+      cwd: cell ? cell.spaceDir : cwd,
       title: typeof params.title === "string" ? params.title : undefined,
       tags,
       sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
       args: params.args === undefined ? undefined : this.argsParam(params, "spawn", false),
     });
+    if (cell) {
+      reserveCell(this.cfg.cellsRoot, cell.reserve);
+      this.log(`cell.reserve bee=${id} origin=${cell.reserve.originRepo} sha=${cell.reserve.sha} space=${cell.spaceDir}`);
+    }
     const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
     return { beeId: id, commandId: cmd.id };
+  }
+
+  private substrateParam(params: Record<string, unknown>): SpawnSubstrate {
+    const v = params.substrate;
+    if (v === undefined || v === null) return "hsr";
+    if (typeof v !== "string" || !(SPAWN_SUBSTRATES as readonly string[]).includes(v)) {
+      throw new RpcError("invalid_request", `substrate must be one of ${SPAWN_SUBSTRATES.join("|")}`);
+    }
+    return v as SpawnSubstrate;
+  }
+
+  /** `spawn.cell` — validated shape (see SpawnCellParams). */
+  private cellParam(params: Record<string, unknown>): SpawnCellParams {
+    const v = params.cell;
+    if (v === null || typeof v !== "object" || Array.isArray(v)) {
+      throw new RpcError("invalid_request", "spawn: substrate 'cell' requires a cell object {originRepo, sha?, warm?, sandbox?}");
+    }
+    const c = v as Record<string, unknown>;
+    if (typeof c.originRepo !== "string" || c.originRepo.length === 0 || !isAbsolute(c.originRepo)) {
+      throw new RpcError("invalid_request", "spawn: cell.originRepo must be an absolute path");
+    }
+    if (c.sha !== undefined && (typeof c.sha !== "string" || c.sha.length === 0)) {
+      throw new RpcError("invalid_request", "spawn: cell.sha must be a non-empty string when given");
+    }
+    if (
+      c.warm !== undefined &&
+      typeof c.warm !== "boolean" &&
+      !(Array.isArray(c.warm) && c.warm.every((d) => typeof d === "string" && d.length > 0))
+    ) {
+      throw new RpcError("invalid_request", "spawn: cell.warm must be a boolean or an array of non-empty strings");
+    }
+    if (c.sandbox !== undefined && typeof c.sandbox !== "boolean") {
+      throw new RpcError("invalid_request", "spawn: cell.sandbox must be a boolean when given");
+    }
+    return {
+      originRepo: c.originRepo,
+      ...(c.sha !== undefined ? { sha: c.sha as string } : {}),
+      ...(c.warm !== undefined ? { warm: c.warm as boolean | string[] } : {}),
+      ...(c.sandbox !== undefined ? { sandbox: c.sandbox as boolean } : {}),
+    };
+  }
+
+  /**
+   * Plan a cell for a new bee: validate the origin, resolve the sha (default
+   * HEAD), and derive the layout — wrapper `<name>-<hash(id)>`, space
+   * `<repo>-space-<hash(id)>` — deterministically from the bee, so a replayed
+   * spawn maps to the same paths. Nothing is written here.
+   */
+  private planCell(id: string, name: string, cell: SpawnCellParams): { spaceDir: string; reserve: ReserveRequest } {
+    const originRepo = resolve(cell.originRepo);
+    if (!existsSync(join(originRepo, ".git"))) {
+      throw new RpcError("invalid_request", `spawn: cell.originRepo ${originRepo} is not a git repository (no .git)`);
+    }
+    const sha = revParse(originRepo, cell.sha ?? "HEAD");
+    if (sha == null) {
+      throw new RpcError(
+        "invalid_request",
+        cell.sha === undefined
+          ? `spawn: origin ${originRepo} has no HEAD commit`
+          : `spawn: cell.sha '${cell.sha}' does not resolve to a commit in ${originRepo}`,
+      );
+    }
+    const cellId = createHash("sha1").update(id).digest("hex").slice(0, 12);
+    const wrapper = `${sanitizeComponent(name)}-${cellId}`;
+    const repoName = sanitizeComponent(basename(originRepo));
+    const warmArtifacts =
+      cell.warm === true ? (this.cfg.cellWarm[originRepo] ?? []) : Array.isArray(cell.warm) ? cell.warm : [];
+    const paths = cellPaths(this.cfg.cellsRoot, wrapper, repoName, cellId);
+    return {
+      spaceDir: paths.spaceDir,
+      reserve: {
+        beeId: id,
+        originRepo,
+        sha,
+        wrapper,
+        repoName,
+        cellId,
+        warmArtifacts,
+        sandbox: cell.sandbox ?? null,
+      },
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // WP6 §5 — cell exit path (spec 05 points 4 + 6)
+  // -------------------------------------------------------------------------
+
+  /** The bee must exist AND be on the cell substrate; returns the cell driver. */
+  private requireCellBee(params: Record<string, unknown>): { beeId: string; cell: CellDriver } {
+    const beeId = this.requireBee(params);
+    const bee = this.mustStore().getBee(beeId);
+    if (bee?.substrate !== "cell") {
+      throw new RpcError("invalid_request", `bee ${beeId} is on substrate '${bee?.substrate}', not cell`);
+    }
+    const driver = this.driver;
+    if (!driver) throw new RpcError("node_stopped", "daemon is shutting down");
+    return { beeId, cell: driver.cell };
+  }
+
+  /**
+   * `cell.capture`: CellDriver.capture verbatim. Refusals and conflicts are
+   * RESULTS (the report is the answer — the UI renders a branch picker or a
+   * conflict staging state), never RPC errors. The transient ref is named by
+   * the idempotency key when given, so a replayed operation is one operation.
+   */
+  private rpcCellCapture(params: Record<string, unknown>): CellCaptureResult {
+    const { beeId, cell } = this.requireCellBee(params);
+    const targetBranch = this.param(params, "targetBranch");
+    const mode = params.mode;
+    if (mode !== "merge" && mode !== "rebase") {
+      throw new RpcError("invalid_request", "cell.capture: mode must be merge|rebase");
+    }
+    const key = this.idempotencyKeyOf(params);
+    const opId = `capture-${key ?? randomUUID()}`;
+    if (!cell.cellOf(beeId)) {
+      // Reserved but never provisioned (or already removed): nothing to capture.
+      return {
+        status: "refused",
+        targetBranch,
+        mode: mode as CellCaptureMode,
+        cellHead: null,
+        baseTarget: null,
+        resultSha: null,
+        conflicts: [],
+        reason: "no_cell_head",
+      };
+    }
+    const report = cell.capture(beeId, { targetBranch, mode: mode as CellCaptureMode, opId });
+    this.log(
+      `cell.capture bee=${beeId} onto=${targetBranch} mode=${mode} status=${report.status}` +
+        (report.reason ? ` reason=${report.reason}` : "") +
+        (report.resultSha ? ` result=${report.resultSha}` : "") +
+        (report.conflicts.length > 0 ? ` conflicts=${report.conflicts.length}` : ""),
+    );
+    return { ...report };
+  }
+
+  /**
+   * `cell.remove`: the A2 dirty guard (CellDriver.removeCell) then the bee's
+   * lifecycle `delete` in the same call. Refused ⇒ nothing changed, no
+   * command. A live runtime is a typed `runtime_refused` — stop it first.
+   */
+  private rpcCellRemove(params: Record<string, unknown>): CellRemoveResult {
+    const { beeId, cell } = this.requireCellBee(params);
+    const store = this.mustStore();
+    if (params.force !== undefined && typeof params.force !== "boolean") {
+      throw new RpcError("invalid_request", "cell.remove: force must be a boolean when given");
+    }
+    const force = params.force === true;
+    const rt = store.currentRuntime(beeId);
+    if ((rt && rt.state !== "stopped") || (rt && this.driver?.hasProcess(beeId, rt.generation))) {
+      throw new RpcError("runtime_refused", `bee ${beeId} has a live runtime (${rt.state}); stop it before removing its cell`);
+    }
+    let result: CellRemoveResult;
+    try {
+      const res = cell.removeCell(beeId, { force });
+      result = res.deleted
+        ? { status: "deleted", forced: res.forced, report: res.report, commandId: null }
+        : { status: "absent", forced: false, report: null, commandId: null };
+    } catch (err) {
+      if (err instanceof CellDeleteRefused) {
+        this.log(`cell.remove bee=${beeId} refused dirty=${JSON.stringify(err.report)}`);
+        return { status: "refused", forced: false, report: err.report, commandId: null };
+      }
+      if (err instanceof CellRuntimeLiveError) throw new RpcError("runtime_refused", err.message);
+      throw err;
+    }
+    const key = this.idempotencyKeyOf(params);
+    const cmd = store.enqueueCommand("delete", beeId, {}, key == null ? {} : { idempotencyKey: key });
+    result.commandId = cmd.id;
+    this.log(`cell.remove bee=${beeId} status=${result.status} forced=${result.forced} delete=${cmd.id}`);
+    return result;
   }
 
   private rpcSend(params: Record<string, unknown>): SendRpcResult {

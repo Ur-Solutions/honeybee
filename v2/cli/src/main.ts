@@ -28,6 +28,8 @@ import {
   type ListResult,
   type MailboxResult,
   type CommandsResult,
+  type CellCaptureResult,
+  type CellRemoveResult,
   type SendRpcResult,
   type SnapshotResult,
   type SetArgsResult,
@@ -96,6 +98,11 @@ const VALUE_FLAGS = new Set([
   "--idempotency-key",
   "--root",
   "--arg",
+  "--substrate",
+  "--origin",
+  "--sha",
+  "--warm",
+  "--onto",
 ]);
 
 function parseArgs(argv: string[]): Parsed {
@@ -227,16 +234,39 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 // commands
 // ---------------------------------------------------------------------------
 
+const SPAWN_USAGE =
+  "usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]\n" +
+  "       hive v2 spawn <name> --agent <agent> --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]";
+
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
   const name = parsed.positional[1];
-  if (!name) throw new Error("usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]");
+  if (!name) throw new Error(SPAWN_USAGE);
   const agent = (parsed.flags.get("--agent") as string | undefined) ?? "claude";
   const cwd = resolve((parsed.flags.get("--cwd") as string | undefined) ?? process.cwd());
+  const substrate = (parsed.flags.get("--substrate") as string | undefined) ?? (parsed.flags.has("--origin") ? "cell" : "hsr");
+  let cell: Record<string, unknown> | undefined;
+  if (substrate === "cell") {
+    const origin = parsed.flags.get("--origin") as string | undefined;
+    if (!origin) throw new Error(`${SPAWN_USAGE}\n(--substrate cell requires --origin <repo>)`);
+    const warmFlag = parsed.flags.get("--warm");
+    const warm = warmFlag === undefined ? undefined : warmFlag === true ? true : warmFlag.split(",").map((d) => d.trim()).filter((d) => d.length > 0);
+    const sandbox = parsed.flags.get("--sandbox") === true ? true : parsed.flags.get("--no-sandbox") === true ? false : undefined;
+    cell = {
+      originRepo: resolve(origin),
+      ...(parsed.flags.has("--sha") ? { sha: parsed.flags.get("--sha") as string } : {}),
+      ...(warm !== undefined ? { warm } : {}),
+      ...(sandbox !== undefined ? { sandbox } : {}),
+    };
+  } else if (parsed.flags.has("--origin") || parsed.flags.has("--sha")) {
+    throw new Error(`${SPAWN_USAGE}\n(--origin/--sha only apply to --substrate cell)`);
+  }
   const result = await withClient(ctx, (c) =>
     c.request<SpawnResult>("spawn", {
       name,
       agent,
       cwd,
+      substrate,
+      ...(cell ? { cell } : {}),
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
       ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
@@ -316,6 +346,83 @@ async function cmdMutation(
     emit(ctx, [`${verb} ${beeId} enqueued (command ${result.commandId})`], { beeId, ...result }, false);
     return 0;
   });
+}
+
+/**
+ * `hive v2 cell capture <bee> --onto <branch> [--rebase]` /
+ * `hive v2 cell remove <bee> [--force]` — the WP6 §5 exit path. Refusals and
+ * conflicts are RESULTS: printed, exit 0 with `--json`; human mode exits 2
+ * for a refused/conflicted capture and a refused remove so scripts can tell.
+ */
+async function cmdCell(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  const needle = parsed.positional[2];
+  const usage = "usage: hive v2 cell capture <bee> --onto <branch> [--rebase] [--idempotency-key k] | cell remove <bee> [--force] [--idempotency-key k]";
+  switch (sub) {
+    case "capture": {
+      const onto = parsed.flags.get("--onto") as string | undefined;
+      if (!needle || !onto) throw new Error(usage);
+      const mode = parsed.flags.get("--rebase") === true ? "rebase" : "merge";
+      return withClient(ctx, async (c) => {
+        const list = await c.request<ListResult>("list");
+        const beeId = resolveBeeIn(list.views, needle);
+        const r = await c.request<CellCaptureResult>("cell.capture", {
+          beeId,
+          targetBranch: onto,
+          mode,
+          idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+        });
+        const dedup = r.deduped ? "deduped: " : "";
+        const lines: string[] = [];
+        switch (r.status) {
+          case "landed":
+            lines.push(`${dedup}landed ${r.cellHead?.slice(0, 12)} onto ${r.targetBranch} (${r.mode}) → ${r.resultSha}${r.baseTarget == null ? " (branch created)" : ""}`);
+            break;
+          case "nothing_to_capture":
+            lines.push(`${dedup}nothing to capture: ${r.targetBranch} already contains ${r.cellHead?.slice(0, 12)}`);
+            break;
+          case "conflict":
+            lines.push(`${dedup}conflict: ${r.mode} of ${r.cellHead?.slice(0, 12)} onto ${r.targetBranch} (${r.baseTarget?.slice(0, 12)}) — your repository was not modified`);
+            for (const path of r.conflicts) lines.push(`  ${path}`);
+            break;
+          case "refused":
+            lines.push(`${dedup}refused (${r.reason}) — your repository was not modified`);
+            break;
+        }
+        emit(ctx, lines, { beeId, ...r }, false);
+        return ctx.json || r.status === "landed" || r.status === "nothing_to_capture" ? 0 : 2;
+      });
+    }
+    case "remove":
+    case "rm": {
+      if (!needle) throw new Error(usage);
+      return withClient(ctx, async (c) => {
+        const list = await c.request<ListResult>("list");
+        const beeId = resolveBeeIn(list.views, needle);
+        const r = await c.request<CellRemoveResult>("cell.remove", {
+          beeId,
+          force: parsed.flags.get("--force") === true,
+          idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+        });
+        const dedup = r.deduped ? "deduped: " : "";
+        const lines: string[] = [];
+        if (r.status === "refused") {
+          const causes = [
+            r.report?.uncommitted ? "uncommitted changes" : null,
+            r.report?.unpushed ? "uncaptured commits" : null,
+            r.report?.originUnknown ? "origin unreachable" : null,
+          ].filter((x) => x != null);
+          lines.push(`${dedup}refused: cell is dirty (${causes.join(", ")}) — pass --force to delete anyway (work is lost)`);
+        } else {
+          lines.push(`${dedup}cell ${r.status}${r.forced ? " (forced)" : ""}; delete ${beeId} enqueued (command ${r.commandId})`);
+        }
+        emit(ctx, lines, { beeId, ...r }, false);
+        return ctx.json || r.status !== "refused" ? 0 : 2;
+      });
+    }
+    default:
+      throw new Error(usage);
+  }
 }
 
 /**
@@ -961,6 +1068,12 @@ Usage: hive v2 <command> [args] [--data-dir d] [--socket s] [--json]
 
 Mutations (RPC, daemon must be running):
   spawn <name> --agent <a> [--cwd d] [--title t] [--tag t]... [--arg a]... [--idempotency-key k]
+  spawn <name> --agent <a> --substrate cell --origin <repo> [--sha s] [--warm [d,d]] [--sandbox|--no-sandbox]
+                                             spawn into a provisioned cell (spec 05): the bee's cwd is
+                                             the cell checkout; --sha defaults to the origin's HEAD
+  cell capture <bee> --onto <branch> [--rebase]   land the cell's commits onto an origin branch
+                                             (merge by default); refusals/conflicts are results
+  cell remove <bee> [--force]                delete the cell (dirty guard, A2) + delete the bee
   send <bee> <message…> [--sender s] [--wait] [--timeout ms] [--idempotency-key k]
   stop | revive | archive | unarchive | delete <bee>
   revive <bee> [--arg a]... | [-- <args…>]   (revive with replacement per-bee args)
@@ -1018,6 +1131,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdMutation(ctx, parsed, command);
       case "bee":
         return await cmdBee(ctx, parsed);
+      case "cell":
+        return await cmdCell(ctx, parsed);
       case "view":
         return await cmdView(ctx, parsed);
       case "list":

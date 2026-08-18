@@ -42,7 +42,10 @@ export interface CellLedger {
   createdAt: number;
   /** Recorded honestly per spec: how the .git actually arrived. */
   copy_mode?: CopyMode;
+  /** Per-cell sandbox override (A4); absent = node-kind default. */
   sandbox?: boolean;
+  /** Warm artifact dirs requested at reservation (A5); absent = none. */
+  warm?: string[];
   operations: Record<string, LedgerOperation>;
 }
 
@@ -53,6 +56,8 @@ export function newLedger(init: {
   wrapper: string;
   spaceName: string;
   now: number;
+  sandbox?: boolean | null;
+  warm?: string[];
 }): CellLedger {
   return {
     version: 1,
@@ -62,6 +67,8 @@ export function newLedger(init: {
     wrapper: init.wrapper,
     spaceName: init.spaceName,
     createdAt: init.now,
+    ...(init.sandbox == null ? {} : { sandbox: init.sandbox }),
+    ...(init.warm && init.warm.length > 0 ? { warm: [...init.warm] } : {}),
     operations: {},
   };
 }

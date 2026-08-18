@@ -62,6 +62,11 @@ export class FakeDriver implements RuntimeDriver {
    * immediate-exit stub / missing-cwd shape). Wins over autoBoot.
    */
   bootCrash = false;
+  /**
+   * When set, start() THROWS this message before owning any process (a cell
+   * whose provisioning failed, an unresolvable spawn spec). Wins over both.
+   */
+  startError: string | null = null;
   /** Every start() call, in order (bee, generation) — how many revives happened. */
   readonly starts: Array<{ beeId: string; generation: number }> = [];
   private nextPid = 100;
@@ -74,6 +79,7 @@ export class FakeDriver implements RuntimeDriver {
   start(beeId: string, generation: number): void {
     if (this.procs.has(beeId)) throw new Error(`fake driver: ${beeId} already live`);
     this.starts.push({ beeId, generation });
+    if (this.startError != null) throw new Error(this.startError);
     const pid = this.nextPid++;
     const proc: FakeProc = { generation, pid, pidStartedAt: this.now(), degraded: false };
     this.procs.set(beeId, proc);

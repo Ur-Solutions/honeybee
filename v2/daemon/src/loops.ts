@@ -465,6 +465,27 @@ export class DaemonCore {
     }
   }
 
+  /**
+   * driver.start for a claimed spawn-shaped command. A driver that throws
+   * BEFORE it owns a process (a cell whose provisioning failed: origin gone,
+   * git/CoW error; a harness whose spawn spec cannot be resolved) is a
+   * spawn failure on the B5 retry table — `spawn_failed` at the budget,
+   * visibly — never a wedged `running` command or a tick error. Returns
+   * false when the command was reported failed (the caller does not settle).
+   */
+  private startRuntime(cmd: CommandRow, generation: number): boolean {
+    try {
+      this.driver.start(cmd.beeId, generation);
+      return true;
+    } catch (err) {
+      if (err instanceof CoreError) throw err; // contract rejections keep their moot path
+      const detail = err instanceof Error ? err.message : String(err);
+      const res = this.store.reportCommandFailure(cmd.id, "spawn_failed", `driver start failed: ${detail}`);
+      this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} gen=${generation} start_failed status=${res.status} attempts=${res.attempts} err=${JSON.stringify(detail)}`);
+      return false;
+    }
+  }
+
   /** Record pid + start-time at spawn (the WP2 amendment) when the driver can report it. */
   private recordProcAtSpawn(beeId: string, generation: number): void {
     if (typeof this.ext.procOf !== "function") return;
@@ -542,7 +563,7 @@ export class DaemonCore {
             return false;
           }
           if (reviveArgs !== undefined) this.store.updateBeeArgs(cmd.beeId, reviveArgs);
-          this.driver.start(cmd.beeId, rt.generation);
+          if (!this.startRuntime(cmd, rt.generation)) return false;
           this.recordProcAtSpawn(cmd.beeId, rt.generation);
           this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} start gen=${rt.generation}`);
           return true;
@@ -553,7 +574,7 @@ export class DaemonCore {
           return false;
         }
         const next = this.store.reviveBee(cmd.beeId, reviveArgs === undefined ? {} : { args: reviveArgs });
-        this.driver.start(cmd.beeId, next.generation);
+        if (!this.startRuntime(cmd, next.generation)) return false;
         this.recordProcAtSpawn(cmd.beeId, next.generation);
         this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} revive gen=${next.generation}`);
         return true;
