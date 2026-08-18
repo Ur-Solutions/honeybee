@@ -30,6 +30,7 @@ export {
   type TrackFields,
 } from "./registry.ts";
 export * from "./packages.ts";
+export * from "./import-frozen.ts";
 export * from "./mirror.ts";
 export { replayAudit } from "./audit.ts";
 export { deriveBeeView } from "./view.ts";

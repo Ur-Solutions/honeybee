@@ -44,7 +44,7 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
-import { IDEMPOTENCY_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_V3_COLUMNS, IDEMPOTENCY_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -81,6 +81,17 @@ export interface CreateBeeInput {
   title?: string;
   tags?: string[];
   sessionLogPath?: string;
+  /** v3 — a known harness session/thread id to resume on the first runtime (imports). */
+  providerSessionId?: string;
+  /** v3 — per-bee env overrides applied over the agent spec at spawn. */
+  env?: Record<string, string>;
+  /** v3 — provenance marker; null/absent for v2-born bees. */
+  importedFrom?: string;
+  /**
+   * Creation timestamp override (epoch ms) — importers preserve the original
+   * record's creation time. Defaults to the store clock.
+   */
+  createdAt?: number;
 }
 
 export interface SendResult {
@@ -169,6 +180,9 @@ function mapBee(r: Row): BeeRow {
     createdAt: Number(r.created_at),
     archivedAt: r.archived_at == null ? null : Number(r.archived_at),
     lastOutputAt: r.last_output_at == null ? null : Number(r.last_output_at),
+    providerSessionId: (r.provider_session_id as string | null) ?? null,
+    env: JSON.parse((r.env as string | null) ?? "{}") as Record<string, string>,
+    importedFrom: (r.imported_from as string | null) ?? null,
   };
 }
 
@@ -403,6 +417,15 @@ export class CoreStore {
       if (!cols.some((c) => c.name === "idempotency_key")) {
         this.db.exec("ALTER TABLE commands ADD COLUMN idempotency_key TEXT");
       }
+      // v2 → v3: additive bee columns (provider_session_id, env, imported_from).
+      // Same discipline: add iff missing, so fresh and v1 stores (whose bees
+      // table was just created in full) are untouched.
+      const beeCols = new Set(
+        (this.db.prepare("SELECT name FROM pragma_table_info('bees')").all() as Row[]).map((c) => String(c.name)),
+      );
+      for (const [name, ddl] of BEES_V3_COLUMNS) {
+        if (!beeCols.has(name)) this.db.exec(`ALTER TABLE bees ADD COLUMN ${ddl}`);
+      }
     }
     // The partial UNIQUE index needs the column, so it is created here — after
     // the migration — not in SCHEMA_SQL.
@@ -452,10 +475,13 @@ export class CoreStore {
       const id = input.id ?? randomUUID();
       if (this.getBee(id)) throw new CoreError(`bee already exists: ${id}`);
       const at = this.now();
+      const createdAt = input.createdAt ?? at;
+      if (!Number.isFinite(createdAt)) throw new CoreError("createBee: createdAt must be a finite epoch-ms number");
       this.db
         .prepare(
-          `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+          `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at,
+                            provider_session_id, env, imported_from)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -466,7 +492,10 @@ export class CoreStore {
           input.title ?? null,
           JSON.stringify(input.tags ?? []),
           input.sessionLogPath ?? null,
-          at,
+          createdAt,
+          input.providerSessionId ?? null,
+          JSON.stringify(input.env ?? {}),
+          input.importedFrom ?? null,
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });
@@ -699,6 +728,42 @@ export class CoreStore {
       }
       const generation = (current?.generation ?? 0) + 1;
       return this.insertRuntime(beeId, generation, this.now(), opts.proc);
+    });
+  }
+
+  /**
+   * v3 (spec 07 §F) — record the harness-native session/thread id a runtime
+   * reported on boot. Bee-scoped (the conversation identity outlives any
+   * generation); an identical value is a silent no-op, so replays and late
+   * duplicate boots never spam the audit log.
+   */
+  recordProviderSessionId(beeId: string, providerSessionId: string): { applied: boolean } {
+    if (typeof providerSessionId !== "string" || providerSessionId.length === 0) {
+      throw new CoreError("recordProviderSessionId: providerSessionId must be a non-empty string");
+    }
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      if (bee.providerSessionId === providerSessionId) return { applied: false };
+      this.db.prepare("UPDATE bees SET provider_session_id = ? WHERE id = ?").run(providerSessionId, beeId);
+      this.audit("bee.provider_session", beeId, {
+        beeId,
+        providerSessionId,
+        previous: bee.providerSessionId,
+      });
+      return { applied: true };
+    });
+  }
+
+  /**
+   * v3 — append the `bee.imported` provenance row (the importer's forensic
+   * record: where the bee came from and what the old record said). Informational
+   * by definition — replayAudit treats it as a no-op; the state-bearing facts
+   * (id, providerSessionId, env, importedFrom) live on the bee row itself.
+   */
+  recordImportProvenance(beeId: string, payload: Record<string, unknown>): void {
+    this.tx(() => {
+      this.mustGetBee(beeId);
+      this.audit("bee.imported", beeId, payload);
     });
   }
 

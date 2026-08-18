@@ -120,7 +120,10 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "lifecycle": "active",
         "createdAt": 1002000,
         "archivedAt": null,
-        "lastOutputAt": null
+        "lastOutputAt": null,
+        "providerSessionId": null,
+        "env": {},
+        "importedFrom": null
       },
       "runtime": {
         "beeId": "BEE_ID",

@@ -88,6 +88,17 @@ export interface FlagEvidence {
   detail: string;
 }
 
+/**
+ * Harness-native session identity reported by a runtime's booted signal
+ * (claude system/init session_id, codex thread id). The daemon records it on
+ * the bee so revive can resume the conversation (spec 07 §F).
+ */
+export interface SessionEvidence {
+  beeId: string;
+  generation: number;
+  sessionId: string;
+}
+
 interface ManagedProcess {
   beeId: string;
   generation: number;
@@ -126,6 +137,7 @@ export class HsrDriver implements RuntimeDriver {
   private readonly pendingStarts = new Map<string, { generation: number }>();
   private events: DriverObservation[] = [];
   private evidence: FlagEvidence[] = [];
+  private sessions: SessionEvidence[] = [];
   /** Delivery ground truth for the invariant checker: messageId → generation. */
   private readonly consumed = new Map<number, number>();
 
@@ -373,6 +385,17 @@ export class HsrDriver implements RuntimeDriver {
     return out;
   }
 
+  /**
+   * Drain harness session ids learned from booted signals (including the late
+   * init a readyAtSpawn harness emits after its first message). The daemon
+   * records them on the bee row (spec 07 §F continuity).
+   */
+  observeSessions(): SessionEvidence[] {
+    const out = this.sessions;
+    this.sessions = [];
+    return out;
+  }
+
   /** Verbatim native-stream session log path for a bee (Q1). */
   sessionLogPath(beeId: string): string {
     return join(this.cfg.sessionLogDir, `${beeId}.jsonl`);
@@ -425,6 +448,7 @@ export class HsrDriver implements RuntimeDriver {
     }
     this.events = [];
     this.evidence = [];
+    this.sessions = [];
   }
 
   // -------------------------------------------------------------------------
@@ -502,7 +526,14 @@ export class HsrDriver implements RuntimeDriver {
   private onSignal(p: ManagedProcess, signal: ReturnType<HarnessAdapter["parseLine"]>[number]): void {
     switch (signal.kind) {
       case "booted": {
-        if (signal.sessionId) p.sessionId = signal.sessionId; // late init still carries it
+        if (signal.sessionId) {
+          // Late init still carries it (claude emits system/init only after the
+          // first user message); the id is a bee fact whenever it is learned.
+          if (p.sessionId !== signal.sessionId) {
+            this.sessions.push({ beeId: p.beeId, generation: p.generation, sessionId: signal.sessionId });
+          }
+          p.sessionId = signal.sessionId;
+        }
         if (p.phase !== "booting") return; // duplicate readiness — normalize away
         // booted = "live and working its initial turn" (running). The adapter
         // follows with turn_ended when the harness boots straight to ready.

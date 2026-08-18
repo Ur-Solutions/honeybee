@@ -16,8 +16,14 @@
  *   v2 — spec 06 §4.2 one-key idempotency: adds the nullable UNIQUE
  *        `commands.idempotency_key` column and the `rpc_idempotency` results
  *        table (additive; migration = ALTER TABLE ADD COLUMN).
+ *   v3 — WP7 continuity (spec 07 §F): adds `bees.provider_session_id` (the
+ *        harness-native session/thread id revive resumes with),
+ *        `bees.env` (per-bee env overrides, e.g. the harness config home an
+ *        imported bee's session lives in) and `bees.imported_from`
+ *        (provenance: null | "frozen"). Additive; migration = ALTER TABLE
+ *        ADD COLUMN ×3.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -37,7 +43,19 @@ CREATE TABLE IF NOT EXISTS bees (
   lifecycle        TEXT NOT NULL CHECK (lifecycle IN ('active','archived')),
   created_at       INTEGER NOT NULL,
   archived_at      INTEGER,
-  last_output_at   INTEGER
+  last_output_at   INTEGER,
+  -- v3: harness-native session/thread id of the bee's conversation (claude
+  -- session_id, codex thread id). Recorded from the runtime's booted signal;
+  -- revive hands it back to the harness (claude --resume / codex thread/resume)
+  -- so a new generation continues the same conversation (spec 07 §F).
+  provider_session_id TEXT,
+  -- v3: per-bee env overrides applied over the agent spec at spawn (json
+  -- object of strings). The importer uses it for the harness config home
+  -- (CLAUDE_CONFIG_DIR / CODEX_HOME / …) an old-world session lives in.
+  env              TEXT NOT NULL DEFAULT '{}',
+  -- v3: provenance — null for bees born in v2, "frozen" for records imported
+  -- from the frozen old-world store (id preserved; details in the audit row).
+  imported_from    TEXT
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
@@ -95,6 +113,10 @@ CREATE INDEX IF NOT EXISTS commands_ready ON commands(status, next_attempt_at, i
 -- The UNIQUE (partial) index on commands.idempotency_key lives in
 -- IDEMPOTENCY_INDEX_SQL below: it can only be created once the column exists,
 -- which on a migrated v1 store happens in the constructor's migration step.
+
+-- v3 additive columns on bees, applied by the constructor's migration step to
+-- stores created before v3 (CREATE TABLE IF NOT EXISTS leaves an existing
+-- table's shape alone). Order matters for nothing; each is added iff missing.
 
 -- Spec 06 §4.2 one-key idempotency: RPC mutation results recorded by key so a
 -- replayed mutation (same caller-supplied idempotencyKey) answers with the
@@ -166,6 +188,13 @@ CREATE TABLE IF NOT EXISTS tracks (
  * the column stays nullable: internal enqueues (send_wake, loop policy stops)
  * carry no key.
  */
+/** v3 columns on `bees` — name → ADD COLUMN clause (migration = add iff missing). */
+export const BEES_V3_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
+  ["provider_session_id", "provider_session_id TEXT"],
+  ["env", "env TEXT NOT NULL DEFAULT '{}'"],
+  ["imported_from", "imported_from TEXT"],
+];
+
 export const IDEMPOTENCY_INDEX_SQL = `
 CREATE UNIQUE INDEX IF NOT EXISTS commands_idempotency_key
   ON commands(idempotency_key) WHERE idempotency_key IS NOT NULL;

@@ -36,6 +36,10 @@ function mapBee(r: Row): BeeRow {
     createdAt: Number(r.created_at),
     archivedAt: r.archived_at == null ? null : Number(r.archived_at),
     lastOutputAt: r.last_output_at == null ? null : Number(r.last_output_at),
+    // v3 columns; tolerate a pre-v3 store file read cold (columns absent).
+    providerSessionId: (r.provider_session_id as string | null | undefined) ?? null,
+    env: JSON.parse((r.env as string | null | undefined) ?? "{}") as Record<string, string>,
+    importedFrom: (r.imported_from as string | null | undefined) ?? null,
   };
 }
 

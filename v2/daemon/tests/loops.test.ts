@@ -250,3 +250,37 @@ test("unit.7: I1 telemetry — the clock is suspended while a closed-list flag i
     rig.cleanup();
   }
 });
+
+test("unit.8: continuity (spec 07 §F) — a booted session id is recorded on the bee for the CURRENT generation only; stale/no-bee evidence is skipped", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig, "bee-s");
+    rig.driver.sessions.push({ beeId: "bee-s", generation: 1, sessionId: "sid-gen1" });
+    rig.core.step();
+    assert.equal(rig.store.getBee("bee-s")?.providerSessionId, "sid-gen1");
+    assert.ok(rig.ops.some((o) => o.startsWith("session.recorded bee=bee-s gen=1")));
+    // same value again → no audit spam
+    const auditBefore = rig.store.lastAuditSeq();
+    rig.driver.sessions.push({ beeId: "bee-s", generation: 1, sessionId: "sid-gen1" });
+    rig.core.step();
+    assert.equal(rig.store.lastAuditSeq(), auditBefore);
+    // stale generation and unknown bee are skipped
+    rig.driver.sessions.push({ beeId: "bee-s", generation: 0, sessionId: "sid-stale" });
+    rig.driver.sessions.push({ beeId: "ghost", generation: 1, sessionId: "sid-ghost" });
+    rig.core.step();
+    assert.equal(rig.store.getBee("bee-s")?.providerSessionId, "sid-gen1");
+    assert.ok(rig.ops.some((o) => o.includes("session.skip bee=bee-s gen=0 reason=stale_generation")));
+    assert.ok(rig.ops.some((o) => o.includes("session.skip bee=ghost gen=1 reason=no_bee")));
+    // revive keeps the id on the bee (the driver's resolve reads it for --resume)
+    rig.store.enqueueCommand("stop", "bee-s", { cause: "stopped_by_user" });
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-s")?.state, "stopped");
+    rig.store.send("bee-s", "wake");
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-s")?.generation, 2);
+    assert.equal(rig.store.getBee("bee-s")?.providerSessionId, "sid-gen1");
+  } finally {
+    rig.cleanup();
+  }
+});

@@ -22,6 +22,7 @@ import type {
   BeeView,
   CommandRow,
   CommandStatus,
+  FrozenImportReport,
   LocalConfigImportReport,
   MessageRow,
   MirrorTemplateRow,
@@ -87,6 +88,8 @@ export const RPC_VERBS = [
   "track.export",
   "track.import",
   "packages.importLocalConfig",
+  // WP7 (spec 07 B4): import the operator's active old-world bees from a frozen store
+  "import.fromFrozen",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -254,6 +257,15 @@ export interface TrackImportResult extends DedupMarkers {
 }
 
 export type ImportLocalConfigResult = LocalConfigImportReport & DedupMarkers;
+
+/**
+ * `import.fromFrozen` (WP7). Params: `{ root?: string, dryRun?: boolean,
+ * force?: boolean }` — root defaults to the node's old-world store (~/.hive).
+ * Result is core's FrozenImportReport verbatim: `applied:false` + `refusal`
+ * when the FROZEN marker is missing or the preflight found live old-world
+ * runtimes (never an RPC error — the report IS the answer).
+ */
+export type ImportFromFrozenResult = FrozenImportReport & DedupMarkers;
 
 export class RpcError extends Error {
   readonly code: RpcErrorCode;

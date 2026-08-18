@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import {
   exportTemplate,
   exportTrack,
+  importFromFrozen,
   importLocalConfig,
   importTemplate,
   importTrack,
@@ -34,6 +35,7 @@ import {
   type RowSource,
   type Scope,
 } from "../../core/src/index.ts";
+import { realPreflightProbes } from "./import-probes.ts";
 import { HsrDriver, type SpawnSpec } from "../../driver-hsr/src/index.ts";
 import { claudeAdapter, codexAdapter, stubAdapter, type HarnessAdapter } from "../../adapters/src/index.ts";
 import { DaemonCore, type BootReport, type I1ViolationEvent } from "./loops.ts";
@@ -49,6 +51,7 @@ import {
   type ListResult,
   type MutationResult,
   type RpcVerb,
+  type ImportFromFrozenResult,
   type ImportLocalConfigResult,
   type SendRpcResult,
   type SnapshotResult,
@@ -70,12 +73,18 @@ import {
 
 const ADAPTER_NAMES = ["claude", "codex", "stub"] as const;
 
-function adapterFor(name: string, cwd: string): HarnessAdapter | null {
+/**
+ * Adapter for a bee. `providerSessionId` (bee row, spec 07 §F) selects the
+ * harness-native resume path: claude via argv (`resumeArgs`, applied by
+ * resolveSpawnSpec), codex via its handshake (`thread/resume`). The stub has
+ * no resume path — a revived stub restarts fresh, like any harness without one.
+ */
+function adapterFor(name: string, cwd: string, providerSessionId: string | null): HarnessAdapter | null {
   switch (name) {
     case "claude":
       return claudeAdapter;
     case "codex":
-      return codexAdapter({ cwd });
+      return codexAdapter({ cwd, ...(providerSessionId ? { resumeThreadId: providerSessionId } : {}) });
     case "stub":
       return stubAdapter;
     default:
@@ -207,20 +216,30 @@ export class HiveDaemon {
   // agents
   // -------------------------------------------------------------------------
 
+  /**
+   * The spawn shape for a bee's NEXT runtime. Continuity (spec 07 §F): when
+   * the bee row carries a provider session id, the harness is asked to resume
+   * it — claude gets `--resume <id>` appended to the agent spec's args, codex
+   * gets `thread/resume` in its handshake — so generation N+1 (revive after a
+   * stop, scale-to-zero, crash, or an old-world import) continues the same
+   * conversation. Per-bee env (the harness config home an imported session
+   * lives under) layers over the agent spec env.
+   */
   private resolveSpawnSpec(beeId: string): SpawnSpec {
     const store = this.mustStore();
     const bee = store.getBee(beeId);
     if (!bee) throw new Error(`resolve: bee ${beeId} not found`);
     const spec = this.cfg.agents[bee.agent];
     if (!spec) throw new Error(`resolve: no agent spec for '${bee.agent}'`);
-    const adapter = adapterFor(spec.adapter ?? bee.agent, bee.cwd);
+    const adapter = adapterFor(spec.adapter ?? bee.agent, bee.cwd, bee.providerSessionId);
     if (!adapter) throw new Error(`resolve: no adapter for agent '${bee.agent}'`);
+    const resume = bee.providerSessionId && adapter.resumeArgs ? adapter.resumeArgs(bee.providerSessionId) : [];
     return {
       adapter,
       command: spec.command,
-      args: spec.args ?? [],
+      args: [...(spec.args ?? []), ...resume],
       cwd: bee.cwd,
-      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}) },
+      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env },
     };
   }
 
@@ -352,6 +371,8 @@ export class HiveDaemon {
         });
       case "packages.importLocalConfig":
         return this.withIdempotency(verb, params, () => this.rpcImportLocalConfig(params));
+      case "import.fromFrozen":
+        return this.withIdempotency(verb, params, () => this.rpcImportFromFrozen(params));
       case "snapshot": {
         const snap = this.snapshot();
         conn.alignWatch(snap.seq);
@@ -617,6 +638,31 @@ export class HiveDaemon {
       defaultSource: "api",
     });
     return { track: res.track, outcome: res.outcome };
+  }
+
+  /**
+   * WP7 (spec 07 B4): import active old-world bees from the frozen store.
+   * The daemon is the sole writer (contract §3.5), so the import runs here;
+   * the preflight probes real pids/tmux (A2). Refusals come back as a report
+   * (`applied:false`, `refusal`), not as RPC errors — the CLI prints them.
+   */
+  private rpcImportFromFrozen(params: Record<string, unknown>): ImportFromFrozenResult {
+    const store = this.mustStore();
+    const root = typeof params.root === "string" && params.root.length > 0 ? params.root : join(homedir(), ".hive");
+    const dryRun = params.dryRun === true;
+    const force = params.force === true;
+    const report = importFromFrozen(store, root, {
+      dryRun,
+      force,
+      knownAgents: Object.keys(this.cfg.agents),
+      probes: realPreflightProbes(),
+    });
+    this.log(
+      `import.fromFrozen root=${root} dryRun=${dryRun} force=${force} applied=${report.applied} ` +
+        `import=${report.plan.counts.import} skip=${report.plan.counts.skip} live=${report.preflight.live.length}` +
+        (report.refusal ? ` refusal=${JSON.stringify(report.refusal.split("\n")[0])}` : ""),
+    );
+    return report;
   }
 
   private rpcImportLocalConfig(params: Record<string, unknown>): ImportLocalConfigResult {

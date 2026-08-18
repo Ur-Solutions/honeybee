@@ -177,3 +177,31 @@ test("codex: turn/start error response with auth signature → auth_needed set",
   assert.equal(signals[0]!.kind, "flag");
   if (signals[0]!.kind === "flag") assert.equal(signals[0]!.flag, "auth_needed");
 });
+
+test("codex: resumeThreadId (spec 07 §F) — handshake sends thread/resume {threadId,…} instead of thread/start; the response's thread.id → booted; no argv resume", () => {
+  const resumed = codexAdapter({ cwd: "/tmp/work", resumeThreadId: "01a00e69-6ee4-7cd1-955c-befcbe8d9540" });
+  assert.equal(resumed.resumeArgs, undefined, "codex resumes through its protocol, not argv");
+  const lines = onlyRespond(resumed.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { userAgent: "codex" } })));
+  assert.equal(lines.length, 2);
+  assert.deepEqual(JSON.parse(lines[1]!), {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "thread/resume",
+    params: { threadId: "01a00e69-6ee4-7cd1-955c-befcbe8d9540", cwd: "/tmp/work", approvalPolicy: "never", sandbox: "danger-full-access" },
+  });
+  // fresh (no resumeThreadId) still starts a thread
+  const fresh = codexAdapter({ cwd: "/tmp/work" });
+  const freshLines = onlyRespond(fresh.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} })));
+  assert.equal((JSON.parse(freshLines[1]!) as { method: string }).method, "thread/start");
+  // resume ack with the thread echoed → booted with the SAME id
+  const booted = resumed.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { thread: { id: "01a00e69-6ee4-7cd1-955c-befcbe8d9540" } } }));
+  assert.equal(booted[0]?.kind, "booted");
+  if (booted[0]?.kind === "booted") assert.equal(booted[0].sessionId, "01a00e69-6ee4-7cd1-955c-befcbe8d9540");
+  // resume ack without a thread body → falls back to the requested id (old adapter behavior)
+  const bare = resumed.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: {} }));
+  assert.equal(bare[0]?.kind, "booted");
+  if (bare[0]?.kind === "booted") assert.equal(bare[0].sessionId, "01a00e69-6ee4-7cd1-955c-befcbe8d9540");
+  // resume error (rollout gone / wrong CODEX_HOME) → no booted; error evidence surfaces only when classifiable
+  const err = resumed.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, error: { code: -32000, message: "thread not found" } }));
+  assert.equal(err.length, 0);
+});

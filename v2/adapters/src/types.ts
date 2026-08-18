@@ -82,6 +82,15 @@ export interface HarnessAdapter {
    * known) — the driver refuses `not_ready` and the daemon retries.
    */
   encodeMessage(body: string, ctx: EncodeContext): string | null;
+  /**
+   * Harness-native resume (spec 07 §F): extra CLI args that make a NEW process
+   * continue the conversation identified by `providerSessionId` (claude:
+   * `--resume <id>`). Absent when the harness resumes through its protocol
+   * instead of argv (codex: `thread/resume` in the handshake — see
+   * `codexAdapter({ resumeThreadId })`) or has no resume mechanism at all
+   * (the runtime restarts fresh on the same session log).
+   */
+  resumeArgs?(providerSessionId: string): string[];
 }
 
 // ---------------------------------------------------------------------------

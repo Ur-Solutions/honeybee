@@ -112,6 +112,18 @@ export function encodeClaudeMessage(body: string): string {
   });
 }
 
+/**
+ * Harness-native resume (spec 07 §F): `claude -p --resume <session_id>` rejoins
+ * the headless conversation with full model context and keeps the SAME
+ * session_id (the init line echoes it) — verified by the old system for
+ * headless↔headless (docs/HSR_EXPLORATION.md 2026-07-03). Requires the process
+ * to run with the CLAUDE_CONFIG_DIR the session was created under (the bee's
+ * env carries it for imported bees). Never combined with `--session-id`.
+ */
+export function claudeResumeArgs(providerSessionId: string): string[] {
+  return ["--resume", providerSessionId];
+}
+
 export const claudeAdapter: HarnessAdapter = {
   harness: "claude",
   // Claude Code accepts additional stream-json user messages mid-turn and
@@ -126,4 +138,5 @@ export const claudeAdapter: HarnessAdapter = {
   encodeMessage(body: string, _ctx: EncodeContext): string | null {
     return encodeClaudeMessage(body);
   },
+  resumeArgs: claudeResumeArgs,
 };
