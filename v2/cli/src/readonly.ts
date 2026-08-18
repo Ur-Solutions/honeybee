@@ -8,6 +8,8 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   deriveBeeView,
+  type TemplateRow,
+  type TrackRow,
   type BeeRow,
   type BeeView,
   type CommandRow,
@@ -79,6 +81,46 @@ function mapCommand(r: Row): CommandRow {
   };
 }
 
+function mapTemplateRow(r: Row): TemplateRow {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    scope: r.scope as TemplateRow["scope"],
+    source: r.source as TemplateRow["source"],
+    description: (r.description as string | null) ?? null,
+    agent: r.agent as string,
+    substrate: (r.substrate as string | null) ?? null,
+    model: (r.model as string | null) ?? null,
+    effort: (r.effort as string | null) ?? null,
+    args: JSON.parse(r.args as string) as string[],
+    prompt: r.prompt as string,
+    preamble: (r.preamble as string | null) ?? null,
+    preambleEnabled: Number(r.preamble_enabled) === 1,
+    cwdPolicy: r.cwd_policy as TemplateRow["cwdPolicy"],
+    cwd: (r.cwd as string | null) ?? null,
+    env: JSON.parse(r.env as string) as Record<string, string>,
+    account: (r.account as string | null) ?? null,
+    yolo: Number(r.yolo) === 1,
+    tags: JSON.parse(r.tags as string) as string[],
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+  };
+}
+
+function mapTrackRow(r: Row): TrackRow {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    scope: r.scope as TrackRow["scope"],
+    source: r.source as TrackRow["source"],
+    description: (r.description as string | null) ?? null,
+    steps: JSON.parse(r.steps as string) as TrackRow["steps"],
+    tags: JSON.parse(r.tags as string) as string[],
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+  };
+}
+
 export interface StaleViewResult {
   view: BeeView;
   bee: BeeRow | null;
@@ -147,6 +189,14 @@ export class ReadOnlyStore {
     return (this.db.prepare("SELECT * FROM mailbox WHERE bee_id = ? ORDER BY id").all(beeId) as Row[]).map(
       mapMessage,
     );
+  }
+
+  listTemplates(): TemplateRow[] {
+    return (this.db.prepare("SELECT * FROM templates ORDER BY id").all() as Row[]).map(mapTemplateRow);
+  }
+
+  listTracks(): TrackRow[] {
+    return (this.db.prepare("SELECT * FROM tracks ORDER BY id").all() as Row[]).map(mapTrackRow);
   }
 
   commands(beeId: string): CommandRow[] {

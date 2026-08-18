@@ -18,9 +18,21 @@
  */
 import { mkdirSync, rmSync } from "node:fs";
 import { appendFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { openCoreStore, type CoreStore } from "../../core/src/index.ts";
+import {
+  exportTemplate,
+  exportTrack,
+  importLocalConfig,
+  importTemplate,
+  importTrack,
+  openCoreStore,
+  serializePackage,
+  type CoreStore,
+  type RowSource,
+  type Scope,
+} from "../../core/src/index.ts";
 import { HsrDriver, type SpawnSpec } from "../../driver-hsr/src/index.ts";
 import { claudeAdapter, codexAdapter, stubAdapter, type HarnessAdapter } from "../../adapters/src/index.ts";
 import { DaemonCore, type BootReport, type I1ViolationEvent } from "./loops.ts";
@@ -35,9 +47,22 @@ import {
   type HealthResult,
   type ListResult,
   type RpcVerb,
+  type ImportLocalConfigResult,
   type SendRpcResult,
   type SnapshotResult,
   type SpawnResult,
+  type TemplateDeleteResult,
+  type TemplateExportResult,
+  type TemplateGetResult,
+  type TemplateImportResult,
+  type TemplateListResult,
+  type TemplatePutResult,
+  type TrackDeleteResult,
+  type TrackExportResult,
+  type TrackGetResult,
+  type TrackImportResult,
+  type TrackListResult,
+  type TrackPutResult,
   type ViewResult,
 } from "./protocol.ts";
 
@@ -271,6 +296,40 @@ export class HiveDaemon {
         return this.rpcDeployInfo();
       case "health":
         return this.rpcHealth();
+      case "template.list":
+        return this.rpcTemplateList(params);
+      case "template.get":
+        return { template: this.requireTemplate(params) } satisfies TemplateGetResult;
+      case "template.put":
+        return this.rpcTemplatePut(params);
+      case "template.delete":
+        return { template: this.mustStore().deleteTemplate(this.param(params, "id")) } satisfies TemplateDeleteResult;
+      case "template.export": {
+        const doc = exportTemplate(this.requireTemplate(params));
+        return { package: doc, text: serializePackage(doc) } satisfies TemplateExportResult;
+      }
+      case "template.import": {
+        const res = importTemplate(this.mustStore(), params.package, this.importOptions(params));
+        return { template: res.row, outcome: res.outcome } satisfies TemplateImportResult;
+      }
+      case "track.list":
+        return this.rpcTrackList(params);
+      case "track.get":
+        return { track: this.requireTrack(params) } satisfies TrackGetResult;
+      case "track.put":
+        return this.rpcTrackPut(params);
+      case "track.delete":
+        return { track: this.mustStore().deleteTrack(this.param(params, "id")) } satisfies TrackDeleteResult;
+      case "track.export": {
+        const doc = exportTrack(this.requireTrack(params));
+        return { package: doc, text: serializePackage(doc) } satisfies TrackExportResult;
+      }
+      case "track.import": {
+        const res = importTrack(this.mustStore(), params.package, this.importOptions(params));
+        return { track: res.row, outcome: res.outcome } satisfies TrackImportResult;
+      }
+      case "packages.importLocalConfig":
+        return this.rpcImportLocalConfig(params);
       case "snapshot": {
         const snap = this.snapshot();
         conn.alignWatch(snap.seq);
@@ -393,9 +452,93 @@ export class HiveDaemon {
 
   private snapshot(): SnapshotResult {
     const store = this.mustStore();
-    // Single-threaded: reading the seq and the views is atomic w.r.t. writes.
+    // Single-threaded: reading the seq and the rows is atomic w.r.t. writes.
     const seq = store.lastAuditSeq();
     this.publishedSeq = seq;
-    return { seq, views: store.listBees().map((b) => this.viewOf(store, b.id)) };
+    return {
+      seq,
+      views: store.listBees().map((b) => this.viewOf(store, b.id)),
+      templates: store.listTemplates(),
+      tracks: store.listTracks(),
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // WP6a — templates, tracks, packages (spec 06 §1.4.1)
+  // -------------------------------------------------------------------------
+
+  private scopeParam(params: Record<string, unknown>): Scope | undefined {
+    const scope = params.scope;
+    if (scope === undefined || scope === null) return undefined;
+    if (scope !== "personal" && scope !== "team" && scope !== "repo") {
+      throw new RpcError("invalid_request", "scope must be personal|team|repo");
+    }
+    return scope;
+  }
+
+  private importOptions(params: Record<string, unknown>): { source: RowSource; scope?: Scope; label?: string } {
+    const source = params.source;
+    if (source !== undefined && typeof source !== "string") {
+      throw new RpcError("invalid_request", "source must be a string when given");
+    }
+    return {
+      source: source !== undefined && source.length > 0 ? (`package:${source.replace(/^package:/, "")}` as RowSource) : "package:rpc",
+      scope: this.scopeParam(params),
+      label: typeof params.label === "string" ? params.label : undefined,
+    };
+  }
+
+  private requireTemplate(params: Record<string, unknown>) {
+    const store = this.mustStore();
+    const id = this.param(params, "id");
+    const template = store.getTemplate(id);
+    if (!template) throw new RpcError("template_not_found", `template not found: ${id}`);
+    return template;
+  }
+
+  private requireTrack(params: Record<string, unknown>) {
+    const store = this.mustStore();
+    const id = this.param(params, "id");
+    const track = store.getTrack(id);
+    if (!track) throw new RpcError("track_not_found", `track not found: ${id}`);
+    return track;
+  }
+
+  private rpcTemplateList(params: Record<string, unknown>): TemplateListResult {
+    const scope = this.scopeParam(params);
+    return { templates: this.mustStore().listTemplates(scope ? { scope } : {}) };
+  }
+
+  private rpcTemplatePut(params: Record<string, unknown>): TemplatePutResult {
+    const store = this.mustStore();
+    const res = store.putTemplate({
+      id: typeof params.id === "string" && params.id.length > 0 ? params.id : undefined,
+      fields: params.fields,
+      defaultSource: "api",
+    });
+    return { template: res.template, outcome: res.outcome };
+  }
+
+  private rpcTrackList(params: Record<string, unknown>): TrackListResult {
+    const scope = this.scopeParam(params);
+    return { tracks: this.mustStore().listTracks(scope ? { scope } : {}) };
+  }
+
+  private rpcTrackPut(params: Record<string, unknown>): TrackPutResult {
+    const store = this.mustStore();
+    const res = store.putTrack({
+      id: typeof params.id === "string" && params.id.length > 0 ? params.id : undefined,
+      fields: params.fields,
+      defaultSource: "api",
+    });
+    return { track: res.track, outcome: res.outcome };
+  }
+
+  private rpcImportLocalConfig(params: Record<string, unknown>): ImportLocalConfigResult {
+    const store = this.mustStore();
+    // The local package source dir: ~/.hive by default (spec 06 §1.4.1 — the
+    // OLD store layout is the human-editable form). Tests always pass `dir`.
+    const dir = typeof params.dir === "string" && params.dir.length > 0 ? params.dir : join(homedir(), ".hive");
+    return importLocalConfig(store, dir, { scope: this.scopeParam(params) });
   }
 }

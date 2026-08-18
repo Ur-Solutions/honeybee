@@ -36,10 +36,23 @@ import {
   type RuntimeRow,
   type RuntimeState,
   type StateDump,
+  type TemplateRow,
+  type TrackRow,
   type Verb,
+  NameConflictError,
+  TemplateNotFoundError,
+  TrackNotFoundError,
 } from "./types.ts";
 import { SCHEMA_SQL } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
+import {
+  fieldsEqual,
+  normalizeTemplate,
+  normalizeTrack,
+  type NormalizeOptions,
+  type TemplateFields,
+  type TrackFields,
+} from "./registry.ts";
 
 export interface CoreStoreOptions {
   /** Injectable clock (epoch ms) for deterministic tests. */
@@ -93,6 +106,21 @@ export interface ReconcileResult {
 export interface LivePid {
   pid: number;
   startedAt: number;
+}
+
+/** Outcome of an idempotent put/import: one row, created / updated / left alone. */
+export type PutOutcome = "created" | "updated" | "unchanged";
+
+export interface PutTemplateInput extends NormalizeOptions {
+  /** Stable id to match/create; absent = match by (scope, name), else mint one. */
+  id?: string;
+  /** Raw template fields — validated by registry.normalizeTemplate. */
+  fields: unknown;
+}
+
+export interface PutTrackInput extends NormalizeOptions {
+  id?: string;
+  fields: unknown;
 }
 
 const LIVE_STATES: readonly RuntimeState[] = ["booting", "running", "idle"];
@@ -167,6 +195,57 @@ function mapCommand(r: Row): CommandRow {
     finishedAt: r.finished_at == null ? null : Number(r.finished_at),
     failureCause: (r.failure_cause as FailureCause | null) ?? null,
   };
+}
+
+function mapTemplate(r: Row): TemplateRow {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    scope: r.scope as TemplateRow["scope"],
+    source: r.source as TemplateRow["source"],
+    description: (r.description as string | null) ?? null,
+    agent: r.agent as string,
+    substrate: (r.substrate as string | null) ?? null,
+    model: (r.model as string | null) ?? null,
+    effort: (r.effort as string | null) ?? null,
+    args: JSON.parse(r.args as string) as string[],
+    prompt: r.prompt as string,
+    preamble: (r.preamble as string | null) ?? null,
+    preambleEnabled: Number(r.preamble_enabled) === 1,
+    cwdPolicy: r.cwd_policy as TemplateRow["cwdPolicy"],
+    cwd: (r.cwd as string | null) ?? null,
+    env: JSON.parse(r.env as string) as Record<string, string>,
+    account: (r.account as string | null) ?? null,
+    yolo: Number(r.yolo) === 1,
+    tags: JSON.parse(r.tags as string) as string[],
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+  };
+}
+
+function mapTrack(r: Row): TrackRow {
+  return {
+    id: r.id as string,
+    name: r.name as string,
+    scope: r.scope as TrackRow["scope"],
+    source: r.source as TrackRow["source"],
+    description: (r.description as string | null) ?? null,
+    steps: JSON.parse(r.steps as string) as TrackRow["steps"],
+    tags: JSON.parse(r.tags as string) as string[],
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+  };
+}
+
+/** Content fields of a stored row (drops id + timestamps) for the unchanged test. */
+function templateFieldsOf(row: TemplateRow): TemplateFields {
+  const { id: _id, createdAt: _c, updatedAt: _u, ...fields } = row;
+  return fields;
+}
+
+function trackFieldsOf(row: TrackRow): TrackFields {
+  const { id: _id, createdAt: _c, updatedAt: _u, ...fields } = row;
+  return fields;
 }
 
 function mapAudit(r: Row): AuditRow {
@@ -988,6 +1067,171 @@ export class CoreStore {
   }
 
   // -------------------------------------------------------------------------
+  // Templates + tracks (spec 06 §1.4.1) — hive-owned registries
+  // -------------------------------------------------------------------------
+
+  getTemplate(id: string): TemplateRow | null {
+    const row = this.db.prepare("SELECT * FROM templates WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapTemplate(row) : null;
+  }
+
+  getTemplateByName(scope: TemplateRow["scope"], name: string): TemplateRow | null {
+    const row = this.db.prepare("SELECT * FROM templates WHERE scope = ? AND name = ?").get(scope, name) as
+      | Row
+      | undefined;
+    return row ? mapTemplate(row) : null;
+  }
+
+  listTemplates(filter: { scope?: TemplateRow["scope"] } = {}): TemplateRow[] {
+    const rows = (
+      filter.scope
+        ? this.db.prepare("SELECT * FROM templates WHERE scope = ? ORDER BY id").all(filter.scope)
+        : this.db.prepare("SELECT * FROM templates ORDER BY id").all()
+    ) as Row[];
+    return rows.map(mapTemplate);
+  }
+
+  /**
+   * Idempotent upsert. Match order: by `id` when given, else by (scope, name).
+   * An id that matches nothing while (scope, name) matches a DIFFERENT row is a
+   * NameConflictError (names are unique per scope; the caller decides).
+   * Identical content = `unchanged`: no write, no audit row, timestamps untouched.
+   */
+  putTemplate(input: PutTemplateInput): { template: TemplateRow; outcome: PutOutcome } {
+    return this.tx(() => {
+      const fields = normalizeTemplate(input.fields, input);
+      const target = this.resolvePutTarget(
+        input.id,
+        () => (input.id ? this.getTemplate(input.id) : null),
+        () => this.getTemplateByName(fields.scope, fields.name),
+        "template",
+      );
+      const at = this.now();
+      if (target) {
+        if (fieldsEqual(templateFieldsOf(target), fields)) return { template: target, outcome: "unchanged" };
+        this.db
+          .prepare(
+            `UPDATE templates SET name = ?, scope = ?, source = ?, description = ?, agent = ?, substrate = ?, model = ?,
+               effort = ?, args = ?, prompt = ?, preamble = ?, preamble_enabled = ?, cwd_policy = ?, cwd = ?, env = ?,
+               account = ?, yolo = ?, tags = ?, updated_at = ? WHERE id = ?`,
+          )
+          .run(...templateBindings(fields), at, target.id);
+        const template = this.getTemplate(target.id) as TemplateRow;
+        this.audit("template.put", null, { template, outcome: "updated" });
+        return { template, outcome: "updated" };
+      }
+      const id = input.id ?? randomUUID();
+      this.db
+        .prepare(
+          `INSERT INTO templates(name, scope, source, description, agent, substrate, model, effort, args, prompt,
+             preamble, preamble_enabled, cwd_policy, cwd, env, account, yolo, tags, updated_at, id, created_at)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(...templateBindings(fields), at, id, at);
+      const template = this.getTemplate(id) as TemplateRow;
+      this.audit("template.put", null, { template, outcome: "created" });
+      return { template, outcome: "created" };
+    });
+  }
+
+  deleteTemplate(id: string): TemplateRow {
+    return this.tx(() => {
+      const template = this.getTemplate(id);
+      if (!template) throw new TemplateNotFoundError(id);
+      this.db.prepare("DELETE FROM templates WHERE id = ?").run(id);
+      this.audit("template.deleted", null, { templateId: id, deletedAt: this.now() });
+      return template;
+    });
+  }
+
+  getTrack(id: string): TrackRow | null {
+    const row = this.db.prepare("SELECT * FROM tracks WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapTrack(row) : null;
+  }
+
+  getTrackByName(scope: TrackRow["scope"], name: string): TrackRow | null {
+    const row = this.db.prepare("SELECT * FROM tracks WHERE scope = ? AND name = ?").get(scope, name) as Row | undefined;
+    return row ? mapTrack(row) : null;
+  }
+
+  listTracks(filter: { scope?: TrackRow["scope"] } = {}): TrackRow[] {
+    const rows = (
+      filter.scope
+        ? this.db.prepare("SELECT * FROM tracks WHERE scope = ? ORDER BY id").all(filter.scope)
+        : this.db.prepare("SELECT * FROM tracks ORDER BY id").all()
+    ) as Row[];
+    return rows.map(mapTrack);
+  }
+
+  /** Same idempotent upsert contract as putTemplate. */
+  putTrack(input: PutTrackInput): { track: TrackRow; outcome: PutOutcome } {
+    return this.tx(() => {
+      const fields = normalizeTrack(input.fields, input);
+      const target = this.resolvePutTarget(
+        input.id,
+        () => (input.id ? this.getTrack(input.id) : null),
+        () => this.getTrackByName(fields.scope, fields.name),
+        "track",
+      );
+      const at = this.now();
+      if (target) {
+        if (fieldsEqual(trackFieldsOf(target), fields)) return { track: target, outcome: "unchanged" };
+        this.db
+          .prepare(
+            "UPDATE tracks SET name = ?, scope = ?, source = ?, description = ?, steps = ?, tags = ?, updated_at = ? WHERE id = ?",
+          )
+          .run(...trackBindings(fields), at, target.id);
+        const track = this.getTrack(target.id) as TrackRow;
+        this.audit("track.put", null, { track, outcome: "updated" });
+        return { track, outcome: "updated" };
+      }
+      const id = input.id ?? randomUUID();
+      this.db
+        .prepare(
+          "INSERT INTO tracks(name, scope, source, description, steps, tags, updated_at, id, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(...trackBindings(fields), at, id, at);
+      const track = this.getTrack(id) as TrackRow;
+      this.audit("track.put", null, { track, outcome: "created" });
+      return { track, outcome: "created" };
+    });
+  }
+
+  deleteTrack(id: string): TrackRow {
+    return this.tx(() => {
+      const track = this.getTrack(id);
+      if (!track) throw new TrackNotFoundError(id);
+      this.db.prepare("DELETE FROM tracks WHERE id = ?").run(id);
+      this.audit("track.deleted", null, { trackId: id, deletedAt: this.now() });
+      return track;
+    });
+  }
+
+  private resolvePutTarget<T extends { id: string; name: string; scope: string }>(
+    wantedId: string | undefined,
+    byId: () => T | null,
+    byName: () => T | null,
+    what: string,
+  ): T | null {
+    const idMatch = byId();
+    const nameMatch = byName();
+    if (idMatch) {
+      if (nameMatch && nameMatch.id !== idMatch.id) {
+        throw new NameConflictError(
+          `${what} name '${nameMatch.name}' in scope '${nameMatch.scope}' is already taken by ${nameMatch.id} (put targets ${idMatch.id})`,
+        );
+      }
+      return idMatch;
+    }
+    if (nameMatch && wantedId !== undefined && wantedId !== nameMatch.id) {
+      throw new NameConflictError(
+        `${what} name '${nameMatch.name}' in scope '${nameMatch.scope}' already exists as ${nameMatch.id}; refusing to create ${wantedId} — delete it or import without an id`,
+      );
+    }
+    return nameMatch;
+  }
+
+  // -------------------------------------------------------------------------
   // Audit access & snapshots
   // -------------------------------------------------------------------------
 
@@ -1014,8 +1258,38 @@ export class CoreStore {
       flags: (this.db.prepare("SELECT * FROM flags ORDER BY id").all() as Row[]).map(mapFlag),
       mailbox: (this.db.prepare("SELECT * FROM mailbox ORDER BY id").all() as Row[]).map(mapMessage),
       commands: (this.db.prepare("SELECT * FROM commands ORDER BY id").all() as Row[]).map(mapCommand),
+      templates: this.listTemplates(),
+      tracks: this.listTracks(),
     };
   }
+}
+
+/** Positional bindings in UPDATE/INSERT column order (name … tags). */
+function templateBindings(f: TemplateFields): Array<string | number | null> {
+  return [
+    f.name,
+    f.scope,
+    f.source,
+    f.description,
+    f.agent,
+    f.substrate,
+    f.model,
+    f.effort,
+    JSON.stringify(f.args),
+    f.prompt,
+    f.preamble,
+    f.preambleEnabled ? 1 : 0,
+    f.cwdPolicy,
+    f.cwd,
+    JSON.stringify(f.env),
+    f.account,
+    f.yolo ? 1 : 0,
+    JSON.stringify(f.tags),
+  ];
+}
+
+function trackBindings(f: TrackFields): Array<string | number | null> {
+  return [f.name, f.scope, f.source, f.description, JSON.stringify(f.steps), JSON.stringify(f.tags)];
 }
 
 /** Open (or create) the node's core store. The returned object is the single writer (B9). */

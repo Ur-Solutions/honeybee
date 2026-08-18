@@ -83,4 +83,45 @@ CREATE TABLE IF NOT EXISTS audit (
   bee_id  TEXT,
   payload TEXT NOT NULL
 ) STRICT;
+
+-- Templates + tracks (spec 06 §1.4.1): hive-owned registries; scope + source are
+-- data on the row; names are unique per scope; steps are an ordered JSON array.
+CREATE TABLE IF NOT EXISTS templates (
+  id               TEXT PRIMARY KEY,
+  name             TEXT NOT NULL,
+  scope            TEXT NOT NULL CHECK (scope IN ('personal','team','repo')),
+  source           TEXT NOT NULL,
+  description      TEXT,
+  agent            TEXT NOT NULL,
+  substrate        TEXT,
+  model            TEXT,
+  effort           TEXT,
+  args             TEXT NOT NULL DEFAULT '[]',
+  prompt           TEXT NOT NULL,
+  preamble         TEXT,
+  preamble_enabled INTEGER NOT NULL DEFAULT 1 CHECK (preamble_enabled IN (0,1)),
+  cwd_policy       TEXT NOT NULL CHECK (cwd_policy IN ('caller','fixed')),
+  cwd              TEXT,
+  env              TEXT NOT NULL DEFAULT '{}',
+  account          TEXT,
+  yolo             INTEGER NOT NULL DEFAULT 0 CHECK (yolo IN (0,1)),
+  tags             TEXT NOT NULL DEFAULT '[]',
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  CHECK ((cwd_policy = 'fixed') = (cwd IS NOT NULL)),
+  UNIQUE (scope, name)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS tracks (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  scope       TEXT NOT NULL CHECK (scope IN ('personal','team','repo')),
+  source      TEXT NOT NULL,
+  description TEXT,
+  steps       TEXT NOT NULL DEFAULT '[]',
+  tags        TEXT NOT NULL DEFAULT '[]',
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (scope, name)
+) STRICT;
 `;
