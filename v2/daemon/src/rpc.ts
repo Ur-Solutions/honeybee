@@ -10,6 +10,8 @@ import { createServer, type Server, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
 import type { AuditRow } from "../../core/src/index.ts";
 import {
+  AccountNotFoundError,
+  AccountReferencedError,
   BeeNotFoundError,
   CoreError,
   IllegalTransitionError,
@@ -65,6 +67,8 @@ export function toRpcError(err: unknown): { code: RpcErrorCode; message: string 
   if (err instanceof TrackNotFoundError) return { code: "track_not_found", message: err.message };
   if (err instanceof QuestionNotFoundError) return { code: "question_not_found", message: err.message };
   if (err instanceof SealNotFoundError) return { code: "seal_not_found", message: err.message };
+  if (err instanceof AccountNotFoundError) return { code: "account_not_found", message: err.message };
+  if (err instanceof AccountReferencedError) return { code: "account_referenced", message: err.message };
   if (err instanceof NameConflictError) return { code: "name_conflict", message: err.message };
   if (err instanceof PackageError) return { code: "invalid_package", message: err.message };
   if (err instanceof IllegalTransitionError) {
@@ -220,6 +224,16 @@ export class RpcServer {
     }
     try {
       const result = this.opts.dispatch(verb as RpcVerb, params, conn);
+      // v7: verbs with a bounded async leg (limits fetch before an auto pick,
+      // the login seat's keychain baseline) return a promise; sync verbs are
+      // answered on the spot exactly as before.
+      if (result instanceof Promise) {
+        result.then(
+          (value) => conn.send({ id, ok: true, result: value }),
+          (err) => conn.send({ id, ok: false, error: toRpcError(err) }),
+        );
+        return;
+      }
       conn.send({ id, ok: true, result });
     } catch (err) {
       conn.send({ id, ok: false, error: toRpcError(err) });

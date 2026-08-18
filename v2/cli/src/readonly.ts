@@ -8,6 +8,8 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   deriveBeeView,
+  type AccountLimitsRow,
+  type AccountRow,
   type TemplateRow,
   type TrackRow,
   type BeeRow,
@@ -49,6 +51,46 @@ function mapBee(r: Row): BeeRow {
     parentId: (r.parent_id as string | null | undefined) ?? null,
     forkedFrom: (r.forked_from as string | null | undefined) ?? null,
     forkSeed: (r.fork_seed as string | null | undefined) ?? null,
+    // v7 column; same tolerance.
+    account: (r.account as string | null | undefined) ?? null,
+  };
+}
+
+function mapAccountRow(r: Row): AccountRow {
+  return {
+    id: r.id as string,
+    harness: r.harness as string,
+    homePath: r.home_path as string,
+    label: r.label as string,
+    status: r.status as AccountRow["status"],
+    penalty: Number(r.penalty),
+    lastLoginAt: r.last_login_at == null ? null : Number(r.last_login_at),
+    exhaustedAt: r.exhausted_at == null ? null : Number(r.exhausted_at),
+    addedAt: Number(r.added_at),
+    updatedAt: Number(r.updated_at),
+  };
+}
+
+function numOrNull(v: unknown): number | null {
+  return v == null ? null : Number(v);
+}
+
+function mapAccountLimitsRow(r: Row): AccountLimitsRow {
+  return {
+    account: r.account as string,
+    fetchedAt: Number(r.fetched_at),
+    readable: Number(r.readable) === 1,
+    error: (r.error as string | null) ?? null,
+    plan: (r.plan as string | null) ?? null,
+    fiveHourPct: numOrNull(r.five_hour_pct),
+    fiveHourResetsAt: numOrNull(r.five_hour_resets_at),
+    fiveHourMinutes: numOrNull(r.five_hour_minutes),
+    weeklyPct: numOrNull(r.weekly_pct),
+    weeklyResetsAt: numOrNull(r.weekly_resets_at),
+    weeklyMinutes: numOrNull(r.weekly_minutes),
+    fableWeeklyPct: numOrNull(r.fable_weekly_pct),
+    fableResetsAt: numOrNull(r.fable_resets_at),
+    fableMinutes: numOrNull(r.fable_minutes),
   };
 }
 
@@ -275,5 +317,18 @@ export class ReadOnlyStore {
     if (!this.tableExists("seals")) return null;
     const row = this.db.prepare("SELECT * FROM seals WHERE id = ?").get(id) as Row | undefined;
     return row ? mapSealRow(row) : null;
+  }
+
+  /** v7 — tolerate a pre-v7 store file (no table): empty. */
+  accounts(harness?: string): AccountRow[] {
+    if (!this.tableExists("accounts")) return [];
+    return (this.db.prepare("SELECT * FROM accounts ORDER BY added_at, id").all() as Row[])
+      .map(mapAccountRow)
+      .filter((a) => harness === undefined || a.harness === harness);
+  }
+
+  accountLimits(): AccountLimitsRow[] {
+    if (!this.tableExists("account_limits")) return [];
+    return (this.db.prepare("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimitsRow);
   }
 }

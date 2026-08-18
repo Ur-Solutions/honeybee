@@ -150,6 +150,13 @@ export interface DaemonCoreOptions {
   onI1Violation?: (violation: I1ViolationEvent) => void;
   /** Q1 (spec 01): delete removes the session log file; core does no file I/O, the daemon does. */
   removeSessionLog?: (path: string) => void;
+  /**
+   * v7 (spec 08): account policy hook — called AFTER each flag evidence is
+   * applied to the store, so the daemon can enact the account-level rules
+   * (auth_needed ↔ accounts.status; rate-limit resource_blocked → exhaustion
+   * evidence + automatic rotation). Absent in the harness (no accounts).
+   */
+  onFlagEvidence?: (ev: FlagEvidenceLike) => void;
 }
 
 const LIVE: readonly RuntimeState[] = ["booting", "running", "idle"];
@@ -163,6 +170,7 @@ export class DaemonCore {
   private readonly faults: FaultHooks | null;
   private readonly onI1Violation: ((violation: I1ViolationEvent) => void) | null;
   private readonly removeSessionLog: ((path: string) => void) | null;
+  private readonly onFlagEvidence: ((ev: FlagEvidenceLike) => void) | null;
   /** In-memory dedup so a breach is reported once per daemon lifetime; the recorder dedups durably. */
   private readonly reportedI1 = new Set<number>();
 
@@ -175,6 +183,7 @@ export class DaemonCore {
     this.faults = opts.faults ?? null;
     this.onI1Violation = opts.onI1Violation ?? null;
     this.removeSessionLog = opts.removeSessionLog ?? null;
+    this.onFlagEvidence = opts.onFlagEvidence ?? null;
   }
 
   private get ext(): ExtendedDriver {
@@ -288,6 +297,7 @@ export class DaemonCore {
       // (I1) — on the boot-failure backoff table, and never while spawn_failed
       // is set (visibly blocked; the operator's revive is the way back).
       this.ensureWake(obs.beeId);
+      this.reviveAfterStopIfRequested(obs.beeId, obs.generation);
     } else if (obs.kind === "booted") {
       this.store.updateRuntimeState(obs.beeId, obs.generation, "running", {
         pid: obs.pid,
@@ -344,7 +354,43 @@ export class DaemonCore {
         this.store.clearFlag(ev.beeId, ev.flag, ev.detail);
       }
       this.log(`flag.${ev.action} bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
+      // v7: account policy (spec 08) rides the same evidence — never throws
+      // into the loop (a policy bug must not stall observation drain).
+      if (this.onFlagEvidence) {
+        try {
+          this.onFlagEvidence(ev);
+        } catch (err) {
+          this.log(`account.policy_error bee=${ev.beeId} flag=${ev.flag} err=${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
+  }
+
+  /**
+   * v7 (bee.swapAccount): a `stop` command may carry `thenRevive: true` —
+   * "stop this generation, then start the next one" — the durable form of
+   * stop → revive that a swap needs (a plain revive enqueued alongside the
+   * stop would be claimed while the old process is still dying). When the
+   * runtime is observed stopped, the pending intent is honored ONCE by
+   * enqueueing a `revive` (which mints generation N+1 with the new account's
+   * env). Idempotent: an existing queued/running revive/wake is enough.
+   */
+  private reviveAfterStopIfRequested(beeId: string, generation: number): void {
+    const cmds = this.store.listCommands({ beeId });
+    const requested = cmds.some(
+      (c) => c.verb === "stop" && c.targetGeneration === generation && c.args.thenRevive === true && (c.status === "done" || c.status === "running"),
+    );
+    if (!requested) return;
+    const pending = cmds.some(
+      (c) => (c.verb === "revive" || c.verb === "send_wake") && (c.status === "queued" || c.status === "running") && (c.targetGeneration ?? 0) >= generation,
+    );
+    if (pending) return;
+    // Only the generation the stop targeted; a later generation means the
+    // revive already happened (or the operator moved on).
+    const rt = this.store.currentRuntime(beeId);
+    if (!rt || rt.generation !== generation || rt.state !== "stopped") return;
+    const cmd = this.store.enqueueCommand("revive", beeId, { reason: "after_stop" });
+    this.log(`revive.after_stop bee=${beeId} gen=${generation} cmd=${cmd.id}`);
   }
 
   /**
@@ -531,6 +577,8 @@ export class DaemonCore {
           // Parenthood certainty: no process exists, so the stop is a fact now.
           this.store.updateRuntimeState(cmd.beeId, gen, "stopped", { exitCause: cause });
           this.ensureWake(cmd.beeId);
+          // thenRevive: this stop command is still `running` here (settled by the caller).
+          this.reviveAfterStopIfRequested(cmd.beeId, gen);
         }
         this.log(`cmd.stop id=${cmd.id} bee=${cmd.beeId} gen=${gen} cause=${cause} hadProcess=${hadProcess}`);
         return true;

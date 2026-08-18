@@ -5,6 +5,8 @@
  * or mis-recorded its audit row.
  */
 import type {
+  AccountLimitsRow,
+  AccountRow,
   AuditRow,
   BeeRow,
   CommandRow,
@@ -13,6 +15,7 @@ import type {
   QuestionRow,
   RuntimeRow,
   SealRow,
+  SelectionCursorRow,
   StateDump,
   TemplateRow,
   TrackRow,
@@ -28,6 +31,9 @@ export function replayAudit(rows: AuditRow[]): StateDump {
   const tracks = new Map<string, TrackRow>();
   const questions = new Map<string, QuestionRow>();
   const seals = new Map<string, SealRow>();
+  const accounts = new Map<string, AccountRow>();
+  const accountLimits = new Map<string, AccountLimitsRow>();
+  const selectionCursors = new Map<string, SelectionCursorRow>();
 
   const rtKey = (beeId: string, generation: number) => `${beeId}#${generation}`;
   const mustBee = (id: string): BeeRow => {
@@ -87,6 +93,42 @@ export function replayAudit(rows: AuditRow[]): StateDump {
       }
       case "bee.orphaned": {
         mustBee(p.beeId as string).parentId = null;
+        break;
+      }
+      case "bee.account_set": {
+        mustBee(p.beeId as string).account = (p.account as string | null) ?? null;
+        break;
+      }
+      case "bee.env_set": {
+        mustBee(p.beeId as string).env = { ...(p.env as Record<string, string>) };
+        break;
+      }
+      case "bee.session_rekeyed": {
+        const bee = mustBee(p.beeId as string);
+        bee.forkSeed = p.forkSeed as string;
+        bee.providerSessionId = null;
+        break;
+      }
+      case "account.put": {
+        const account = p.account as AccountRow;
+        accounts.set(account.id, { ...account });
+        break;
+      }
+      case "account.removed": {
+        const id = p.accountId as string;
+        if (!accounts.delete(id)) throw new Error(`audit replay: unknown account ${id}`);
+        accountLimits.delete(id);
+        if (p.cursorCleared === true) selectionCursors.delete(p.harness as string);
+        break;
+      }
+      case "account_limits.put": {
+        const limits = p.limits as AccountLimitsRow;
+        accountLimits.set(limits.account, { ...limits });
+        break;
+      }
+      case "selection_cursor.set": {
+        const cursor = p.cursor as SelectionCursorRow;
+        selectionCursors.set(cursor.harness, { ...cursor });
         break;
       }
       case "bee.deleted": {
@@ -243,5 +285,8 @@ export function replayAudit(rows: AuditRow[]): StateDump {
     tracks: [...tracks.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     questions: [...questions.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     seals: [...seals.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    accounts: [...accounts.values()].sort((a, b) => a.addedAt - b.addedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    accountLimits: [...accountLimits.values()].sort((a, b) => (a.account < b.account ? -1 : a.account > b.account ? 1 : 0)),
+    selectionCursors: [...selectionCursors.values()].sort((a, b) => (a.harness < b.harness ? -1 : a.harness > b.harness ? 1 : 0)),
   };
 }

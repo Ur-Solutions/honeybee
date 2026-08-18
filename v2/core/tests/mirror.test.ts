@@ -7,6 +7,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  MIRROR_ACCOUNT_AUDIT_KINDS,
+  MIRROR_ACCOUNT_KEYS,
+  MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS,
+  MIRROR_ACCOUNT_LIMITS_KEYS,
   MIRROR_BEE_RECORD_KEYS,
   MIRROR_BEE_ROW_KEYS,
   MIRROR_BEE_VIEW_KEYS,
@@ -66,6 +70,11 @@ test("mirror.1: live rows carry exactly the declared keys — bees (view/bee/run
     assert.deepEqual(keysOf(answered), [...MIRROR_QUESTION_KEYS].sort());
     const seal = store.createSeal(bee.id, { title: "done", body: "all green", refs: ["abc123"] });
     assert.deepEqual(keysOf(seal), [...MIRROR_SEAL_KEYS].sort());
+    // v7: accounts + limits mirror as store rows, verbatim.
+    const account = store.createAccount({ id: "claude-a", harness: "claude", homePath: "/tmp/h", label: "a" });
+    assert.deepEqual(keysOf(account), [...MIRROR_ACCOUNT_KEYS].sort());
+    const limits = store.putAccountLimits("claude-a", { readable: true, weekly: { usedPercent: 10 } });
+    assert.deepEqual(keysOf(limits), [...MIRROR_ACCOUNT_LIMITS_KEYS].sort());
     store.close();
   } finally {
     h.cleanup();
@@ -95,6 +104,13 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
     const question = store.askQuestion(bee.id, { id: "q-1", text: "ship it?", options: ["yes", "no"] });
     store.answerQuestion(question.id, "yes", { answeredBy: "operator" });
     const seal = store.createSeal(bee.id, { id: "seal-1", title: "shipped", body: "landed on main", refs: ["main@abc"] });
+    const account = store.createAccount({ id: "codex-work", harness: "codex", homePath: "/tmp/homes/codex-work", label: "work", penalty: 5 });
+    const limits = store.putAccountLimits(account.id, {
+      readable: true,
+      plan: "pro",
+      fiveHour: { usedPercent: 12, resetsAt: 2_000_000, windowMinutes: 300 },
+      weekly: { usedPercent: 40, resetsAt: 3_000_000, windowMinutes: 10_080 },
+    });
     const snapshot: MirrorSnapshot = {
       seq: store.lastAuditSeq(),
       bees: [{ view: store.view(bee.id), bee: store.getBee(bee.id), runtime: store.currentRuntime(bee.id) }],
@@ -102,13 +118,15 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       tracks: [track],
       questions: [store.getQuestion(question.id)!],
       seals: [seal],
+      accounts: [account],
+      accountLimits: [limits],
     };
     // Neutralize the one nondeterministic value (bee uuid) then freeze.
     const text = JSON.stringify(snapshot, null, 2).replaceAll(bee.id, "BEE_ID");
     assert.equal(
       text,
       `{
-  "seq": 8,
+  "seq": 10,
   "bees": [
     {
       "view": {
@@ -145,7 +163,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "args": null,
         "parentId": null,
         "forkedFrom": null,
-        "forkSeed": null
+        "forkSeed": null,
+        "account": null
       },
       "runtime": {
         "beeId": "BEE_ID",
@@ -241,6 +260,38 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       ],
       "createdAt": 1015000
     }
+  ],
+  "accounts": [
+    {
+      "id": "codex-work",
+      "harness": "codex",
+      "homePath": "/tmp/homes/codex-work",
+      "label": "work",
+      "status": "ok",
+      "penalty": 5,
+      "lastLoginAt": null,
+      "exhaustedAt": null,
+      "addedAt": 1017000,
+      "updatedAt": 1017000
+    }
+  ],
+  "accountLimits": [
+    {
+      "account": "codex-work",
+      "fetchedAt": 1019000,
+      "readable": true,
+      "error": null,
+      "plan": "pro",
+      "fiveHourPct": 12,
+      "fiveHourResetsAt": 2000000,
+      "fiveHourMinutes": 300,
+      "weeklyPct": 40,
+      "weeklyResetsAt": 3000000,
+      "weeklyMinutes": 10080,
+      "fableWeeklyPct": null,
+      "fableResetsAt": null,
+      "fableMinutes": null
+    }
   ]
 }`,
     );
@@ -286,6 +337,18 @@ test("mirror.3: template/track audit kinds are exactly the declared mirror kinds
     assert.deepEqual(keysOf((delA?.payload ?? {}) as object), ["deletedAt", "templateId"]);
     assert.deepEqual(keysOf((putK?.payload ?? {}) as object), ["outcome", "track"]);
     assert.deepEqual(keysOf((delK?.payload ?? {}) as object), ["deletedAt", "trackId"]);
+    // v7: account / limits audit kinds + payload shapes.
+    store.createAccount({ id: "claude-x", harness: "claude", homePath: "/tmp/x", label: "x" });
+    store.setAccountPenalty("claude-x", 10);
+    store.putAccountLimits("claude-x", { readable: false, error: "boom" });
+    store.removeAccount("claude-x");
+    const v7 = store.auditRows().filter((r) => r.kind.startsWith("account"));
+    assert.deepEqual(v7.map((r) => r.kind), ["account.put", "account.put", "account_limits.put", "account.removed"]);
+    for (const r of v7) assert.ok(([...MIRROR_ACCOUNT_AUDIT_KINDS, ...MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS] as string[]).includes(r.kind));
+    assert.deepEqual(keysOf(v7[0]!.payload), ["account", "outcome"]);
+    assert.deepEqual(keysOf(v7[1]!.payload), ["account", "changed", "outcome", "previous", "reason"]);
+    assert.deepEqual(keysOf(v7[2]!.payload), ["limits"]);
+    assert.deepEqual(keysOf(v7[3]!.payload), ["accountId", "cursorCleared", "harness", "removedAt"]);
     store.close();
   } finally {
     h.cleanup();

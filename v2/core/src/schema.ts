@@ -39,8 +39,15 @@
  *        runtime forks from; consumed when the fork reports its own id),
  *        plus the `questions` and `seals` tables. Additive; migration =
  *        ALTER TABLE ADD COLUMN ×3 + CREATE TABLE IF NOT EXISTS ×2.
+ *   v7 — accounts and auth (spec 08 CORE): adds the `accounts` table (a
+ *        provider login identity: harness + home + label + status + penalty),
+ *        `account_limits` (the latest limits snapshot per account, feeding
+ *        the calibrated selector), `selection_cursors` (per-harness near-tie
+ *        rotation cursor — a row, not a json file) and `bees.account`
+ *        (declared intent, concrete after spawn — never 'auto'). Additive;
+ *        migration = ALTER TABLE ADD COLUMN ×1 + CREATE TABLE IF NOT EXISTS ×3.
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -90,7 +97,12 @@ CREATE TABLE IF NOT EXISTS bees (
   -- v6: one-shot fork seed — the SOURCE's provider session id the first
   -- runtime forks from (claude --resume <seed> --fork-session, codex
   -- thread/fork); cleared once the fork's own session id is recorded.
-  fork_seed        TEXT
+  fork_seed        TEXT,
+  -- v7: the account (accounts.id) this bee runs on — declared intent made
+  -- concrete at spawn ('auto' is resolved BEFORE the row is written; never
+  -- stored). Soft reference: account.remove refuses while any bee carries
+  -- it. The mechanism stays bees.env[HOME_ENV[harness]] = accounts.home_path.
+  account          TEXT
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
@@ -200,6 +212,56 @@ CREATE TABLE IF NOT EXISTS seals (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS seals_bee ON seals(bee_id, created_at);
 
+-- v7 (spec 08): accounts — a provider login identity (the WHO). One account
+-- = one run-home (home_path, the WHERE); every bee on the account shares it.
+-- status: ok | auth_needed (adapter/login evidence) | paused (operator: out
+-- of the auto pool; explicit spawn refused). penalty: operator hint added to
+-- the selector's effective weekly load. exhausted_at: last rate-limit
+-- exhaustion evidence (rotation cool-off).
+CREATE TABLE IF NOT EXISTS accounts (
+  id            TEXT PRIMARY KEY,
+  harness       TEXT NOT NULL,
+  home_path     TEXT NOT NULL,
+  label         TEXT NOT NULL,
+  status        TEXT NOT NULL CHECK (status IN ('ok','auth_needed','paused')),
+  penalty       INTEGER NOT NULL DEFAULT 0,
+  last_login_at INTEGER,
+  exhausted_at  INTEGER,
+  added_at      INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS accounts_harness ON accounts(harness, added_at, id);
+
+-- v7: the latest limits snapshot per account (one row, replaced on fetch).
+-- Percentages are provider "used%" per window; *_resets_at epoch ms;
+-- *_minutes the window length when known (pace needs it). readable = the
+-- fetch answered (0 = the fetch failed; error says why; the selector ranks
+-- unreadable accounts last).
+CREATE TABLE IF NOT EXISTS account_limits (
+  account              TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  fetched_at           INTEGER NOT NULL,
+  readable             INTEGER NOT NULL CHECK (readable IN (0,1)),
+  error                TEXT,
+  plan                 TEXT,
+  five_hour_pct        REAL,
+  five_hour_resets_at  INTEGER,
+  five_hour_minutes    INTEGER,
+  weekly_pct           REAL,
+  weekly_resets_at     INTEGER,
+  weekly_minutes       INTEGER,
+  fable_weekly_pct     REAL,
+  fable_resets_at      INTEGER,
+  fable_minutes        INTEGER
+) STRICT;
+
+-- v7: per-harness near-tie rotation cursor (the old round-robin.json
+-- 'auto-tie:<harness>' key, now a row).
+CREATE TABLE IF NOT EXISTS selection_cursors (
+  harness         TEXT PRIMARY KEY,
+  last_account_id TEXT NOT NULL,
+  updated_at      INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS audit (
   seq     INTEGER PRIMARY KEY AUTOINCREMENT,
   ts      INTEGER NOT NULL,
@@ -258,7 +320,7 @@ CREATE TABLE IF NOT EXISTS tracks (
 /**
  * Additive columns on `bees` since v2 — name → ADD COLUMN clause (migration =
  * add iff missing). v3: provider_session_id, env, imported_from; v4:
- * spawn_failures; v5: args; v6: parent_id, forked_from, fork_seed.
+ * spawn_failures; v5: args; v6: parent_id, forked_from, fork_seed; v7: account.
  */
 export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["provider_session_id", "provider_session_id TEXT"],
@@ -269,6 +331,7 @@ export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: s
   ["parent_id", "parent_id TEXT"],
   ["forked_from", "forked_from TEXT"],
   ["fork_seed", "fork_seed TEXT"],
+  ["account", "account TEXT"],
 ];
 
 export const IDEMPOTENCY_INDEX_SQL = `
