@@ -16,6 +16,8 @@ export {
   type PutOutcome,
   type PutTemplateInput,
   type PutTrackInput,
+  type EnqueuedCommand,
+  type RpcIdempotencyRecord,
 } from "./store.ts";
 export {
   normalizeTemplate,
@@ -31,4 +33,4 @@ export * from "./packages.ts";
 export * from "./mirror.ts";
 export { replayAudit } from "./audit.ts";
 export { deriveBeeView } from "./view.ts";
-export { SCHEMA_SQL } from "./schema.ts";
+export { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";

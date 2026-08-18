@@ -126,6 +126,12 @@ export interface CommandRow {
   enqueuedAt: number;
   finishedAt: number | null;
   failureCause: FailureCause | null;
+  /**
+   * Caller-supplied dedup key (spec 06 §4.2 one-key rule): UNIQUE when set;
+   * re-enqueueing with the same key returns THIS row instead of a new one.
+   * Null for internal enqueues (send_wake, loop policy stops).
+   */
+  idempotencyKey: string | null;
 }
 
 export interface AuditRow {
@@ -296,6 +302,21 @@ export class SecondWriterError extends CoreError {
 }
 
 export class CommandProtocolError extends CoreError {}
+
+/**
+ * The store file is stamped with a schema version this code cannot open:
+ * `schema_newer` = downgrade (a newer daemon wrote it — refuse, never guess);
+ * `schema_migration_required` = an older version with no migration path in
+ * this code (no silent bumps — migrations are explicit, spec 06 §6).
+ */
+export class SchemaVersionError extends CoreError {
+  readonly kind: "schema_newer" | "schema_migration_required";
+
+  constructor(kind: "schema_newer" | "schema_migration_required", message: string) {
+    super(message);
+    this.kind = kind;
+  }
+}
 
 export class TemplateNotFoundError extends CoreError {
   constructor(id: string) {

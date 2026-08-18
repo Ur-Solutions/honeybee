@@ -21,6 +21,7 @@ import type {
   BeeRow,
   BeeView,
   CommandRow,
+  CommandStatus,
   LocalConfigImportReport,
   MessageRow,
   MirrorTemplateRow,
@@ -112,19 +113,32 @@ export type WatchFrame =
 // Result shapes
 // ---------------------------------------------------------------------------
 
-export interface SpawnResult {
+/**
+ * One-key idempotency (spec 06 §4.2): every mutation verb accepts an optional
+ * caller-supplied `idempotencyKey` param. A key already seen answers with the
+ * ORIGINAL recorded result plus these replay markers instead of executing
+ * again — `deduped: true`, and (for command-backed mutations) `status` = the
+ * original command's CURRENT status, so a replay after settle returns the
+ * settled outcome, not a new command. Fresh executions omit both fields.
+ */
+export interface DedupMarkers {
+  deduped?: boolean;
+  status?: CommandStatus;
+}
+
+export interface SpawnResult extends DedupMarkers {
   beeId: string;
   commandId: number;
 }
 
-export interface SendRpcResult {
+export interface SendRpcResult extends DedupMarkers {
   messageId: number;
   /** The send_wake enqueued in the same transaction, when one was needed. */
   commandId: number | null;
   unarchived: boolean;
 }
 
-export interface MutationResult {
+export interface MutationResult extends DedupMarkers {
   commandId: number;
 }
 
@@ -191,12 +205,12 @@ export interface TemplateGetResult {
   template: MirrorTemplateRow;
 }
 
-export interface TemplatePutResult {
+export interface TemplatePutResult extends DedupMarkers {
   template: MirrorTemplateRow;
   outcome: "created" | "updated" | "unchanged";
 }
 
-export interface TemplateDeleteResult {
+export interface TemplateDeleteResult extends DedupMarkers {
   template: MirrorTemplateRow;
 }
 
@@ -207,7 +221,7 @@ export interface TemplateExportResult {
   text: string;
 }
 
-export interface TemplateImportResult {
+export interface TemplateImportResult extends DedupMarkers {
   template: MirrorTemplateRow;
   outcome: "created" | "updated" | "unchanged";
 }
@@ -220,12 +234,12 @@ export interface TrackGetResult {
   track: MirrorTrackRow;
 }
 
-export interface TrackPutResult {
+export interface TrackPutResult extends DedupMarkers {
   track: MirrorTrackRow;
   outcome: "created" | "updated" | "unchanged";
 }
 
-export interface TrackDeleteResult {
+export interface TrackDeleteResult extends DedupMarkers {
   track: MirrorTrackRow;
 }
 
@@ -234,12 +248,12 @@ export interface TrackExportResult {
   text: string;
 }
 
-export interface TrackImportResult {
+export interface TrackImportResult extends DedupMarkers {
   track: MirrorTrackRow;
   outcome: "created" | "updated" | "unchanged";
 }
 
-export type ImportLocalConfigResult = LocalConfigImportReport;
+export type ImportLocalConfigResult = LocalConfigImportReport & DedupMarkers;
 
 export class RpcError extends Error {
   readonly code: RpcErrorCode;
