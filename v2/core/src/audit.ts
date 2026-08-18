@@ -12,6 +12,8 @@ import type {
   MessageRow,
   RuntimeRow,
   StateDump,
+  TemplateRow,
+  TrackRow,
 } from "./types.ts";
 
 export function replayAudit(rows: AuditRow[]): StateDump {
@@ -20,6 +22,8 @@ export function replayAudit(rows: AuditRow[]): StateDump {
   const flags = new Map<number, FlagRow>();
   const mailbox = new Map<number, MessageRow>();
   const commands = new Map<number, CommandRow>();
+  const templates = new Map<string, TemplateRow>();
+  const tracks = new Map<string, TrackRow>();
 
   const rtKey = (beeId: string, generation: number) => `${beeId}#${generation}`;
   const mustBee = (id: string): BeeRow => {
@@ -138,6 +142,24 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         mustBee(p.beeId as string).lastOutputAt = p.at as number;
         break;
       }
+      case "template.put": {
+        const template = p.template as TemplateRow;
+        templates.set(template.id, { ...template });
+        break;
+      }
+      case "template.deleted": {
+        if (!templates.delete(p.templateId as string)) throw new Error(`audit replay: unknown template ${String(p.templateId)}`);
+        break;
+      }
+      case "track.put": {
+        const track = p.track as TrackRow;
+        tracks.set(track.id, { ...track });
+        break;
+      }
+      case "track.deleted": {
+        if (!tracks.delete(p.trackId as string)) throw new Error(`audit replay: unknown track ${String(p.trackId)}`);
+        break;
+      }
       // Recorded no-ops and informational rows: state unchanged by definition.
       case "runtime.stale_update":
       case "flag.clear_noop":
@@ -158,5 +180,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
     flags: [...flags.values()].sort((a, b) => a.id - b.id),
     mailbox: [...mailbox.values()].sort((a, b) => a.id - b.id),
     commands: [...commands.values()].sort((a, b) => a.id - b.id),
+    templates: [...templates.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    tracks: [...tracks.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
   };
 }

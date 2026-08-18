@@ -13,7 +13,22 @@ export {
   type DeleteResult,
   type ReconcileResult,
   type LivePid,
+  type PutOutcome,
+  type PutTemplateInput,
+  type PutTrackInput,
 } from "./store.ts";
+export {
+  normalizeTemplate,
+  normalizeTrack,
+  stableStringify,
+  isRowSource,
+  isScope,
+  type NormalizeOptions,
+  type TemplateFields,
+  type TrackFields,
+} from "./registry.ts";
+export * from "./packages.ts";
+export * from "./mirror.ts";
 export { replayAudit } from "./audit.ts";
 export { deriveBeeView } from "./view.ts";
 export { SCHEMA_SQL } from "./schema.ts";

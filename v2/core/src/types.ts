@@ -153,6 +153,90 @@ export interface BeeView {
   flags: Flag[];
 }
 
+// ---------------------------------------------------------------------------
+// Templates + tracks — hive concepts (spec 06 §1.4.1 ownership table).
+// "Rows are truth, files are packages": these tables are the registry; the
+// package format in packages.ts is the portable artifact.
+// ---------------------------------------------------------------------------
+
+/** Scope is data on the row (spec 06 §1.4.1). */
+export const SCOPES = ["personal", "team", "repo"] as const;
+export type Scope = (typeof SCOPES)[number];
+
+/**
+ * Where a row came from. Closed prefixes:
+ *   `api`               — put through the RPC/CLI verbs
+ *   `package:<path>`    — imported from a package document (path or `rpc`)
+ *   `local-config`      — imported from the local config source (~/.hive/*)
+ */
+export type RowSource = "api" | "local-config" | `package:${string}`;
+
+/** Where a template-spawned bee runs: caller's cwd, or a fixed absolute path. */
+export const CWD_POLICIES = ["caller", "fixed"] as const;
+export type CwdPolicy = (typeof CWD_POLICIES)[number];
+
+export interface TemplateRow {
+  id: string;
+  name: string;
+  scope: Scope;
+  source: RowSource;
+  description: string | null;
+  /** Agent key (old system: `bee`) — resolved against the node's agent table at spawn. */
+  agent: string;
+  /** Substrate default; null = node default. */
+  substrate: string | null;
+  /** Model / effort defaults handed to the harness adapter; null = harness default. */
+  model: string | null;
+  effort: string | null;
+  /** Extra harness CLI args, pass-through. */
+  args: string[];
+  /** The task instruction the spawned bee receives. */
+  prompt: string;
+  /** Custom preamble text (null = the node's default preamble when enabled). */
+  preamble: string | null;
+  /** false = spawn with no preamble at all (old system: `preamble: false`). */
+  preambleEnabled: boolean;
+  cwdPolicy: CwdPolicy;
+  /** Absolute path when cwdPolicy = fixed; null otherwise. */
+  cwd: string | null;
+  env: Record<string, string>;
+  /** Credential/account selector (old system field, kept faithful; null = default). */
+  account: string | null;
+  /** Skip-permissions mode for the harness (old system: `yolo`). */
+  yolo: boolean;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export const TRACK_STEP_STATUSES = ["pending", "running", "done", "skipped"] as const;
+export type TrackStepStatus = (typeof TRACK_STEP_STATUSES)[number];
+
+/** One ordered step of a track: references a template by stable id, or is free-form. */
+export interface TrackStep {
+  id: string;
+  name: string;
+  /** Free-form step kind (old system node type: action|orchestrate|review|ask|deploy); default `action`. */
+  kind: string;
+  /** Stable template id this step spawns from; null = free-form. Not validated at import (loosely coupled). */
+  templateId: string | null;
+  instruction: string | null;
+  note: string | null;
+  status: TrackStepStatus;
+}
+
+export interface TrackRow {
+  id: string;
+  name: string;
+  scope: Scope;
+  source: RowSource;
+  description: string | null;
+  steps: TrackStep[];
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 /** Deterministic full-store snapshot (audit excluded); comparison target for replay. */
 export interface StateDump {
   bees: BeeRow[];
@@ -160,6 +244,8 @@ export interface StateDump {
   flags: FlagRow[];
   mailbox: MessageRow[];
   commands: CommandRow[];
+  templates: TemplateRow[];
+  tracks: TrackRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -210,3 +296,21 @@ export class SecondWriterError extends CoreError {
 }
 
 export class CommandProtocolError extends CoreError {}
+
+export class TemplateNotFoundError extends CoreError {
+  constructor(id: string) {
+    super(`template not found: ${id}`);
+  }
+}
+
+export class TrackNotFoundError extends CoreError {
+  constructor(id: string) {
+    super(`track not found: ${id}`);
+  }
+}
+
+/** A put/import would leave two rows with the same (scope, name) — names are unique per scope. */
+export class NameConflictError extends CoreError {}
+
+/** A package document (or a local config file) failed validation. */
+export class PackageError extends CoreError {}

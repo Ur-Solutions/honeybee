@@ -16,7 +16,19 @@
  *   {type:"gap", seq} — the server bounded the batch (or restarted) and the
  *     client must refetch the snapshot (fail-closed cursor).
  */
-import type { AuditRow, BeeRow, BeeView, CommandRow, MessageRow, RuntimeRow } from "../../core/src/index.ts";
+import type {
+  AuditRow,
+  BeeRow,
+  BeeView,
+  CommandRow,
+  LocalConfigImportReport,
+  MessageRow,
+  MirrorTemplateRow,
+  MirrorTrackRow,
+  RuntimeRow,
+  TemplatePackage,
+  TrackPackage,
+} from "../../core/src/index.ts";
 import type { BootReport } from "./loops.ts";
 
 export const PROTOCOL = "v2/1";
@@ -32,6 +44,12 @@ export const RPC_ERROR_CODES = [
   "lifecycle_refused",
   /** Verb-specific refusal: the runtime state forbids the operation. */
   "runtime_refused",
+  /** Registry refusals (WP6a): missing rows and per-scope name collisions. */
+  "template_not_found",
+  "track_not_found",
+  "name_conflict",
+  /** A package document failed header/field validation. */
+  "invalid_package",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -54,6 +72,20 @@ export const RPC_VERBS = [
   // watch
   "watch",
   "snapshot",
+  // templates + tracks + packages (WP6a, spec 06 §1.4.1)
+  "template.list",
+  "template.get",
+  "template.put",
+  "template.delete",
+  "template.export",
+  "template.import",
+  "track.list",
+  "track.get",
+  "track.put",
+  "track.delete",
+  "track.export",
+  "track.import",
+  "packages.importLocalConfig",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -142,7 +174,72 @@ export interface HealthResult {
 export interface SnapshotResult {
   seq: number;
   views: ViewResult[];
+  /** Mirror-shaped registry rows (WP6a): store rows verbatim, snapshot-consistent with `seq`. */
+  templates: MirrorTemplateRow[];
+  tracks: MirrorTrackRow[];
 }
+
+// ---------------------------------------------------------------------------
+// Template / track / package verb shapes (WP6a)
+// ---------------------------------------------------------------------------
+
+export interface TemplateListResult {
+  templates: MirrorTemplateRow[];
+}
+
+export interface TemplateGetResult {
+  template: MirrorTemplateRow;
+}
+
+export interface TemplatePutResult {
+  template: MirrorTemplateRow;
+  outcome: "created" | "updated" | "unchanged";
+}
+
+export interface TemplateDeleteResult {
+  template: MirrorTemplateRow;
+}
+
+export interface TemplateExportResult {
+  /** The parsed package document. */
+  package: TemplatePackage;
+  /** Canonical serialized text (what belongs in a file, byte-stable). */
+  text: string;
+}
+
+export interface TemplateImportResult {
+  template: MirrorTemplateRow;
+  outcome: "created" | "updated" | "unchanged";
+}
+
+export interface TrackListResult {
+  tracks: MirrorTrackRow[];
+}
+
+export interface TrackGetResult {
+  track: MirrorTrackRow;
+}
+
+export interface TrackPutResult {
+  track: MirrorTrackRow;
+  outcome: "created" | "updated" | "unchanged";
+}
+
+export interface TrackDeleteResult {
+  track: MirrorTrackRow;
+}
+
+export interface TrackExportResult {
+  package: TrackPackage;
+  text: string;
+}
+
+export interface TrackImportResult {
+  track: MirrorTrackRow;
+  outcome: "created" | "updated" | "unchanged";
+}
+
+export type ImportLocalConfigResult = LocalConfigImportReport;
 
 export class RpcError extends Error {
   readonly code: RpcErrorCode;

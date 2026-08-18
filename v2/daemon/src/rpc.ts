@@ -9,7 +9,15 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
 import type { AuditRow } from "../../core/src/index.ts";
-import { BeeNotFoundError, CoreError, IllegalTransitionError } from "../../core/src/index.ts";
+import {
+  BeeNotFoundError,
+  CoreError,
+  IllegalTransitionError,
+  NameConflictError,
+  PackageError,
+  TemplateNotFoundError,
+  TrackNotFoundError,
+} from "../../core/src/index.ts";
 import {
   PROTOCOL,
   RPC_VERBS,
@@ -51,6 +59,10 @@ interface Connection extends RpcConn {
 export function toRpcError(err: unknown): { code: RpcErrorCode; message: string } {
   if (err instanceof RpcError) return { code: err.code, message: err.message };
   if (err instanceof BeeNotFoundError) return { code: "bee_not_found", message: err.message };
+  if (err instanceof TemplateNotFoundError) return { code: "template_not_found", message: err.message };
+  if (err instanceof TrackNotFoundError) return { code: "track_not_found", message: err.message };
+  if (err instanceof NameConflictError) return { code: "name_conflict", message: err.message };
+  if (err instanceof PackageError) return { code: "invalid_package", message: err.message };
   if (err instanceof IllegalTransitionError) {
     const code: RpcErrorCode = err.message.includes("lifecycle") ? "lifecycle_refused" : "runtime_refused";
     return { code, message: err.message };

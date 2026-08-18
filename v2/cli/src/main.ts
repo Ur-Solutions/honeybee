@@ -21,6 +21,7 @@ import {
   type ExecRunner,
   type ServiceManager,
 } from "../../daemon/src/service.ts";
+import { readFileSync, writeFileSync } from "node:fs";
 import {
   RpcError,
   type HealthResult,
@@ -30,6 +31,19 @@ import {
   type SendRpcResult,
   type SnapshotResult,
   type SpawnResult,
+  type ImportLocalConfigResult,
+  type TemplateDeleteResult,
+  type TemplateExportResult,
+  type TemplateGetResult,
+  type TemplateImportResult,
+  type TemplateListResult,
+  type TemplatePutResult,
+  type TrackDeleteResult,
+  type TrackExportResult,
+  type TrackGetResult,
+  type TrackImportResult,
+  type TrackListResult,
+  type TrackPutResult,
   type ViewResult,
   type WatchFrame,
 } from "../../daemon/src/protocol.ts";
@@ -64,6 +78,12 @@ const VALUE_FLAGS = new Set([
   "--data-dir",
   "--config",
   "--socket",
+  "--scope",
+  "--source",
+  "--file",
+  "--out",
+  "--dir",
+  "--id",
 ]);
 
 function parseArgs(argv: string[]): Parsed {
@@ -405,6 +425,238 @@ async function cmdWatch(ctx: CliContext, parsed: Parsed): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// templates + tracks + packages (WP6a)
+// ---------------------------------------------------------------------------
+
+interface RegistryRowLike {
+  id: string;
+  name: string;
+  scope: string;
+  source: string;
+  updatedAt: number;
+}
+
+function resolveRegistryRow<T extends RegistryRowLike>(rows: T[], needle: string, what: string): T {
+  const byId = rows.find((r) => r.id === needle);
+  if (byId) return byId;
+  const byName = rows.filter((r) => r.name === needle);
+  if (byName.length === 1) return byName[0] as T;
+  if (byName.length > 1) {
+    throw new Error(`${what} name '${needle}' is ambiguous across scopes (${byName.map((r) => r.scope).join(", ")}) — use the id`);
+  }
+  throw new Error(`${what} not found: ${needle}`);
+}
+
+function registryLine(prefix: string, r: RegistryRowLike, extra: string): string {
+  return `${prefix}${r.id}  ${r.name}  scope=${r.scope}  source=${r.source}  ${extra}`;
+}
+
+async function cmdTemplate(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1] ?? "list";
+  const scope = parsed.flags.get("--scope") as string | undefined;
+  switch (sub) {
+    case "list":
+    case "ls": {
+      const { result, stale } = await readPath(
+        ctx,
+        (c) => c.request<TemplateListResult>("template.list", scope ? { scope } : {}),
+        (store) => ({ templates: store.listTemplates().filter((t) => scope == null || t.scope === scope) }),
+      );
+      const lines = result.templates.map((t) => registryLine(stale ? "stale: " : "", t, `agent=${t.agent}`));
+      emit(ctx, lines.length > 0 ? lines : [`${stale ? "stale: " : ""}no templates`], result, stale);
+      return 0;
+    }
+    case "get":
+    case "show": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive v2 template get <id|name>");
+      const { result, stale } = await readPath(
+        ctx,
+        async (c) => {
+          const { templates } = await c.request<TemplateListResult>("template.list");
+          return c.request<TemplateGetResult>("template.get", { id: resolveRegistryRow(templates, needle, "template").id });
+        },
+        (store) => ({ template: resolveRegistryRow(store.listTemplates(), needle, "template") }),
+      );
+      emit(ctx, [JSON.stringify(result.template, null, 2)], result, stale);
+      return 0;
+    }
+    case "put": {
+      const file = parsed.flags.get("--file") as string | undefined;
+      if (!file) throw new Error("usage: hive v2 template put --file fields.json [--id id]");
+      const result = await withClient(ctx, (c) =>
+        c.request<TemplatePutResult>("template.put", {
+          fields: JSON.parse(readFileSync(resolve(file), "utf8")),
+          id: parsed.flags.get("--id") as string | undefined,
+        }),
+      );
+      emit(ctx, [`${result.outcome} template ${result.template.id} (${result.template.name})`], result, false);
+      return 0;
+    }
+    case "delete":
+    case "rm": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive v2 template delete <id|name>");
+      const result = await withClient(ctx, async (c) => {
+        const { templates } = await c.request<TemplateListResult>("template.list");
+        return c.request<TemplateDeleteResult>("template.delete", { id: resolveRegistryRow(templates, needle, "template").id });
+      });
+      emit(ctx, [`deleted template ${result.template.id} (${result.template.name})`], result, false);
+      return 0;
+    }
+    case "export": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive v2 template export <id|name> [--out file.json]");
+      const result = await withClient(ctx, async (c) => {
+        const { templates } = await c.request<TemplateListResult>("template.list");
+        return c.request<TemplateExportResult>("template.export", { id: resolveRegistryRow(templates, needle, "template").id });
+      });
+      const out = parsed.flags.get("--out") as string | undefined;
+      if (out) {
+        writeFileSync(resolve(out), result.text);
+        emit(ctx, [`exported template package to ${resolve(out)}`], result, false);
+      } else {
+        ctx.io.out(result.text.trimEnd());
+      }
+      return 0;
+    }
+    case "import": {
+      const file = parsed.flags.get("--file") as string | undefined ?? parsed.positional[2];
+      if (!file) throw new Error("usage: hive v2 template import <package.json> [--scope s] [--source label]");
+      const path = resolve(file);
+      const result = await withClient(ctx, (c) =>
+        c.request<TemplateImportResult>("template.import", {
+          package: JSON.parse(readFileSync(path, "utf8")),
+          source: (parsed.flags.get("--source") as string | undefined) ?? path,
+          scope,
+          label: path,
+        }),
+      );
+      emit(ctx, [`${result.outcome} template ${result.template.id} (${result.template.name}) from ${path}`], result, false);
+      return 0;
+    }
+    default:
+      throw new Error("usage: hive v2 template <list|get|put|delete|export|import>");
+  }
+}
+
+async function cmdTrack(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1] ?? "list";
+  const scope = parsed.flags.get("--scope") as string | undefined;
+  switch (sub) {
+    case "list":
+    case "ls": {
+      const { result, stale } = await readPath(
+        ctx,
+        (c) => c.request<TrackListResult>("track.list", scope ? { scope } : {}),
+        (store) => ({ tracks: store.listTracks().filter((t) => scope == null || t.scope === scope) }),
+      );
+      const lines = result.tracks.map((t) => registryLine(stale ? "stale: " : "", t, `steps=${t.steps.length}`));
+      emit(ctx, lines.length > 0 ? lines : [`${stale ? "stale: " : ""}no tracks`], result, stale);
+      return 0;
+    }
+    case "get":
+    case "show": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive v2 track get <id|name>");
+      const { result, stale } = await readPath(
+        ctx,
+        async (c) => {
+          const { tracks } = await c.request<TrackListResult>("track.list");
+          return c.request<TrackGetResult>("track.get", { id: resolveRegistryRow(tracks, needle, "track").id });
+        },
+        (store) => ({ track: resolveRegistryRow(store.listTracks(), needle, "track") }),
+      );
+      emit(ctx, [JSON.stringify(result.track, null, 2)], result, stale);
+      return 0;
+    }
+    case "put": {
+      const file = parsed.flags.get("--file") as string | undefined;
+      if (!file) throw new Error("usage: hive v2 track put --file fields.json [--id id]");
+      const result = await withClient(ctx, (c) =>
+        c.request<TrackPutResult>("track.put", {
+          fields: JSON.parse(readFileSync(resolve(file), "utf8")),
+          id: parsed.flags.get("--id") as string | undefined,
+        }),
+      );
+      emit(ctx, [`${result.outcome} track ${result.track.id} (${result.track.name})`], result, false);
+      return 0;
+    }
+    case "delete":
+    case "rm": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive v2 track delete <id|name>");
+      const result = await withClient(ctx, async (c) => {
+        const { tracks } = await c.request<TrackListResult>("track.list");
+        return c.request<TrackDeleteResult>("track.delete", { id: resolveRegistryRow(tracks, needle, "track").id });
+      });
+      emit(ctx, [`deleted track ${result.track.id} (${result.track.name})`], result, false);
+      return 0;
+    }
+    case "export": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive v2 track export <id|name> [--out file.json]");
+      const result = await withClient(ctx, async (c) => {
+        const { tracks } = await c.request<TrackListResult>("track.list");
+        return c.request<TrackExportResult>("track.export", { id: resolveRegistryRow(tracks, needle, "track").id });
+      });
+      const out = parsed.flags.get("--out") as string | undefined;
+      if (out) {
+        writeFileSync(resolve(out), result.text);
+        emit(ctx, [`exported track package to ${resolve(out)}`], result, false);
+      } else {
+        ctx.io.out(result.text.trimEnd());
+      }
+      return 0;
+    }
+    case "import": {
+      const file = parsed.flags.get("--file") as string | undefined ?? parsed.positional[2];
+      if (!file) throw new Error("usage: hive v2 track import <package.json> [--scope s] [--source label]");
+      const path = resolve(file);
+      const result = await withClient(ctx, (c) =>
+        c.request<TrackImportResult>("track.import", {
+          package: JSON.parse(readFileSync(path, "utf8")),
+          source: (parsed.flags.get("--source") as string | undefined) ?? path,
+          scope,
+          label: path,
+        }),
+      );
+      emit(ctx, [`${result.outcome} track ${result.track.id} (${result.track.name}) from ${path}`], result, false);
+      return 0;
+    }
+    default:
+      throw new Error("usage: hive v2 track <list|get|put|delete|export|import>");
+  }
+}
+
+async function cmdPackages(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  switch (sub) {
+    case "import-local": {
+      // Manual invocation only (v1): the FUTURE auto-import hook lives in
+      // core/packages.ts, deliberately uncalled.
+      const dir = parsed.flags.get("--dir") as string | undefined;
+      const result = await withClient(ctx, (c) =>
+        c.request<ImportLocalConfigResult>("packages.importLocalConfig", {
+          ...(dir ? { dir: resolve(dir) } : {}),
+          scope: parsed.flags.get("--scope") as string | undefined,
+        }),
+      );
+      const lines = [
+        `imported local config from ${result.dir}`,
+        ...result.templates.map((t) => `  template ${t.name}: ${t.outcome} (${t.id})`),
+        ...result.tracks.map((t) => `  track ${t.name}: ${t.outcome} (${t.id})`),
+        ...result.skipped.map((s) => `  skipped ${s.path}: ${s.reason}`),
+      ];
+      emit(ctx, lines, result, false);
+      return 0;
+    }
+    default:
+      throw new Error("usage: hive v2 packages import-local [--dir d] [--scope s]");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // daemon service subcommands
 // ---------------------------------------------------------------------------
 
@@ -533,6 +785,13 @@ Reads (RPC; read-only store fallback labeled STALE when daemon is down):
   view <bee> · list [--all|--archived] · mailbox <bee> · commands <bee>
   deploy-info · health
 
+Templates + tracks + packages (spec 06 §1.4.1 — rows are truth, files are packages):
+  template list [--scope s] · get|export <id|name> [--out f] · put --file f [--id id]
+  template delete <id|name> · import <package.json> [--scope s] [--source label]
+  track    list [--scope s] · get|export <id|name> [--out f] · put --file f [--id id]
+  track    delete <id|name> · import <package.json> [--scope s] [--source label]
+  packages import-local [--dir d] [--scope s]   import ~/.hive-style local config (manual, v1)
+
 Watch:
   watch [--bee id]        whole-node change stream (snapshot + seq deltas)
 
@@ -576,6 +835,12 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdHealth(ctx);
       case "watch":
         return await cmdWatch(ctx, parsed);
+      case "template":
+        return await cmdTemplate(ctx, parsed);
+      case "track":
+        return await cmdTrack(ctx, parsed);
+      case "packages":
+        return await cmdPackages(ctx, parsed);
       case "daemon":
         return await cmdDaemon(ctx, parsed);
       case "help":
