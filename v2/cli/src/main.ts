@@ -109,6 +109,7 @@ const VALUE_FLAGS = new Set([
   "--title",
   "--tag",
   "--sender",
+  "--urgency",
   "--timeout",
   "--lifecycle",
   "--bee",
@@ -746,7 +747,7 @@ async function cmdSend(ctx: CliContext, parsed: Parsed): Promise<number> {
   const [, needle, ...bodyParts] = parsed.positional;
   const body = bodyParts.join(" ");
   if (!needle || body.length === 0) {
-    throw new Error("usage: hive v2 send <bee> <message…> [--sender s] [--wait] [--timeout ms] [--idempotency-key k]");
+    throw new Error("usage: hive v2 send <bee> <message…> [--urgency now|next|idle] [--sender s] [--wait] [--timeout ms] [--idempotency-key k]");
   }
   return withClient(ctx, async (c) => {
     const list = await c.request<ListResult>("list");
@@ -755,6 +756,8 @@ async function cmdSend(ctx: CliContext, parsed: Parsed): Promise<number> {
       beeId,
       body,
       sender: parsed.flags.get("--sender") as string | undefined,
+      // v8: delivery urgency (validated by the daemon; omitted = next).
+      urgency: parsed.flags.get("--urgency") as string | undefined,
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
     if (parsed.flags.get("--wait") !== true) {
@@ -1551,7 +1554,9 @@ Mutations (RPC, daemon must be running):
   cell capture <bee> --onto <branch> [--rebase]   land the cell's commits onto an origin branch
                                              (merge by default); refusals/conflicts are results
   cell remove <bee> [--force]                delete the cell (dirty guard, A2) + delete the bee
-  send <bee> <message…> [--sender s] [--wait] [--timeout ms] [--idempotency-key k]
+  send <bee> <message…> [--urgency now|next|idle] [--sender s] [--wait] [--timeout ms] [--idempotency-key k]
+                          urgency: now = interrupt the current turn, then deliver;
+                          next = the next accept point (default); idle = wait until the turn ends
   stop | revive | archive | unarchive | delete <bee>
   revive <bee> [--arg a]... | [-- <args…>]   (revive with replacement per-bee args)
   bee set-args <bee> -- <args…> | --clear    per-bee harness args (--model, --effort, …);

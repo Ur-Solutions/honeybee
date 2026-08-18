@@ -541,3 +541,153 @@ test("unit.10 (spec 08): the onFlagEvidence hook fires after each applied eviden
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Delivery urgency (schema v8 — spec 01 Q2 amendment 2026-08-18): the delivery
+// loop's eligibility rule, the mid-turn interrupt for `now`, the FIFO-among-
+// eligible ordering, and the I1 clock that starts at eligibility for `idle`.
+// ---------------------------------------------------------------------------
+
+/** Drive an idle bee into a turn (store state `running`). */
+function startTurn(rig: Rig, id = "bee-1"): void {
+  const rt = rig.store.currentRuntime(id);
+  assert.equal(rt?.state, "idle", "startTurn wants an idle runtime");
+  rig.driver.events.push({ beeId: id, generation: rt!.generation, kind: "turn_started" });
+  rig.core.step();
+  assert.equal(rig.store.currentRuntime(id)?.state, "running");
+}
+
+test("urgency.d1: `idle` is not delivered while the runtime is running — it lands at turn end", () => {
+  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    const res = rig.store.send("bee-1", "when you are done", { urgency: "idle" });
+    for (let i = 0; i < 5; i++) {
+      rig.clock.now += 10;
+      rig.core.step();
+    }
+    assert.deepEqual(rig.driver.deliveredIds, [], "held for the whole turn");
+    assert.equal(rig.driver.interrupts.length, 0, "idle never interrupts");
+    // Turn ends → same step: observation drains to idle, delivery loop delivers.
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.core.step();
+    assert.deepEqual(rig.driver.deliveredIds, [res.message.id]);
+    assert.equal(rig.store.getMessage(res.message.id)?.deliveredGeneration, 1);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("urgency.d2: `now` mid-turn interrupts exactly once, then delivers at the resulting accept point", () => {
+  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    rig.driver.acceptDeliveries = false; // the accept point is slow to open
+    const res = rig.store.send("bee-1", "drop everything", { urgency: "now" });
+    rig.core.step();
+    assert.deepEqual(rig.driver.interrupts, [{ beeId: "bee-1", generation: 1 }], "interrupt issued");
+    // Simulate the turn_ended landing slowly: swallow it and keep stepping —
+    // the interrupt must NOT be re-issued for the same message.
+    rig.driver.events = [];
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.driver.interrupts.length, 1, "one interrupt per message");
+    assert.deepEqual(rig.driver.deliveredIds, [], "not delivered while refused");
+    // The accept point opens (turn_ended observed, deliveries accepted).
+    rig.driver.acceptDeliveries = true;
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.core.step();
+    assert.deepEqual(rig.driver.deliveredIds, [res.message.id]);
+    assert.equal(rig.driver.interrupts.length, 1);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("urgency.d3: `now` to an idle runtime is a plain delivery — no interrupt", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    const res = rig.store.send("bee-1", "asap", { urgency: "now" });
+    rig.core.step();
+    assert.deepEqual(rig.driver.deliveredIds, [res.message.id]);
+    assert.equal(rig.driver.interrupts.length, 0);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("urgency.d4: ordering — urgency governs WHEN a message is eligible; among eligible, enqueue order wins", () => {
+  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    const m1 = rig.store.send("bee-1", "idle-1", { urgency: "idle" }).message;
+    const m2 = rig.store.send("bee-1", "next-2").message;
+    const m3 = rig.store.send("bee-1", "idle-3", { urgency: "idle" }).message;
+    const m4 = rig.store.send("bee-1", "now-4", { urgency: "now" }).message;
+    // Mid-turn: m1/m3 are held; m2 and m4 are eligible; m2 (older) delivers
+    // first; m4's now-ness still interrupts the turn.
+    rig.core.step();
+    assert.deepEqual(rig.driver.deliveredIds, [m2.id], "idle does not block a later next");
+    assert.deepEqual(rig.driver.interrupts, [{ beeId: "bee-1", generation: 1 }], "the pending now interrupts");
+    // The interrupt's turn_ended drains → idle: everything is eligible, FIFO wins.
+    rig.core.step();
+    rig.core.step();
+    rig.core.step();
+    assert.deepEqual(rig.driver.deliveredIds, [m2.id, m1.id, m3.id, m4.id], "enqueue order among eligible");
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("urgency.d5: `idle` to a stopped bee still revives (revive-on-message unchanged) and delivers once idle", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    rig.store.enqueueCommand("stop", "bee-1", { cause: "stopped_by_user" });
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "stopped");
+    const res = rig.store.send("bee-1", "for later", { urgency: "idle" });
+    assert.ok(res.wakeCommand, "urgency never affects the wake");
+    rig.core.step(); // send_wake → revive gen 2 (autoBoot: booted + turn_ended)
+    rig.core.step(); // observations → idle; delivery in the same step
+    assert.deepEqual(rig.driver.deliveredIds, [res.message.id]);
+    assert.equal(rig.store.getMessage(res.message.id)?.deliveredGeneration, 2);
+    assert.equal(rig.driver.interrupts.length, 0);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("urgency.d6: I1 telemetry — an `idle` message's deadline clock starts at eligibility (turn end), not enqueue", () => {
+  const rig = makeRig({ i1DeadlineSteps: 200, turnHangTimeoutSteps: 1_000_000 });
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    const res = rig.store.send("bee-1", "patient", { urgency: "idle" });
+    // Far past what would breach an enqueue-based deadline: no violation —
+    // the turn is exactly what `idle` opted into waiting for.
+    rig.clock.now += 5_000;
+    rig.core.step();
+    assert.equal(rig.violations.length, 0, "no false I1 violation during a long turn");
+    // Turn ends but delivery is refused: the clock now runs from eligibility.
+    rig.driver.acceptDeliveries = false;
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.core.step();
+    const eligibleAt = rig.clock.now;
+    rig.clock.now += 150; // inside the 200-step bound from ELIGIBILITY
+    rig.core.step();
+    assert.equal(rig.violations.length, 0, "inside the eligibility-based deadline");
+    rig.clock.now += 100; // past it
+    rig.core.step();
+    assert.equal(rig.violations.length, 1, "breach recorded once eligible + overdue");
+    assert.equal(rig.violations[0]?.messageId, res.message.id);
+    assert.ok((rig.violations[0]?.deadline ?? 0) >= eligibleAt + 200, "deadline base is eligibility, not enqueue");
+  } finally {
+    rig.cleanup();
+  }
+});

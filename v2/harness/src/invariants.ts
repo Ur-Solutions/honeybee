@@ -220,11 +220,23 @@ export class InvariantChecker {
         0,
         ...dump.flags.filter((f) => f.beeId === bee.id && f.clearedAt != null).map((f) => f.clearedAt as number),
       );
+      // v8: the CURRENT runtime decides `idle`-urgency eligibility (mirrors
+      // the daemon's delivery loop + I1 telemetry).
+      const rt = dump.runtimes
+        .filter((r) => r.beeId === bee.id)
+        .reduce<(typeof dump.runtimes)[number] | null>((a, b) => (a == null || b.generation > a.generation ? b : a), null);
       const pending = dump.mailbox
         .filter((m) => m.beeId === bee.id && m.deliveredAt == null)
         .sort((a, b) => a.id - b.id);
       pending.forEach((m, pos) => {
-        const base = Math.max(m.enqueuedAt, lastClear);
+        // v8 (Q2 amendment): an `idle` message's clock is suspended while the
+        // runtime is running and starts when it becomes eligible (the
+        // runtime's transition out of `running`) — never a breach mid-turn.
+        let base = Math.max(m.enqueuedAt, lastClear);
+        if (m.urgency === "idle") {
+          if (rt?.state === "running") return;
+          base = Math.max(base, rt?.updatedAt ?? 0);
+        }
         const deadline = base + (pos + 1) * this.bounds.i1BoundSteps;
         if (now > deadline) {
           this.report(

@@ -454,3 +454,99 @@ test("int.7: immediate-exit agent → bounded revives on backoff, spawn_failed a
     cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Delivery urgency (schema v8 — spec 01 Q2 amendment) against the REAL stack:
+// daemon process + HsrDriver + stub agent.
+// ---------------------------------------------------------------------------
+
+test("int.urgency.1: mid-turn `now` — the turn is interrupted, the message delivers immediately, and the bee keeps working", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+    const beeId = await spawnAndSettle(client, "urgent-now");
+
+    // Open a long turn (the stub works it for 4s), wait until it is running.
+    const slow = await client.request<SendRpcResult>("send", { beeId, body: "@slow:4000" });
+    await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId });
+      return v.view.runtimeState === "running";
+    }, "slow turn running");
+
+    const before = Date.now();
+    const urgent = await client.request<SendRpcResult>("send", { beeId, body: "drop everything", urgency: "now" });
+    await waitDelivered(client, beeId, urgent.messageId, "now-message delivered mid-turn");
+    assert.ok(Date.now() - before < 3000, "delivered well before the 4s turn would have ended");
+    // Loop ops land in the op log file (hived.log), not stdout.
+    await waitFor(() => readFileSync(`${dir}/hived.log`, "utf8").includes("deliver.interrupt"), "the delivery loop interrupted the turn");
+
+    // The turn continues: the interrupted stub works the delivered message as
+    // its own turn and the bee settles idle with nothing pending.
+    await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId });
+      return v.view.runtimeState === "idle";
+    }, "bee idle after the urgent turn");
+    const mail = await client.request<MailboxResult>("mailbox", { beeId });
+    assert.equal(mail.messages.filter((m) => m.deliveredAt == null).length, 0, "nothing left pending");
+    assert.equal(mail.messages.find((m) => m.id === urgent.messageId)?.urgency, "now", "urgency surfaces on the mailbox read");
+    assert.equal(mail.messages.find((m) => m.id === slow.messageId)?.urgency, "next", "default urgency is next");
+    client.close();
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
+test("int.urgency.2: mid-turn `idle` — held while the turn runs, delivered only after it ends", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+    const beeId = await spawnAndSettle(client, "urgent-idle");
+
+    await client.request<SendRpcResult>("send", { beeId, body: "@slow:1500" });
+    await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId });
+      return v.view.runtimeState === "running";
+    }, "slow turn running");
+
+    const later = await client.request<SendRpcResult>("send", { beeId, body: "when you are done", urgency: "idle" });
+    // While the turn runs, the message must stay undelivered (poll a few ticks).
+    for (let i = 0; i < 8; i++) {
+      const v = await client.request<ViewResult>("view", { beeId });
+      if (v.view.runtimeState !== "running") break;
+      const mail = await client.request<MailboxResult>("mailbox", { beeId });
+      assert.equal(mail.messages.find((m) => m.id === later.messageId)?.deliveredAt, null, "idle message held mid-turn");
+      await sleep(100);
+    }
+    await waitDelivered(client, beeId, later.messageId, "idle message delivered after the turn ended");
+    assert.ok(!readFileSync(`${dir}/hived.log`, "utf8").includes("deliver.interrupt"), "idle never interrupts");
+    client.close();
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
+test("int.urgency.3: an unknown urgency is a typed invalid_request, and nothing is enqueued", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+    const beeId = await spawnAndSettle(client, "urgent-bad");
+    await assert.rejects(
+      client.request("send", { beeId, body: "x", urgency: "soon" }),
+      (err: Error & { code?: string }) => err.code === "invalid_request",
+    );
+    const mail = await client.request<MailboxResult>("mailbox", { beeId });
+    assert.equal(mail.messages.length, 0, "the refused send inserted nothing");
+    client.close();
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});

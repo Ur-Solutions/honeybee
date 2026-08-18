@@ -156,13 +156,35 @@ export interface FlagRow {
   clearedAt: number | null;
 }
 
+/**
+ * Delivery urgency (spec 01 Q2 amendment 2026-08-18) — the intent the old buz
+ * tiers expressed as UX, kept as a first-class message attribute:
+ *   now  — the agent needs this immediately: interrupt the current turn
+ *          (driver.interrupt), then deliver at the resulting accept point.
+ *   next — as soon as convenient: the harness's next accept point (default —
+ *          today's behavior, unchanged).
+ *   idle — when the agent is done: never delivered while the runtime state is
+ *          `running`; delivered once it is idle (revive-on-message for stopped
+ *          bees is unchanged — urgency never affects WHETHER a wake happens).
+ * Urgency governs WHEN a message becomes eligible for delivery; among eligible
+ * messages, enqueue order (per-bee FIFO, Q2) wins. It never reorders the queue.
+ */
+export const MESSAGE_URGENCIES = ["now", "next", "idle"] as const;
+export type Urgency = (typeof MESSAGE_URGENCIES)[number];
+
 export interface MessageRow {
   id: number;
   beeId: string;
   sender: string;
   body: string;
-  /** Q2 — reserved for future queue tiers. NOT consulted by ordering logic today. */
+  /**
+   * Q2 — the reserved tier column, kept for compat; its ROLE is superseded by
+   * `urgency` (the amendment resolved what the tiers meant). NOT consulted by
+   * ordering or delivery logic.
+   */
   priority: number;
+  /** v8 — delivery urgency; governs eligibility, never FIFO order (see MESSAGE_URGENCIES). */
+  urgency: Urgency;
   enqueuedAt: number;
   deliveredAt: number | null;
   deliveredGeneration: number | null;
@@ -435,6 +457,13 @@ export class UnknownFlagError extends CoreError {
 export class UnknownVerbError extends CoreError {
   constructor(verb: string) {
     super(`unknown verb: ${verb} — the verb list is closed (${VERBS.join(", ")})`);
+  }
+}
+
+/** v8 — send() with an urgency outside the closed list throws (mirrors UnknownFlagError). */
+export class UnknownUrgencyError extends CoreError {
+  constructor(urgency: string) {
+    super(`unknown urgency: ${urgency} — the urgency list is closed (${MESSAGE_URGENCIES.join(", ")})`);
   }
 }
 

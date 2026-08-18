@@ -20,8 +20,10 @@ import {
   RUNTIME_TRANSITIONS,
   RUNTIME_VERBS,
   SecondWriterError,
+  MESSAGE_URGENCIES,
   UnknownFailureCauseError,
   UnknownFlagError,
+  UnknownUrgencyError,
   UnknownVerbError,
   VERBS,
   type AccountLimitsRow,
@@ -44,6 +46,7 @@ import {
   type StateDump,
   type TemplateRow,
   type TrackRow,
+  type Urgency,
   type Verb,
   ACCOUNT_STATUSES,
   AccountNotFoundError,
@@ -56,7 +59,7 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
-import { BEES_ADDITIVE_COLUMNS, IDEMPOTENCY_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_ADDITIVE_COLUMNS, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -442,6 +445,7 @@ function mapMessage(r: Row): MessageRow {
     sender: r.sender as string,
     body: r.body as string,
     priority: Number(r.priority),
+    urgency: r.urgency as Urgency,
     enqueuedAt: Number(r.enqueued_at),
     deliveredAt: r.delivered_at == null ? null : Number(r.delivered_at),
     deliveredGeneration: r.delivered_generation == null ? null : Number(r.delivered_generation),
@@ -651,6 +655,13 @@ export class CoreStore {
       );
       for (const [name, ddl] of BEES_ADDITIVE_COLUMNS) {
         if (!beeCols.has(name)) this.db.exec(`ALTER TABLE bees ADD COLUMN ${ddl}`);
+      }
+      // v7 → v8: additive urgency column on mailbox (spec 01 Q2 amendment).
+      const mailCols = new Set(
+        (this.db.prepare("SELECT name FROM pragma_table_info('mailbox')").all() as Row[]).map((c) => String(c.name)),
+      );
+      for (const [name, ddl] of MAILBOX_ADDITIVE_COLUMNS) {
+        if (!mailCols.has(name)) this.db.exec(`ALTER TABLE mailbox ADD COLUMN ${ddl}`);
       }
     }
     // The partial UNIQUE index needs the column, so it is created here — after
@@ -1336,7 +1347,9 @@ export class CoreStore {
    * bee has no row → BeeNotFoundError). Archived bees auto-unarchive (Q3). When no
    * live runtime exists, a `send_wake` command is enqueued in the SAME transaction.
    */
-  send(beeId: string, body: string, opts: { sender?: string; priority?: number } = {}): SendResult {
+  send(beeId: string, body: string, opts: { sender?: string; priority?: number; urgency?: Urgency } = {}): SendResult {
+    const urgency = opts.urgency ?? "next";
+    if (!(MESSAGE_URGENCIES as readonly string[]).includes(urgency)) throw new UnknownUrgencyError(urgency);
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       let unarchived = false;
@@ -1346,14 +1359,15 @@ export class CoreStore {
       }
       const at = this.now();
       const res = this.db
-        .prepare("INSERT INTO mailbox(bee_id, sender, body, priority, enqueued_at) VALUES(?, ?, ?, ?, ?)")
-        .run(beeId, opts.sender ?? "operator", body, opts.priority ?? 0, at);
+        .prepare("INSERT INTO mailbox(bee_id, sender, body, priority, urgency, enqueued_at) VALUES(?, ?, ?, ?, ?, ?)")
+        .run(beeId, opts.sender ?? "operator", body, opts.priority ?? 0, urgency, at);
       const message: MessageRow = {
         id: Number(res.lastInsertRowid),
         beeId,
         sender: opts.sender ?? "operator",
         body,
         priority: opts.priority ?? 0,
+        urgency,
         enqueuedAt: at,
         deliveredAt: null,
         deliveredGeneration: null,
@@ -1364,7 +1378,11 @@ export class CoreStore {
     });
   }
 
-  /** Undelivered messages, per-bee FIFO (Q2 — priority column intentionally unused). */
+  /**
+   * Undelivered messages, per-bee FIFO (Q2 — priority column intentionally
+   * unused). v8: `urgency` rides along; ELIGIBILITY is the daemon delivery
+   * loop's job — the store never reorders or filters by it.
+   */
   undeliveredMessages(beeId: string): MessageRow[] {
     const rows = this.db
       .prepare("SELECT * FROM mailbox WHERE bee_id = ? AND delivered_at IS NULL ORDER BY id")
@@ -1980,7 +1998,9 @@ export class CoreStore {
       }
       const answeredBy = opts.answeredBy ?? "operator";
       const body = `[answer to question ${questionId}] ${text}\n\n(question was: ${question.text})`;
-      const send = this.send(question.beeId, body, { sender: answeredBy });
+      // Urgency ruling: an answer is "as soon as convenient" — `next`, never an
+      // interrupt (the bee asked; it is presumably working toward the answer).
+      const send = this.send(question.beeId, body, { sender: answeredBy, urgency: "next" });
       const at = this.now();
       this.db
         .prepare(

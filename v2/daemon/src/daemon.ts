@@ -31,6 +31,7 @@ import {
   importLocalConfig,
   importTemplate,
   importTrack,
+  MESSAGE_URGENCIES,
   openCoreStore,
   serializePackage,
   type AccountRow,
@@ -39,6 +40,7 @@ import {
   type CoreStore,
   type RowSource,
   type Scope,
+  type Urgency,
 } from "../../core/src/index.ts";
 import { AccountsService, type LimitsFetchers, type LoginSeat } from "./accountsService.ts";
 import type { KeychainReader, KeychainWriter } from "./keychain.ts";
@@ -1237,7 +1239,15 @@ export class HiveDaemon {
     const beeId = this.param(params, "beeId");
     const body = this.param(params, "body");
     const sender = typeof params.sender === "string" && params.sender.length > 0 ? params.sender : "operator";
-    const res = store.send(beeId, body, { sender });
+    // v8: optional delivery urgency (spec 01 Q2 amendment); omitted = 'next'.
+    let urgency: Urgency = "next";
+    if (params.urgency !== undefined && params.urgency !== null) {
+      if (typeof params.urgency !== "string" || !(MESSAGE_URGENCIES as readonly string[]).includes(params.urgency)) {
+        throw new RpcError("invalid_request", `send: urgency must be one of ${MESSAGE_URGENCIES.join("|")}`);
+      }
+      urgency = params.urgency as Urgency;
+    }
+    const res = store.send(beeId, body, { sender, urgency });
     return { messageId: res.message.id, commandId: res.wakeCommand?.id ?? null, unarchived: res.unarchived };
   }
 

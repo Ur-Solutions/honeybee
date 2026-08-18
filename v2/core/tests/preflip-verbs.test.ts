@@ -290,7 +290,7 @@ test("v6.migration: a v5 store opens as v6 — parent_id/forked_from/fork_seed a
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 7);
+      assert.equal(SCHEMA_VERSION, 8);
       const cols = (check.prepare("SELECT name FROM pragma_table_info('bees')").all() as Array<{ name: string }>).map((c) => c.name);
       for (const c of ["parent_id", "forked_from", "fork_seed", "args", "spawn_failures"]) assert.ok(cols.includes(c), c);
       const tables = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name);

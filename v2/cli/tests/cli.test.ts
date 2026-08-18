@@ -621,3 +621,47 @@ test("cli.7: cutover verbs — `freeze` writes/refuses locally; `import --from-f
     fx.cleanup();
   }
 });
+
+test("cli.urgency: send --urgency passes through to the row; the mailbox read surfaces it; an unknown value is a typed error", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const s = capture();
+    assert.equal(
+      await runV2Cli(["spawn", "worker", "--agent", "stub", "--cwd", "/tmp", "--data-dir", dir, "--json"], s.io),
+      0,
+    );
+    await waitFor(async () => {
+      const l = capture();
+      await runV2Cli(["view", "worker", "--data-dir", dir, "--json"], l.io);
+      return (JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string } }).view?.runtimeState === "idle";
+    }, "worker idle", 10_000);
+
+    // --urgency idle passes through (the bee is idle, so it still delivers).
+    const w = capture();
+    assert.equal(
+      await runV2Cli(["send", "worker", "for later", "--urgency", "idle", "--wait", "--data-dir", dir, "--json"], w.io),
+      0,
+    );
+    const sent = JSON.parse(w.out[0] ?? "{}") as { messageId: number };
+    // Default: no flag = next.
+    const d = capture();
+    assert.equal(await runV2Cli(["send", "worker", "plain", "--wait", "--data-dir", dir, "--json"], d.io), 0);
+    const plain = JSON.parse(d.out[0] ?? "{}") as { messageId: number };
+
+    const m = capture();
+    assert.equal(await runV2Cli(["mailbox", "worker", "--data-dir", dir, "--json"], m.io), 0);
+    const mail = JSON.parse(m.out[0] ?? "{}") as { messages: Array<{ id: number; urgency: string }> };
+    assert.equal(mail.messages.find((x) => x.id === sent.messageId)?.urgency, "idle");
+    assert.equal(mail.messages.find((x) => x.id === plain.messageId)?.urgency, "next");
+
+    // Unknown urgency: the daemon's typed invalid_request surfaces, exit 1.
+    const bad = capture();
+    assert.equal(await runV2Cli(["send", "worker", "x", "--urgency", "soon", "--data-dir", dir], bad.io), 1);
+    assert.ok(bad.err[0]?.includes("invalid_request"), bad.err.join("\n"));
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});

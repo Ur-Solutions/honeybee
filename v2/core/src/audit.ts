@@ -165,7 +165,9 @@ export function replayAudit(rows: AuditRow[]): StateDump {
       }
       case "mail.enqueued": {
         const message = p.message as MessageRow;
-        mailbox.set(message.id, { ...message });
+        // v8 back-compat: pre-urgency audit rows replay as the migrated
+        // store reads them — the column default, `next`.
+        mailbox.set(message.id, { ...message, urgency: message.urgency ?? "next" });
         break;
       }
       case "mail.delivered": {
