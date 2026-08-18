@@ -90,6 +90,7 @@ import {
   type AccountLoginResult,
   type AccountRemoveResult,
   type AccountUpdateResult,
+  type AuditTailResult,
   type LoginSeatInfo,
   type SwapAccountResult,
   type CellCaptureMode,
@@ -613,6 +614,8 @@ export class HiveDaemon {
         return { messages: this.mustStore().listMessages(this.requireBee(params)) };
       case "commands":
         return { commands: this.mustStore().listCommands({ beeId: this.requireBee(params) }) };
+      case "audit.tail":
+        return this.rpcAuditTail(params);
       case "deployInfo":
         return this.rpcDeployInfo();
       case "health":
@@ -1283,6 +1286,22 @@ export class HiveDaemon {
       .filter((b) => lifecycle == null || b.lifecycle === lifecycle)
       .map((b) => this.viewOf(store, b.id));
     return { views };
+  }
+
+  /**
+   * `audit.tail` — bounded audit-log read for `hive v2 events`. `afterSeq`
+   * is a follow cursor (rows with seq > afterSeq only); `limit` keeps the
+   * LAST n rows after the bee filter (default 100, capped at 1000).
+   */
+  private rpcAuditTail(params: Record<string, unknown>): AuditTailResult {
+    const store = this.mustStore();
+    const afterSeq = typeof params.afterSeq === "number" && Number.isFinite(params.afterSeq) ? params.afterSeq : 0;
+    const rawLimit = typeof params.limit === "number" && Number.isFinite(params.limit) ? Math.floor(params.limit) : 100;
+    const limit = Math.max(1, Math.min(1000, rawLimit));
+    const beeId = typeof params.beeId === "string" && params.beeId.length > 0 ? params.beeId : null;
+    let rows = store.auditRows(afterSeq);
+    if (beeId) rows = rows.filter((r) => r.beeId === beeId);
+    return { rows: rows.slice(-limit) };
   }
 
   private rpcDeployInfo(): DeployInfoResult {

@@ -181,6 +181,164 @@ export const TRANSCRIPT_PARSERS: Record<string, TranscriptParser> = {
 };
 
 // ---------------------------------------------------------------------------
+// rendering — readable turns from a session-log / transcript jsonl line
+// (the CLI's `transcript`/`last` verbs; same format knowledge as the parsers
+// above, extended to TEXT extraction: sender/assistant text kept, tool
+// traffic elided to one-liners)
+// ---------------------------------------------------------------------------
+
+export type TranscriptTurnRole = "user" | "assistant" | "tool" | "system";
+
+export interface TranscriptTurn {
+  role: TranscriptTurnRole;
+  text: string;
+}
+
+export interface TranscriptRenderer {
+  readonly harness: string;
+  /** Pure, stateless: one raw jsonl line → zero or more readable turns. */
+  renderLine(line: string): TranscriptTurn[];
+}
+
+/**
+ * Content blocks (claude message.content and friends) → readable turns.
+ * Text blocks join into one turn of `role`; tool blocks become one-liners.
+ */
+function turnsFromBlocks(role: TranscriptTurnRole, content: unknown): TranscriptTurn[] {
+  if (typeof content === "string") {
+    return content.trim().length > 0 ? [{ role, text: content }] : [];
+  }
+  if (!Array.isArray(content)) return [];
+  const turns: TranscriptTurn[] = [];
+  const texts: string[] = [];
+  for (const b of content) {
+    if (b == null || typeof b !== "object") continue;
+    const block = b as Record<string, unknown>;
+    switch (block.type) {
+      case "text":
+        if (typeof block.text === "string" && block.text.trim().length > 0) texts.push(block.text);
+        break;
+      case "input_text":
+      case "output_text":
+        if (typeof block.text === "string" && block.text.trim().length > 0) texts.push(block.text);
+        break;
+      case "tool_use":
+        turns.push({ role: "tool", text: `[tool_use: ${typeof block.name === "string" ? block.name : "?"}]` });
+        break;
+      case "tool_result":
+        turns.push({ role: "tool", text: "[tool_result]" });
+        break;
+      case "thinking":
+      case "redacted_thinking":
+        break; // elided
+      default:
+        break;
+    }
+  }
+  if (texts.length > 0) turns.unshift({ role, text: texts.join("\n") });
+  return turns;
+}
+
+/**
+ * claude — handles BOTH the native stream-json envelope the HSR driver logs
+ * verbatim ({type:"assistant"|"user"|"result"|"system", message:{content}})
+ * and the transcript-file rows (~/.claude/projects/…): the two shapes agree
+ * on type + message.content. `result` rows duplicate the final assistant
+ * text and are skipped; system/thinking rows are elided.
+ */
+export const claudeTranscriptRenderer: TranscriptRenderer = {
+  harness: "claude",
+  renderLine(line: string): TranscriptTurn[] {
+    const row = jsonLine(line);
+    if (!row) return [];
+    if (row.isSidechain === true || row.isMeta === true) return [];
+    const message = row.message as { content?: unknown } | undefined;
+    if (row.type === "user") return turnsFromBlocks("user", message?.content);
+    if (row.type === "assistant") return turnsFromBlocks("assistant", message?.content);
+    return [];
+  },
+};
+
+/**
+ * codex — rollout rows {timestamp, type, payload}. Rendering prefers the
+ * `response_item` rows (both roles appear there); `event_msg`/`agent_message`
+ * duplicates the assistant text and is skipped. function calls → one-liners.
+ */
+export const codexTranscriptRenderer: TranscriptRenderer = {
+  harness: "codex",
+  renderLine(line: string): TranscriptTurn[] {
+    const row = jsonLine(line);
+    if (!row) return [];
+    if (row.type !== "response_item") return [];
+    const payload = row.payload as Record<string, unknown> | undefined;
+    if (!payload) return [];
+    if (payload.type === "message") {
+      const role = payload.role === "user" ? "user" : payload.role === "assistant" ? "assistant" : null;
+      return role ? turnsFromBlocks(role, payload.content) : [];
+    }
+    if (payload.type === "function_call") {
+      return [{ role: "tool", text: `[tool_use: ${typeof payload.name === "string" ? payload.name : "?"}]` }];
+    }
+    if (payload.type === "function_call_output") return [{ role: "tool", text: "[tool_result]" }];
+    return []; // reasoning etc: elided
+  },
+};
+
+/** grok — chat_history rows; synthetic user rows (injected context) elided. */
+export const grokTranscriptRenderer: TranscriptRenderer = {
+  harness: "grok",
+  renderLine(line: string): TranscriptTurn[] {
+    const row = jsonLine(line);
+    if (!row) return [];
+    if (row.synthetic_reason != null) return [];
+    const message = row.message as { role?: unknown; content?: unknown } | undefined;
+    const role = typeof message?.role === "string" ? message.role : row.type;
+    const content = message?.content ?? row.content;
+    if (role === "user") return turnsFromBlocks("user", content);
+    if (role === "assistant") return turnsFromBlocks("assistant", content);
+    return [];
+  },
+};
+
+/** stub — the test agent's NDJSON ({event:"text"|"error"|…}); text = assistant output. */
+export const stubTranscriptRenderer: TranscriptRenderer = {
+  harness: "stub",
+  renderLine(line: string): TranscriptTurn[] {
+    const row = jsonLine(line);
+    if (!row || typeof row.event !== "string") return [];
+    if (row.event === "text" && typeof row.text === "string") return [{ role: "assistant", text: row.text }];
+    if (row.event === "error") return [{ role: "system", text: `[error: ${String(row.message ?? "?")}]` }];
+    return [];
+  },
+};
+
+export const TRANSCRIPT_RENDERERS: Record<string, TranscriptRenderer> = {
+  claude: claudeTranscriptRenderer,
+  codex: codexTranscriptRenderer,
+  grok: grokTranscriptRenderer,
+  stub: stubTranscriptRenderer,
+};
+
+/**
+ * Render a batch of raw jsonl lines for a harness. An unknown harness falls
+ * back to the claude-shaped renderer (the most common envelope) — callers can
+ * always reach the verbatim lines with `--raw`.
+ */
+export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
+  const renderer = TRANSCRIPT_RENDERERS[harness] ?? claudeTranscriptRenderer;
+  return lines.flatMap((line) => renderer.renderLine(line));
+}
+
+/** The most recent assistant turn's text, or null. */
+export function lastAssistantText(turns: readonly TranscriptTurn[]): string | null {
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i] as TranscriptTurn;
+    if (turn.role === "assistant") return turn.text;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // discovery — bind the newest matching file created around/after spawn
 // ---------------------------------------------------------------------------
 
