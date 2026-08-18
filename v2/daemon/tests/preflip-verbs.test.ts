@@ -415,8 +415,14 @@ test("v6.rpc.6: questions + seals — ask → open row → answer → delivered 
     const mail = messages.find((m) => m.id === answered.messageId)!;
     assert.ok(mail.body.startsWith(`[answer to question ${asked.question.id}] rebase`), mail.body);
     assert.equal(mail.sender, "tormod");
+    // "delivered" only means the driver accepted the write; the runtime is
+    // still reported idle until the daemon's next tick observes turn_started,
+    // so waiting on idle here would pass BEFORE the turn — wait for the echo
+    // (the stub's evidence it worked the answer) like the interrupt test does.
+    const logPath = join(dir, "session-logs", `${beeId}.jsonl`);
+    await waitFor(() => existsSync(logPath) && /echo:\[answer to question/.test(readFileSync(logPath, "utf8")), "answer worked by the bee", 12_000);
     await waitState(client, beeId, "idle", "answer turn ended");
-    assert.match(readFileSync(join(dir, "session-logs", `${beeId}.jsonl`), "utf8"), /echo:\[answer to question/);
+    assert.match(readFileSync(logPath, "utf8"), /echo:\[answer to question/);
     const replay = await client.request<QuestionAnswerResult>("question.answer", { questionId: asked.question.id, answer: "rebase", answeredBy: "tormod", idempotencyKey: "ans-1" });
     assert.equal(replay.deduped, true);
     assert.equal(replay.messageId, answered.messageId, "no second delivery");
