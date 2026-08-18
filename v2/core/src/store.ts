@@ -24,6 +24,9 @@ import {
   UnknownFlagError,
   UnknownVerbError,
   VERBS,
+  type AccountLimitsRow,
+  type AccountRow,
+  type AccountStatus,
   type AuditRow,
   type BeeRow,
   type BeeView,
@@ -37,10 +40,14 @@ import {
   type RuntimeRow,
   type RuntimeState,
   type SealRow,
+  type SelectionCursorRow,
   type StateDump,
   type TemplateRow,
   type TrackRow,
   type Verb,
+  ACCOUNT_STATUSES,
+  AccountNotFoundError,
+  AccountReferencedError,
   NameConflictError,
   QuestionNotFoundError,
   QuestionNotOpenError,
@@ -107,6 +114,8 @@ export interface CreateBeeInput {
   forkedFrom?: string | null;
   /** v6 — one-shot fork seed: the source's provider session id to fork from on the first runtime. */
   forkSeed?: string | null;
+  /** v7 — the account this bee runs on (must exist; the daemon resolves `auto` before this). */
+  account?: string | null;
   /**
    * Creation timestamp override (epoch ms) — importers preserve the original
    * record's creation time. Defaults to the store clock.
@@ -133,6 +142,31 @@ export interface AskQuestionInput {
 export interface AnswerResult {
   question: QuestionRow;
   send: SendResult;
+}
+
+/** v7 — `createAccount` input. */
+export interface CreateAccountInput {
+  id: string;
+  harness: string;
+  homePath: string;
+  label: string;
+  status?: AccountStatus;
+  penalty?: number;
+  lastLoginAt?: number | null;
+  /** Registration timestamp override (the importer preserves the old registry's addedAt). */
+  addedAt?: number;
+}
+
+/** v7 — `putAccountLimits` input (the fetcher's parsed snapshot). */
+export interface PutAccountLimitsInput {
+  readable: boolean;
+  error?: string | null;
+  plan?: string | null;
+  fiveHour?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
+  weekly?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
+  fableWeekly?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
+  /** Snapshot time override; defaults to the store clock. */
+  fetchedAt?: number;
 }
 
 /** `createSeal` input. */
@@ -260,7 +294,50 @@ function mapBee(r: Row): BeeRow {
     parentId: (r.parent_id as string | null) ?? null,
     forkedFrom: (r.forked_from as string | null) ?? null,
     forkSeed: (r.fork_seed as string | null) ?? null,
+    account: (r.account as string | null) ?? null,
   };
+}
+
+function mapAccount(r: Row): AccountRow {
+  return {
+    id: r.id as string,
+    harness: r.harness as string,
+    homePath: r.home_path as string,
+    label: r.label as string,
+    status: r.status as AccountStatus,
+    penalty: Number(r.penalty),
+    lastLoginAt: r.last_login_at == null ? null : Number(r.last_login_at),
+    exhaustedAt: r.exhausted_at == null ? null : Number(r.exhausted_at),
+    addedAt: Number(r.added_at),
+    updatedAt: Number(r.updated_at),
+  };
+}
+
+function numOrNull(v: unknown): number | null {
+  return v == null ? null : Number(v);
+}
+
+function mapAccountLimits(r: Row): AccountLimitsRow {
+  return {
+    account: r.account as string,
+    fetchedAt: Number(r.fetched_at),
+    readable: Number(r.readable) === 1,
+    error: (r.error as string | null) ?? null,
+    plan: (r.plan as string | null) ?? null,
+    fiveHourPct: numOrNull(r.five_hour_pct),
+    fiveHourResetsAt: numOrNull(r.five_hour_resets_at),
+    fiveHourMinutes: numOrNull(r.five_hour_minutes),
+    weeklyPct: numOrNull(r.weekly_pct),
+    weeklyResetsAt: numOrNull(r.weekly_resets_at),
+    weeklyMinutes: numOrNull(r.weekly_minutes),
+    fableWeeklyPct: numOrNull(r.fable_weekly_pct),
+    fableResetsAt: numOrNull(r.fable_resets_at),
+    fableMinutes: numOrNull(r.fable_minutes),
+  };
+}
+
+function mapSelectionCursor(r: Row): SelectionCursorRow {
+  return { harness: r.harness as string, lastAccountId: r.last_account_id as string, updatedAt: Number(r.updated_at) };
 }
 
 function mapQuestion(r: Row): QuestionRow {
@@ -319,6 +396,14 @@ function normalizeBeeArgs(args: unknown, where: string): string[] | null {
     throw new CoreError(`${where}: args must be an array of strings or null`);
   }
   return [...(args as string[])];
+}
+
+/** v7 — the operator's auto-pick penalty: 0..100 effective-load points (the old registry's bounds). */
+function normalizePenalty(value: unknown, where: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100) {
+    throw new CoreError(`${where}: penalty must be a number from 0 to 100`);
+  }
+  return value;
 }
 
 function sameArgs(a: string[] | null, b: string[] | null): boolean {
@@ -620,11 +705,17 @@ export class CoreStore {
       if (!Number.isFinite(createdAt)) throw new CoreError("createBee: createdAt must be a finite epoch-ms number");
       const args = normalizeBeeArgs(input.args, "createBee");
       requireNonEmpty(input.name, "createBee: name");
+      const account = input.account ?? null;
+      if (account !== null) {
+        if (typeof account !== "string" || account.length === 0) throw new CoreError("createBee: account must be a non-empty string or null");
+        if (account === "auto") throw new CoreError("createBee: account 'auto' is a selection intent, never a stored binding — resolve it first");
+        this.mustGetAccount(account);
+      }
       this.db
         .prepare(
           `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at,
-                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed, account)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -643,6 +734,7 @@ export class CoreStore {
           input.parentId ?? null,
           input.forkedFrom ?? null,
           input.forkSeed ?? null,
+          account,
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });
@@ -1970,6 +2062,275 @@ export class CoreStore {
   }
 
   // -------------------------------------------------------------------------
+  // v7 — accounts (spec 08): identity rows, limits snapshots, selection cursor
+  // -------------------------------------------------------------------------
+
+  private mustGetAccount(id: string): AccountRow {
+    const account = this.getAccount(id);
+    if (!account) throw new AccountNotFoundError(id);
+    return account;
+  }
+
+  getAccount(id: string): AccountRow | null {
+    const row = this.db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapAccount(row) : null;
+  }
+
+  /** Accounts, registration order (added_at, then id) — the selector's deterministic tie-break order. */
+  listAccounts(filter: { harness?: string } = {}): AccountRow[] {
+    const rows = (
+      filter.harness !== undefined
+        ? this.db.prepare("SELECT * FROM accounts WHERE harness = ? ORDER BY added_at, id").all(filter.harness)
+        : this.db.prepare("SELECT * FROM accounts ORDER BY added_at, id").all()
+    ) as Row[];
+    return rows.map(mapAccount);
+  }
+
+  /**
+   * v7 — register an account (one row = one provider identity = one
+   * run-home). Audited as `account.put {account, outcome:"created"}`; every
+   * later field change is `account.put {account, outcome:"updated", changed}`
+   * so the mirror row is always the payload verbatim.
+   */
+  createAccount(input: CreateAccountInput): AccountRow {
+    const id = requireNonEmpty(input.id, "createAccount: id");
+    const harness = requireNonEmpty(input.harness, "createAccount: harness");
+    const homePath = requireNonEmpty(input.homePath, "createAccount: homePath");
+    const label = requireNonEmpty(input.label, "createAccount: label");
+    if (id === "auto") throw new CoreError("createAccount: 'auto' is reserved (the selection intent)");
+    const status = input.status ?? "ok";
+    if (!(ACCOUNT_STATUSES as readonly string[]).includes(status)) throw new CoreError(`createAccount: status must be one of ${ACCOUNT_STATUSES.join("|")}`);
+    const penalty = normalizePenalty(input.penalty ?? 0, "createAccount");
+    return this.tx(() => {
+      if (this.getAccount(id)) throw new CoreError(`account already exists: ${id}`);
+      const at = this.now();
+      const addedAt = input.addedAt ?? at;
+      if (!Number.isFinite(addedAt)) throw new CoreError("createAccount: addedAt must be a finite epoch-ms number");
+      this.db
+        .prepare(
+          `INSERT INTO accounts(id, harness, home_path, label, status, penalty, last_login_at, exhausted_at, added_at, updated_at)
+           VALUES(?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        )
+        .run(id, harness, homePath, label, status, penalty, input.lastLoginAt ?? null, addedAt, at);
+      const account = this.mustGetAccount(id);
+      this.audit("account.put", null, { account, outcome: "created" });
+      return account;
+    });
+  }
+
+  /** Bees (any lifecycle) bound to the account, by id. */
+  beesOnAccount(accountId: string): BeeRow[] {
+    const rows = this.db.prepare("SELECT * FROM bees WHERE account = ? ORDER BY id").all(accountId) as Row[];
+    return rows.map(mapBee);
+  }
+
+  /**
+   * v7 — remove an account. REFUSES (typed AccountReferencedError) while any
+   * bee references it — swap or delete them first. The limits row cascades.
+   */
+  removeAccount(id: string): AccountRow {
+    return this.tx(() => {
+      const account = this.mustGetAccount(id);
+      const referenced = this.beesOnAccount(id).map((b) => b.id);
+      if (referenced.length > 0) throw new AccountReferencedError(id, referenced);
+      this.db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
+      // A cursor pointing at the removed account is stale but harmless (the
+      // rotation treats an unknown last id as "start over"); drop it anyway
+      // so the dump stays tidy.
+      const cursor = this.getSelectionCursor(account.harness);
+      if (cursor && cursor.lastAccountId === id) {
+        this.db.prepare("DELETE FROM selection_cursors WHERE harness = ?").run(account.harness);
+      }
+      this.audit("account.removed", null, {
+        accountId: id,
+        harness: account.harness,
+        removedAt: this.now(),
+        cursorCleared: cursor?.lastAccountId === id,
+      });
+      return account;
+    });
+  }
+
+  private applyAccountUpdate(id: string, patch: Partial<Pick<AccountRow, "status" | "penalty" | "lastLoginAt" | "exhaustedAt" | "homePath" | "label">>, reason: string | null): { account: AccountRow; applied: boolean } {
+    const before = this.mustGetAccount(id);
+    const next: AccountRow = { ...before, ...patch };
+    const changed = (Object.keys(patch) as Array<keyof typeof patch>).filter((k) => before[k] !== next[k]);
+    if (changed.length === 0) return { account: before, applied: false };
+    const at = this.now();
+    this.db
+      .prepare(
+        "UPDATE accounts SET status = ?, penalty = ?, last_login_at = ?, exhausted_at = ?, home_path = ?, label = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(next.status, next.penalty, next.lastLoginAt, next.exhaustedAt, next.homePath, next.label, at, id);
+    const account = this.mustGetAccount(id);
+    this.audit("account.put", null, { account, outcome: "updated", changed, previous: Object.fromEntries(changed.map((k) => [k, before[k]])), reason });
+    return { account, applied: true };
+  }
+
+  /**
+   * v7 — set the account status (ok | auth_needed | paused). `reason` is the
+   * evidence (audit only). Identical = silent no-op.
+   */
+  setAccountStatus(id: string, status: AccountStatus, reason?: string): { account: AccountRow; applied: boolean } {
+    if (!(ACCOUNT_STATUSES as readonly string[]).includes(status)) throw new CoreError(`setAccountStatus: status must be one of ${ACCOUNT_STATUSES.join("|")}`);
+    return this.tx(() => this.applyAccountUpdate(id, { status }, reason ?? null));
+  }
+
+  /** v7 — the operator's placement penalty (0..100 effective-load points; 0 clears). */
+  setAccountPenalty(id: string, penalty: number): { account: AccountRow; applied: boolean } {
+    const value = normalizePenalty(penalty, "setAccountPenalty");
+    return this.tx(() => this.applyAccountUpdate(id, { penalty: value }, "operator"));
+  }
+
+  /** v7 — a completed login: status ok + last_login_at (contrary evidence for auth_needed). */
+  recordAccountLogin(id: string, at?: number): { account: AccountRow; applied: boolean } {
+    return this.tx(() => {
+      const before = this.mustGetAccount(id);
+      const loginAt = at ?? this.now();
+      // A paused account stays paused (the operator parked it); auth_needed clears.
+      const status: AccountStatus = before.status === "paused" ? "paused" : "ok";
+      return this.applyAccountUpdate(id, { status, lastLoginAt: loginAt }, "login completed");
+    });
+  }
+
+  /** v7 — rate-limit exhaustion evidence on the account (rotation cool-off). null clears. */
+  recordAccountExhaustion(id: string, at: number | null): { account: AccountRow; applied: boolean } {
+    return this.tx(() => this.applyAccountUpdate(id, { exhaustedAt: at }, at === null ? "provider served a turn" : "rate limit evidence"));
+  }
+
+  /** v7 — relabel / re-home (importer + operator edits). */
+  updateAccountFields(id: string, patch: { homePath?: string; label?: string }): { account: AccountRow; applied: boolean } {
+    const next: { homePath?: string; label?: string } = {};
+    if (patch.homePath !== undefined) next.homePath = requireNonEmpty(patch.homePath, "updateAccountFields: homePath");
+    if (patch.label !== undefined) next.label = requireNonEmpty(patch.label, "updateAccountFields: label");
+    return this.tx(() => this.applyAccountUpdate(id, next, "fields"));
+  }
+
+  /**
+   * v7 — bind (or unbind: null) a bee to an account. The account must exist;
+   * the caller (daemon) enforces harness match and derives the home env.
+   * Audited `bee.account_set {beeId, account, previous}`; identical = no-op.
+   */
+  setBeeAccount(beeId: string, account: string | null): { bee: BeeRow; applied: boolean } {
+    if (account !== null && (typeof account !== "string" || account.length === 0)) throw new CoreError("setBeeAccount: account must be a non-empty string or null");
+    if (account === "auto") throw new CoreError("setBeeAccount: account 'auto' is a selection intent, never a stored binding");
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      if (account !== null) this.mustGetAccount(account);
+      if (bee.account === account) return { bee, applied: false };
+      this.db.prepare("UPDATE bees SET account = ? WHERE id = ?").run(account, beeId);
+      this.audit("bee.account_set", beeId, { beeId, account, previous: bee.account });
+      return { bee: this.mustGetBee(beeId), applied: true };
+    });
+  }
+
+  /**
+   * v7 — replace a bee's env overrides (the home-env mechanism the account
+   * binding derives). Audited `bee.env_set {beeId, env, previous}`; identical
+   * = no-op. Takes effect on the NEXT runtime.
+   */
+  setBeeEnv(beeId: string, env: Record<string, string>): { bee: BeeRow; applied: boolean } {
+    if (env === null || typeof env !== "object" || Array.isArray(env) || Object.values(env).some((v) => typeof v !== "string")) {
+      throw new CoreError("setBeeEnv: env must be an object of strings");
+    }
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      const next = { ...env };
+      if (JSON.stringify(bee.env) === JSON.stringify(next)) return { bee, applied: false };
+      this.db.prepare("UPDATE bees SET env = ? WHERE id = ?").run(JSON.stringify(next), beeId);
+      this.audit("bee.env_set", beeId, { beeId, env: next, previous: bee.env });
+      return { bee: this.mustGetBee(beeId), applied: true };
+    });
+  }
+
+  /**
+   * v7 — set the fork seed / provider session pair directly (bee.swapAccount:
+   * a claude cross-account move resumes the source conversation under a NEW
+   * session id via `--resume <seed> --fork-session`, exactly like bee.fork).
+   * Audited `bee.session_rekeyed {beeId, forkSeed, previousProviderSessionId}`.
+   */
+  rekeyBeeSession(beeId: string): { bee: BeeRow; applied: boolean } {
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      if (!bee.providerSessionId) return { bee, applied: false };
+      this.db.prepare("UPDATE bees SET fork_seed = ?, provider_session_id = NULL WHERE id = ?").run(bee.providerSessionId, beeId);
+      this.audit("bee.session_rekeyed", beeId, { beeId, forkSeed: bee.providerSessionId, previousProviderSessionId: bee.providerSessionId });
+      return { bee: this.mustGetBee(beeId), applied: true };
+    });
+  }
+
+  getAccountLimits(accountId: string): AccountLimitsRow | null {
+    const row = this.db.prepare("SELECT * FROM account_limits WHERE account = ?").get(accountId) as Row | undefined;
+    return row ? mapAccountLimits(row) : null;
+  }
+
+  listAccountLimits(): AccountLimitsRow[] {
+    return (this.db.prepare("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimits);
+  }
+
+  /** v7 — replace the account's limits snapshot (one row per account). Audited `account_limits.put {limits}`. */
+  putAccountLimits(accountId: string, input: PutAccountLimitsInput): AccountLimitsRow {
+    return this.tx(() => {
+      this.mustGetAccount(accountId);
+      const at = input.fetchedAt ?? this.now();
+      const w = (x: PutAccountLimitsInput["weekly"]) =>
+        x ? [x.usedPercent, x.resetsAt ?? null, x.windowMinutes ?? null] : [null, null, null];
+      this.db
+        .prepare(
+          `INSERT INTO account_limits(account, fetched_at, readable, error, plan,
+             five_hour_pct, five_hour_resets_at, five_hour_minutes,
+             weekly_pct, weekly_resets_at, weekly_minutes,
+             fable_weekly_pct, fable_resets_at, fable_minutes)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(account) DO UPDATE SET
+             fetched_at = excluded.fetched_at, readable = excluded.readable, error = excluded.error, plan = excluded.plan,
+             five_hour_pct = excluded.five_hour_pct, five_hour_resets_at = excluded.five_hour_resets_at, five_hour_minutes = excluded.five_hour_minutes,
+             weekly_pct = excluded.weekly_pct, weekly_resets_at = excluded.weekly_resets_at, weekly_minutes = excluded.weekly_minutes,
+             fable_weekly_pct = excluded.fable_weekly_pct, fable_resets_at = excluded.fable_resets_at, fable_minutes = excluded.fable_minutes`,
+        )
+        .run(
+          accountId,
+          at,
+          input.readable ? 1 : 0,
+          input.error ?? null,
+          input.plan ?? null,
+          ...w(input.fiveHour),
+          ...w(input.weekly),
+          ...w(input.fableWeekly),
+        );
+      const limits = this.getAccountLimits(accountId) as AccountLimitsRow;
+      this.audit("account_limits.put", null, { limits });
+      return limits;
+    });
+  }
+
+  getSelectionCursor(harness: string): SelectionCursorRow | null {
+    const row = this.db.prepare("SELECT * FROM selection_cursors WHERE harness = ?").get(harness) as Row | undefined;
+    return row ? mapSelectionCursor(row) : null;
+  }
+
+  listSelectionCursors(): SelectionCursorRow[] {
+    return (this.db.prepare("SELECT * FROM selection_cursors ORDER BY harness").all() as Row[]).map(mapSelectionCursor);
+  }
+
+  /** v7 — advance the per-harness near-tie rotation cursor. Audited `selection_cursor.set`. */
+  setSelectionCursor(harness: string, lastAccountId: string): SelectionCursorRow {
+    requireNonEmpty(harness, "setSelectionCursor: harness");
+    requireNonEmpty(lastAccountId, "setSelectionCursor: lastAccountId");
+    return this.tx(() => {
+      const at = this.now();
+      this.db
+        .prepare(
+          "INSERT INTO selection_cursors(harness, last_account_id, updated_at) VALUES(?, ?, ?) ON CONFLICT(harness) DO UPDATE SET last_account_id = excluded.last_account_id, updated_at = excluded.updated_at",
+        )
+        .run(harness, lastAccountId, at);
+      const cursor = this.getSelectionCursor(harness) as SelectionCursorRow;
+      this.audit("selection_cursor.set", null, { cursor });
+      return cursor;
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Audit access & snapshots
   // -------------------------------------------------------------------------
 
@@ -2000,6 +2361,9 @@ export class CoreStore {
       tracks: this.listTracks(),
       questions: (this.db.prepare("SELECT * FROM questions ORDER BY id").all() as Row[]).map(mapQuestion),
       seals: (this.db.prepare("SELECT * FROM seals ORDER BY id").all() as Row[]).map(mapSeal),
+      accounts: this.listAccounts(),
+      accountLimits: this.listAccountLimits(),
+      selectionCursors: this.listSelectionCursors(),
     };
   }
 }

@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigError, DEFAULTS, defaultDataDir, loadNodeConfig } from "../src/config.ts";
 
@@ -141,5 +141,45 @@ test("config.8: cells (WP5) — root default, sandbox override tri-state, warm m
     assert.throws(() => loadNodeConfig(dir), ConfigError);
     writeFileSync(join(dir, "config.json"), JSON.stringify({ cells: { sandbox: "yes" } }));
     assert.throws(() => loadNodeConfig(dir), ConfigError);
+  });
+});
+
+test("config.6 (spec 08): accounts settings default (vault/homes under ~/.hive, 1h stale, 15 min sweep, 5h cool-off, no tmux socket) and validate; agents.<a>.login parses", () => {
+  withDir((dir) => {
+    const defaults = loadNodeConfig(dir);
+    assert.equal(defaults.accounts.vaultDir, join(homedir(), ".hive", "vault"));
+    assert.equal(defaults.accounts.homesDir, join(homedir(), ".hive", "homes"));
+    assert.equal(defaults.accounts.limitsStaleMs, 60 * 60 * 1000);
+    assert.equal(defaults.accounts.limitsRefreshMs, 15 * 60 * 1000);
+    assert.equal(defaults.accounts.limitsFetchTimeoutMs, 15_000);
+    assert.equal(defaults.accounts.loginTimeoutMs, 10 * 60 * 1000);
+    assert.equal(defaults.accounts.exhaustionCoolOffMs, 5 * 60 * 60 * 1000);
+    assert.equal(defaults.accounts.tmuxSocket, null);
+    assert.equal(defaults.agents.claude?.login, undefined);
+    writeFileSync(
+      join(dir, "config.json"),
+      JSON.stringify({
+        accounts: { vaultDir: "/v", homesDir: "/h", limitsStaleMs: 5, limitsRefreshMs: 0, tmuxSocket: "s" },
+        agents: { claude: { command: "claude", login: { command: "claude", args: ["auth", "login"] } } },
+      }),
+    );
+    const cfg = loadNodeConfig(dir);
+    assert.equal(cfg.accounts.vaultDir, "/v");
+    assert.equal(cfg.accounts.homesDir, "/h");
+    assert.equal(cfg.accounts.limitsStaleMs, 5);
+    assert.equal(cfg.accounts.limitsRefreshMs, 0);
+    assert.equal(cfg.accounts.tmuxSocket, "s");
+    assert.deepEqual(cfg.agents.claude?.login, { command: "claude", args: ["auth", "login"] });
+    for (const bad of [
+      { accounts: [] },
+      { accounts: { vaultDir: "" } },
+      { accounts: { limitsStaleMs: "1h" } },
+      { accounts: { tmuxSocket: "" } },
+      { agents: { claude: { command: "claude", login: "claude" } } },
+      { agents: { claude: { command: "claude", login: { command: "claude", args: [1] } } } },
+    ]) {
+      writeFileSync(join(dir, "config.json"), JSON.stringify(bad));
+      assert.throws(() => loadNodeConfig(dir), ConfigError, JSON.stringify(bad));
+    }
   });
 });

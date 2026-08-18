@@ -15,7 +15,10 @@
  * --session-id <new>` WITHOUT --fork-session is refused like the real CLI.
  * A `control_request {subtype:"interrupt"}` line (v6 bee.interrupt) ends the
  * in-flight turn with a result line, like the real CLI. `@slow:<ms>` in a
- * message makes the turn take that long.
+ * message makes the turn take that long. `@ratelimit` in a message makes the
+ * turn hit the provider wall like the real CLI does: a `rate_limit_event`
+ * with status "rejected" and an errored result (spec 08 rotation trigger).
+ * `@authfail` makes the turn fail with "Not logged in · /login".
  *
  * env FAKE_CLAUDE_ARGV_LOG   append {argv, cwd, env:{CLAUDE_CONFIG_DIR, HIVE_BEE, HIVE_BEE_ID, HIVE_PARENT}, sessionId, resumed, forked} per boot
  * env FAKE_CLAUDE_FAIL_RESUME=1  exit 1 on --resume ("No conversation found") — the failure shape
@@ -85,6 +88,15 @@ rl.on("line", (raw) => {
   const slow = /@slow:(\d+)/.exec(text);
   turnTimer = setTimeout(() => {
     turnTimer = null;
+    if (text.includes("@ratelimit")) {
+      emit({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: Math.floor(Date.now() / 1000) + 3600, rateLimitType: "five_hour" }, session_id: sessionId });
+      emit({ type: "result", subtype: "error_during_execution", is_error: true, result: "You've hit your usage limit (rate limit reached)", session_id: sessionId });
+      return;
+    }
+    if (text.includes("@authfail")) {
+      emit({ type: "result", subtype: "error_during_execution", is_error: true, result: "Not logged in · /login", session_id: sessionId });
+      return;
+    }
     emit({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo:${text}` }] }, session_id: sessionId });
     emit({ type: "result", subtype: "success", is_error: false, result: `echo:${text}`, session_id: sessionId });
   }, slow ? Number(slow[1]) : 10);

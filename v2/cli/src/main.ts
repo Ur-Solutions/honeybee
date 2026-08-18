@@ -24,6 +24,16 @@ import {
 import { readFileSync, writeFileSync } from "node:fs";
 import {
   RpcError,
+  type AccountAddResult,
+  type AccountBackfillResult,
+  type AccountGetResult,
+  type AccountImportRegistryResult,
+  type AccountLimitsResult,
+  type AccountListResult,
+  type AccountLoginResult,
+  type AccountRemoveResult,
+  type AccountUpdateResult,
+  type SwapAccountResult,
   type ChildrenResult,
   type ForkResult,
   type HealthResult,
@@ -125,6 +135,11 @@ const VALUE_FLAGS = new Set([
   "--prompt",
   "--body",
   "--by",
+  // v7 (accounts)
+  "--account",
+  "--home",
+  "--penalty",
+  "--harness",
   ...LIST_FLAGS,
 ]);
 
@@ -272,7 +287,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 // ---------------------------------------------------------------------------
 
 const SPAWN_USAGE =
-  "usage: hive v2 spawn <name> --agent <agent> [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
+  "usage: hive v2 spawn <name> --agent <agent> [--account id|auto|none] [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
   "       hive v2 spawn <name> --agent <agent> --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]";
 
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -313,6 +328,9 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
         if (list.views.some((v) => v.bee?.id === self)) parentId = self;
       }
     }
+    // v7: --account <id> | auto (default) | none (explicitly unbound).
+    const accountFlag = parsed.flags.get("--account") as string | undefined;
+    const account = accountFlag === undefined ? undefined : accountFlag === "none" ? null : accountFlag;
     return c.request<SpawnResult>("spawn", {
       name,
       agent,
@@ -323,16 +341,171 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
       tags: parsed.tags,
       ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
       ...(parentId ? { parentId } : {}),
+      ...(account !== undefined ? { account } : {}),
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
   });
+  const accountNote = result.account ? `; account ${result.account}${result.accountReason ? ` — ${result.accountReason}` : ""}` : "";
   emit(
     ctx,
-    [`${result.deduped ? "deduped: already " : ""}spawned ${result.beeId} (command ${result.commandId}${result.status ? ` ${result.status}` : ""})`],
+    [`${result.deduped ? "deduped: already " : ""}spawned ${result.beeId} (command ${result.commandId}${result.status ? ` ${result.status}` : ""}${accountNote})`],
     result,
     false,
   );
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// v7 (spec 08): accounts + swap-account
+// ---------------------------------------------------------------------------
+
+function pct(v: number | null): string {
+  return v === null ? "-" : `${Math.round(v)}%`;
+}
+
+function accountLine(a: AccountListResult["accounts"][number], limits: AccountListResult["limits"][number] | undefined, stale: boolean): string {
+  const prefix = stale ? "stale: " : "";
+  const usage = limits
+    ? limits.readable
+      ? `  weekly=${pct(limits.weeklyPct)} 5h=${pct(limits.fiveHourPct)}${limits.fableWeeklyPct !== null ? ` fable=${pct(limits.fableWeeklyPct)}` : ""}${limits.plan ? ` plan=${limits.plan}` : ""}`
+      : `  limits=unreadable(${limits.error ?? "?"})`
+    : "";
+  const penalty = a.penalty > 0 ? `  penalty=${a.penalty}` : "";
+  const login = a.lastLoginAt ? `  lastLogin=${new Date(a.lastLoginAt).toISOString()}` : "";
+  return `${prefix}${a.id}  ${a.harness}  ${a.status}  ${a.homePath}${penalty}${usage}${login}`;
+}
+
+const ACCOUNT_USAGE =
+  "usage: hive v2 account list [--harness h] | get <id> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
+  "       hive v2 account remove|pause|unpause <id> | penalty <id> <0-100> | login <id> | limits [<id>]\n" +
+  "       hive v2 account import [--root ~/.hive] [--dry-run] | backfill [--dry-run]";
+
+async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  const key = parsed.flags.get("--idempotency-key") as string | undefined;
+  switch (sub) {
+    case "list":
+    case "ls": {
+      const harness = parsed.flags.get("--harness") as string | undefined;
+      const { result, stale } = await readPath(
+        ctx,
+        (c) => c.request<AccountListResult>("account.list", harness ? { harness } : {}),
+        (store) => ({ accounts: store.accounts(harness), limits: store.accountLimits() }),
+      );
+      const byId = new Map(result.limits.map((l) => [l.account, l]));
+      const lines = result.accounts.length === 0 ? [`${stale ? "stale: " : ""}no accounts`] : result.accounts.map((a) => accountLine(a, byId.get(a.id), stale));
+      emit(ctx, lines, result, stale);
+      return 0;
+    }
+    case "get":
+    case "show": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountGetResult>("account.get", { id }));
+      const lines = [
+        accountLine(r.account, r.limits ?? undefined, false),
+        `  credentialed=${r.credentialed}  bees=${r.bees.length > 0 ? r.bees.join(",") : "-"}${r.loginSeat ? `  loginSeat=${r.loginSeat.session} (${r.loginSeat.attach})` : ""}`,
+      ];
+      emit(ctx, lines, r, false);
+      return 0;
+    }
+    case "add": {
+      const [, , harness, label] = parsed.positional;
+      if (!harness || !label) throw new Error(ACCOUNT_USAGE);
+      const penaltyFlag = parsed.flags.get("--penalty") as string | undefined;
+      const r = await withClient(ctx, (c) =>
+        c.request<AccountAddResult>("account.add", {
+          harness,
+          label,
+          ...(parsed.flags.has("--id") ? { id: parsed.flags.get("--id") as string } : {}),
+          ...(parsed.flags.has("--home") ? { homePath: resolve(parsed.flags.get("--home") as string) } : {}),
+          ...(penaltyFlag !== undefined ? { penalty: Number(penaltyFlag) } : {}),
+          idempotencyKey: key,
+        }),
+      );
+      emit(ctx, [`${r.deduped ? "deduped: " : ""}added account ${r.account.id} (${r.account.harness}; home ${r.account.homePath}) — log in with: hive v2 account login ${r.account.id}`], r, false);
+      return 0;
+    }
+    case "remove":
+    case "rm": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountRemoveResult>("account.remove", { id, idempotencyKey: key }));
+      emit(ctx, [`${r.deduped ? "deduped: " : ""}removed account ${r.account.id}`], r, false);
+      return 0;
+    }
+    case "pause":
+    case "unpause": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountUpdateResult>(`account.${sub}`, { id, idempotencyKey: key }));
+      emit(ctx, [`${r.deduped ? "deduped: " : ""}${r.applied ? `${sub}d` : "unchanged"} ${r.account.id} (status ${r.account.status})`], r, false);
+      return 0;
+    }
+    case "penalty": {
+      const [, , id, raw] = parsed.positional;
+      if (!id || raw === undefined) throw new Error(ACCOUNT_USAGE);
+      const penalty = Number(raw);
+      const r = await withClient(ctx, (c) => c.request<AccountUpdateResult>("account.setPenalty", { id, penalty, idempotencyKey: key }));
+      emit(ctx, [`${r.deduped ? "deduped: " : ""}${r.applied ? "set" : "unchanged"} penalty for ${r.account.id}: ${r.account.penalty}`], r, false);
+      return 0;
+    }
+    case "login": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountLoginResult>("account.login", { id, idempotencyKey: key }));
+      emit(
+        ctx,
+        [
+          `${r.deduped ? "deduped: " : ""}${r.rejoined ? "rejoined" : "started"} the login seat for ${r.accountId}: complete the login in the seat, then detach`,
+          `  ${r.seat.attach}`,
+          "  (the daemon captures the credential into the vault and marks the account ok when it lands)",
+        ],
+        r,
+        false,
+      );
+      return 0;
+    }
+    case "limits": {
+      const id = parsed.positional[2];
+      const r = await withClient(ctx, (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}));
+      const lines = r.limits.map((l) =>
+        l.readable
+          ? `${l.account}  weekly=${pct(l.weeklyPct)} 5h=${pct(l.fiveHourPct)}${l.fableWeeklyPct !== null ? ` fable=${pct(l.fableWeeklyPct)}` : ""}${l.plan ? ` plan=${l.plan}` : ""}  fetched=${new Date(l.fetchedAt).toISOString()}`
+          : `${l.account}  unreadable: ${l.error ?? "?"}`,
+      );
+      emit(ctx, lines.length > 0 ? lines : ["no accounts"], r, false);
+      return 0;
+    }
+    case "import": {
+      const root = parsed.flags.get("--root") as string | undefined;
+      const dryRun = parsed.flags.get("--dry-run") === true;
+      const r = await withClient(ctx, (c) => c.request<AccountImportRegistryResult>("account.importRegistry", { ...(root ? { root: resolve(root) } : {}), dryRun, idempotencyKey: key }));
+      const lines: string[] = [];
+      if (r.refusal) lines.push(`refused: ${r.refusal}`);
+      lines.push(`${r.dryRun ? "dry-run: would import" : r.applied ? "imported" : "import"} ${r.counts.import} account(s), skip ${r.counts.skip} (from ${r.registryPath})`);
+      for (const [harness, c] of Object.entries(r.byHarness)) lines.push(`  ${harness}: import ${c.import}, skip ${c.skip}`);
+      for (const e of r.entries) {
+        lines.push(`  ${e.action === "import" ? "+" : "="} ${e.id}  ${e.harness}${e.status === "paused" ? "  paused" : ""}${e.penalty ? `  penalty=${e.penalty}` : ""}  vaultCreds=${e.vaultHasCredentials ?? "?"} homeCreds=${e.homeHasCredentials ?? "?"}${e.reason ? `  (${e.reason})` : ""}${e.note ? `  note: ${e.note}` : ""}`);
+      }
+      if (r.backfill) lines.push(`backfill: bound ${r.backfill.bound.length} env-only bee(s); ${r.backfill.unmatched.length} unmatched`);
+      emit(ctx, lines, r, false);
+      return r.refusal ? 2 : 0;
+    }
+    case "backfill": {
+      const dryRun = parsed.flags.get("--dry-run") === true;
+      const r = await withClient(ctx, (c) => c.request<AccountBackfillResult>("account.backfill", { dryRun, idempotencyKey: key }));
+      const lines = [
+        `${r.dryRun ? "dry-run: would bind" : "bound"} ${r.bound.length} bee(s); ${r.unmatched.length} unmatched`,
+        ...r.bound.map((b) => `  ${b.beeId} → ${b.account} (${b.home})`),
+        ...r.unmatched.map((u) => `  ${u.beeId} unmatched home ${u.home}`),
+      ];
+      emit(ctx, lines, r, false);
+      return 0;
+    }
+    default:
+      throw new Error(ACCOUNT_USAGE);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,8 +893,25 @@ async function cmdCell(ctx: CliContext, parsed: Parsed): Promise<number> {
 async function cmdBee(ctx: CliContext, parsed: Parsed): Promise<number> {
   const sub = parsed.positional[1];
   const needle = parsed.positional[2];
-  const usage = "usage: hive v2 bee set-args <bee> -- <args…> | bee set-args <bee> --clear | bee args <bee>";
+  const usage = "usage: hive v2 bee set-args <bee> -- <args…> | bee set-args <bee> --clear | bee args <bee> | bee swap-account <bee> <account>";
   switch (sub) {
+    case "swap-account": {
+      const account = parsed.positional[3];
+      if (!needle || !account) throw new Error(usage);
+      return withClient(ctx, async (c) => {
+        const list = await c.request<ListResult>("list");
+        const beeId = resolveBeeIn(list.views, needle);
+        const r = await c.request<SwapAccountResult>("bee.swapAccount", { beeId, account, idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined });
+        const what = r.action === "noop" ? "already on" : r.action === "stop_then_revive" ? `swapping to` : "rebound to";
+        emit(
+          ctx,
+          [`${r.deduped ? "deduped: " : ""}${beeId} ${what} ${r.to}${r.from ? ` (from ${r.from})` : ""}${r.rekeyed ? "; conversation resumes under a new session id" : ""}${r.commandId != null ? ` (stop ${r.commandId} → revive)` : ""}`],
+          r,
+          false,
+        );
+        return 0;
+      });
+    }
     case "set-args": {
       if (!needle) throw new Error(usage);
       const clear = parsed.flags.get("--clear") === true;
@@ -1375,6 +1565,18 @@ Mutations (RPC, daemon must be running):
   ask <question…> [--option o]... [--bee b]  (from inside a bee) ask the operator; the answer comes back as mail
   answer <question-id> <answer…> [--by who]  answer an open question (also: question answer …)
   seal <title> [--body t] [--ref r]... [--bee b]   record a seal for this bee (metadata; current generation)
+  spawn … [--account <id>|auto|none]         account binding (spec 08): auto (default) = the calibrated
+                                             least-loaded pick; an explicit id is validated
+  bee swap-account <bee> <account>           move a bee to another account of the SAME harness
+                                             (stop → rebind → revive with resume; claude gets a new session id)
+  account list [--harness h] · get <id>      accounts + latest limits (read-only fallback when the daemon is down)
+  account add <harness> <label> [--id id] [--home dir] [--penalty n]
+  account remove|pause|unpause <id> · penalty <id> <0-100>
+  account login <id>                         the login seat: a detached tmux session running the harness's
+                                             own login against the account's home; captured to the vault
+  account limits [<id>]                      refresh + show provider limits (feeds the auto pick)
+  account import [--root ~/.hive] [--dry-run] import the OLD vault registry (read-only) into rows + backfill
+  account backfill [--dry-run]               bind env-only (imported) bees to accounts by home path
   (--idempotency-key: spec 06 §4.2 one-key rule — a replayed key returns the
    original outcome, marked deduped, instead of executing twice)
 
@@ -1448,6 +1650,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdSeal(ctx, parsed);
       case "cell":
         return await cmdCell(ctx, parsed);
+      case "account":
+        return await cmdAccount(ctx, parsed);
       case "view":
         return await cmdView(ctx, parsed);
       case "list":

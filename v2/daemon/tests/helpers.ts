@@ -16,6 +16,7 @@ import { RpcClient } from "../../cli/src/client.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const AGENT_PATH = join(here, "..", "..", "driver-hsr", "test-agent", "agent.mjs");
+export const FAKE_LOGIN_PATH = join(here, "..", "..", "driver-hsr", "test-agent", "fake-login.mjs");
 export const DAEMON_BIN = join(here, "..", "src", "bin.ts");
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -207,6 +208,16 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
     stopKillGraceMs: 500,
     retry: { maxAttempts: 4, backoffBaseMs: 50 },
     ...file,
+    // v7 SAFETY: the vault + homes ALWAYS live inside the temp dir — never
+    // ~/.hive/vault or ~/.hive/homes; login seats use a private tmux socket.
+    accounts: {
+      vaultDir: join(dir, "vault"),
+      homesDir: join(dir, "homes"),
+      tmuxSocket: `hb-v2-test-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
+      limitsRefreshMs: 0,
+      loginTimeoutMs: 20_000,
+      ...(file.accounts ?? {}),
+    },
     agents: {
       stub: {
         command: process.execPath,
@@ -228,7 +239,9 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
   const socketPath = join(dir, "hived.sock");
   const storePath = join(dir, "core.sqlite3");
   const proc = spawn(process.execPath, [DAEMON_BIN, "--data-dir", dir], {
-    env: { ...process.env, HIVE_V2_DATA_DIR: dir },
+    // HIVE_NO_KEYCHAIN: the daemon under test never touches the developer's
+    // real macOS Keychain (spec 08 keychain bridge is off unless injected).
+    env: { ...process.env, HIVE_V2_DATA_DIR: dir, HIVE_NO_KEYCHAIN: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let out = "";

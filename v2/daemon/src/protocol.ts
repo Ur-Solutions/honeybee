@@ -19,6 +19,8 @@
 import type {
   AuditRow,
   BeeRow,
+  MirrorAccountLimitsRow,
+  MirrorAccountRow,
   BeeView,
   CommandRow,
   CommandStatus,
@@ -57,6 +59,16 @@ export const RPC_ERROR_CODES = [
   /** v6 (additive): question / seal lookups. */
   "question_not_found",
   "seal_not_found",
+  /** v7 (spec 08, additive): account verbs. */
+  "account_not_found",
+  /** The account is paused (explicit spawn / swap onto it refused). */
+  "account_paused",
+  /** The account's harness differs from the bee's agent (spawn / swap). */
+  "harness_mismatch",
+  /** `account.remove` while bees still reference the account. */
+  "account_referenced",
+  /** `auto` found no usable account (none registered/credentialed, all paused, or none untried). */
+  "account_unavailable",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -113,6 +125,21 @@ export const RPC_VERBS = [
   "seal.create",
   "seal.list",
   "seal.get",
+  // v7 (spec 08 CORE, additive to v2/1): accounts + auth. `spawn` also takes
+  // `account?` ('auto' default → the calibrated selector; explicit id; null =
+  // unbound).
+  "account.list",
+  "account.get",
+  "account.add",
+  "account.remove",
+  "account.pause",
+  "account.unpause",
+  "account.setPenalty",
+  "account.login",
+  "account.limits",
+  "account.importRegistry",
+  "account.backfill",
+  "bee.swapAccount",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -155,6 +182,134 @@ export interface DedupMarkers {
 export interface SpawnResult extends DedupMarkers {
   beeId: string;
   commandId: number;
+  /**
+   * v7: the account the bee was bound to (null = unbound: no accounts for the
+   * harness, or `account: null` requested) and, for an `auto` pick, the
+   * selector's reason line.
+   */
+  account?: string | null;
+  accountReason?: string;
+}
+
+// ---------------------------------------------------------------------------
+// v7 (spec 08) — accounts + auth. All mutations take the optional idempotencyKey.
+// ---------------------------------------------------------------------------
+
+/** `account.list {harness?}` — rows verbatim + their latest limits snapshots (mirror shapes). */
+export interface AccountListResult {
+  accounts: MirrorAccountRow[];
+  limits: MirrorAccountLimitsRow[];
+}
+
+/** The login seat handle (a detached tmux session; the operator attaches to complete the login). */
+export interface LoginSeatInfo {
+  accountId: string;
+  session: string;
+  socket: string | null;
+  /** The attach command line. */
+  attach: string;
+  startedAt: number;
+  deadline: number;
+}
+
+/** `account.get {id}` — `account_not_found` when absent. */
+export interface AccountGetResult {
+  account: MirrorAccountRow;
+  limits: MirrorAccountLimitsRow | null;
+  /** Bee ids bound to the account. */
+  bees: string[];
+  /** Whether the vault / home hold the harness's primary credential. */
+  credentialed: boolean;
+  /** An open login seat, if any. */
+  loginSeat: LoginSeatInfo | null;
+}
+
+/**
+ * `account.add {harness, label, id?, homePath?, penalty?}` — id defaults to
+ * `<harness>-<safe(label)>`, homePath to `<homesDir>/<id>`. Audit account.put.
+ */
+export interface AccountAddResult extends DedupMarkers {
+  account: MirrorAccountRow;
+}
+
+/** `account.remove {id}` — `account_referenced` while bees carry it. */
+export interface AccountRemoveResult extends DedupMarkers {
+  account: MirrorAccountRow;
+}
+
+/** `account.pause {id}` / `account.unpause {id}` / `account.setPenalty {id, penalty}` — `applied:false` = already so. */
+export interface AccountUpdateResult extends DedupMarkers {
+  account: MirrorAccountRow;
+  applied: boolean;
+}
+
+/**
+ * `account.login {id}` — start (or rejoin) the login seat: a detached tmux
+ * session running the harness's own login against the account's home. The
+ * daemon watches for the credential change (mtime past baseline / Keychain
+ * digest drift), captures the recipe files into the vault, marks the account
+ * ok + last_login_at and clears auth_needed on its bees. Returns immediately.
+ */
+export interface AccountLoginResult extends DedupMarkers {
+  accountId: string;
+  seat: LoginSeatInfo;
+  rejoined: boolean;
+}
+
+/** `account.limits {id?}` — refresh now (all accounts when no id) and return the rows. */
+export interface AccountLimitsResult extends DedupMarkers {
+  limits: MirrorAccountLimitsRow[];
+}
+
+/** `account.importRegistry {root?, dryRun?}` — the old ~/.hive/vault/accounts.json → rows (read-only on the old tree). */
+export interface AccountImportRegistryResult extends DedupMarkers {
+  root: string;
+  registryPath: string;
+  dryRun: boolean;
+  applied: boolean;
+  refusal?: string;
+  entries: Array<{
+    id: string;
+    harness: string;
+    action: "import" | "skip";
+    reason?: string;
+    note?: string;
+    homePath?: string;
+    vaultHasCredentials?: boolean;
+    homeExists?: boolean;
+    homeHasCredentials?: boolean;
+    penalty?: number;
+    status?: "ok" | "paused";
+  }>;
+  counts: { import: number; skip: number };
+  byHarness: Record<string, { import: number; skip: number }>;
+  /** The env-only bee backfill run right after a real import (absent on dry-run). */
+  backfill?: AccountBackfillResult;
+}
+
+/** `account.backfill {dryRun?}` — env-only bees → bees.account by home path. */
+export interface AccountBackfillResult extends DedupMarkers {
+  dryRun: boolean;
+  bound: Array<{ beeId: string; account: string; home: string }>;
+  unmatched: Array<{ beeId: string; home: string }>;
+}
+
+/**
+ * `bee.swapAccount {beeId, account}` — same-harness only (`harness_mismatch`),
+ * `account_paused` refused, `account_not_found`. Rebinds the bee (account +
+ * home env), then: a live runtime is stopped and revived with resume
+ * (`stop_then_revive`, the stop command id); a stopped bee is just rebound
+ * (`rebind_only`; the next wake resumes on the new account). Claude
+ * cross-account moves are rekeyed: the conversation resumes under a NEW
+ * session id (`--resume <seed> --fork-session`).
+ */
+export interface SwapAccountResult extends DedupMarkers {
+  beeId: string;
+  from: string | null;
+  to: string;
+  action: "stop_then_revive" | "rebind_only" | "noop";
+  commandId: number | null;
+  rekeyed: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +540,9 @@ export interface SnapshotResult {
   /** v6 (additive): questions + seals, store rows verbatim, snapshot-consistent with `seq`. */
   questions: MirrorQuestionRow[];
   seals: MirrorSealRow[];
+  /** v7 (additive): accounts + latest limits, store rows verbatim. */
+  accounts: MirrorAccountRow[];
+  accountLimits: MirrorAccountLimitsRow[];
 }
 
 // ---------------------------------------------------------------------------

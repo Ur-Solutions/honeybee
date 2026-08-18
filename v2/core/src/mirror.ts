@@ -12,7 +12,7 @@
  * Changing anything here is a protocol change (bump PROTOCOL in the daemon).
  * The shape snapshot test (tests/mirror.test.ts) fails on any drift.
  */
-import type { AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TemplateRow, TrackRow } from "./types.ts";
+import type { AccountLimitsRow, AccountRow, AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TemplateRow, TrackRow } from "./types.ts";
 
 /** One bee as apiaryd stores it: B8 view verbatim + record + current runtime. */
 export interface MirrorBeeRow {
@@ -34,6 +34,12 @@ export type MirrorQuestionRow = QuestionRow;
 /** v6: seals mirror as their store rows, verbatim. */
 export type MirrorSealRow = SealRow;
 
+/** v7 (spec 08): accounts mirror as their store rows, verbatim (`hive_accounts`). */
+export type MirrorAccountRow = AccountRow;
+
+/** v7: the latest limits snapshot per account, verbatim (`hive_account_limits` — the account-menu usage hint). */
+export type MirrorAccountLimitsRow = AccountLimitsRow;
+
 /**
  * The versioned snapshot: replace all mirror tables in one transaction
  * stamped `seq`, then apply deltas with `baseSeq === seq`. `questions` and
@@ -47,6 +53,9 @@ export interface MirrorSnapshot {
   tracks: MirrorTrackRow[];
   questions: MirrorQuestionRow[];
   seals: MirrorSealRow[];
+  /** v7 (additive): accounts + their latest limits, store rows verbatim. */
+  accounts: MirrorAccountRow[];
+  accountLimits: MirrorAccountLimitsRow[];
 }
 
 /** A watch delta is a contiguous run of audit rows (see daemon protocol.ts WatchFrame). */
@@ -79,11 +88,24 @@ export type MirrorDelta = AuditRow;
  *                                                                        (questions table: status/answer)
  *   seal.created       → { seal: SealRow }                             (seals table: insert)
  * `bee.provider_session` may now also carry `forkSeedConsumed` (bee row: forkSeed → null).
+ * v7 (accounts, spec 08) adds, all additive:
+ *   account.put          → { account: AccountRow, outcome: "created"|"updated", changed?, previous?, reason? }
+ *                                                                        (accounts table: upsert the row verbatim)
+ *   account.removed      → { accountId, harness, removedAt, cursorCleared }  (accounts + account_limits: delete)
+ *   account_limits.put   → { limits: AccountLimitsRow }                 (account_limits table: upsert)
+ *   selection_cursor.set → { cursor }                                   (internal; no mirror table)
+ *   bee.account_set      → { beeId, account, previous }                 (bee row: account)
+ *   bee.env_set          → { beeId, env, previous }                     (bee row: env)
+ *   bee.session_rekeyed  → { beeId, forkSeed, previousProviderSessionId } (bee row: forkSeed set, providerSessionId → null)
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
 export const MIRROR_QUESTION_AUDIT_KINDS = ["question.asked", "question.answered"] as const;
 export const MIRROR_SEAL_AUDIT_KINDS = ["seal.created"] as const;
+export const MIRROR_ACCOUNT_AUDIT_KINDS = ["account.put", "account.removed"] as const;
+export const MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS = ["account_limits.put", "account.removed"] as const;
+export type MirrorAccountAuditKind = (typeof MIRROR_ACCOUNT_AUDIT_KINDS)[number];
+export type MirrorAccountLimitsAuditKind = (typeof MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS)[number];
 export type MirrorTemplateAuditKind = (typeof MIRROR_TEMPLATE_AUDIT_KINDS)[number];
 export type MirrorTrackAuditKind = (typeof MIRROR_TRACK_AUDIT_KINDS)[number];
 export type MirrorQuestionAuditKind = (typeof MIRROR_QUESTION_AUDIT_KINDS)[number];
@@ -131,6 +153,8 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "parentId",
   "forkedFrom",
   "forkSeed",
+  // v7: additive — the account binding (accounts.id | null).
+  "account",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",
@@ -181,3 +205,31 @@ export const MIRROR_QUESTION_KEYS = [
   "deliveryMessageId",
 ] as const;
 export const MIRROR_SEAL_KEYS = ["id", "beeId", "generation", "title", "body", "refs", "createdAt"] as const;
+export const MIRROR_ACCOUNT_KEYS = [
+  "id",
+  "harness",
+  "homePath",
+  "label",
+  "status",
+  "penalty",
+  "lastLoginAt",
+  "exhaustedAt",
+  "addedAt",
+  "updatedAt",
+] as const;
+export const MIRROR_ACCOUNT_LIMITS_KEYS = [
+  "account",
+  "fetchedAt",
+  "readable",
+  "error",
+  "plan",
+  "fiveHourPct",
+  "fiveHourResetsAt",
+  "fiveHourMinutes",
+  "weeklyPct",
+  "weeklyResetsAt",
+  "weeklyMinutes",
+  "fableWeeklyPct",
+  "fableResetsAt",
+  "fableMinutes",
+] as const;

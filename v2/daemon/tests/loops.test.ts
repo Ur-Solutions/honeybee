@@ -459,3 +459,85 @@ test("budget.7: a runtime that reached running/idle and then crashed is not a sp
     rig.cleanup();
   }
 });
+
+test("unit.9 (spec 08 swap): a `stop {thenRevive}` command revives the NEXT generation once the runtime is observed stopped — durable, once, and never while a wake is already pending; the account policy hook sees every applied evidence", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    rig.store.enqueueCommand("stop", "bee-1", { cause: "stopped_by_system", reason: "swap_account:test", thenRevive: true });
+    rig.core.step(); // execute stop → process dying (exited queued)
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle", "the stop is async: exited not yet observed");
+    rig.core.step(); // exited observed → stopped → revive enqueued (after_stop) → executed in the same step
+    const revives = rig.store.listCommands({ beeId: "bee-1" }).filter((c) => c.verb === "revive");
+    assert.equal(revives.length, 1, "exactly one revive");
+    assert.equal(revives[0]?.args.reason, "after_stop");
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.generation, 2);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.ok(rig.ops.some((o) => o.startsWith("revive.after_stop bee=bee-1 gen=1")));
+    // a plain stop (no thenRevive) never revives
+    rig.store.enqueueCommand("stop", "bee-1", { cause: "stopped_by_user" });
+    rig.core.step();
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "stopped");
+    assert.equal(rig.store.currentRuntime("bee-1")?.generation, 2);
+    // thenRevive with mail already pending: the send_wake carries the revive; no duplicate
+    rig.store.enqueueCommand("revive", "bee-1");
+    rig.core.step();
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.generation, 3);
+    rig.store.enqueueCommand("stop", "bee-1", { cause: "stopped_by_system", thenRevive: true });
+    rig.core.step(); // stop executed, process dying
+    rig.store.send("bee-1", "mail during the swap"); // runtime still 'idle' in the store → no wake yet
+    rig.core.step(); // exited → stopped; ensureWake enqueues send_wake; thenRevive sees it pending → no revive
+    const cmds = rig.store.listCommands({ beeId: "bee-1" });
+    assert.equal(cmds.filter((c) => c.verb === "revive").length, 2, "no third revive: the wake covers it");
+    rig.core.step();
+    rig.core.step();
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.generation, 4);
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 0, "the mail rode the swap onto generation 4");
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("unit.10 (spec 08): the onFlagEvidence hook fires after each applied evidence and a throwing hook never stalls the loop", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-loops-"));
+  const clock = { now: 1000 };
+  const now = (): number => clock.now;
+  const store = openCoreStore(join(dir, "core.sqlite3"), { now });
+  const driver = new FakeDriver(now);
+  const seen: string[] = [];
+  const ops: string[] = [];
+  const core = new DaemonCore({
+    store,
+    driver,
+    policy: { bootHangTimeoutSteps: 50, turnHangTimeoutSteps: 50, commandsPerStep: 8 },
+    now,
+    log: (op) => ops.push(op),
+    onFlagEvidence: (ev) => {
+      seen.push(`${ev.flag}:${ev.action}`);
+      if (ev.detail === "boom") throw new Error("policy bug");
+    },
+  });
+  try {
+    core.boot();
+    store.createBee({ id: "b", name: "b", agent: "stub", substrate: "hsr", cwd: "/tmp" });
+    store.enqueueCommand("spawn", "b");
+    core.step();
+    core.step();
+    driver.evidence.push({ beeId: "b", generation: 1, flag: "resource_blocked", action: "set", detail: "boom" });
+    driver.evidence.push({ beeId: "b", generation: 1, flag: "auth_needed", action: "set", detail: "not logged in" });
+    core.step();
+    assert.deepEqual(seen, ["resource_blocked:set", "auth_needed:set"]);
+    assert.deepEqual(store.activeFlags("b").map((f) => f.flag).sort(), ["auth_needed", "resource_blocked"], "both flags applied despite the throwing hook");
+    assert.ok(ops.some((o) => o.startsWith("account.policy_error bee=b flag=resource_blocked")));
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

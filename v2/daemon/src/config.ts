@@ -25,6 +25,32 @@ export interface AgentSpecConfig {
   /** Adapter name: claude | codex | stub. Defaults to the agent key itself. */
   adapter?: string;
   env?: Record<string, string>;
+  /**
+   * v7 (spec 08): the harness's own login invocation for `account.login`'s
+   * seat (default = the recipe's: bare `claude`, `codex login`, …). Tests
+   * point it at a fake login that writes the recipe file.
+   */
+  login?: { command: string; args?: string[] };
+}
+
+/** v7 (spec 08): accounts + vault settings. */
+export interface AccountsConfig {
+  /** Credential vault root (`<vault>/<harness>/<accountId>/`). Default ~/.hive/vault (the old layout, shared on purpose). */
+  vaultDir?: string;
+  /** Run-homes root (`<homes>/<accountId>`). Default ~/.hive/homes. */
+  homesDir?: string;
+  /** A limits row older than this is refreshed before an `auto` pick. Default 1h. */
+  limitsStaleMs?: number;
+  /** Periodic in-daemon limits refresh while running. Default 15 min; 0 disables. */
+  limitsRefreshMs?: number;
+  /** Per-fetch bound for a provider limits read. Default 15s. */
+  limitsFetchTimeoutMs?: number;
+  /** tmux socket name (`tmux -L <name>`) for login seats; absent = the default server. Tests use a private one. */
+  tmuxSocket?: string;
+  /** How long a login seat is watched for the credential change. Default 10 min. */
+  loginTimeoutMs?: number;
+  /** Rotation cool-off: an account with rate-limit exhaustion evidence younger than this is not rotated ONTO. Default 5h. */
+  exhaustionCoolOffMs?: number;
 }
 
 /** Node kinds (core contract §1): decides the cell-sandbox default (A4). */
@@ -82,6 +108,8 @@ export interface NodeConfigFile {
   telemetryPath?: string;
   sessionLogDir?: string;
   agents?: Record<string, AgentSpecConfig>;
+  /** v7 (spec 08). */
+  accounts?: AccountsConfig;
 }
 
 export interface ResolvedNodeConfig {
@@ -115,6 +143,8 @@ export interface ResolvedNodeConfig {
   telemetryPath: string;
   sessionLogDir: string;
   agents: Record<string, AgentSpecConfig>;
+  /** v7 (spec 08): resolved accounts settings (every field defaulted). */
+  accounts: Required<Omit<AccountsConfig, "tmuxSocket">> & { tmuxSocket: string | null };
 }
 
 export class ConfigError extends Error {
@@ -151,6 +181,11 @@ export const DEFAULTS = {
   stopKillGraceMs: 5000,
   adoptToleranceMs: 5000,
   watchMaxBatch: 256,
+  limitsStaleMs: 60 * 60 * 1000,
+  limitsRefreshMs: 15 * 60 * 1000,
+  limitsFetchTimeoutMs: 15_000,
+  loginTimeoutMs: 10 * 60 * 1000,
+  exhaustionCoolOffMs: 5 * 60 * 60 * 1000,
 } as const;
 
 /** Default per-node data directory; overridable via HIVE_V2_DATA_DIR (tests always set it). */
@@ -261,9 +296,41 @@ function agentsOf(raw: Record<string, unknown>): Record<string, AgentSpecConfig>
       }
       entry.env = s.env as Record<string, string>;
     }
+    if (s.login !== undefined) {
+      const l = s.login as Record<string, unknown> | null;
+      if (l === null || typeof l !== "object" || Array.isArray(l) || typeof l.command !== "string" || l.command.length === 0) {
+        throw new ConfigError(`config: agents.${name}.login must be an object {command, args?}`);
+      }
+      if (l.args !== undefined && (!Array.isArray(l.args) || l.args.some((a) => typeof a !== "string"))) {
+        throw new ConfigError(`config: agents.${name}.login.args must be a string array`);
+      }
+      entry.login = { command: l.command, ...(l.args !== undefined ? { args: l.args as string[] } : {}) };
+    }
     out[name] = entry;
   }
   return out;
+}
+
+function accountsOf(raw: Record<string, unknown>): ResolvedNodeConfig["accounts"] {
+  const v = raw.accounts;
+  if (v !== undefined && (v === null || typeof v !== "object" || Array.isArray(v))) {
+    throw new ConfigError("config: accounts must be an object");
+  }
+  const a = (v ?? {}) as Record<string, unknown>;
+  const socket = a.tmuxSocket;
+  if (socket !== undefined && (typeof socket !== "string" || socket.length === 0)) {
+    throw new ConfigError("config: accounts.tmuxSocket must be a non-empty string when given");
+  }
+  return {
+    vaultDir: str(a, "vaultDir", join(homedir(), ".hive", "vault")),
+    homesDir: str(a, "homesDir", join(homedir(), ".hive", "homes")),
+    limitsStaleMs: num(a, "limitsStaleMs", DEFAULTS.limitsStaleMs),
+    limitsRefreshMs: num(a, "limitsRefreshMs", DEFAULTS.limitsRefreshMs),
+    limitsFetchTimeoutMs: num(a, "limitsFetchTimeoutMs", DEFAULTS.limitsFetchTimeoutMs),
+    loginTimeoutMs: num(a, "loginTimeoutMs", DEFAULTS.loginTimeoutMs),
+    exhaustionCoolOffMs: num(a, "exhaustionCoolOffMs", DEFAULTS.exhaustionCoolOffMs),
+    tmuxSocket: (socket as string | undefined) ?? null,
+  };
 }
 
 /**
@@ -333,5 +400,6 @@ export function loadNodeConfig(dataDir: string, configPath?: string): ResolvedNo
     telemetryPath: str(raw, "telemetryPath", join(dataDir, "telemetry.sqlite3")),
     sessionLogDir: str(raw, "sessionLogDir", join(dataDir, "session-logs")),
     agents: { ...BUILTIN_AGENTS, ...agentsOf(raw) },
+    accounts: accountsOf(raw),
   };
 }

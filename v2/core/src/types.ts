@@ -126,6 +126,14 @@ export interface BeeRow {
    * generations resume that id like any bee. Null for non-forks.
    */
   forkSeed: string | null;
+  /**
+   * v7 — the account (accounts.id) this bee runs on; null = no account
+   * binding (an env-only imported bee, or a harness with no accounts). Set
+   * concretely at spawn (`auto` resolves BEFORE createBee and is never
+   * stored) and by `bee.swapAccount`. bees.env[HOME_ENV[harness]] carries the
+   * derived home path.
+   */
+  account: string | null;
 }
 
 export interface RuntimeRow {
@@ -186,6 +194,60 @@ export interface AuditRow {
   kind: string;
   beeId: string | null;
   payload: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// v7 — accounts (spec 08): identity rows, limits snapshots, selection cursor
+// ---------------------------------------------------------------------------
+
+export const ACCOUNT_STATUSES = ["ok", "auth_needed", "paused"] as const;
+export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
+
+/** A provider login identity: the WHO. One account = one run-home. */
+export interface AccountRow {
+  /** `<harness>-<label>` (safe-named, lower-cased). */
+  id: string;
+  harness: string;
+  /** The account's run-home (`~/.hive/homes/<id>` by default); every bee on the account shares it. */
+  homePath: string;
+  label: string;
+  status: AccountStatus;
+  /** Operator hint added to the selector's effective weekly load (0 = none). */
+  penalty: number;
+  lastLoginAt: number | null;
+  /** Last rate-limit exhaustion evidence (rotation cool-off); null = never. */
+  exhaustedAt: number | null;
+  addedAt: number;
+  updatedAt: number;
+}
+
+/**
+ * The latest limits snapshot per account. `readable=false` = the fetch
+ * failed (`error` says why); percentages are the provider's used% per
+ * window; `*ResetsAt` epoch ms; `*Minutes` the window length (pace).
+ */
+export interface AccountLimitsRow {
+  account: string;
+  fetchedAt: number;
+  readable: boolean;
+  error: string | null;
+  plan: string | null;
+  fiveHourPct: number | null;
+  fiveHourResetsAt: number | null;
+  fiveHourMinutes: number | null;
+  weeklyPct: number | null;
+  weeklyResetsAt: number | null;
+  weeklyMinutes: number | null;
+  fableWeeklyPct: number | null;
+  fableResetsAt: number | null;
+  fableMinutes: number | null;
+}
+
+/** Per-harness near-tie rotation cursor. */
+export interface SelectionCursorRow {
+  harness: string;
+  lastAccountId: string;
+  updatedAt: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +400,10 @@ export interface StateDump {
   /** v6 */
   questions: QuestionRow[];
   seals: SealRow[];
+  /** v7 */
+  accounts: AccountRow[];
+  accountLimits: AccountLimitsRow[];
+  selectionCursors: SelectionCursorRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -436,3 +502,20 @@ export class SealNotFoundError extends CoreError {
 
 /** A package document (or a local config file) failed validation. */
 export class PackageError extends CoreError {}
+
+/** v7 — account lookups. */
+export class AccountNotFoundError extends CoreError {
+  constructor(id: string) {
+    super(`account not found: ${id}`);
+  }
+}
+
+/** v7 — `account.remove` while bees still reference the account. */
+export class AccountReferencedError extends CoreError {
+  readonly beeIds: string[];
+
+  constructor(id: string, beeIds: string[]) {
+    super(`account ${id} is referenced by ${beeIds.length} bee(s): ${beeIds.join(", ")} — swap or delete them first`);
+    this.beeIds = beeIds;
+  }
+}

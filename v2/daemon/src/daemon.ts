@@ -23,6 +23,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  accountIdFor,
+  homeEnvFor,
   exportTemplate,
   exportTrack,
   importFromFrozen,
@@ -31,11 +33,16 @@ import {
   importTrack,
   openCoreStore,
   serializePackage,
+  type AccountRow,
+  type BeeRow,
   type CommandRow,
   type CoreStore,
   type RowSource,
   type Scope,
 } from "../../core/src/index.ts";
+import { AccountsService, type LimitsFetchers, type LoginSeat } from "./accountsService.ts";
+import type { KeychainReader, KeychainWriter } from "./keychain.ts";
+import type { FlagEvidenceLike } from "./loops.ts";
 import { realPreflightProbes } from "./import-probes.ts";
 import { HsrDriver, type SpawnSpec } from "../../driver-hsr/src/index.ts";
 import {
@@ -72,6 +79,17 @@ import {
   PROTOCOL,
   RpcError,
   SPAWN_SUBSTRATES,
+  type AccountAddResult,
+  type AccountBackfillResult,
+  type AccountGetResult,
+  type AccountImportRegistryResult,
+  type AccountLimitsResult,
+  type AccountListResult,
+  type AccountLoginResult,
+  type AccountRemoveResult,
+  type AccountUpdateResult,
+  type LoginSeatInfo,
+  type SwapAccountResult,
   type CellCaptureMode,
   type CellCaptureResult,
   type CellRemoveResult,
@@ -208,6 +226,25 @@ export function beeIdentityEnv(bee: { id: string; name: string; parentId: string
 
 const OP_LOG_TAIL = 40;
 
+/** v7: injectable transports for in-process tests (the daemon binary uses the defaults). */
+export interface HiveDaemonDeps {
+  keychainReader?: KeychainReader;
+  keychainWriter?: KeychainWriter;
+  fetchers?: LimitsFetchers;
+}
+
+/** Rate-limit cause classifier for resource_blocked evidence (spec 08 rotation trigger). */
+export function isRateLimitCause(detail: string): boolean {
+  const m = detail.toLowerCase();
+  return m.includes("rate limit") || m.includes("rate-limit") || m.includes("rate_limit") || m.includes("429") || (m.includes("quota") && (m.includes("exceeded") || m.includes("exhausted"))) || m.includes("usage limit");
+}
+
+/** Per-bee rotation opt-out: tag or arg `autoswap=false` (also `--autoswap=false`). */
+export function autoswapDisabled(bee: { tags: string[]; args: string[] | null }): boolean {
+  const spelled = (v: string) => /^-{0,2}autoswap=false$/i.test(v.trim());
+  return bee.tags.some(spelled) || (bee.args ?? []).some(spelled);
+}
+
 /** Verbs whose result `status` is the verb's own report, not a command status (see withIdempotency). */
 const OWN_STATUS_VERBS: ReadonlySet<RpcVerb> = new Set<RpcVerb>(["cell.capture", "cell.remove"]);
 
@@ -228,9 +265,20 @@ export class HiveDaemon {
   private stopping = false;
   private publishedSeq = 0;
   private readonly opLog: string[] = [];
+  private accounts: AccountsService | null = null;
+  private readonly deps: HiveDaemonDeps;
+  /** v7 rotation bound: one attempt per (bee, generation) exhaustion event. */
+  private readonly rotatedGenerations = new Map<string, number>();
 
-  constructor(cfg: ResolvedNodeConfig) {
+  constructor(cfg: ResolvedNodeConfig, deps: HiveDaemonDeps = {}) {
     this.cfg = cfg;
+    this.deps = deps;
+  }
+
+  /** The account plane (tests reach the selector / login seat / importer through it). */
+  get accountsService(): AccountsService {
+    if (!this.accounts) throw new Error("daemon not started");
+    return this.accounts;
   }
 
   // -------------------------------------------------------------------------
@@ -249,6 +297,14 @@ export class HiveDaemon {
       backoffBaseMs: this.cfg.backoffBaseMs,
     });
     this.store = store;
+    this.accounts = new AccountsService({
+      store,
+      cfg: this.cfg,
+      log: (op) => this.log(op),
+      keychainReader: this.deps.keychainReader,
+      keychainWriter: this.deps.keychainWriter,
+      fetchers: this.deps.fetchers,
+    });
     const hsrConfig = {
       sessionLogDir: this.cfg.sessionLogDir,
       stopKillGraceMs: this.cfg.stopKillGraceMs,
@@ -285,6 +341,7 @@ export class HiveDaemon {
       log: (op) => this.log(op),
       onI1Violation: (v) => this.recordI1(v),
       removeSessionLog: (path) => rmSync(path, { force: true }),
+      onFlagEvidence: (ev) => this.applyAccountPolicy(ev),
     });
     // Behavior 2: re-adopt surviving runtimes by the identities core recorded
     // at spawn, so DaemonCore.boot()'s snapshotLive() sees them and
@@ -327,6 +384,9 @@ export class HiveDaemon {
       core.step();
       this.ticks += 1;
       this.lastTickAt = Date.now();
+      // v7: bounded in-daemon limits refresh + login-seat watch (no forks).
+      this.accounts?.periodicRefreshTick();
+      void this.pollLoginSeats();
     } catch (err) {
       // A tick error is a bug, never a reason to abandon the node: the loops
       // are idempotent over durable state, so the next tick retries.
@@ -368,12 +428,22 @@ export class HiveDaemon {
     if (!spec) throw new Error(`resolve: no agent spec for '${bee.agent}'`);
     const { adapter, args } = composeSpawn(spec, spec.adapter ?? bee.agent, bee);
     if (!adapter) throw new Error(`resolve: no adapter for agent '${bee.agent}'`);
+    // v7 (spec 08): a bound bee runs in its account's home. The env is derived
+    // from the account row (the mechanism), and an EMPTY home is activated
+    // from the vault right here — a populated home is never touched.
+    let accountEnv: Record<string, string> = {};
+    if (bee.account && this.accounts) {
+      const account = store.getAccount(bee.account);
+      if (!account) throw new Error(`resolve: bee ${beeId} is bound to unknown account ${bee.account}`);
+      accountEnv = this.accounts.homeEnvOf(account);
+      this.accounts.activateForSpawn(account, bee);
+    }
     return {
       adapter,
       command: spec.command,
       args,
       cwd: bee.cwd,
-      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...beeIdentityEnv(bee) },
+      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...accountEnv, ...beeIdentityEnv(bee) },
     };
   }
 
@@ -453,7 +523,31 @@ export class HiveDaemon {
   private dispatch(verb: RpcVerb, params: Record<string, unknown>, conn: RpcConn): unknown {
     switch (verb) {
       case "spawn":
-        return this.withIdempotency(verb, params, () => this.rpcSpawn(params));
+        return this.rpcSpawnWithAccount(params);
+      case "bee.swapAccount":
+        return this.withIdempotency(verb, params, () => this.rpcSwapAccount(params));
+      case "account.list":
+        return this.rpcAccountList(params);
+      case "account.get":
+        return this.rpcAccountGet(params);
+      case "account.add":
+        return this.withIdempotency(verb, params, () => this.rpcAccountAdd(params));
+      case "account.remove":
+        return this.withIdempotency(verb, params, () => ({ account: this.mustStore().removeAccount(this.param(params, "id")) }) satisfies AccountRemoveResult);
+      case "account.pause":
+        return this.withIdempotency(verb, params, () => this.rpcAccountStatus(params, "paused"));
+      case "account.unpause":
+        return this.withIdempotency(verb, params, () => this.rpcAccountStatus(params, "ok"));
+      case "account.setPenalty":
+        return this.withIdempotency(verb, params, () => this.rpcAccountSetPenalty(params));
+      case "account.login":
+        return this.rpcAccountLogin(params);
+      case "account.limits":
+        return this.rpcAccountLimits(params);
+      case "account.importRegistry":
+        return this.withIdempotency(verb, params, () => this.rpcAccountImportRegistry(params));
+      case "account.backfill":
+        return this.withIdempotency(verb, params, () => this.rpcAccountBackfill(params));
       case "send":
         return this.withIdempotency(verb, params, () => this.rpcSend(params));
       case "stop":
@@ -655,7 +749,74 @@ export class HiveDaemon {
     });
   }
 
-  private rpcSpawn(params: Record<string, unknown>): SpawnResult {
+  /**
+   * v7 (spec 08): `spawn {account?}` — 'auto' (default) resolves to a concrete
+   * account BEFORE the bee row is written; the bounded limits refresh for
+   * stale rows happens first (async), then the pick + createBee + spawn
+   * command run in ONE store transaction under the idempotency wrapper.
+   */
+  private async rpcSpawnWithAccount(params: Record<string, unknown>): Promise<SpawnResult> {
+    const store = this.mustStore();
+    const key = this.idempotencyKeyOf(params);
+    // A replayed key answers from the record without paying a limits fetch.
+    if (key != null && store.lookupRpcResult(key)) return this.withIdempotency("spawn", params, () => this.rpcSpawn(params, null));
+    const agent = this.param(params, "agent");
+    const request = this.accountParam(params);
+    if (request === "auto" && this.accounts && store.listAccounts({ harness: agent }).length > 1) {
+      // Refresh stale limits for the candidates (bounded; failures become
+      // unreadable rows and never block the spawn).
+      await this.accounts.ensureFreshLimits(agent, { model: this.modelParamOf(params, agent) });
+    }
+    return this.withIdempotency("spawn", params, () => this.rpcSpawn(params, request));
+  }
+
+  /** `account?` on spawn: undefined → 'auto'; null → unbound; string → explicit id (or 'auto'). */
+  private accountParam(params: Record<string, unknown>): string | null {
+    const v = params.account;
+    if (v === undefined) return "auto";
+    if (v === null) return null;
+    if (typeof v !== "string" || v.length === 0) throw new RpcError("invalid_request", "spawn: account must be an account id, 'auto', or null");
+    return v;
+  }
+
+  /** The `--model` the bee will run with (for the Fable-scoped selection tier): bee args over agent defaults. */
+  private modelParamOf(params: Record<string, unknown>, agent: string): string | undefined {
+    const args = Array.isArray(params.args) ? (params.args as unknown[]).filter((a): a is string => typeof a === "string") : [];
+    const spec = this.cfg.agents[agent];
+    const all = [...(spec?.defaultArgs ?? []), ...args];
+    let model: string | undefined;
+    for (let i = 0; i < all.length; i += 1) {
+      const a = all[i] as string;
+      if (a === "--model" || a === "-m") model = all[i + 1];
+      else if (a.startsWith("--model=")) model = a.slice("--model=".length);
+    }
+    return model;
+  }
+
+  /**
+   * Resolve the account for a new bee: explicit id → validated
+   * (account_not_found / account_paused / harness_mismatch); 'auto' → the
+   * calibrated selector (unbound when the harness has no accounts at all;
+   * `account_unavailable` when it has some but none is usable); null →
+   * unbound.
+   */
+  private resolveSpawnAccount(request: string | null, agent: string, params: Record<string, unknown>): { account: AccountRow | null; reason: string | null } {
+    const store = this.mustStore();
+    if (request === null) return { account: null, reason: null };
+    if (request !== "auto") {
+      const account = store.getAccount(request);
+      if (!account) throw new RpcError("account_not_found", `account not found: ${request}`);
+      if (account.harness !== agent) throw new RpcError("harness_mismatch", `account ${account.id} is a ${account.harness} account; the bee runs ${agent}`);
+      if (account.status === "paused") throw new RpcError("account_paused", `account ${account.id} is paused; unpause it or pick another`);
+      return { account, reason: "explicit" };
+    }
+    if (!this.accounts || store.listAccounts({ harness: agent }).length === 0) return { account: null, reason: null };
+    const pick = this.accounts.pick(agent, { model: this.modelParamOf(params, agent) });
+    if (!pick.ok) throw new RpcError("account_unavailable", pick.message);
+    return { account: pick.account, reason: pick.reason };
+  }
+
+  private rpcSpawn(params: Record<string, unknown>, accountRequest: string | null): SpawnResult {
     const store = this.mustStore();
     const key = this.idempotencyKeyOf(params);
     // Belt-and-braces guard for a key already stamped on a command at the
@@ -682,6 +843,10 @@ export class HiveDaemon {
     const parentId = this.parentParam(params);
     const id = typeof params.id === "string" && params.id.length > 0 ? params.id : randomUUID();
     const driver = this.driver;
+    // v7: the account is resolved BEFORE the row is written ('auto' is never
+    // stored); the home env is derived from the account row.
+    const { account, reason: accountReason } = this.resolveSpawnAccount(accountRequest, agent, params);
+    const accountEnv = account && this.accounts ? this.accounts.homeEnvOf(account) : {};
     // Cell substrate: the cell owns the cwd (the space checkout). The seed
     // ledger is written in the same call, AFTER the row exists (createBee
     // is the id/name gate) and before the spawn command is enqueued —
@@ -698,13 +863,15 @@ export class HiveDaemon {
       sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
       args: params.args === undefined ? undefined : this.argsParam(params, "spawn", false),
       parentId,
+      ...(account ? { account: account.id, env: accountEnv } : {}),
     });
     if (cell) {
       reserveCell(this.cfg.cellsRoot, cell.reserve);
       this.log(`cell.reserve bee=${id} origin=${cell.reserve.originRepo} sha=${cell.reserve.sha} space=${cell.spaceDir}`);
     }
     const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
-    return { beeId: id, commandId: cmd.id };
+    if (account) this.log(`spawn.account bee=${id} account=${account.id}${accountReason ? ` reason=${JSON.stringify(accountReason)}` : ""}`);
+    return { beeId: id, commandId: cmd.id, account: account?.id ?? null, ...(accountReason && accountReason !== "explicit" ? { accountReason } : {}) };
   }
 
   private substrateParam(params: Record<string, unknown>): SpawnSubstrate {
@@ -988,6 +1155,8 @@ export class HiveDaemon {
       parentId: source.id,
       forkedFrom: source.id,
       forkSeed,
+      // v7: a fork runs on the source's account (same identity, same home).
+      account: source.account,
     });
     store.recordFork(id, source.id, forkSeed);
     const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
@@ -1153,7 +1322,266 @@ export class HiveDaemon {
       tracks: store.listTracks(),
       questions: store.listQuestions(),
       seals: store.listSeals(),
+      accounts: store.listAccounts(),
+      accountLimits: store.listAccountLimits(),
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // v7 (spec 08) — accounts + auth
+  // -------------------------------------------------------------------------
+
+  private mustAccounts(): AccountsService {
+    if (!this.accounts || this.stopping) throw new RpcError("node_stopped", "daemon is shutting down");
+    return this.accounts;
+  }
+
+  private requireAccount(params: Record<string, unknown>, key = "id"): AccountRow {
+    const id = this.param(params, key);
+    const account = this.mustStore().getAccount(id);
+    if (!account) throw new RpcError("account_not_found", `account not found: ${id}`);
+    return account;
+  }
+
+  private seatInfo(seat: LoginSeat | null): LoginSeatInfo | null {
+    if (!seat) return null;
+    return { accountId: seat.accountId, session: seat.session, socket: seat.socket, attach: seat.attach, startedAt: seat.startedAt, deadline: seat.deadline };
+  }
+
+  private rpcAccountList(params: Record<string, unknown>): AccountListResult {
+    const store = this.mustStore();
+    const harness = typeof params.harness === "string" && params.harness.length > 0 ? params.harness : undefined;
+    const accounts = store.listAccounts(harness ? { harness } : {});
+    const ids = new Set(accounts.map((a) => a.id));
+    return { accounts, limits: store.listAccountLimits().filter((l) => ids.has(l.account)) };
+  }
+
+  private rpcAccountGet(params: Record<string, unknown>): AccountGetResult {
+    const store = this.mustStore();
+    const account = this.requireAccount(params);
+    return {
+      account,
+      limits: store.getAccountLimits(account.id),
+      bees: store.beesOnAccount(account.id).map((b) => b.id),
+      credentialed: this.mustAccounts().credentialed(account),
+      loginSeat: this.seatInfo(this.mustAccounts().seatOf(account.id)),
+    };
+  }
+
+  private rpcAccountAdd(params: Record<string, unknown>): AccountAddResult {
+    const store = this.mustStore();
+    const harness = this.param(params, "harness");
+    const label = this.param(params, "label");
+    const id = typeof params.id === "string" && params.id.length > 0 ? params.id : accountIdFor(harness, label);
+    const homePath = typeof params.homePath === "string" && params.homePath.length > 0 ? resolve(params.homePath) : this.mustAccounts().defaultHomeOf(id);
+    const penalty = params.penalty === undefined ? 0 : params.penalty;
+    if (typeof penalty !== "number") throw new RpcError("invalid_request", "account.add: penalty must be a number");
+    if (store.getAccount(id)) throw new RpcError("invalid_request", `account already exists: ${id}`);
+    const account = store.createAccount({ id, harness, label, homePath, penalty });
+    this.log(`account.add id=${id} harness=${harness} home=${homePath}`);
+    return { account };
+  }
+
+  private rpcAccountStatus(params: Record<string, unknown>, status: "paused" | "ok"): AccountUpdateResult {
+    const account = this.requireAccount(params);
+    const res = this.mustStore().setAccountStatus(account.id, status, status === "paused" ? "operator pause" : "operator unpause");
+    this.log(`account.${status === "paused" ? "pause" : "unpause"} id=${account.id} applied=${res.applied}`);
+    return { account: res.account, applied: res.applied };
+  }
+
+  private rpcAccountSetPenalty(params: Record<string, unknown>): AccountUpdateResult {
+    const account = this.requireAccount(params);
+    const penalty = params.penalty;
+    if (typeof penalty !== "number" || !Number.isFinite(penalty) || penalty < 0 || penalty > 100) {
+      throw new RpcError("invalid_request", "account.setPenalty: penalty must be a number from 0 to 100");
+    }
+    const res = this.mustStore().setAccountPenalty(account.id, penalty);
+    this.log(`account.setPenalty id=${account.id} penalty=${penalty} applied=${res.applied}`);
+    return { account: res.account, applied: res.applied };
+  }
+
+  private async rpcAccountLogin(params: Record<string, unknown>): Promise<AccountLoginResult> {
+    const account = this.requireAccount(params);
+    const key = this.idempotencyKeyOf(params);
+    const store = this.mustStore();
+    if (key != null) {
+      const hit = store.lookupRpcResult(key);
+      if (hit) return { ...(hit.result as AccountLoginResult), deduped: true };
+    }
+    let started: { seat: LoginSeat; rejoined: boolean };
+    try {
+      started = await this.mustAccounts().startLogin(account);
+    } catch (err) {
+      throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
+    }
+    const result: AccountLoginResult = { accountId: account.id, seat: this.seatInfo(started.seat) as LoginSeatInfo, rejoined: started.rejoined };
+    if (key != null) store.recordRpcResult(key, "account.login", null, result);
+    return result;
+  }
+
+  private async rpcAccountLimits(params: Record<string, unknown>): Promise<AccountLimitsResult> {
+    const accounts = this.mustAccounts();
+    const ids = params.id === undefined || params.id === null ? undefined : [this.requireAccount(params).id];
+    const limits = await accounts.refreshLimits(ids);
+    return { limits };
+  }
+
+  private rpcAccountImportRegistry(params: Record<string, unknown>): AccountImportRegistryResult {
+    const root = typeof params.root === "string" && params.root.length > 0 ? params.root : join(homedir(), ".hive");
+    const dryRun = params.dryRun === true;
+    const report = this.mustAccounts().importRegistry(root, { dryRun });
+    this.log(`account.importRegistry root=${root} dryRun=${dryRun} applied=${report.applied} import=${report.counts.import} skip=${report.counts.skip}${report.refusal ? ` refusal=${JSON.stringify(report.refusal)}` : ""}`);
+    const backfill = report.applied ? this.mustAccounts().backfillBeeAccounts() : undefined;
+    return { ...report, ...(backfill ? { backfill } : {}) };
+  }
+
+  private rpcAccountBackfill(params: Record<string, unknown>): AccountBackfillResult {
+    return this.mustAccounts().backfillBeeAccounts({ dryRun: params.dryRun === true });
+  }
+
+  /**
+   * `bee.swapAccount {beeId, account}` (spec 08): same-harness only. Rebind
+   * (account + home env; claude cross-account: rekey the session so the
+   * conversation resumes under a NEW id via --resume <seed> --fork-session),
+   * then stop the live runtime with `thenRevive` so the next generation
+   * boots in the new account's home and resumes. A stopped bee is only
+   * rebound (its next wake runs on the new account).
+   */
+  private rpcSwapAccount(params: Record<string, unknown>): SwapAccountResult {
+    const store = this.mustStore();
+    const beeId = this.requireBee(params);
+    const bee = store.getBee(beeId) as BeeRow;
+    const target = this.requireAccount(params, "account");
+    return this.performSwap(bee, target, "operator");
+  }
+
+  private performSwap(bee: BeeRow, target: AccountRow, by: "operator" | "rotation"): SwapAccountResult {
+    const store = this.mustStore();
+    const accounts = this.mustAccounts();
+    if (target.harness !== bee.agent) {
+      throw new RpcError("harness_mismatch", `account ${target.id} is a ${target.harness} account; bee ${bee.name} runs ${bee.agent}`);
+    }
+    if (target.status === "paused") throw new RpcError("account_paused", `account ${target.id} is paused`);
+    const from = bee.account;
+    if (from === target.id) return { beeId: bee.id, from, to: target.id, action: "noop", commandId: null, rekeyed: false };
+    const rt = store.currentRuntime(bee.id);
+    const live = rt != null && rt.state !== "stopped";
+    let rekeyed = false;
+    let commandId: number | null = null;
+    store.transact(() => {
+      store.setBeeAccount(bee.id, target.id);
+      const key = homeEnvFor(bee.agent);
+      const env = { ...bee.env };
+      if (key) delete env[key];
+      store.setBeeEnv(bee.id, { ...env, ...accounts.homeEnvOf(target) });
+      // Claude cross-account moves mint a fresh session id (the old
+      // copyThread rule): the resume runs as `--resume <seed> --fork-session`.
+      if (bee.agent === "claude" && from !== target.id) rekeyed = store.rekeyBeeSession(bee.id).applied;
+      if (live && rt) {
+        commandId = store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: `swap_account:${by}`, thenRevive: true }).id;
+      }
+    });
+    const action: SwapAccountResult["action"] = live ? "stop_then_revive" : "rebind_only";
+    this.log(`bee.swapAccount bee=${bee.id} from=${from ?? "-"} to=${target.id} by=${by} action=${action} rekeyed=${rekeyed}${commandId != null ? ` stop=${commandId}` : ""}`);
+    return { beeId: bee.id, from, to: target.id, action, commandId, rekeyed };
+  }
+
+  /**
+   * Account policy over adapter flag evidence (spec 08 "auth_needed ↔ Log in"
+   * + "Automatic rotation on exhaustion"):
+   *  - auth_needed set → accounts.status = auth_needed (bee flag already set
+   *    by the loop); auth_needed clear (authenticated turn) → status ok.
+   *  - resource_blocked set with a rate-limit cause → exhaustion evidence on
+   *    the account, then ONE rotation attempt for this (bee, generation):
+   *    selection for the harness excluding the current account (and recently
+   *    exhausted ones); a candidate → swapAccount; none → the bee stays
+   *    flagged and visible. Per-bee opt-out: tag/arg `autoswap=false`.
+   *  - resource_blocked clear (turn served / allowed again) → exhaustion cleared.
+   */
+  private applyAccountPolicy(ev: FlagEvidenceLike): void {
+    const store = this.mustStore();
+    const accounts = this.accounts;
+    if (!accounts) return;
+    const bee = store.getBee(ev.beeId);
+    if (!bee || !bee.account) return;
+    const account = store.getAccount(bee.account);
+    if (!account) return;
+    if (ev.flag === "auth_needed") {
+      if (ev.action === "set") {
+        if (account.status !== "paused" && store.setAccountStatus(account.id, "auth_needed", `bee ${bee.id}: ${ev.detail.slice(0, 200)}`).applied) {
+          this.log(`account.auth_needed account=${account.id} bee=${bee.id} gen=${ev.generation}`);
+        }
+      } else if (account.status === "auth_needed") {
+        store.setAccountStatus(account.id, "ok", `bee ${bee.id}: ${ev.detail.slice(0, 200)}`);
+        this.log(`account.auth_ok account=${account.id} bee=${bee.id} gen=${ev.generation}`);
+      }
+      return;
+    }
+    if (ev.flag !== "resource_blocked") return;
+    if (ev.action === "clear") {
+      if (account.exhaustedAt != null) store.recordAccountExhaustion(account.id, null);
+      return;
+    }
+    if (!isRateLimitCause(ev.detail)) return;
+    // Exhaustion evidence on the account (rotation cool-off). Debounced: a
+    // provider re-reports the wall on every call; one stamp a minute is plenty.
+    const now = Date.now();
+    if (account.exhaustedAt == null || now - account.exhaustedAt > 60_000) store.recordAccountExhaustion(account.id, now);
+    if (autoswapDisabled(bee)) {
+      this.log(`account.rotate bee=${bee.id} account=${account.id} skipped=autoswap_disabled`);
+      return;
+    }
+    // Bounded: one attempt per exhaustion event (= per generation; a swap mints the next).
+    const rt = store.currentRuntime(bee.id);
+    const generation = rt?.generation ?? ev.generation;
+    if (this.rotatedGenerations.get(bee.id) === generation) return;
+    this.rotatedGenerations.set(bee.id, generation);
+    const pick = accounts.pick(bee.agent, { excludeAccountIds: new Set([account.id]), excludeRecentlyExhausted: true, model: this.modelOfBee(bee) });
+    if (!pick.ok) {
+      this.log(`account.rotate bee=${bee.id} account=${account.id} skipped=no_candidate (${pick.message})`);
+      return;
+    }
+    try {
+      const res = this.performSwap(bee, pick.account, "rotation");
+      this.log(`account.rotate bee=${bee.id} from=${account.id} to=${pick.account.id} action=${res.action} reason=${JSON.stringify(pick.reason)}`);
+    } catch (err) {
+      this.log(`account.rotate bee=${bee.id} from=${account.id} to=${pick.account.id} failed=${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** The bee's effective model (its args over the agent defaults), for the Fable tier. */
+  private modelOfBee(bee: BeeRow): string | undefined {
+    const spec = this.cfg.agents[bee.agent];
+    const all = [...(spec?.defaultArgs ?? []), ...(bee.args ?? [])];
+    let model: string | undefined;
+    for (let i = 0; i < all.length; i += 1) {
+      const a = all[i] as string;
+      if (a === "--model" || a === "-m") model = all[i + 1];
+      else if (a.startsWith("--model=")) model = a.slice("--model=".length);
+    }
+    return model;
+  }
+
+  /** Tick: poll open login seats; a completed login clears auth_needed on the account's bees (contrary evidence). */
+  private async pollLoginSeats(): Promise<void> {
+    const accounts = this.accounts;
+    const store = this.store;
+    if (!accounts || !store || this.stopping) return;
+    let outcomes;
+    try {
+      outcomes = await accounts.pollLoginSeats();
+    } catch (err) {
+      this.log(`account.login.poll_error ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    for (const done of outcomes) {
+      if (this.stopping) return;
+      for (const bee of store.beesOnAccount(done.accountId)) {
+        if (store.clearFlag(bee.id, "auth_needed", `login completed for account ${done.accountId}`).applied) {
+          this.log(`flag.clear bee=${bee.id} flag=auth_needed by=login`);
+        }
+      }
+    }
   }
 
   // -------------------------------------------------------------------------

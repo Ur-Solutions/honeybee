@@ -74,6 +74,13 @@ function checkInvariants(dump: StateDump): void {
   }
   for (const sl of dump.seals) assert.ok(beeIds.has(sl.beeId));
   for (const bee of dump.bees) if (bee.parentId != null) assert.ok(beeIds.has(bee.parentId), `dangling parent ${bee.parentId}`);
+  // v7: a bee's account binding names a live account (remove refuses while
+  // referenced); limits rows and cursors only ever name live accounts.
+  const accountIds = new Set(dump.accounts.map((a) => a.id));
+  for (const bee of dump.bees) if (bee.account != null) assert.ok(accountIds.has(bee.account), `dangling account ${bee.account}`);
+  for (const l of dump.accountLimits) assert.ok(accountIds.has(l.account));
+  for (const c of dump.selectionCursors) assert.ok(accountIds.has(c.lastAccountId));
+  for (const a of dump.accounts) assert.ok(a.penalty >= 0 && a.penalty <= 100);
   const seenKeys = new Set<string>();
   for (const cmd of dump.commands) {
     // Spec 06 §4.2 one-key rule: a key never lands on two commands.
@@ -118,6 +125,35 @@ function fuzzRun(seed: number, ops: number): void {
     () => {
       const bee = pick(store.listBees());
       if (bee) store.renameBee(bee.id, `fz-r${Math.floor(rnd() * 5)}`);
+    },
+    // v7: accounts — create / bind / edit / limits / cursor / remove (refused while referenced)
+    () => {
+      const id = `claude-acc${Math.floor(rnd() * 4)}`;
+      if (!store.getAccount(id)) store.createAccount({ id, harness: "claude", homePath: `/tmp/homes/${id}`, label: id, penalty: Math.floor(rnd() * 30) });
+    },
+    () => {
+      const bee = pick(store.listBees());
+      const account = pick(store.listAccounts());
+      if (bee) store.setBeeAccount(bee.id, account && rnd() < 0.8 ? account.id : null);
+    },
+    () => {
+      const account = pick(store.listAccounts());
+      if (!account) return;
+      const r = rnd();
+      if (r < 0.3) store.setAccountStatus(account.id, pick(["ok", "auth_needed", "paused"] as const));
+      else if (r < 0.5) store.setAccountPenalty(account.id, Math.floor(rnd() * 100));
+      else if (r < 0.7) store.recordAccountLogin(account.id);
+      else if (r < 0.85) store.putAccountLimits(account.id, { readable: rnd() < 0.8, weekly: { usedPercent: Math.floor(rnd() * 100) } });
+      else store.setSelectionCursor("claude", account.id);
+    },
+    () => {
+      const account = pick(store.listAccounts());
+      if (!account) return;
+      try {
+        store.removeAccount(account.id);
+      } catch (err) {
+        if (!(err instanceof CoreError)) throw err; // referenced: refused, nothing changed
+      }
     },
     () => {
       const bee = pick(store.listBees());
