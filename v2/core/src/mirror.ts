@@ -53,7 +53,9 @@ export type MirrorDelta = AuditRow;
  * the delta re-reads that bee (view) — or takes the snapshot path.
  * v3 adds `bee.provider_session` (bee row: providerSessionId changed) and
  * `bee.imported` (informational provenance; no row change beyond the
- * preceding bee.created).
+ * preceding bee.created). v4 adds `bee.spawn_failures` (bee row:
+ * spawnFailures changed) and `wake.suppressed` (informational: a wake was
+ * not enqueued because `spawn_failed` is set; no row change).
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
@@ -93,6 +95,8 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "providerSessionId",
   "env",
   "importedFrom",
+  // v4: consecutive boot failures (the spawn-retry budget); additive likewise.
+  "spawnFailures",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",

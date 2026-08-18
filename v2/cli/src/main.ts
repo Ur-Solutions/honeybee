@@ -148,13 +148,16 @@ function resolveBeeIn(views: ViewResult[], needle: string): string {
 function viewLine(v: ViewResult, stale: boolean): string {
   const bee = v.bee;
   const flags = v.view.flags.length > 0 ? ` flags=${v.view.flags.join(",")}` : "";
+  // Consecutive boot failures (the spawn-retry budget) — shown while non-zero
+  // so an operator sees a bee that is backing off before it gets flagged.
+  const failures = (bee?.spawnFailures ?? 0) > 0 ? ` bootFailures=${bee?.spawnFailures}` : "";
   const status =
     v.view.runtimeState === "stopped"
       ? `stopped(${v.view.exitCause})`
       : (v.view.runtimeState ?? "no-runtime");
   const derived = v.view.working ? "working" : v.view.waitingForYou ? "waiting-for-you" : "quiet";
   const prefix = stale ? "stale: " : "";
-  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}`;
+  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}`;
 }
 
 function emit(ctx: CliContext, human: string[], jsonValue: unknown, stale: boolean): void {

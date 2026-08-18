@@ -44,7 +44,7 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
-import { BEES_V3_COLUMNS, IDEMPOTENCY_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_ADDITIVE_COLUMNS, IDEMPOTENCY_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -58,9 +58,16 @@ import {
 export interface CoreStoreOptions {
   /** Injectable clock (epoch ms) for deterministic tests. */
   now?: () => number;
-  /** B5 bounded retries: attempts allowed before a command settles `failed`. Default 5. */
+  /**
+   * B5 bounded retries: attempts allowed before a command settles `failed`.
+   * Also the spawn-failure budget: consecutive boot failures per bee before
+   * `spawn_failed` is set and wake-driven revives stop. Default 5.
+   */
   maxAttempts?: number;
-  /** B5 backoff base: next_attempt_at = now + base * 2^(attempts-1). Default 30s. */
+  /**
+   * B5 backoff base: next_attempt_at = now + base * 2^(attempts-1). The same
+   * table schedules the next wake after a boot failure. Default 30s.
+   */
   backoffBaseMs?: number;
   /**
    * Retention bound for the rpc_idempotency table (spec 06 §4.2): the newest N
@@ -96,10 +103,31 @@ export interface CreateBeeInput {
 
 export interface SendResult {
   message: MessageRow;
-  /** The send_wake enqueued in the same transaction when no live runtime existed (B4/B5). */
+  /**
+   * The send_wake enqueued in the same transaction when no live runtime
+   * existed (B4/B5) — or the already-pending one. Null when a runtime is live,
+   * or when the bee carries `spawn_failed` (the wake is suppressed: the bee is
+   * visibly blocked until contrary evidence or an operator revive; the mail
+   * stays durable and is delivered by the next live runtime).
+   */
   wakeCommand: CommandRow | null;
   /** True when the send auto-unarchived an archived bee (Q3). */
   unarchived: boolean;
+}
+
+/** Outcome of a wake request (send() inline, or the daemon's sweeps). */
+export interface WakeResult {
+  /** The send_wake now pending for the bee (new or already there); null when none. */
+  command: CommandRow | null;
+  /**
+   * enqueued   — a new send_wake was enqueued (possibly deferred: see nextAttemptAt)
+   * pending    — an identical wake was already queued/running for this generation
+   * live       — a runtime is live; nothing to wake
+   * no_mail    — nothing undelivered (enqueueWake only)
+   * suppressed — `spawn_failed` is set: visibly blocked, no wake until an
+   *              operator revive or contrary evidence clears it
+   */
+  outcome: "enqueued" | "pending" | "live" | "no_mail" | "suppressed";
 }
 
 export interface DeleteResult {
@@ -183,6 +211,7 @@ function mapBee(r: Row): BeeRow {
     providerSessionId: (r.provider_session_id as string | null) ?? null,
     env: JSON.parse((r.env as string | null) ?? "{}") as Record<string, string>,
     importedFrom: (r.imported_from as string | null) ?? null,
+    spawnFailures: Number(r.spawn_failures ?? 0),
   };
 }
 
@@ -417,13 +446,13 @@ export class CoreStore {
       if (!cols.some((c) => c.name === "idempotency_key")) {
         this.db.exec("ALTER TABLE commands ADD COLUMN idempotency_key TEXT");
       }
-      // v2 → v3: additive bee columns (provider_session_id, env, imported_from).
-      // Same discipline: add iff missing, so fresh and v1 stores (whose bees
-      // table was just created in full) are untouched.
+      // v2 → v3: additive bee columns (provider_session_id, env, imported_from);
+      // v3 → v4: spawn_failures. Same discipline: add iff missing, so fresh
+      // and v1 stores (whose bees table was just created in full) are untouched.
       const beeCols = new Set(
         (this.db.prepare("SELECT name FROM pragma_table_info('bees')").all() as Row[]).map((c) => String(c.name)),
       );
-      for (const [name, ddl] of BEES_V3_COLUMNS) {
+      for (const [name, ddl] of BEES_ADDITIVE_COLUMNS) {
         if (!beeCols.has(name)) this.db.exec(`ALTER TABLE bees ADD COLUMN ${ddl}`);
       }
     }
@@ -678,7 +707,130 @@ export class CoreStore {
         .run(state, opts.exitCause ?? null, pid, pidStartedAt, at, beeId, generation);
       const runtime = this.currentRuntime(beeId);
       this.audit("runtime.updated", beeId, { runtime });
+      // Spawn-failure budget (contract §4.2 spawn_failed, B5 bounded): a
+      // runtime that dies on its own while still booting is a boot failure;
+      // reaching running is the contrary evidence that resets the budget.
+      if (current.state === "booting") {
+        if (state === "stopped" && (opts.exitCause === "crashed" || opts.exitCause === "clean")) {
+          this.applySpawnFailure(beeId, generation, opts.exitCause);
+        } else if (state === "running") {
+          this.applySpawnFailuresReset(beeId, `runtime booted (generation ${generation})`);
+        }
+      }
       return { applied: true };
+    });
+  }
+
+  /**
+   * One more consecutive boot failure for the bee. Below the budget the next
+   * wake is deferred by the B5 backoff table (see applyWakeIfNeeded); at the
+   * budget the `spawn_failed` flag is set — visibly blocked — and no further
+   * wakes are enqueued until contrary evidence clears it.
+   */
+  private applySpawnFailure(beeId: string, generation: number, exitCause: ExitCause): void {
+    const failures = this.mustGetBee(beeId).spawnFailures + 1;
+    this.db.prepare("UPDATE bees SET spawn_failures = ? WHERE id = ?").run(failures, beeId);
+    this.audit("bee.spawn_failures", beeId, {
+      beeId,
+      spawnFailures: failures,
+      reason: "boot_exit",
+      generation,
+      exitCause,
+      budget: this.maxAttempts,
+    });
+    if (failures >= this.maxAttempts) {
+      this.applySetFlag(
+        beeId,
+        "spawn_failed",
+        `runtime exited during boot ${failures} times in a row (generation ${generation}, ${exitCause}); ` +
+          "not reviving again until it boots or an operator revives it",
+      );
+    }
+  }
+
+  private applySpawnFailuresReset(beeId: string, reason: string): { applied: boolean } {
+    const bee = this.mustGetBee(beeId);
+    let applied = false;
+    if (bee.spawnFailures !== 0) {
+      this.db.prepare("UPDATE bees SET spawn_failures = 0 WHERE id = ?").run(beeId);
+      this.audit("bee.spawn_failures", beeId, { beeId, spawnFailures: 0, reason });
+      applied = true;
+    }
+    // Contrary evidence clears the flag (spec 03): every setter has a clearer.
+    // Silent when nothing was set — success is the common case.
+    if (this.applyClearFlag(beeId, "spawn_failed", reason, { auditNoop: false }).applied) applied = true;
+    return { applied };
+  }
+
+  /**
+   * Operator action against the spawn-failure budget: an explicit `revive`
+   * resets the counter and clears `spawn_failed`, granting a fresh budget for
+   * the attempt it is about to make ("no flag is permanent short of operator
+   * action", spec 03). Idempotent; a no-op when nothing is set.
+   */
+  resetSpawnFailures(beeId: string, reason = "operator revive"): { applied: boolean } {
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      return this.applySpawnFailuresReset(beeId, reason);
+    });
+  }
+
+  /**
+   * When the next wake-driven revive may run after boot failures: the B5
+   * table (base × 2^(n-1)) from the moment the last generation stopped.
+   * Undefined = no boot failures, wake immediately.
+   */
+  private wakeNotBefore(bee: BeeRow, current: RuntimeRow | null): number | undefined {
+    if (bee.spawnFailures <= 0 || !current) return undefined;
+    return current.updatedAt + this.backoffBaseMs * 2 ** (bee.spawnFailures - 1);
+  }
+
+  /**
+   * Enqueue a send_wake for a bee with no live runtime — the ONE place a wake
+   * is scheduled (send() and the daemon's wake sweeps both land here). Bounded
+   * queue: an identical pending wake for the same generation is returned as-is.
+   * Suppressed (null) while `spawn_failed` is set — the bee is visibly blocked;
+   * mail stays durable; the operator's revive is the way back. Deferred by the
+   * B5 backoff table when the bee has consecutive boot failures.
+   */
+  private applyWakeIfNeeded(beeId: string): WakeResult {
+    const bee = this.mustGetBee(beeId);
+    const current = this.currentRuntime(beeId);
+    if (current && LIVE_STATES.includes(current.state)) return { command: null, outcome: "live" };
+    const targetGeneration = current?.generation ?? 0;
+    const dupe = this.db
+      .prepare(
+        `SELECT * FROM commands WHERE bee_id = ? AND verb = 'send_wake'
+         AND status IN ('queued','running') AND target_generation = ? LIMIT 1`,
+      )
+      .get(beeId, targetGeneration) as Row | undefined;
+    if (dupe) return { command: mapCommand(dupe), outcome: "pending" };
+    const flagged = this.db
+      .prepare("SELECT id FROM flags WHERE bee_id = ? AND flag = 'spawn_failed' AND cleared_at IS NULL")
+      .get(beeId) as Row | undefined;
+    if (flagged) {
+      this.audit("wake.suppressed", beeId, {
+        beeId,
+        targetGeneration,
+        flag: "spawn_failed",
+        spawnFailures: bee.spawnFailures,
+      });
+      return { command: null, outcome: "suppressed" };
+    }
+    const command = this.applyEnqueue("send_wake", beeId, {}, targetGeneration, null, this.wakeNotBefore(bee, current));
+    return { command, outcome: "enqueued" };
+  }
+
+  /**
+   * Daemon wake sweep: enqueue a send_wake iff the bee has undelivered mail
+   * and no live runtime (and no pending wake). Same rules as send()'s inline
+   * wake — flag suppression and boot-failure backoff included.
+   */
+  enqueueWake(beeId: string): WakeResult {
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      if (this.undeliveredMessages(beeId).length === 0) return { command: null, outcome: "no_mail" };
+      return this.applyWakeIfNeeded(beeId);
     });
   }
 
@@ -813,24 +965,33 @@ export class CoreStore {
     this.assertKnownFlag(flag);
     return this.tx(() => {
       this.mustGetBee(beeId);
-      const existing = this.db
-        .prepare("SELECT id FROM flags WHERE bee_id = ? AND flag = ? AND cleared_at IS NULL")
-        .get(beeId, flag) as Row | undefined;
-      if (!existing) {
-        this.audit("flag.clear_noop", beeId, { beeId, flag });
-        return { applied: false };
-      }
-      const at = this.now();
-      this.db.prepare("UPDATE flags SET cleared_at = ? WHERE id = ?").run(at, Number(existing.id));
-      this.audit("flag.cleared", beeId, {
-        flagId: Number(existing.id),
-        beeId,
-        flag,
-        clearedAt: at,
-        detail: detail ?? null,
-      });
-      return { applied: true };
+      return this.applyClearFlag(beeId, flag, detail ?? null, { auditNoop: true });
     });
+  }
+
+  private applyClearFlag(
+    beeId: string,
+    flag: Flag,
+    detail: string | null,
+    opts: { auditNoop: boolean },
+  ): { applied: boolean } {
+    const existing = this.db
+      .prepare("SELECT id FROM flags WHERE bee_id = ? AND flag = ? AND cleared_at IS NULL")
+      .get(beeId, flag) as Row | undefined;
+    if (!existing) {
+      if (opts.auditNoop) this.audit("flag.clear_noop", beeId, { beeId, flag });
+      return { applied: false };
+    }
+    const at = this.now();
+    this.db.prepare("UPDATE flags SET cleared_at = ? WHERE id = ?").run(at, Number(existing.id));
+    this.audit("flag.cleared", beeId, {
+      flagId: Number(existing.id),
+      beeId,
+      flag,
+      clearedAt: at,
+      detail,
+    });
+    return { applied: true };
   }
 
   activeFlags(beeId: string): FlagRow[] {
@@ -872,19 +1033,7 @@ export class CoreStore {
         deliveredGeneration: null,
       };
       this.audit("mail.enqueued", beeId, { message });
-      const current = this.currentRuntime(beeId);
-      let wakeCommand: CommandRow | null = null;
-      if (!current || !LIVE_STATES.includes(current.state)) {
-        const targetGeneration = current?.generation ?? 0;
-        // Bounded queue: an identical pending wake for the same generation is enough.
-        const dupe = this.db
-          .prepare(
-            `SELECT * FROM commands WHERE bee_id = ? AND verb = 'send_wake'
-             AND status IN ('queued','running') AND target_generation = ? LIMIT 1`,
-          )
-          .get(beeId, targetGeneration) as Row | undefined;
-        wakeCommand = dupe ? mapCommand(dupe) : this.applyEnqueue("send_wake", beeId, {}, targetGeneration);
-      }
+      const wakeCommand = this.applyWakeIfNeeded(beeId).command;
       return { message, wakeCommand, unarchived };
     });
   }
@@ -1015,14 +1164,17 @@ export class CoreStore {
     args: Record<string, unknown>,
     targetGeneration: number | null,
     idempotencyKey: string | null = null,
+    /** Earliest claim time (deferred wake after boot failures); never earlier than now. */
+    notBefore?: number,
   ): CommandRow {
     const at = this.now();
+    const nextAttemptAt = notBefore === undefined ? at : Math.max(at, notBefore);
     const res = this.db
       .prepare(
         `INSERT INTO commands(verb, bee_id, args, target_generation, status, attempts, next_attempt_at, enqueued_at, idempotency_key)
          VALUES(?, ?, ?, ?, 'queued', 0, ?, ?, ?)`,
       )
-      .run(verb, beeId, JSON.stringify(args), targetGeneration, at, at, idempotencyKey);
+      .run(verb, beeId, JSON.stringify(args), targetGeneration, nextAttemptAt, at, idempotencyKey);
     const command: CommandRow = {
       id: Number(res.lastInsertRowid),
       verb,
@@ -1031,7 +1183,7 @@ export class CoreStore {
       targetGeneration,
       status: "queued",
       attempts: 0,
-      nextAttemptAt: at,
+      nextAttemptAt,
       enqueuedAt: at,
       finishedAt: null,
       failureCause: null,

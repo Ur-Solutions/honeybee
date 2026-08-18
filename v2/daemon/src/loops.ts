@@ -21,7 +21,11 @@
  *     for one, stop it so revive-on-message hands the mailbox to a fresh
  *     generation — delivery stays bounded, I1 holds
  *  6. execute queued commands (claim → effect via driver → settle,
- *     generation-fenced, idempotent)
+ *     generation-fenced, idempotent). Revive-on-message is bounded by the
+ *     store's spawn-failure budget: a runtime that exits during boot counts
+ *     against the BEE (not the wake command), the next wake sits on the B5
+ *     backoff table, and at the budget `spawn_failed` is set and wakes stop —
+ *     an explicit `revive` resets the budget and retries regardless
  *  7. delivery loop: push undelivered mailbox messages into live runtimes
  *  8. I1 telemetry: record undelivered-past-deadline messages as structured
  *     violations (spec 04 behavior 5 — the 99.99% counter)
@@ -266,11 +270,23 @@ export class DaemonCore {
       return;
     }
     if (target === "stopped") {
+      const failuresBefore = rt.state === "booting" ? (this.store.getBee(obs.beeId)?.spawnFailures ?? 0) : null;
       this.store.updateRuntimeState(obs.beeId, obs.generation, "stopped", {
         exitCause: obs.exitCause ?? "crashed",
       });
       this.log(`obs.exited bee=${obs.beeId} gen=${obs.generation} cause=${obs.exitCause}`);
-      // A dead runtime with pending mail must be revived — no user intervention (I1).
+      if (failuresBefore != null) {
+        // The store counts a boot exit iff the process died on its own
+        // (crashed/clean) — one budget per bee across wake-driven revives.
+        const failures = this.store.getBee(obs.beeId)?.spawnFailures ?? 0;
+        if (failures > failuresBefore) {
+          const flagged = this.store.activeFlags(obs.beeId).some((f) => f.flag === "spawn_failed");
+          this.log(`spawn.failure bee=${obs.beeId} gen=${obs.generation} failures=${failures} flagged=${flagged}`);
+        }
+      }
+      // A dead runtime with pending mail must be revived — no user intervention
+      // (I1) — on the boot-failure backoff table, and never while spawn_failed
+      // is set (visibly blocked; the operator's revive is the way back).
       this.ensureWake(obs.beeId);
     } else if (obs.kind === "booted") {
       this.store.updateRuntimeState(obs.beeId, obs.generation, "running", {
@@ -285,23 +301,23 @@ export class DaemonCore {
     }
   }
 
-  /** Enqueue a send_wake iff the bee has undelivered mail and no live runtime and no pending wake. */
+  /**
+   * Enqueue a send_wake iff the bee has undelivered mail, no live runtime and
+   * no pending wake. The store owns the rule (send() shares it): a wake is
+   * deferred on the B5 backoff table after boot failures and suppressed while
+   * `spawn_failed` is set. Returns true iff a NEW wake was enqueued now.
+   */
   private ensureWake(beeId: string): boolean {
-    if (this.store.undeliveredMessages(beeId).length === 0) return false;
-    const rt = this.store.currentRuntime(beeId);
-    if (rt && LIVE.includes(rt.state)) return false;
-    const gen = rt?.generation ?? 0;
-    const pending = this.store
-      .listCommands({ beeId })
-      .some(
-        (c) =>
-          c.verb === "send_wake" &&
-          (c.status === "queued" || c.status === "running") &&
-          c.targetGeneration === gen,
-      );
-    if (pending) return false;
-    this.store.enqueueCommand("send_wake", beeId);
-    this.log(`wake.enqueued bee=${beeId} gen=${gen}`);
+    const { command, outcome } = this.store.enqueueWake(beeId);
+    if (outcome === "suppressed") {
+      this.log(`wake.suppressed bee=${beeId} flag=spawn_failed`);
+      return false;
+    }
+    if (outcome !== "enqueued" || !command) return false;
+    this.log(
+      `wake.enqueued bee=${beeId} gen=${command.targetGeneration ?? 0}` +
+        (command.nextAttemptAt > command.enqueuedAt ? ` notBefore=${command.nextAttemptAt}` : ""),
+    );
     return true;
   }
 
@@ -501,6 +517,14 @@ export class DaemonCore {
       case "spawn":
       case "revive":
       case "send_wake": {
+        if (cmd.verb === "revive") {
+          // Operator action (explicit verb): a fresh spawn-failure budget and
+          // the spawn_failed flag cleared — the attempt below runs regardless
+          // of the flag. spawn_failed clears otherwise only on contrary
+          // evidence (a successful boot), never on the mere act of starting.
+          const { applied } = this.store.resetSpawnFailures(cmd.beeId, `operator revive (command ${cmd.id})`);
+          if (applied) this.log(`spawn.budget_reset bee=${cmd.beeId} by=revive cmd=${cmd.id}`);
+        }
         const rt = this.store.currentRuntime(cmd.beeId);
         if (rt && LIVE.includes(rt.state)) {
           if (this.driver.hasProcess(cmd.beeId, rt.generation)) {
@@ -515,7 +539,6 @@ export class DaemonCore {
           }
           this.driver.start(cmd.beeId, rt.generation);
           this.recordProcAtSpawn(cmd.beeId, rt.generation);
-          this.store.clearFlag(cmd.beeId, "spawn_failed", "runtime started");
           this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} start gen=${rt.generation}`);
           return true;
         }
@@ -527,7 +550,6 @@ export class DaemonCore {
         const next = this.store.reviveBee(cmd.beeId);
         this.driver.start(cmd.beeId, next.generation);
         this.recordProcAtSpawn(cmd.beeId, next.generation);
-        this.store.clearFlag(cmd.beeId, "spawn_failed", "runtime started");
         this.log(`cmd.${cmd.verb} id=${cmd.id} bee=${cmd.beeId} revive gen=${next.generation}`);
         return true;
       }

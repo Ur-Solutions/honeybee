@@ -218,13 +218,23 @@ export class HsrDriver implements RuntimeDriver {
     if (spec.adapter.readyAtSpawn) {
       // claude stream-json emits nothing until the first stdin message; treat
       // spawn as ready (stdin buffers safely) instead of deadlocking on init.
+      // The driver-side accept point opens now; the synthetic `booted`
+      // OBSERVATION waits for the OS to confirm the process exists (`spawn`
+      // event, milliseconds later). A spawn that fails outright (missing
+      // cwd/binary, EACCES) emits `error` and never `spawn`, so the store sees
+      // exited(crashed) while still booting — a boot failure that counts
+      // against the bee's spawn-failure budget, not a phantom
+      // running → crashed generation that revives forever.
       proc.phase = "idle";
-      this.events.push({
-        beeId,
-        generation,
-        kind: "booted",
-        pid: proc.pid,
-        pidStartedAt: proc.pidStartedAt,
+      child.on("spawn", () => {
+        if (proc.exited) return;
+        this.events.push({
+          beeId,
+          generation,
+          kind: "booted",
+          pid: proc.pid,
+          pidStartedAt: proc.pidStartedAt,
+        });
       });
     }
   }

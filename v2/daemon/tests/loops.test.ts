@@ -284,3 +284,151 @@ test("unit.8: continuity (spec 07 §F) — a booted session id is recorded on th
     rig.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Spawn-failure budget (the WP7 importer hazard): a runtime that dies during
+// boot must revive on a bounded, backed-off schedule and end in spawn_failed —
+// never crash → wake → revive at tick speed forever.
+// ---------------------------------------------------------------------------
+
+/** Run steps until the wake backoff elapses each time; returns the op log slice. */
+function stepUntilQuiet(rig: Rig, maxSteps: number): void {
+  for (let i = 0; i < maxSteps; i++) {
+    rig.core.step();
+    const pending = rig.store.listCommands({ beeId: "bee-1", status: "queued" });
+    // Jump the clock to the next deferred wake (the real daemon just waits).
+    const next = pending.reduce((acc, c) => Math.max(acc, c.nextAttemptAt), 0);
+    if (next > rig.clock.now) rig.clock.now = next;
+  }
+}
+
+test("budget.5: immediate-exit runtime → bounded revives with backoff, spawn_failed at the budget, no further wakes", () => {
+  // maxAttempts 3 / backoffBaseMs 1 in the rig: failures 1,2 defer the next
+  // wake by 1 and 2 ms; failure 3 sets the flag.
+  const rig = makeRig({ i1DeadlineSteps: 200 });
+  try {
+    rig.driver.bootCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "stub", substrate: "hsr", cwd: "/nope" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    rig.store.send("bee-1", "hello?"); // pending mail is what makes revives happen
+    stepUntilQuiet(rig, 40);
+
+    const bee = rig.store.getBee("bee-1")!;
+    assert.equal(bee.spawnFailures, 3, "one budget across wake-driven revives");
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"]);
+    // Exactly the budget's worth of starts (spawn + 2 revives), not 40.
+    assert.equal(rig.driver.starts.length, 3, `starts: ${JSON.stringify(rig.driver.starts)}`);
+    assert.equal(rig.store.currentRuntime("bee-1")?.generation, 3);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "stopped");
+    // Wakes were deferred on the backoff table: each revive's wake had a
+    // nextAttemptAt strictly after its enqueue.
+    const wakes = rig.store.listCommands({ beeId: "bee-1" }).filter((c) => c.verb === "send_wake");
+    assert.equal(wakes.length, 2, "one wake per revive below the budget; none once flagged");
+    for (const w of wakes) assert.ok(w.nextAttemptAt > w.enqueuedAt, `wake ${w.id} was not deferred`);
+    assert.equal(rig.store.listCommands({ beeId: "bee-1", status: "queued" }).length, 0, "no wake pending");
+    assert.ok(rig.ops.some((o) => o.startsWith("wake.suppressed bee=bee-1")), "suppression is logged");
+    // Steady state: more steps + more mail change nothing but the mailbox.
+    const startsBefore = rig.driver.starts.length;
+    rig.store.send("bee-1", "anyone?");
+    rig.clock.now += 10_000;
+    for (let i = 0; i < 20; i++) rig.core.step();
+    assert.equal(rig.driver.starts.length, startsBefore, "no revive while spawn_failed is set");
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 2, "mail stays durable");
+    assert.equal(rig.store.view("bee-1").reachable, true);
+    assert.equal(rig.store.view("bee-1").blocked, true);
+    assert.equal(rig.violations.length, 0, "flagged = visibly blocked; the I1 clock is suspended");
+    // A fresh DaemonCore over the same store (daemon restart) sweeps no wake for it either.
+    const core2 = new DaemonCore({
+      store: rig.store,
+      driver: rig.driver,
+      policy: { bootHangTimeoutSteps: 50, turnHangTimeoutSteps: 50, commandsPerStep: 8 },
+      now: () => rig.clock.now,
+      log: (op) => rig.ops.push(op),
+    });
+    const report = core2.boot();
+    assert.equal(report.wakesEnqueued, 0, "boot sweep respects spawn_failed");
+    for (let i = 0; i < 5; i++) core2.step();
+    assert.equal(rig.driver.starts.length, startsBefore);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("budget.6: an explicit operator revive retries regardless of spawn_failed and clears it on success; the mail then flows", () => {
+  const rig = makeRig();
+  try {
+    rig.driver.bootCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "stub", substrate: "hsr", cwd: "/nope" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    const sent = rig.store.send("bee-1", "deliver me eventually");
+    stepUntilQuiet(rig, 30);
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"]);
+    const startsBefore = rig.driver.starts.length;
+
+    // Still broken: revive tries once more (fresh budget), fails, and the
+    // budget runs down again from zero — bounded, then flagged again.
+    rig.store.enqueueCommand("revive", "bee-1");
+    rig.core.step(); // executes revive: reset + start (crashes at boot)
+    assert.ok(rig.ops.some((o) => o.startsWith("spawn.budget_reset bee=bee-1 by=revive")));
+    assert.equal(rig.driver.starts.length, startsBefore + 1, "revive retried despite the flag");
+    stepUntilQuiet(rig, 30);
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((f) => f.flag), ["spawn_failed"], "flagged again after a fresh budget");
+    assert.equal(rig.driver.starts.length, startsBefore + 3, "fresh budget of maxAttempts (3) starts, no more");
+
+    // Fixed (cwd restored, binary present): revive boots, the flag clears on
+    // booted (contrary evidence), the counter resets, the mail is delivered.
+    rig.driver.bootCrash = false;
+    rig.store.enqueueCommand("revive", "bee-1");
+    for (let i = 0; i < 4; i++) rig.core.step();
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 0);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.deepEqual(rig.driver.deliveredIds, [sent.message.id]);
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 0);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("budget.7: a runtime that reached running/idle and then crashed is not a spawn failure — revive is immediate and uncounted", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig); // gen 1 idle
+    rig.driver.acceptDeliveries = false; // keep mail pending so the crash triggers a wake
+    rig.store.send("bee-1", "pending");
+    // Crash mid-life, three times over — more than the budget of 3.
+    for (let gen = 1; gen <= 3; gen++) {
+      const rt = rig.store.currentRuntime("bee-1")!;
+      assert.equal(rt.generation, gen);
+      rig.driver.procs.delete("bee-1");
+      rig.driver.events.push({ beeId: "bee-1", generation: gen, kind: "exited", exitCause: "crashed" });
+      rig.core.step(); // exit → stopped(crashed) → wake (immediate)
+      const wake = rig.store.listCommands({ beeId: "bee-1" }).filter((c) => c.verb === "send_wake").at(-1)!;
+      assert.equal(wake.nextAttemptAt, wake.enqueuedAt, "no backoff for a post-boot crash");
+      rig.core.step(); // wake → revive → booted + turn_ended
+      rig.core.step(); // drain → idle
+      assert.equal(rig.store.currentRuntime("bee-1")?.generation, gen + 1);
+      assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 0);
+    }
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    // Hang-policy stops of a booting runtime are not boot failures either.
+    rig.driver.autoBoot = false;
+    rig.driver.procs.delete("bee-1");
+    rig.driver.events.push({ beeId: "bee-1", generation: 4, kind: "exited", exitCause: "crashed" });
+    rig.core.step(); // → wake
+    rig.core.step(); // → revive gen 5, booting forever
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "booting");
+    rig.clock.now += 100; // past bootHangTimeoutSteps (50)
+    rig.core.step(); // hang policy enqueues stop
+    rig.core.step(); // stop executes → exited(stopped_by_system)
+    rig.core.step(); // drain (→ wake → gen 6 booting again; slow loop, bounded by the hang timeout)
+    const gen5 = rig.store.listRuntimes("bee-1").find((r) => r.generation === 5);
+    assert.equal(gen5?.state, "stopped");
+    assert.equal(gen5?.exitCause, "stopped_by_system");
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 0, "a boot hang stopped by policy is not a spawn failure");
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+  } finally {
+    rig.cleanup();
+  }
+});

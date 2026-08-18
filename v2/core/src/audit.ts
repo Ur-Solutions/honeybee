@@ -61,6 +61,10 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         mustBee(p.beeId as string).providerSessionId = p.providerSessionId as string;
         break;
       }
+      case "bee.spawn_failures": {
+        mustBee(p.beeId as string).spawnFailures = p.spawnFailures as number;
+        break;
+      }
       case "bee.deleted": {
         const beeId = p.beeId as string;
         bees.delete(beeId);
@@ -171,6 +175,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
       case "mail.deliver_noop":
       case "command.complete_noop":
       case "command.dedup":
+      case "wake.suppressed":
       case "boot.reconciled":
         break;
       default:

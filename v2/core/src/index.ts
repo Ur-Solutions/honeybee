@@ -10,6 +10,7 @@ export {
   type CoreStoreOptions,
   type CreateBeeInput,
   type SendResult,
+  type WakeResult,
   type DeleteResult,
   type ReconcileResult,
   type LivePid,

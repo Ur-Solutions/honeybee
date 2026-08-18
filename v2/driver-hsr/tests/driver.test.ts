@@ -390,11 +390,14 @@ test("readyAtSpawn: silent-until-input runtime (claude stream-json) is deliverab
   });
   try {
     driver.start("ras-1", 1);
-    const first = driver.observe();
-    assert.ok(first.some((e) => e.kind === "booted"), "synthetic booted at spawn");
     const out = driver.deliver("ras-1", 1, 1, "hello");
     assert.equal(out.accepted, true, `deliver at spawn: ${out.reason ?? "accepted"}`);
-    const seen: string[] = [];
+    // The synthetic booted observation arrives as soon as the OS confirms the
+    // spawn (the `spawn` event, milliseconds) — never gated on the runtime's
+    // first output line.
+    const first = await drainUntil(driver, (e) => ofKind(e, "booted").length > 0, 2000);
+    assert.equal(ofKind(first, "exited").length, 0, "no exit before the synthetic booted");
+    const seen: string[] = first.map((e) => e.kind);
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline && !seen.includes("turn_ended")) {
       seen.push(...driver.observe().map((e) => e.kind));
@@ -404,6 +407,50 @@ test("readyAtSpawn: silent-until-input runtime (claude stream-json) is deliverab
     assert.ok(seen.includes("turn_ended"), "turn_ended from the late stream");
   } finally {
     driver.stop("ras-1", 1, "stopped_by_system");
+  }
+});
+
+test("readyAtSpawn: a spawn that fails outright (missing cwd / binary) is exited(crashed) with NO synthetic booted", async (t) => {
+  // The spawn-loop hazard: before, the synthetic booted was pushed
+  // synchronously, so a claude bee with a missing cwd looked like
+  // booted → running → crashed every generation and never counted as a boot
+  // failure. The `spawn` event gate makes the failure honest: the store stays
+  // in booting, the exit counts against the bee's spawn-failure budget.
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-ras-fail-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const missingCwd = new HsrDriver({
+    sessionLogDir: join(dir, "logs-cwd"),
+    resolve: () => ({
+      adapter: claudeAdapter,
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 5000)"],
+      cwd: join(dir, "no-such-cwd"),
+    }),
+  });
+  try {
+    missingCwd.start("ras-cwd", 1);
+    const events = await drainUntil(missingCwd, (e) => ofKind(e, "exited").length > 0, 2000);
+    assert.equal(ofKind(events, "booted").length, 0, "no synthetic booted for a failed spawn");
+    assert.equal(ofKind(events, "exited")[0]!.exitCause, "crashed");
+    assert.equal(missingCwd.hasProcess("ras-cwd", 1), false);
+  } finally {
+    missingCwd.disposeAll();
+  }
+  const missingBinary = new HsrDriver({
+    sessionLogDir: join(dir, "logs-bin"),
+    resolve: () => ({
+      adapter: claudeAdapter,
+      command: join(dir, "no-such-claude"),
+      args: [],
+    }),
+  });
+  try {
+    missingBinary.start("ras-bin", 1);
+    const events = await drainUntil(missingBinary, (e) => ofKind(e, "exited").length > 0, 2000);
+    assert.equal(ofKind(events, "booted").length, 0, "no synthetic booted for a missing binary");
+    assert.equal(ofKind(events, "exited")[0]!.exitCause, "crashed");
+  } finally {
+    missingBinary.disposeAll();
   }
 });
 
