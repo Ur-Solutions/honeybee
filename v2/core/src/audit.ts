@@ -149,7 +149,9 @@ export function replayAudit(rows: AuditRow[]): StateDump {
       case "runtime.created":
       case "runtime.updated": {
         const rt = p.runtime as RuntimeRow;
-        runtimes.set(rtKey(rt.beeId, rt.generation), { ...rt });
+        // v9 back-compat: pre-boot_evidence audit rows replay as the migrated
+        // store reads them — the column default, NULL.
+        runtimes.set(rtKey(rt.beeId, rt.generation), { ...rt, bootEvidence: rt.bootEvidence ?? null });
         break;
       }
       case "flag.set": {

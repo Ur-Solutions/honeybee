@@ -52,8 +52,19 @@
  *        stays for compat but is documentation-only; urgency is the semantics
  *        (eligibility, never FIFO reordering). Additive; migration =
  *        ALTER TABLE ADD COLUMN ×1.
+ *   v9 — synthetic-boot budget (the 2026-08-18 soak finding): adds
+ *        `runtimes.boot_evidence` ('synthetic'|'real', NULL while booting) —
+ *        HOW the runtime left `booting`. A readyAtSpawn harness (claude
+ *        stream-json) gets a driver-minted synthetic `booted` at spawn; that
+ *        must not reset the bee's spawn-failure budget, and a crashed/clean
+ *        exit from a synthetic-running generation counts against the budget
+ *        exactly like an exit during `booting`. Only REAL evidence (a signal
+ *        the adapter parsed from actual process output) marks 'real' and
+ *        resets the budget. Additive; migration = ALTER TABLE ADD COLUMN ×1;
+ *        existing live rows migrate as NULL, which counts as real for exit
+ *        accounting (never punish a pre-migration runtime).
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -120,6 +131,13 @@ CREATE TABLE IF NOT EXISTS runtimes (
   exit_cause     TEXT CHECK (exit_cause IN ('clean','crashed','stopped_by_user','stopped_by_system','machine_restart')),
   pid            INTEGER,
   pid_started_at INTEGER,
+  -- v9: how this runtime left booting (NULL = it has not). 'synthetic' =
+  -- only a driver-minted observation (readyAtSpawn spawn-event booted) —
+  -- provisional: the process has proven nothing; its crashed/clean exit
+  -- counts against the bee's spawn-failure budget like a booting exit.
+  -- 'real' = the adapter parsed actual process output — the contrary
+  -- evidence that resets the budget and clears spawn_failed.
+  boot_evidence  TEXT CHECK (boot_evidence IN ('synthetic','real')),
   started_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   PRIMARY KEY (bee_id, generation),
@@ -353,6 +371,14 @@ export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: s
  */
 export const MAILBOX_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["urgency", "urgency TEXT NOT NULL DEFAULT 'next' CHECK (urgency IN ('now','next','idle'))"],
+];
+
+/**
+ * Additive columns on `runtimes` since v8 — same add-iff-missing discipline.
+ * v9: boot_evidence.
+ */
+export const RUNTIMES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
+  ["boot_evidence", "boot_evidence TEXT CHECK (boot_evidence IN ('synthetic','real'))"],
 ];
 
 export const IDEMPOTENCY_INDEX_SQL = `

@@ -454,6 +454,72 @@ test("readyAtSpawn: a spawn that fails outright (missing cwd / binary) is exited
   }
 });
 
+test("readyAtSpawn v9: the spawn booted is SYNTHETIC; zero-output instant death emits no real evidence (the 2026-08-18 soak loop)", async (t) => {
+  // A harness that spawns fine, writes NOTHING, and dies ~50ms later. The
+  // driver must report: booted{synthetic} (the OS spawn event) then
+  // exited(crashed) — and never a real (adapter-parsed) observation the
+  // daemon could mistake for boot evidence.
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-synth-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({
+      adapter: { ...stubAdapter, readyAtSpawn: true },
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => process.exit(9), 50)"],
+      cwd: dir,
+    }),
+  });
+  try {
+    driver.start("synth-1", 1);
+    const events = await drainUntil(driver, (e) => ofKind(e, "exited").length > 0, 3000);
+    const booted = ofKind(events, "booted");
+    assert.equal(booted.length, 1, "exactly the synthetic booted");
+    assert.equal(booted[0]!.synthetic, true, "the spawn-event booted must be marked synthetic");
+    assert.equal(ofKind(events, "exited")[0]!.exitCause, "crashed");
+    assert.equal(
+      events.filter((e) => e.kind !== "exited" && e.synthetic !== true).length,
+      0,
+      "no real evidence from a process that never spoke",
+    );
+  } finally {
+    driver.disposeAll();
+  }
+});
+
+test("readyAtSpawn v9: the first parsed output pushes a REAL booted (boot evidence); the deliver-opened turn_started is synthetic", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-synth-ev-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({
+      adapter: { ...stubAdapter, readyAtSpawn: true },
+      command: process.execPath,
+      args: [AGENT_PATH],
+      cwd: dir,
+      env: { ...process.env, STUB_TURN_MS: "5", STUB_SESSION_ID: "sess-ev" },
+    }),
+  });
+  try {
+    driver.start("synth-2", 1);
+    // The stub emits its ready line spontaneously: synthetic booted first
+    // (spawn event), then the REAL booted minted from the first parsed line.
+    const events = await drainUntil(driver, (e) => ofKind(e, "booted").length >= 2, 3000);
+    const booted = ofKind(events, "booted");
+    assert.equal(booted[0]!.synthetic, true, "spawn-event booted is synthetic");
+    assert.notEqual(booted[1]!.synthetic, true, "first parsed output mints the real booted");
+    assert.ok(booted[1]!.pid != null && booted[1]!.pid > 0, "the real booted carries process identity");
+    // Delivery into the idle accept point opens the turn driver-side —
+    // synthetic; the stub's turn_ended is parsed output — real.
+    assert.equal(driver.deliver("synth-2", 1, 7, "hi").accepted, true);
+    const turn = await drainUntil(driver, (e) => ofKind(e, "turn_ended").length > 0, 3000);
+    assert.equal(ofKind(turn, "turn_started")[0]!.synthetic, true, "deliver-opened turn_started is synthetic");
+    assert.notEqual(ofKind(turn, "turn_ended")[0]!.synthetic, true, "parsed turn_ended is real");
+  } finally {
+    driver.disposeAll();
+  }
+});
+
 test("late init must not close an in-flight turn (cell smoke 2026-08-17 phantom turn_ended)", async (t) => {
   // Real claude: init arrives ~100ms AFTER the first message, then the model
   // works for a while, then `result`. Before the fix the adapter's

@@ -274,6 +274,23 @@ export class DaemonCore {
       );
       return;
     }
+    // v9 synthetic-boot budget: a non-synthetic booted/turn observation was
+    // parsed by the adapter from REAL process output — the boot evidence that
+    // resets the bee's spawn-failure budget and clears spawn_failed. Driver-
+    // minted observations (synthetic: the readyAtSpawn booted, the deliver-
+    // opened turn_started) prove nothing and never touch the budget.
+    if (obs.kind !== "exited" && obs.synthetic !== true && rt.bootEvidence !== "real") {
+      const { applied } = this.store.recordBootEvidence(obs.beeId, obs.generation);
+      if (applied) this.log(`spawn.evidence bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind}`);
+    }
+    if (obs.kind === "booted" && rt.state !== "booting") {
+      // booted only ever moves booting → running. A late/duplicate booted
+      // (readyAtSpawn harnesses emit their real init after the first message)
+      // is evidence — recorded above — never a state edge (an idle runtime
+      // must not phantom-start a turn from it).
+      this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=booted reason=already_${rt.state}`);
+      return;
+    }
     if (rt.state === target) {
       this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind} reason=already_${target}`);
       return;
@@ -285,7 +302,11 @@ export class DaemonCore {
       return;
     }
     if (target === "stopped") {
-      const failuresBefore = rt.state === "booting" ? (this.store.getBee(obs.beeId)?.spawnFailures ?? 0) : null;
+      // v9: a generation whose running state came only from a synthetic
+      // booted (bootEvidence 'synthetic') is still a boot failure when it
+      // dies on its own — same budget as an exit during `booting`.
+      const countable = rt.state === "booting" || rt.bootEvidence === "synthetic";
+      const failuresBefore = countable ? (this.store.getBee(obs.beeId)?.spawnFailures ?? 0) : null;
       this.store.updateRuntimeState(obs.beeId, obs.generation, "stopped", {
         exitCause: obs.exitCause ?? "crashed",
       });
@@ -308,8 +329,11 @@ export class DaemonCore {
       this.store.updateRuntimeState(obs.beeId, obs.generation, "running", {
         pid: obs.pid,
         pidStartedAt: obs.pidStartedAt,
+        // Provisional when driver-minted: the budget resets only on REAL
+        // evidence (recordBootEvidence above), never on the synthetic booted.
+        synthetic: obs.synthetic === true,
       });
-      this.log(`obs.booted bee=${obs.beeId} gen=${obs.generation} pid=${obs.pid}`);
+      this.log(`obs.booted bee=${obs.beeId} gen=${obs.generation} pid=${obs.pid}${obs.synthetic ? " synthetic" : ""}`);
     } else {
       this.store.updateRuntimeState(obs.beeId, obs.generation, target);
       if (obs.kind === "turn_ended") this.store.recordOutput(obs.beeId);

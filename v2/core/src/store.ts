@@ -59,7 +59,7 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
-import { BEES_ADDITIVE_COLUMNS, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_ADDITIVE_COLUMNS, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -422,6 +422,7 @@ function mapRuntime(r: Row): RuntimeRow {
     exitCause: (r.exit_cause as ExitCause | null) ?? null,
     pid: r.pid == null ? null : Number(r.pid),
     pidStartedAt: r.pid_started_at == null ? null : Number(r.pid_started_at),
+    bootEvidence: (r.boot_evidence as RuntimeRow["bootEvidence"]) ?? null,
     startedAt: Number(r.started_at),
     updatedAt: Number(r.updated_at),
   };
@@ -662,6 +663,15 @@ export class CoreStore {
       );
       for (const [name, ddl] of MAILBOX_ADDITIVE_COLUMNS) {
         if (!mailCols.has(name)) this.db.exec(`ALTER TABLE mailbox ADD COLUMN ${ddl}`);
+      }
+      // v8 → v9: additive boot_evidence column on runtimes (synthetic-boot
+      // budget). Existing rows migrate as NULL — never treated as synthetic,
+      // so a pre-migration live runtime is never punished retroactively.
+      const runtimeCols = new Set(
+        (this.db.prepare("SELECT name FROM pragma_table_info('runtimes')").all() as Row[]).map((c) => String(c.name)),
+      );
+      for (const [name, ddl] of RUNTIMES_ADDITIVE_COLUMNS) {
+        if (!runtimeCols.has(name)) this.db.exec(`ALTER TABLE runtimes ADD COLUMN ${ddl}`);
       }
     }
     // The partial UNIQUE index needs the column, so it is created here — after
@@ -931,12 +941,20 @@ export class CoreStore {
    * B2 — state update stamped with the generation it refers to. An update for a
    * non-current generation is a recorded no-op (audit row, no state change).
    * Illegal transitions for the CURRENT generation throw.
+   *
+   * v9 `opts.synthetic` (booting → running only): the transition was derived
+   * from a DRIVER-MINTED observation (the readyAtSpawn synthetic booted), not
+   * from real process output. The state still moves — delivery needs the
+   * runtime out of `booting` — but it is provisional: the spawn-failure
+   * budget is NOT reset, and a later crashed/clean exit of this generation
+   * counts against the budget exactly like an exit during `booting` (unless
+   * `recordBootEvidence` upgraded it to real first).
    */
   updateRuntimeState(
     beeId: string,
     generation: number,
     state: RuntimeState,
-    opts: { exitCause?: ExitCause; pid?: number; pidStartedAt?: number } = {},
+    opts: { exitCause?: ExitCause; pid?: number; pidStartedAt?: number; synthetic?: boolean } = {},
   ): { applied: boolean } {
     if (!RUNTIME_TRANSITIONS[state]) {
       throw new IllegalTransitionError(`unknown runtime state: ${state}`);
@@ -976,25 +994,63 @@ export class CoreStore {
       const at = this.now();
       const pid = opts.pid !== undefined ? opts.pid : current.pid;
       const pidStartedAt = opts.pidStartedAt !== undefined ? opts.pidStartedAt : current.pidStartedAt;
+      // v9 boot evidence: set on the booting → running edge, sticky afterwards
+      // ('real' is never downgraded — evidence, once seen, stays evidence).
+      let bootEvidence = current.bootEvidence;
+      if (current.state === "booting" && state === "running" && bootEvidence !== "real") {
+        bootEvidence = opts.synthetic === true ? "synthetic" : "real";
+      }
       this.db
         .prepare(
-          `UPDATE runtimes SET state = ?, exit_cause = ?, pid = ?, pid_started_at = ?, updated_at = ?
+          `UPDATE runtimes SET state = ?, exit_cause = ?, pid = ?, pid_started_at = ?, boot_evidence = ?, updated_at = ?
            WHERE bee_id = ? AND generation = ?`,
         )
-        .run(state, opts.exitCause ?? null, pid, pidStartedAt, at, beeId, generation);
+        .run(state, opts.exitCause ?? null, pid, pidStartedAt, bootEvidence, at, beeId, generation);
       const runtime = this.currentRuntime(beeId);
       this.audit("runtime.updated", beeId, { runtime });
       // Spawn-failure budget (contract §4.2 spawn_failed, B5 bounded): a
-      // runtime that dies on its own while still booting is a boot failure;
-      // reaching running is the contrary evidence that resets the budget.
-      if (current.state === "booting") {
-        if (state === "stopped" && (opts.exitCause === "crashed" || opts.exitCause === "clean")) {
+      // runtime that dies on its own having proven NOTHING — still booting,
+      // or running only on a synthetic booted (the 2026-08-18 soak loop) —
+      // is a boot failure; REAL evidence (adapter-parsed output) is the
+      // contrary evidence that resets the budget.
+      if (state === "stopped" && (opts.exitCause === "crashed" || opts.exitCause === "clean")) {
+        if (current.state === "booting" || current.bootEvidence === "synthetic") {
           this.applySpawnFailure(beeId, generation, opts.exitCause);
-        } else if (state === "running") {
-          this.applySpawnFailuresReset(beeId, `runtime booted (generation ${generation})`);
         }
+      } else if (current.state === "booting" && state === "running" && bootEvidence === "real") {
+        this.applySpawnFailuresReset(beeId, `runtime booted (generation ${generation})`);
       }
       return { applied: true };
+    });
+  }
+
+  /**
+   * v9 — real boot evidence for the CURRENT generation: the adapter parsed an
+   * actual line from the process (a real booted/init, a turn signal, flag
+   * evidence — any parsed output). Upgrades a provisional (synthetic) or
+   * still-booting runtime to `boot_evidence = 'real'`, resets the bee's
+   * spawn-failure budget and clears `spawn_failed` (spec 03 contrary
+   * evidence). Idempotent; a stale generation or an already-stopped runtime
+   * is a silent no-op — the exit accounting for it has already happened.
+   */
+  recordBootEvidence(beeId: string, generation: number, reason?: string): { applied: boolean } {
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const current = this.currentRuntime(beeId);
+      if (!current || current.generation !== generation || current.state === "stopped") {
+        return { applied: false };
+      }
+      if (current.bootEvidence !== "real") {
+        this.db
+          .prepare("UPDATE runtimes SET boot_evidence = 'real' WHERE bee_id = ? AND generation = ?")
+          .run(beeId, generation);
+        this.audit("runtime.updated", beeId, { runtime: this.currentRuntime(beeId) });
+      }
+      const { applied } = this.applySpawnFailuresReset(
+        beeId,
+        reason ?? `runtime produced real output (generation ${generation})`,
+      );
+      return { applied: applied || current.bootEvidence !== "real" };
     });
   }
 

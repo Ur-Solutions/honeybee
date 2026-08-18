@@ -64,6 +64,22 @@ export class FakeDriver implements RuntimeDriver {
    */
   bootCrash = false;
   /**
+   * v9 — the readyAtSpawn instant-death shape (the 2026-08-18 soak loop): a
+   * claude-like harness spawns fine (the driver mints a SYNTHETIC booted from
+   * the OS spawn event), produces ZERO output, and dies ~instantly. start
+   * queues booted{synthetic} + exited(crashed) and the process is gone. Wins
+   * over autoBoot; loses to bootCrash/startError.
+   */
+  synthBootCrash = false;
+  /**
+   * v9 — a readyAtSpawn harness that DOES produce real output before dying
+   * (claude emits its late init, then crashes): booted{synthetic}, then the
+   * real booted the HsrDriver pushes when the adapter parses the first line,
+   * then exited(crashed). Real evidence makes this a normal post-running
+   * crash — never a spawn failure. Loses to bootCrash/synthBootCrash.
+   */
+  synthBootEvidenceCrash = false;
+  /**
    * When set, start() THROWS this message before owning any process (a cell
    * whose provisioning failed, an unresolvable spawn spec). Wins over both.
    */
@@ -85,6 +101,17 @@ export class FakeDriver implements RuntimeDriver {
     const proc: FakeProc = { generation, pid, pidStartedAt: this.now(), degraded: false };
     this.procs.set(beeId, proc);
     if (this.bootCrash) {
+      this.procs.delete(beeId);
+      this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
+    if (this.synthBootCrash || this.synthBootEvidenceCrash) {
+      this.events.push({ beeId, generation, kind: "booted", pid, pidStartedAt: proc.pidStartedAt, synthetic: true });
+      if (this.synthBootEvidenceCrash) {
+        // The HsrDriver pushes a real booted the moment the adapter parses
+        // the first actual output line of a readyAtSpawn process.
+        this.events.push({ beeId, generation, kind: "booted", pid, pidStartedAt: proc.pidStartedAt });
+      }
       this.procs.delete(beeId);
       this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
       return;
