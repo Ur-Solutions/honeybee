@@ -20,6 +20,7 @@ import {
   type BuildArtifactContext,
   type RestartDaemonContext,
 } from "../deployRuntime.js";
+import { storeRoot } from "../fsx.js";
 import { actionLine, bold, dim, formatRelativeTime, isPretty, note, tildify, yellow } from "../format.js";
 import { flag, numberFlag, truthy, type Parsed } from "../parse.js";
 
@@ -78,7 +79,19 @@ export async function buildDeployArtifact(
   await runStep("npm", ["ci"], checkout, log);
   await runStep("npm", ["run", "check"], checkout, log);
   await runStep("npm", ["run", "build"], checkout, log);
-  await runStep("npm", ["test"], checkout, log);
+  if (existsSync(join(storeRoot(), "FROZEN"))) {
+    // Post-flip node (WP7): the old suite's CLI-shelling tests don't override
+    // the store root, so on a frozen machine they route into v2 and hang
+    // (2026-08-19: deploy gate deadlocked against its own flip). The v2
+    // battery is the gate for what actually ships; the old suite keeps
+    // running in repo CI until WP8 removes the old tree.
+    log("deploy: frozen node — gating on the v2 battery instead of the legacy suite");
+    for (const script of ["v2:test", "v2:daemon", "v2:driver", "v2:harness"]) {
+      await runStep("npm", ["run", script], checkout, log);
+    }
+  } else {
+    await runStep("npm", ["test"], checkout, log);
+  }
 
   // npm pack gives exactly the `files` set a real install would receive; the
   // lockfile rides along so the stage can `npm ci --omit=dev` production deps.
