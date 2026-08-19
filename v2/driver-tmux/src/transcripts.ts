@@ -269,6 +269,31 @@ export const codexTranscriptRenderer: TranscriptRenderer = {
   renderLine(line: string): TranscriptTurn[] {
     const row = jsonLine(line);
     if (!row) return [];
+    // hsr substrate: the session log records the codex APP-SERVER protocol
+    // (jsonrpc notifications), not the rollout file. `item/completed` carries
+    // the same turns under a different envelope; `turn/completed` re-lists
+    // them and is skipped to avoid duplicates (2026-08-19 soak finding —
+    // `last`/`transcript` were blind to hsr codex output).
+    if (typeof row.method === "string") {
+      if (row.method !== "item/completed") return [];
+      const item = (row.params as { item?: Record<string, unknown> } | undefined)?.item;
+      if (!item || typeof item.type !== "string") return [];
+      if (item.type === "agentMessage") {
+        return typeof item.text === "string" && item.text.trim().length > 0
+          ? [{ role: "assistant", text: item.text }]
+          : [];
+      }
+      if (item.type === "userMessage") return turnsFromBlocks("user", item.content);
+      if (item.type === "commandExecution") {
+        return [{ role: "tool", text: `[command: ${typeof item.command === "string" ? item.command : "?"}]` }];
+      }
+      if (item.type === "mcpToolCall") {
+        const inv = item.invocation as { tool?: unknown } | undefined;
+        return [{ role: "tool", text: `[tool_use: ${typeof inv?.tool === "string" ? inv.tool : "?"}]` }];
+      }
+      if (item.type === "fileChange") return [{ role: "tool", text: "[file_change]" }];
+      return []; // reasoning, webSearch previews etc: elided
+    }
     if (row.type !== "response_item") return [];
     const payload = row.payload as Record<string, unknown> | undefined;
     if (!payload) return [];
