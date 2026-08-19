@@ -830,7 +830,7 @@ export class HiveDaemon {
     // withIdempotency answers first.
     if (key != null) {
       const original = store.getCommandByIdempotencyKey(key);
-      if (original) return { beeId: original.beeId, commandId: original.id, status: original.status, deduped: true };
+      if (original) return { beeId: original.beeId, handle: this.mustStore().getBee(original.beeId)?.handle ?? null, commandId: original.id, status: original.status, deduped: true };
     }
     const name = this.param(params, "name");
     const agent = this.param(params, "agent");
@@ -857,7 +857,7 @@ export class HiveDaemon {
     // is the id/name gate) and before the spawn command is enqueued —
     // inside the idempotency transaction, so a failure here leaves no bee.
     const cell = substrate === "cell" ? this.planCell(id, name, this.cellParam(params)) : null;
-    store.createBee({
+    const { bee: created } = store.createBee({
       id,
       name,
       agent,
@@ -876,7 +876,7 @@ export class HiveDaemon {
     }
     const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
     if (account) this.log(`spawn.account bee=${id} account=${account.id}${accountReason ? ` reason=${JSON.stringify(accountReason)}` : ""}`);
-    return { beeId: id, commandId: cmd.id, account: account?.id ?? null, ...(accountReason && accountReason !== "explicit" ? { accountReason } : {}) };
+    return { beeId: id, handle: created.handle, commandId: cmd.id, account: account?.id ?? null, ...(accountReason && accountReason !== "explicit" ? { accountReason } : {}) };
   }
 
   private substrateParam(params: Record<string, unknown>): SpawnSubstrate {

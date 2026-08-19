@@ -134,6 +134,14 @@ export interface BeeRow {
    * derived home path.
    */
   account: string | null;
+  /**
+   * v10 — short human display id (`CL.a3f2`: harness prefix + hex), minted
+   * by the owning node at spawn and UNIQUE per node. The human tier of the
+   * resolution ladder (id → handle → name → unique prefix); the UUID `id`
+   * stays the only identifier machines pass around. Null only on rows from
+   * a pre-v10 store opened read-only (the migration backfills on open).
+   */
+  handle: string | null;
 }
 
 /**

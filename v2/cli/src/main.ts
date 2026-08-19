@@ -226,15 +226,42 @@ function makeContext(parsed: Parsed, io: CliIo): CliContext {
 }
 
 // ---------------------------------------------------------------------------
-// bee resolution (exact id, else unique name)
+// bee resolution ladder (v10): exact id → exact handle (case-insensitive) →
+// exact name → unique prefix of any of those. Ambiguity is a loud, listing
+// error — never a guess.
 // ---------------------------------------------------------------------------
 
-function resolveBeeIn(views: ViewResult[], needle: string): string {
+function beeLabel(b: { id: string; handle: string | null; name: string }): string {
+  return b.handle ? `${b.handle} (${b.name})` : `${b.id} (${b.name})`;
+}
+
+export function resolveBeeIn(views: ViewResult[], needle: string): string {
   const byId = views.find((v) => v.bee?.id === needle);
   if (byId?.bee) return byId.bee.id;
+  const lower = needle.toLowerCase();
+  const byHandle = views.find((v) => v.bee?.handle?.toLowerCase() === lower);
+  if (byHandle?.bee) return byHandle.bee.id;
   const byName = views.filter((v) => v.bee?.name === needle);
   if (byName.length === 1 && byName[0]?.bee) return byName[0].bee.id;
-  if (byName.length > 1) throw new Error(`bee name '${needle}' is ambiguous (${byName.length} matches) — use the id`);
+  if (byName.length > 1) throw new Error(`bee name '${needle}' is ambiguous (${byName.length} matches) — use the handle or id`);
+  // Prefix tier: 3+ chars so a stray letter never resolves by accident.
+  if (needle.length >= 3) {
+    const prefixed = views.filter((v) => {
+      const b = v.bee;
+      if (!b) return false;
+      return b.id.startsWith(needle) || (b.handle != null && b.handle.toLowerCase().startsWith(lower)) || b.name.startsWith(needle);
+    });
+    if (prefixed.length === 1 && prefixed[0]?.bee) return prefixed[0].bee.id;
+    if (prefixed.length > 1) {
+      const listed = prefixed
+        .slice(0, 6)
+        .map((v) => (v.bee ? beeLabel(v.bee) : "?"))
+        .join(", ");
+      throw new Error(
+        `'${needle}' is ambiguous (${prefixed.length} matches: ${listed}${prefixed.length > 6 ? ", …" : ""}) — add characters or use the handle/id`,
+      );
+    }
+  }
   throw new RpcError("bee_not_found", `bee not found: ${needle}`);
 }
 
@@ -257,7 +284,11 @@ function viewLine(v: ViewResult, stale: boolean): string {
   const args = bee?.args && bee.args.length > 0 ? `  args=${JSON.stringify(bee.args)}` : "";
   const parent = bee?.parentId ? `  parent=${bee.parentId}` : "";
   const tags = bee?.tags && bee.tags.length > 0 ? `  tags=${bee.tags.join(",")}` : "";
-  return `${prefix}${bee?.id ?? v.view.beeId}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}${args}${parent}${tags}`;
+  // Handle leads (the human tier); the canonical UUID rides at the end for
+  // copy/paste and for scripts that grep by id.
+  const lead = bee?.handle ?? bee?.id ?? v.view.beeId;
+  const idTail = bee?.handle ? `  id=${bee.id}` : "";
+  return `${prefix}${lead}  ${bee?.name ?? "?"}  agent=${bee?.agent ?? "?"}  gen=${v.view.generation ?? 0}  ${status}  ${derived}  ${v.view.lifecycle ?? "deleted"}${flags}${failures}${args}${parent}${tags}${idTail}`;
 }
 
 function emit(ctx: CliContext, human: string[], jsonValue: unknown, stale: boolean): void {
@@ -401,7 +432,7 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
   const accountNote = result.account ? `; account ${result.account}${result.accountReason ? ` — ${result.accountReason}` : ""}` : "";
   emit(
     ctx,
-    [`${result.deduped ? "deduped: already " : ""}spawned ${result.beeId} (command ${result.commandId}${result.status ? ` ${result.status}` : ""}${accountNote})`],
+    [`${result.deduped ? "deduped: already " : ""}spawned ${result.handle ?? result.beeId} (${result.handle ? `${result.beeId}; ` : ""}command ${result.commandId}${result.status ? ` ${result.status}` : ""}${accountNote})`],
     result,
     false,
   );
@@ -1432,7 +1463,7 @@ async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
   );
   emit(
     ctx,
-    [`spawned ${spawned.beeId} (command ${spawned.commandId}); sent message ${sent.messageId} (${prompt.length} chars) — inspect with: hive v2 tail ${name} | wait ${name}`],
+    [`spawned ${spawned.handle ?? spawned.beeId} (${spawned.handle ? `${spawned.beeId}; ` : ""}command ${spawned.commandId}); sent message ${sent.messageId} (${prompt.length} chars) — inspect with: hive v2 tail ${name} | wait ${name}`],
     { ...spawned, messageId: sent.messageId },
     false,
   );
@@ -2151,7 +2182,12 @@ export function serviceEnv(
 
 export function serviceExecArgs(dataDir: string, env: Record<string, string | undefined> = process.env): string[] {
   if (env.HIVE_V2_SERVICE_ARGS) return JSON.parse(env.HIVE_V2_SERVICE_ARGS) as string[];
-  const entry = resolve(process.argv[1] ?? "");
+  // Prefer the versioned-runtime entry over argv[1]: the PATH `hive` shim can
+  // drift (2026-08-19: it pointed at a working checkout), and the `current`
+  // symlink is the deploy contract — a service pinned to it follows every
+  // deploy across restarts.
+  const runtimeEntry = join(homedir(), ".hive", "runtime", "current", "dist", "cli.js");
+  const entry = existsSync(runtimeEntry) ? runtimeEntry : resolve(process.argv[1] ?? "");
   // Invoked through the old hive binary → the daemon runs as `hive v2 daemon
   // run`; invoked through the standalone v2 bin → no `v2` prefix.
   const viaHive = !/[/\\]v2[/\\]/.test(entry);

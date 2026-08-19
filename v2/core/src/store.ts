@@ -59,7 +59,7 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "./types.ts";
-import { BEES_ADDITIVE_COLUMNS, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -73,6 +73,8 @@ import {
 export interface CoreStoreOptions {
   /** Injectable clock (epoch ms) for deterministic tests. */
   now?: () => number;
+  /** Injectable randomness (0..1) for deterministic handle minting in tests. */
+  random?: () => number;
   /**
    * B5 bounded retries: attempts allowed before a command settles `failed`.
    * Also the spawn-failure budget: consecutive boot failures per bee before
@@ -119,6 +121,12 @@ export interface CreateBeeInput {
   forkSeed?: string | null;
   /** v7 — the account this bee runs on (must exist; the daemon resolves `auto` before this). */
   account?: string | null;
+  /**
+   * v10 — explicit display handle (importers preserving an old pretty id).
+   * Absent = the store mints one (`CL.a3f2`: harness prefix + hex, unique
+   * per node). Must be unique; a taken handle is a loud CoreError.
+   */
+  handle?: string;
   /**
    * Creation timestamp override (epoch ms) — importers preserve the original
    * record's creation time. Defaults to the store clock.
@@ -275,6 +283,19 @@ const LIVE_STATES: readonly RuntimeState[] = ["booting", "running", "idle"];
 
 type Row = Record<string, unknown>;
 
+/**
+ * v10 — pretty handle shape: harness prefix + '.' + lowercase hex
+ * (`CL.a3f2`). The regex is what the migration backfill uses to let an
+ * imported bee whose OLD id already looks like a handle keep it.
+ */
+export const HANDLE_RE = /^[A-Z]{2}\.[0-9a-f]{3,8}$/;
+
+/** Harness → handle prefix: first two letters, uppercased (claude→CL, codex→CO, grok→GR). */
+export function handlePrefix(agent: string): string {
+  const letters = agent.replace(/[^a-zA-Z]/g, "").slice(0, 2).toUpperCase();
+  return letters.length === 2 ? letters : (letters + "XX").slice(0, 2);
+}
+
 function mapBee(r: Row): BeeRow {
   return {
     id: r.id as string,
@@ -298,6 +319,7 @@ function mapBee(r: Row): BeeRow {
     forkedFrom: (r.forked_from as string | null) ?? null,
     forkSeed: (r.fork_seed as string | null) ?? null,
     account: (r.account as string | null) ?? null,
+    handle: (r.handle as string | null) ?? null,
   };
 }
 
@@ -535,6 +557,7 @@ export class CoreStore {
   readonly path: string;
   private readonly db: DatabaseSync;
   private readonly now: () => number;
+  private readonly random: () => number;
   private readonly maxAttempts: number;
   private readonly backoffBaseMs: number;
   private readonly maxRpcIdempotencyRows: number;
@@ -546,6 +569,7 @@ export class CoreStore {
   constructor(path: string, opts: CoreStoreOptions = {}) {
     this.path = path;
     this.now = opts.now ?? Date.now;
+    this.random = opts.random ?? Math.random;
     this.maxAttempts = opts.maxAttempts ?? 5;
     this.backoffBaseMs = opts.backoffBaseMs ?? 30_000;
     this.maxRpcIdempotencyRows = opts.maxRpcIdempotencyRows ?? 10_000;
@@ -673,10 +697,23 @@ export class CoreStore {
       for (const [name, ddl] of RUNTIMES_ADDITIVE_COLUMNS) {
         if (!runtimeCols.has(name)) this.db.exec(`ALTER TABLE runtimes ADD COLUMN ${ddl}`);
       }
+      // v9 → v10: mint display handles for existing bees. An imported bee
+      // whose old id already IS a pretty handle (CL.7920-style) keeps it —
+      // the operator's known references survive the cutover.
+      const unhandled = this.db.prepare("SELECT id, agent FROM bees WHERE handle IS NULL").all() as Row[];
+      for (const b of unhandled) {
+        const id = String(b.id);
+        const keepOldId =
+          HANDLE_RE.test(id) &&
+          this.db.prepare("SELECT 1 FROM bees WHERE handle = ?").get(id) === undefined;
+        const handle = keepOldId ? id : this.mintHandle(String(b.agent));
+        this.db.prepare("UPDATE bees SET handle = ? WHERE id = ?").run(handle, id);
+      }
     }
-    // The partial UNIQUE index needs the column, so it is created here — after
-    // the migration — not in SCHEMA_SQL.
+    // The partial UNIQUE indexes need their columns, so they are created here
+    // — after the migration — not in SCHEMA_SQL.
     this.db.exec(IDEMPOTENCY_INDEX_SQL);
+    this.db.exec(HANDLE_INDEX_SQL);
     this.db
       .prepare(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -717,10 +754,40 @@ export class CoreStore {
   // B1 — bee lifecycle
   // -------------------------------------------------------------------------
 
+  /**
+   * v10 — mint a unique display handle for the agent: prefix + 4 hex chars,
+   * growing to 5 then 6 on sustained collision. Single writer per node, so
+   * a read-check + retry is race-free. ~65k values at 4 chars per node; the
+   * growth path means exhaustion degrades to longer handles, never failure
+   * (a hard bound guards a broken rng).
+   */
+  private mintHandle(agent: string): string {
+    const prefix = handlePrefix(agent);
+    const taken = this.db.prepare("SELECT 1 FROM bees WHERE handle = ?");
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const len = attempt < 16 ? 4 : attempt < 40 ? 5 : 6;
+      let suffix = "";
+      for (let i = 0; i < len; i++) suffix += Math.floor(this.random() * 16).toString(16);
+      const handle = `${prefix}.${suffix}`;
+      if (!taken.get(handle)) return handle;
+    }
+    throw new CoreError(`mintHandle: could not find a free handle for ${agent} after 64 attempts`);
+  }
+
   createBee(input: CreateBeeInput): { bee: BeeRow; runtime: RuntimeRow } {
     return this.tx(() => {
       const id = input.id ?? randomUUID();
       if (this.getBee(id)) throw new CoreError(`bee already exists: ${id}`);
+      let handle: string;
+      if (input.handle !== undefined) {
+        requireNonEmpty(input.handle, "createBee: handle");
+        if (this.db.prepare("SELECT 1 FROM bees WHERE handle = ?").get(input.handle)) {
+          throw new CoreError(`createBee: handle already taken: ${input.handle}`);
+        }
+        handle = input.handle;
+      } else {
+        handle = this.mintHandle(input.agent);
+      }
       const at = this.now();
       const createdAt = input.createdAt ?? at;
       if (!Number.isFinite(createdAt)) throw new CoreError("createBee: createdAt must be a finite epoch-ms number");
@@ -735,8 +802,8 @@ export class CoreStore {
       this.db
         .prepare(
           `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at,
-                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed, account)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed, account, handle)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -756,6 +823,7 @@ export class CoreStore {
           input.forkedFrom ?? null,
           input.forkSeed ?? null,
           account,
+          handle,
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });

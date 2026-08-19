@@ -198,8 +198,13 @@ export function runSim(
     wakesEnqueued: 0,
   };
 
+  // v10: handle minting draws randomness — it must be seeded or replay-from-
+  // seed diverges on bees' handles. A SEPARATE stream (not `prng`): store
+  // draws must never perturb the workload/fault sequence a seed pins down.
+  const storePrng = new Prng(seed ^ 0x9e3779b9);
   const storeOpts = {
     now: clock.now,
+    random: () => storePrng.next(),
     maxAttempts: config.policy.maxAttempts,
     backoffBaseMs: config.policy.backoffBaseSteps,
   };
