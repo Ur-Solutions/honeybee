@@ -82,6 +82,13 @@ export class FakeDriver implements RuntimeDriver {
    */
   synthBootEvidenceCrash = false;
   /**
+   * v9 — a healthy readyAtSpawn boot: booted{synthetic} and the process STAYS
+   * ALIVE producing nothing (claude waiting for its first stdin). The store
+   * shows running on synthetic evidence only — the shape the idle-urgency
+   * eligibility rule exists for. Loses to the crash modes above.
+   */
+  synthBootAlive = false;
+  /**
    * When set, start() THROWS this message before owning any process (a cell
    * whose provisioning failed, an unresolvable spawn spec). Wins over both.
    */
@@ -105,6 +112,10 @@ export class FakeDriver implements RuntimeDriver {
     if (this.bootCrash) {
       this.procs.delete(beeId);
       this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
+    if (this.synthBootAlive) {
+      this.events.push({ beeId, generation, kind: "booted", pid, pidStartedAt: proc.pidStartedAt, synthetic: true });
       return;
     }
     if (this.synthBootCrash || this.synthBootEvidenceCrash) {

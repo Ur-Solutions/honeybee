@@ -689,7 +689,9 @@ export class DaemonCore {
    *   now  — always eligible; mid-turn it additionally asks the driver to
    *          interrupt the current turn (once), then delivers at the
    *          resulting accept point;
-   *   idle — eligible only while the runtime is NOT `running` (a running turn
+   *   idle — eligible unless a REAL turn is running: `running` on synthetic
+   *          boot evidence alone is provisional (open accept point, nothing
+   *          to disturb) and does not gate idle mail (a running turn
    *          is never disturbed; revive-on-message for stopped bees is
    *          unchanged and urgency never affects wakes).
    * Among ELIGIBLE messages, enqueue order (per-bee FIFO, Q2) wins: an `idle`
@@ -702,7 +704,15 @@ export class DaemonCore {
       if (!rt || rt.state === "stopped" || rt.state === "booting") continue;
       const pending = this.store.undeliveredMessages(bee.id);
       if (pending.length === 0) continue;
-      const eligible = rt.state === "running" ? pending.filter((m) => m.urgency !== "idle") : pending;
+      // `running` on nothing but a SYNTHETIC boot is provisional (v9): the
+      // driver's accept point is open and no real turn exists to disturb, so
+      // `idle` mail is eligible. Without this, idle mail sent to a stopped
+      // readyAtSpawn bee revives a runtime it can then never deliver to —
+      // hang-stop → wake → revive, churning generations (found 2026-08-19 by
+      // budget.11's race; real claude would end mis-flagged spawn_failed).
+      // Any real parsed output upgrades bootEvidence and re-engages the gate.
+      const trulyMidTurn = rt.state === "running" && rt.bootEvidence === "real";
+      const eligible = trulyMidTurn ? pending.filter((m) => m.urgency !== "idle") : pending;
       if (eligible.length === 0) continue;
       if (rt.state === "running") {
         // Mid-turn `now`: interrupt first (the v6 verb), then deliver. One
@@ -766,7 +776,10 @@ export class DaemonCore {
         // once out of `running`, the base is that transition (rt.updatedAt).
         let base = m.enqueuedAt;
         if (m.urgency === "idle") {
-          if (rt?.state === "running") return;
+          // Mirrors the delivery rule: synthetic-boot `running` is provisional
+          // — idle mail is ELIGIBLE there, so its clock runs (else the churn
+          // this rule prevents would also be invisible to I1).
+          if (rt?.state === "running" && rt.bootEvidence === "real") return;
           base = Math.max(base, rt?.updatedAt ?? m.enqueuedAt);
         }
         const deadline = base + (pos + 1) * bound;

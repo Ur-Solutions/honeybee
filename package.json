@@ -40,7 +40,7 @@
     "v2:harness:long": "HARNESS_PROFILE=long node --test \"v2/harness/tests/*.test.ts\"",
     "v2:driver": "node --test \"v2/adapters/tests/*.test.ts\" \"v2/driver-hsr/tests/*.test.ts\"",
     "v2:driver2": "node --test \"v2/driver-cell/tests/*.test.ts\" \"v2/driver-tmux/tests/*.test.ts\"",
-    "v2:daemon": "node --test \"v2/daemon/tests/*.test.ts\" \"v2/cli/tests/*.test.ts\"",
+    "v2:daemon": "node --test --test-concurrency=1 \"v2/daemon/tests/*.test.ts\" \"v2/cli/tests/*.test.ts\"",
     "v2:harness:real": "node --test \"v2/driver-hsr/tests/harness/*.test.ts\" \"v2/driver-cell/tests/harness/*.test.ts\" \"v2/driver-tmux/tests/harness/*.test.ts\"",
     "deploy": "node scripts/deploy-settle.mjs",
     "pretest": "npm run build:test",
