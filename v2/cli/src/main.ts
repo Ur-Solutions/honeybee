@@ -2560,7 +2560,35 @@ Daemon:
   daemon run                                  run the daemon in the foreground
   daemon install|uninstall|start|stop|status`;
 
+/**
+ * The package version, resolved relative to this module: works from the
+ * dist bundle (runtime/<sha>/dist/v2/cli.js → ../../package.json) and from
+ * source (v2/cli/src/main.ts → repo root). "unknown" beats a crash — Apiary's
+ * launch-time Doctor gates every local run on `hive --version` succeeding
+ * (2026-08-19: the flip routed --version into v2, which refused it, and the
+ * capability gate silently disabled spawning; never again).
+ */
+export function hiveVersion(): string {
+  for (const rel of ["../../package.json", "../../../package.json", "../../../../package.json"]) {
+    try {
+      const pkg = JSON.parse(readFileSync(new URL(rel, import.meta.url), "utf8")) as {
+        name?: string;
+        version?: string;
+      };
+      if (pkg.name === "honeybee" && typeof pkg.version === "string") return pkg.version;
+    } catch {
+      // keep walking up
+    }
+  }
+  return "unknown";
+}
+
 export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<number> {
+  // Before flag parsing: --version must never be an "unknown flag" error.
+  if (argv[0] === "--version" || argv[0] === "-v" || argv[0] === "version") {
+    io.out(`honeybee ${hiveVersion()}`);
+    return 0;
+  }
   let parsed: Parsed;
   try {
     parsed = parseArgs(argv);
