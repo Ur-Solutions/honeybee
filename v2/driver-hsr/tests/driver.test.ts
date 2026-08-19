@@ -448,7 +448,16 @@ test("readyAtSpawn: a spawn that fails outright (missing cwd / binary) is exited
     missingBinary.start("ras-bin", 1);
     const events = await drainUntil(missingBinary, (e) => ofKind(e, "exited").length > 0, 2000);
     assert.equal(ofKind(events, "booted").length, 0, "no synthetic booted for a missing binary");
-    assert.equal(ofKind(events, "exited")[0]!.exitCause, "crashed");
+    const exited = ofKind(events, "exited")[0]!;
+    assert.equal(exited.exitCause, "crashed");
+    // The OS error is the only witness to WHY (no stderr from a process that
+    // never ran): it must ride the exit observation and the stderr sidecar.
+    assert.match(exited.detail ?? "", /ENOENT/, "exit observation carries the spawn error");
+    assert.match(
+      readFileSync(join(dir, "logs-bin", "ras-bin.stderr.log"), "utf8"),
+      /spawn error: .*ENOENT/,
+      "sidecar records the spawn error",
+    );
   } finally {
     missingBinary.disposeAll();
   }

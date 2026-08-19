@@ -309,8 +309,11 @@ export class DaemonCore {
       const failuresBefore = countable ? (this.store.getBee(obs.beeId)?.spawnFailures ?? 0) : null;
       this.store.updateRuntimeState(obs.beeId, obs.generation, "stopped", {
         exitCause: obs.exitCause ?? "crashed",
+        exitDetail: obs.detail,
       });
-      this.log(`obs.exited bee=${obs.beeId} gen=${obs.generation} cause=${obs.exitCause}`);
+      this.log(
+        `obs.exited bee=${obs.beeId} gen=${obs.generation} cause=${obs.exitCause}${obs.detail ? ` detail=${obs.detail}` : ""}`,
+      );
       if (failuresBefore != null) {
         // The store counts a boot exit iff the process died on its own
         // (crashed/clean) — one budget per bee across wake-driven revives.

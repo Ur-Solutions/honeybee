@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
-import { runV2Cli, serviceExecArgs, serviceLabel, type CliIo } from "../src/main.ts";
+import { runV2Cli, serviceEnv, serviceExecArgs, serviceLabel, type CliIo } from "../src/main.ts";
 import { claudeHsrRecord, makeFrozenFixture } from "../../core/tests/frozen-fixture.ts";
 import { commitInCell, g, makeOrigin } from "../../driver-cell/tests/helpers.ts";
 
@@ -552,6 +552,10 @@ test("cli.6: service glue — label never the live daemon's, exec args env overr
   const computed = serviceExecArgs("/data", {});
   assert.equal(computed[0], process.execPath);
   assert.deepEqual(computed.slice(-3), ["run", "--data-dir", "/data"]);
+  // Service env bakes the installing shell's PATH (launchd/systemd give the
+  // daemon a bare PATH that cannot resolve claude/codex — 2026-08-19 soak).
+  assert.deepEqual(serviceEnv("/data", { PATH: "/a:/b" }), { HIVE_V2_DATA_DIR: "/data", PATH: "/a:/b" });
+  assert.deepEqual(serviceEnv("/data", {}), { HIVE_V2_DATA_DIR: "/data" });
 });
 
 test("cli.7: cutover verbs — `freeze` writes/refuses locally; `import --from-frozen` reports (dry-run, marker refusal, real import, idempotent) over RPC", async () => {

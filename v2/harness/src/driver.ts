@@ -44,6 +44,12 @@ export interface DriverObservation {
   pidStartedAt?: number;
   exitCause?: ObservedExitCause;
   /**
+   * Diagnostic for `exited` — e.g. the OS spawn error (ENOENT on a missing
+   * binary) when the process never started. Flows into the spawn-failure
+   * audit row and the `spawn_failed` flag text so a crash is never mute.
+   */
+  detail?: string;
+  /**
    * True when the DRIVER minted this observation itself instead of deriving it
    * from the process's own output (the readyAtSpawn synthetic `booted`; the
    * `turn_started` the driver opens when it injects input into an idle
