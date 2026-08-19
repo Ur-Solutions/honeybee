@@ -159,6 +159,9 @@ const VALUE_FLAGS = new Set([
   "--kind",
   "--tail",
   "--idle-ms",
+  // buz compatibility (contract B4a)
+  "--tier",
+  "--sender-human",
   ...LIST_FLAGS,
 ]);
 
@@ -1192,6 +1195,93 @@ async function cmdMailbox(ctx: CliContext, parsed: Parsed): Promise<number> {
   );
   emit(ctx, lines.length > 0 ? lines : [`${prefix}mailbox empty`], result, stale);
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// buz compatibility (contract B4a: buz IS the mailbox)
+// ---------------------------------------------------------------------------
+
+/** v1 tier → v2 urgency (the Q2 amendment's mapping). */
+const TIER_TO_URGENCY: Record<string, string> = {
+  interrupt: "now",
+  "next-tool": "next",
+  queue: "idle",
+  passive: "idle",
+};
+
+/**
+ * `hive v2 buz <send|inbox|…>` — the v1 buz surface mapped onto the mailbox.
+ * Imported bees carry preambles and histories that speak
+ * `hive buz send <bee> --sender <me> -p "<body>"`; this keeps that muscle
+ * memory working. Tiers map onto urgency; everything lands in the ONE
+ * mailbox — there is no buz store. Sender defaults to the ambient
+ * HIVE_BEE_ID (a bee messaging a peer), exactly the old default.
+ */
+async function cmdBuz(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const sub = parsed.positional[1];
+  switch (sub) {
+    case "send": {
+      const target = parsed.positional[2];
+      const prompt =
+        (parsed.flags.get("--prompt") as string | undefined) ?? parsed.positional.slice(3).join(" ");
+      if (!target || prompt.length === 0) {
+        throw new Error(
+          "usage: hive v2 buz send <bee> -p <body> [--sender <bee>|--sender-human <name>] " +
+            "[--tier interrupt|next-tool|queue|passive | --urgency now|next|idle] [--wait]",
+        );
+      }
+      const tier = parsed.flags.get("--tier") as string | undefined;
+      if (tier !== undefined && TIER_TO_URGENCY[tier] === undefined) {
+        throw new Error(
+          `buz: unknown tier "${tier}" — tiers map onto urgency: interrupt→now, next-tool→next, queue/passive→idle`,
+        );
+      }
+      const senderHuman = parsed.flags.get("--sender-human") as string | undefined;
+      if (senderHuman !== undefined && parsed.flags.has("--sender")) {
+        throw new Error("buz: --sender and --sender-human are mutually exclusive");
+      }
+      const sender = senderHuman
+        ? `human:${senderHuman}`
+        : ((parsed.flags.get("--sender") as string | undefined) ?? process.env.HIVE_BEE_ID);
+      const fwd: Parsed = { ...parsed, positional: ["send", target, prompt], flags: new Map(parsed.flags) };
+      fwd.flags.delete("--prompt");
+      fwd.flags.delete("--tier");
+      fwd.flags.delete("--sender-human");
+      if (sender !== undefined) fwd.flags.set("--sender", sender);
+      if (tier !== undefined && !parsed.flags.has("--urgency")) {
+        fwd.flags.set("--urgency", TIER_TO_URGENCY[tier] as string);
+      }
+      return cmdSend(ctx, fwd);
+    }
+    case "inbox": {
+      const target = parsed.positional[2] ?? process.env.HIVE_BEE_ID;
+      if (!target) {
+        throw new Error("usage: hive v2 buz inbox [bee]   (defaults to HIVE_BEE_ID inside a bee)");
+      }
+      return cmdMailbox(ctx, { ...parsed, positional: ["mailbox", target] });
+    }
+    case "outbox":
+    case "queue":
+    case "quarantine":
+    case "requeue":
+    case "read":
+    case "cancel":
+    case "reconcile":
+    case "purge":
+    case "config": {
+      ctx.io.err(
+        `hive v2 buz ${sub}: retired — buz is the mailbox now (one store, no tier machinery).\n` +
+          "  queued/undelivered:  hive v2 mailbox <bee>\n" +
+          "  delivery history:    hive v2 events --bee <bee> --kind 'mail.*'\n" +
+          "  send with urgency:   hive v2 send <bee> <msg> --urgency now|next|idle",
+      );
+      return 1;
+    }
+    default:
+      throw new Error(
+        "usage: hive v2 buz <send|inbox> …   (buz is the mailbox: send maps to `send`, inbox to `mailbox`)",
+      );
+  }
 }
 
 async function cmdCommands(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -2415,6 +2505,9 @@ Message:
   question list [--bee b] [--open]
   seal <title> [--body t] [--ref r]... [--bee b]   record a seal (metadata; current generation)
   seal list [--bee b] · seal get <id>
+  buz send <bee> -p <body> [--sender b|--sender-human n] [--tier t]   v1 compat: a mailbox send
+                          (tiers map onto urgency: interrupt→now, next-tool→next, queue/passive→idle)
+  buz inbox [bee]                             v1 compat: the mailbox (defaults to self inside a bee)
 
 Observe:
   list [--all|--archived]                     all bees with state (aliases: ls, ps)
@@ -2483,6 +2576,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdSpawn(ctx, parsed);
       case "send":
         return await cmdSend(ctx, parsed);
+      case "buz":
+        return await cmdBuz(ctx, parsed);
       case "stop":
       case "revive":
       case "archive":

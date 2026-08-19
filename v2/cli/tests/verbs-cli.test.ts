@@ -600,3 +600,77 @@ test("handles.live: spawn returns the minted handle; ls leads with it and keeps 
     cleanup();
   }
 });
+
+test("verbs.buz: v1 compat — buz send maps tiers onto urgency + sender; buz inbox = mailbox; retired subs guide loudly", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  const savedBeeId = process.env.HIVE_BEE_ID;
+  try {
+    daemon = await startDaemon(dir);
+    const s = capture();
+    assert.equal(
+      await runV2Cli(["spawn", "peer", "--agent", "stub", "--cwd", "/tmp", "--data-dir", dir, "--json"], s.io),
+      0,
+    );
+    await idleBee(dir, "peer");
+
+    // The exact muscle-memory shape from old preambles:
+    //   hive buz send <bee> --sender <me> -p "<body>" --tier queue
+    const a = capture();
+    assert.equal(
+      await runV2Cli(
+        ["buz", "send", "peer", "--sender", "CL.7920", "-p", "status please", "--tier", "queue", "--data-dir", dir, "--json"],
+        a.io,
+      ),
+      0,
+    );
+    const m = capture();
+    await runV2Cli(["mailbox", "peer", "--data-dir", dir, "--json"], m.io);
+    const mail = JSON.parse(m.out[0] ?? "{}") as {
+      messages: Array<{ sender: string; body: string; urgency: string }>;
+    };
+    const row = mail.messages.find((x) => x.body === "status please");
+    assert.equal(row?.sender, "CL.7920");
+    assert.equal(row?.urgency, "idle", "tier queue maps to urgency idle");
+
+    // --sender-human → human:<name>; positional body works like plain send.
+    const b = capture();
+    assert.equal(
+      await runV2Cli(["buz", "send", "peer", "hello", "there", "--sender-human", "tormod", "--data-dir", dir, "--json"], b.io),
+      0,
+    );
+    const m2 = capture();
+    await runV2Cli(["mailbox", "peer", "--data-dir", dir, "--json"], m2.io);
+    const mail2 = JSON.parse(m2.out[0] ?? "{}") as { messages: Array<{ sender: string; body: string; urgency: string }> };
+    const row2 = mail2.messages.find((x) => x.body === "hello there");
+    assert.equal(row2?.sender, "human:tormod");
+    assert.equal(row2?.urgency, "next", "no tier → the v2 default");
+
+    // Ambient sender: HIVE_BEE_ID fills --sender, exactly the old default.
+    process.env.HIVE_BEE_ID = "CO.amb";
+    const c = capture();
+    assert.equal(await runV2Cli(["buz", "send", "peer", "-p", "ambient", "--data-dir", dir, "--json"], c.io), 0);
+    const m3 = capture();
+    await runV2Cli(["mailbox", "peer", "--data-dir", dir, "--json"], m3.io);
+    const mail3 = JSON.parse(m3.out[0] ?? "{}") as { messages: Array<{ sender: string; body: string }> };
+    assert.equal(mail3.messages.find((x) => x.body === "ambient")?.sender, "CO.amb");
+
+    // buz inbox <bee> renders the same mailbox.
+    const d = capture();
+    assert.equal(await runV2Cli(["buz", "inbox", "peer", "--data-dir", dir], d.io), 0);
+    assert.ok(d.out.some((l) => l.includes("status please")));
+
+    // Unknown tier is loud; retired subcommands guide to the v2 verbs.
+    const e = capture();
+    assert.equal(await runV2Cli(["buz", "send", "peer", "-p", "x", "--tier", "sometime", "--data-dir", dir], e.io), 1);
+    assert.match([...e.err, ...e.out].join("\n"), /unknown tier "sometime"/);
+    const f = capture();
+    assert.equal(await runV2Cli(["buz", "queue", "--data-dir", dir], f.io), 1);
+    assert.match([...f.err, ...f.out].join("\n"), /retired — buz is the mailbox now/);
+  } finally {
+    if (savedBeeId === undefined) delete process.env.HIVE_BEE_ID;
+    else process.env.HIVE_BEE_ID = savedBeeId;
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
