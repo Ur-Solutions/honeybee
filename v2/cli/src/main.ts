@@ -162,6 +162,72 @@ const VALUE_FLAGS = new Set([
   ...LIST_FLAGS,
 ]);
 
+/**
+ * Flags taking an OPTIONAL value: `--warm dirs` or bare `--warm` (the cell
+ * usage documents both). Bare form must not swallow the next token.
+ */
+const OPTIONAL_VALUE_FLAGS = new Set(["--warm"]);
+
+/**
+ * Every boolean flag the CLI understands. Kept explicit (with VALUE_FLAGS) so
+ * an unknown flag is a LOUD error instead of a silently-ignored no-op: the
+ * 2026-08-19 soak lost a spawn to `--substarte cell`, which parsed as an
+ * unknown boolean plus a stray positional and quietly spawned an hsr claude.
+ */
+const BOOL_FLAGS = new Set([
+  "--json",
+  "--all",
+  "--archived",
+  "--verbose",
+  "--dry-run",
+  "--force",
+  "--wait",
+  "--follow",
+  "--no-follow",
+  "--raw",
+  "--keep",
+  "--seal",
+  "--print",
+  "--open",
+  "--clear",
+  "--rebase",
+  "--from-frozen",
+  "--no-parent",
+  "--sandbox",
+  "--no-sandbox",
+]);
+
+const KNOWN_FLAGS = new Set([...VALUE_FLAGS, ...BOOL_FLAGS, ...OPTIONAL_VALUE_FLAGS]);
+
+/** Cheap edit distance, for "did you mean --substrate?" on a typo. */
+function editDistance(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  const cur = new Array<number>(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min((cur[j - 1] as number) + 1, (prev[j] as number) + 1, (prev[j - 1] as number) + cost);
+    }
+    for (let j = 0; j <= b.length; j++) prev[j] = cur[j] as number;
+  }
+  return prev[b.length] as number;
+}
+
+function unknownFlagError(flag: string): Error {
+  let best: string | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (const known of KNOWN_FLAGS) {
+    const d = editDistance(flag, known);
+    if (d < bestScore) {
+      bestScore = d;
+      best = known;
+    }
+  }
+  const hint = best && bestScore <= 3 ? ` — did you mean ${best}?` : "";
+  return new Error(`unknown flag: ${flag}${hint}`);
+}
+
 /** Short-flag aliases (v1 ergonomics), expanded before classification. */
 const SHORT_ALIASES: Record<string, string> = {
   "-p": "--prompt",
@@ -185,6 +251,14 @@ function parseArgs(argv: string[]): Parsed {
     const a = SHORT_ALIASES[raw] ?? raw;
     if (!a.startsWith("--")) {
       positional.push(a);
+      continue;
+    }
+    if (!KNOWN_FLAGS.has(a)) throw unknownFlagError(raw);
+    if (OPTIONAL_VALUE_FLAGS.has(a)) {
+      // Value only when the next token is not another flag.
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) flags.set(a, true);
+      else flags.set(a, argv[++i] as string);
       continue;
     }
     if (VALUE_FLAGS.has(a)) {
@@ -365,14 +439,29 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 // ---------------------------------------------------------------------------
 
 const SPAWN_USAGE =
-  "usage: hive v2 spawn <name> --agent <agent> [--account id|auto|none] [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
-  "       hive v2 spawn <name> --agent <agent> --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]";
+  "usage: hive v2 spawn <name> [agent] [--agent <agent>] [--account id|auto|none] [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
+  "       hive v2 spawn <name> [agent] --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]\n" +
+  "       (agent may be positional — v1 ergonomics — or --agent; default claude)";
 
 /** The spawn RPC path (name = positional[1]) — shared by spawn and the x/run sugar. */
-async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult> {
+async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & { agent: string; substrate: string }> {
   const name = parsed.positional[1];
   if (!name) throw new Error(SPAWN_USAGE);
-  const agent = (parsed.flags.get("--agent") as string | undefined) ?? "claude";
+  // Agent positionally (v1 took the harness as an argument: `hive spawn
+  // <harness>`) or via --agent. Silently defaulting a typed-but-dropped agent
+  // to claude is how the 2026-08-19 soak got a claude bee it asked to be
+  // codex, so a conflict between the two forms is an error, not a precedence
+  // puzzle.
+  const positionalAgent = parsed.positional[2];
+  const flagAgent = parsed.flags.get("--agent") as string | undefined;
+  if (positionalAgent && flagAgent && positionalAgent !== flagAgent) {
+    throw new Error(`${SPAWN_USAGE}\n(agent given twice and they disagree: '${positionalAgent}' vs --agent ${flagAgent})`);
+  }
+  const stray = parsed.positional[3];
+  if (stray !== undefined) {
+    throw new Error(`${SPAWN_USAGE}\n(unexpected argument '${stray}' — spawn takes <name> and an optional agent)`);
+  }
+  const agent = flagAgent ?? positionalAgent ?? "claude";
   const cwd = resolve((parsed.flags.get("--cwd") as string | undefined) ?? process.cwd());
   const substrate = (parsed.flags.get("--substrate") as string | undefined) ?? (parsed.flags.has("--origin") ? "cell" : "hsr");
   let cell: Record<string, unknown> | undefined;
@@ -424,7 +513,7 @@ async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult> {
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
   });
-  return result;
+  return { ...result, agent, substrate };
 }
 
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -432,7 +521,10 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
   const accountNote = result.account ? `; account ${result.account}${result.accountReason ? ` — ${result.accountReason}` : ""}` : "";
   emit(
     ctx,
-    [`${result.deduped ? "deduped: already " : ""}spawned ${result.handle ?? result.beeId} (${result.handle ? `${result.beeId}; ` : ""}command ${result.commandId}${result.status ? ` ${result.status}` : ""}${accountNote})`],
+    // The confirmation names the agent + substrate actually used: a dropped
+    // or defaulted agent must be visible at spawn time, not discovered in
+    // `ls` an hour later (2026-08-19 soak).
+    [`${result.deduped ? "deduped: already " : ""}spawned ${result.handle ?? result.beeId} (${result.handle ? `${result.beeId}; ` : ""}${result.agent}/${result.substrate}; command ${result.commandId}${result.status ? ` ${result.status}` : ""}${accountNote})`],
     result,
     false,
   );
