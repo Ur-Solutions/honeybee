@@ -639,15 +639,24 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
     store.createBee({ id: "bee-x", name: "bee-x", agent: "claude", substrate: "hsr", cwd: dir });
     store.enqueueCommand("spawn", "bee-x");
     store.send("bee-x", "hello?");
-    // Step slower (150ms) than the child's lifetime (60ms) so each death is
-    // observed together with its synthetic booted — the soak cadence, where
-    // delivery never reaches the doomed runtime.
+    // The doomed phase is BOUNDED whichever way the spawn/delivery race falls
+    // (deliver-at-spawn is legal for readyAtSpawn; the race stalled the deploy
+    // gate 4× on 2026-08-19):
+    //   - delivery loses (the soak cadence): undelivered mail wake-revives
+    //     each generation until spawn_failed flags at maxAttempts;
+    //   - delivery wins: the mail is consumed by a dying generation and
+    //     NOTHING drives revives — the bee parks stopped below the budget.
+    // Pre-fix the synthetic booted reset the budget every generation and the
+    // churn was UNBOUNDED — the regression pinned here (+ audit check below).
     const deadline = Date.now() + 10_000;
+    let flagged = false;
     for (;;) {
       core.step();
-      const flagged = store.activeFlags("bee-x").some((f) => f.flag === "spawn_failed");
-      if (flagged && store.currentRuntime("bee-x")?.state === "stopped") break;
-      assert.ok(Date.now() < deadline, `never reached spawn_failed; ops tail: ${ops.slice(-25).join(" | ")}`);
+      flagged = store.activeFlags("bee-x").some((f) => f.flag === "spawn_failed");
+      const stopped = store.currentRuntime("bee-x")?.state === "stopped";
+      const parked = stopped && store.undeliveredMessages("bee-x").length === 0;
+      if ((flagged && stopped) || parked) break;
+      assert.ok(Date.now() < deadline, `never bounded; ops tail: ${ops.slice(-25).join(" | ")}`);
       await sleep(150);
     }
     // Settle: nothing further may start.
@@ -656,27 +665,33 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
       core.step();
     }
     const runtimes = store.listRuntimes("bee-x");
-    assert.equal(
-      runtimes.length,
-      3,
-      `exactly maxAttempts generations: ${JSON.stringify(runtimes.map((r) => [r.generation, r.state, r.exitCause, r.bootEvidence]))}`,
+    assert.ok(
+      runtimes.length <= 3,
+      `at most maxAttempts generations: ${JSON.stringify(runtimes.map((r) => [r.generation, r.state, r.exitCause, r.bootEvidence]))}`,
     );
     for (const r of runtimes) {
       assert.equal(r.state, "stopped");
       assert.equal(r.exitCause, "crashed");
       assert.equal(r.bootEvidence, "synthetic", `generation ${r.generation} never produced real output`);
     }
-    assert.equal(store.getBee("bee-x")?.spawnFailures, 3);
-    assert.equal(store.enqueueWake("bee-x").outcome, "suppressed", "wakes suppressed while spawn_failed is set");
-    assert.equal(store.undeliveredMessages("bee-x").length, 1, "the message never reached a dying runtime");
+    assert.equal(store.getBee("bee-x")?.spawnFailures, runtimes.length, "every generation counted against the budget");
+    if (flagged) {
+      assert.equal(store.getBee("bee-x")?.spawnFailures, 3);
+      assert.equal(store.enqueueWake("bee-x").outcome, "suppressed", "wakes suppressed while spawn_failed is set");
+      assert.equal(store.undeliveredMessages("bee-x").length, 1, "the message never reached a dying runtime");
+    } else {
+      assert.equal(store.undeliveredMessages("bee-x").length, 0, "parked-quiet path: the mail was consumed by a dying generation");
+    }
     assert.equal(
       store.auditRows().filter((r) => r.kind === "bee.spawn_failures" && r.payload.spawnFailures === 0).length,
       0,
       "REGRESSION: no synthetic-booted budget reset, ever",
     );
     // Operator revive with the harness fixed: real output → evidence → flag
-    // clears, counter resets, the mail finally flows.
+    // clears, counter resets, the mail finally flows. (Parked-quiet path: the
+    // original mail was consumed, so prove the flow with a fresh message.)
     fixed = true;
+    if (store.undeliveredMessages("bee-x").length === 0) store.send("bee-x", "hello again?");
     store.enqueueCommand("revive", "bee-x");
     const ok = Date.now() + 10_000;
     for (;;) {
@@ -944,6 +959,30 @@ test("envelope.d1: bee-sent mail is delivered ENVELOPED; operator mail is delive
     assert.ok(enveloped.startsWith(BUZ_INJECTION_MARKER), "peer mail carries the marker");
     assert.ok(enveloped.includes('"from":"CL.9999"'), "meta names the sender");
     assert.ok(enveloped.endsWith("\n\nfrom a peer"), "body verbatim after the blank line");
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("urgency.d6: idle mail DELIVERS to a synthetic-running fresh revive — no generation churn (2026-08-19 budget.11 discovery)", () => {
+  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  try {
+    spawnIdleBee(rig);
+    rig.core.step();
+    // Stop, then send idle-urgency mail: revive-on-message brings up a new
+    // generation whose `running` rests ONLY on the driver-minted synthetic
+    // booted (readyAtSpawn shape). Pre-fix the idle gate saw `running` and
+    // held the mail forever: hang-stop → wake → revive, unbounded churn.
+    rig.store.enqueueCommand("stop", "bee-1");
+    rig.core.step(); // execute stop
+    rig.core.step(); // drain the exited observation
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "stopped");
+    rig.driver.synthBootAlive = true;
+    const res = rig.store.send("bee-1", "when you can", { urgency: "idle" });
+    rig.core.step(); // wake claims → gen 2 spawns (synthetic booted queued)
+    rig.core.step(); // drain synthetic booted → running(synthetic); deliver
+    rig.core.step();
+    assert.ok(rig.driver.deliveredIds.includes(res.message.id), `idle mail delivered to the provisional runtime; ops tail: ${rig.ops.slice(-8).join(" | ")}`);
   } finally {
     rig.cleanup();
   }

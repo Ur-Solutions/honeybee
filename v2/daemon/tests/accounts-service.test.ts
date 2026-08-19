@@ -508,10 +508,13 @@ test("login.1: the login seat (tmux, FAKE harness login) — mtime past baseline
     const rejoin = await svc.startLogin(account);
     assert.equal(rejoin.rejoined, true);
     // poll like the tick loop does until the fake login writes the file
+    // 30s: the write lands ~300ms in, but node --test runs files in parallel
+    // and a saturated dev box starves the tmux child (in-isolation runtime is
+    // ~600ms; the 10s budget flaked the deploy gate 4× on 2026-08-19).
     const outcome = await waitFor(async () => {
       const done = await svc.pollLoginSeats();
       return done[0] ?? null;
-    }, "login captured", 10_000, 100);
+    }, "login captured", 30_000, 100);
     assert.equal(outcome.accountId, account.id);
     assert.equal(outcome.detectedBy, "mtime");
     assert.deepEqual(outcome.captured, ["auth.json", "config.toml"]);
