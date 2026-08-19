@@ -668,3 +668,41 @@ test("v6 interrupt: a harness without an in-band interrupt answers unsupported (
     rig.cleanup();
   }
 });
+
+test("self-woken turn: unprompted assistant output on an IDLE runtime opens a turn — one turn_started, then result closes it (2026-08-19 'needs your reply' while working)", async (t) => {
+  // A harness-internal wake (background-task notification, scheduled
+  // continuation) starts a turn with NO delivery and NO user message. The
+  // store must show running, not idle/"needs your reply".
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-selfwake-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "self-waker.mjs");
+  writeFileSync(fake, `
+    // Boot to idle (init + result), then 300ms later SELF-WAKE: two assistant
+    // lines and a closing result, all unprompted.
+    process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "sw-sess" }) + "\\n");
+    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ready" }) + "\\n");
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "working on the wake" }] } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } }) + "\\n");
+      setTimeout(() => {
+        process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "wake done" }) + "\\n");
+      }, 200);
+    }, 300);
+    setInterval(() => {}, 1000);
+  `);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({ adapter: claudeAdapter, command: process.execPath, args: [fake], cwd: dir }),
+  });
+  try {
+    driver.start("sw-1", 1);
+    // readyAtSpawn boot emits NO turn events (init/result while phase idle
+    // are normalized away) — the first turn_ended IS the self-woken turn's.
+    const events = await drainUntil(driver, (e) => ofKind(e, "turn_ended").length >= 1, 4000);
+    assert.equal(ofKind(events, "turn_started").length, 1, "one opening edge (driver dedupes the second assistant line)");
+    assert.equal(ofKind(events, "turn_ended").length, 1, "result closes the self-woken turn");
+  } finally {
+    driver.stop("sw-1", 1, "stopped_by_system");
+    driver.disposeAll();
+  }
+});
