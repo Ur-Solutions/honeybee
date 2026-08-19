@@ -187,6 +187,20 @@ test("verbs.transcript+last: stub session log rendered as turns; --raw verbatim;
     const last = capture();
     assert.equal(await runV2Cli(["last", "talker", "--data-dir", dir], last.io), 0);
     assert.equal(last.out[0], "echo:second");
+
+    // tail renders like transcript (v1 tail showed the readable pane; a
+    // pane-less bee must not get raw jsonl instead — contract §6). --raw is
+    // the verbatim stream. --no-follow so the test does not block.
+    const tail = capture();
+    assert.equal(await runV2Cli(["tail", "talker", "--no-follow", "--data-dir", dir], tail.io), 0);
+    assert.deepEqual(tail.out, ["[assistant] echo:first", "[assistant] echo:second"]);
+    const tailRaw = capture();
+    assert.equal(await runV2Cli(["tail", "talker", "--raw", "--no-follow", "--data-dir", dir], tailRaw.io), 0);
+    assert.ok(tailRaw.out.every((l) => l.startsWith("{")), tailRaw.out[0]);
+    // -n bounds the rendered lines.
+    const tailN = capture();
+    assert.equal(await runV2Cli(["tail", "talker", "-n", "1", "--no-follow", "--data-dir", dir], tailN.io), 0);
+    assert.deepEqual(tailN.out, ["[assistant] echo:second"]);
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();
@@ -246,7 +260,7 @@ test("verbs.transcript: claude-format fixture — text turns kept, tool traffic 
   }
 });
 
-test("verbs.tail: raw backlog with -n, then follows appends until SIGINT; --no-follow exits after the backlog", async () => {
+test("verbs.tail: rendered backlog with -n (--raw for verbatim), then follows appends until SIGINT; --no-follow exits after the backlog", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
   try {
     const logPath = join(dir, "log.jsonl");
@@ -255,16 +269,22 @@ test("verbs.tail: raw backlog with -n, then follows appends until SIGINT; --no-f
     store.createBee({ id: "tail-1", name: "tailee", agent: "stub", substrate: "hsr", cwd: "/tmp", sessionLogPath: logPath });
     store.close();
 
+    // Default: rendered turns (v1 tail showed readable pane output).
     const a = capture();
     assert.equal(await runV2Cli(["tail", "tailee", "-n", "2", "--no-follow", "--data-dir", dir], a.io), 0);
-    assert.deepEqual(a.out, [JSON.stringify({ event: "text", text: "b" }), JSON.stringify({ event: "text", text: "c" })]);
+    assert.deepEqual(a.out, ["[assistant] b", "[assistant] c"]);
+
+    // --raw is the verbatim session log.
+    const rawTail = capture();
+    assert.equal(await runV2Cli(["tail", "tailee", "-n", "2", "--raw", "--no-follow", "--data-dir", dir], rawTail.io), 0);
+    assert.deepEqual(rawTail.out, [JSON.stringify({ event: "text", text: "b" }), JSON.stringify({ event: "text", text: "c" })]);
 
     // follow: appended lines stream out; SIGINT ends the follow. Invoke the
     // follow's own SIGINT listener directly (a synthetic process.emit would
     // also hit the test runner's handlers).
     const before = new Set(process.listeners("SIGINT"));
     const f = capture();
-    const done = runV2Cli(["tail", "tailee", "-n", "1", "--data-dir", dir], f.io);
+    const done = runV2Cli(["tail", "tailee", "-n", "1", "--raw", "--data-dir", dir], f.io);
     await sleep(100);
     appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "d" })}\n`);
     await waitFor(() => f.out.some((l) => l.includes('"text":"d"')), "appended line followed", 5000);
