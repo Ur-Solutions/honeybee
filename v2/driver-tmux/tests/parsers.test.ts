@@ -10,6 +10,7 @@ import {
   claudeProjectKey,
   claudeTranscriptParser,
   codexTranscriptParser,
+  codexTranscriptRenderer,
   grokTranscriptParser,
 } from "../src/transcripts.ts";
 
@@ -44,6 +45,44 @@ test("parsers.claude: user rows start turns; sidechain/meta/tool rows do not; as
 
 test("parsers.claude: project key derivation matches the v1 rule", () => {
   assert.equal(claudeProjectKey("/Users/u/Code/my.app"), "-Users-u-Code-my-app");
+});
+
+test("renderer.codex: hsr app-server envelope (item/completed) renders alongside the rollout shape", () => {
+  const r = codexTranscriptRenderer;
+  // hsr session logs record jsonrpc notifications, not rollout rows
+  // (2026-08-19 soak: `last`/`transcript` were blind to hsr codex output).
+  assert.deepEqual(
+    r.renderLine(j({ method: "item/completed", params: { item: { type: "agentMessage", id: "m1", text: "NECTAR" } } })),
+    [{ role: "assistant", text: "NECTAR" }],
+  );
+  assert.deepEqual(
+    r.renderLine(
+      j({
+        method: "item/completed",
+        params: { item: { type: "userMessage", content: [{ type: "text", text: "do it" }] } },
+      }),
+    ),
+    [{ role: "user", text: "do it" }],
+  );
+  assert.deepEqual(
+    r.renderLine(j({ method: "item/completed", params: { item: { type: "commandExecution", command: "ls -la" } } })),
+    [{ role: "tool", text: "[command: ls -la]" }],
+  );
+  assert.deepEqual(
+    r.renderLine(j({ method: "item/completed", params: { item: { type: "mcpToolCall", invocation: { tool: "self" } } } })),
+    [{ role: "tool", text: "[tool_use: self]" }],
+  );
+  // reasoning elided; turn/completed re-lists items and must NOT duplicate
+  assert.deepEqual(r.renderLine(j({ method: "item/completed", params: { item: { type: "reasoning", content: [] } } })), []);
+  assert.deepEqual(
+    r.renderLine(j({ method: "turn/completed", params: { turn: { items: [{ type: "agentMessage", text: "NECTAR" }] } } })),
+    [],
+  );
+  // rollout shape still renders
+  assert.deepEqual(
+    r.renderLine(j({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] } })),
+    [{ role: "assistant", text: "hi" }],
+  );
 });
 
 test("parsers.codex: turn_context/task_started start, task_complete ends explicitly, messages are output", () => {
