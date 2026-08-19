@@ -107,6 +107,19 @@ export async function restartDeployedDaemon({ root, log }: RestartDaemonContext)
     return;
   }
   const cli = join(root, CURRENT_LINK_NAME, "dist", "cli.js");
+  if (existsSync(join(root, "..", "FROZEN"))) {
+    // WP7 B5: the old store is frozen — the flip is live. A routine deploy
+    // must manage the V2 service and never resurrect the old daemon (the
+    // freeze marker is the same switch that makes plain `hive` mean v2).
+    await runStep(process.execPath, [cli, "v2", "daemon", "install"], root, log);
+    try {
+      await runStep(process.execPath, [cli, "v2", "daemon", "stop"], root, log);
+    } catch {
+      log("deploy: v2 daemon was not running (fresh start)");
+    }
+    await runStep(process.execPath, [cli, "v2", "daemon", "start"], root, log);
+    return;
+  }
   await runStep(process.execPath, [cli, "daemon", "install", "--force"], root, log);
   await runStep(process.execPath, [cli, "daemon", "restart"], root, log);
 }

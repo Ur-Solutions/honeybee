@@ -2,7 +2,10 @@
 // hive CLI entrypoint: argv parsing + top-level command dispatch. Every command
 // handler lives in src/commands/*, shared helpers in src/cli/shared.ts, and the
 // HSR runner host in src/hsr/runnerHost.ts (HIVE-15 decomposition of cli.ts).
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { getCompletions } from "./completion.js";
+import { storeRoot } from "./fsx.js";
 import { dispatchCellBrokerVerb } from "./cellBroker.js";
 import { bold, cyan, dim, errorPrefix, gray, isPretty, yellow } from "./format.js";
 import { flag, parse, truthy } from "./parse.js";
@@ -58,29 +61,47 @@ export { assertResumable, tmuxSessionSurvives } from "./commands/migrate.js";
 export { assertSingleBeeInvocation } from "./commands/run.js";
 export { resolvePromptArg } from "./commands/loop.js";
 
+/** Load the v2 CLI: the compiled dist/v2/cli.js bundle, or the TS entry from source. */
+async function loadV2Cli(): Promise<{ runV2Cli(args: string[]): Promise<number> }> {
+  const candidates = [
+    new URL("./v2/cli.js", import.meta.url).href,
+    new URL("../v2/cli/src/main.ts", import.meta.url).href,
+  ];
+  for (const spec of candidates) {
+    try {
+      return (await import(spec)) as { runV2Cli(args: string[]): Promise<number> };
+    } catch (err) {
+      if ((err as { code?: string }).code !== "ERR_MODULE_NOT_FOUND") throw err;
+    }
+  }
+  throw new Error("hive v2: missing v2 CLI artifact (dist/v2/cli.js) — rebuild with `npm run build`");
+}
+
+/**
+ * WP7 B5 — the flip. The freeze marker (`<store>/FROZEN`, written by
+ * `hive v2 freeze` at cutover step B3) IS the switch: once the old store is
+ * frozen, every plain `hive` verb IS the v2 surface. Old-world verbs are then
+ * reachable only where they own machinery the v2 stack does not: `deploy`
+ * (versioned runtime management) and shell completion plumbing. Rollback
+ * (removing the marker, reset-07 §C) un-flips automatically — no config, no
+ * second switch to forget.
+ */
+const V1_VERBS_KEPT_WHEN_FROZEN = new Set(["deploy", "__complete"]);
+
+export function v2IsDefault(argv0: string | undefined): boolean {
+  if (argv0 !== undefined && V1_VERBS_KEPT_WHEN_FROZEN.has(argv0)) return false;
+  return existsSync(join(storeRoot(), "FROZEN"));
+}
+
 async function main(argv: string[]) {
   if (argv[0] === "v2") {
     // Reset WP4: route `hive v2 …` into the v2 stack (v2/cli). Additive
-    // routing only — every other path is untouched. The compiled build ships
-    // the v2 CLI as the dist/v2/cli.js bundle (scripts/build-v2-artifact.mjs);
-    // running from source (tsx) falls back to the v2 TypeScript entry.
-    const candidates = [
-      new URL("./v2/cli.js", import.meta.url).href,
-      new URL("../v2/cli/src/main.ts", import.meta.url).href,
-    ];
-    let v2: { runV2Cli(args: string[]): Promise<number> } | null = null;
-    for (const spec of candidates) {
-      try {
-        v2 = (await import(spec)) as { runV2Cli(args: string[]): Promise<number> };
-        break;
-      } catch (err) {
-        if ((err as { code?: string }).code !== "ERR_MODULE_NOT_FOUND") throw err;
-      }
-    }
-    if (!v2) {
-      throw new Error("hive v2: missing v2 CLI artifact (dist/v2/cli.js) — rebuild with `npm run build`");
-    }
-    process.exitCode = await v2.runV2Cli(argv.slice(1));
+    // routing only — every other path is untouched.
+    process.exitCode = await (await loadV2Cli()).runV2Cli(argv.slice(1));
+    return;
+  }
+  if (v2IsDefault(argv[0])) {
+    process.exitCode = await (await loadV2Cli()).runV2Cli(argv);
     return;
   }
   if (argv[0] === "__complete") {
