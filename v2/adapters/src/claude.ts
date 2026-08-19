@@ -95,7 +95,15 @@ export function parseClaudeLine(line: string): AdapterSignal[] {
       return rateLimitSignals(msg.rate_limit_info);
     case "result":
       return resultSignals(msg);
-    case "assistant": // mid-turn output — activity, not a state edge
+    case "assistant":
+      // Usually mid-turn output — the driver dedupes by phase, so this is a
+      // no-op while running. But a SELF-WOKEN turn (harness-internal wake:
+      // background-task notifications, scheduled continuations) has no
+      // delivery and no user message — assistant output on an idle runtime
+      // is its ONLY opening edge. Without this, self-woken bees showed
+      // idle/"needs your reply" while actively working (2026-08-19, observed
+      // on the cutover executor itself).
+      return [{ kind: "turn_started" }];
     case "user":
     case "control_request": // interactive prompts are out of WP3 scope
     case "control_response":

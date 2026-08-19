@@ -32,11 +32,14 @@ test("claude: system/init → booted(sessionId) + spawn_failed clear + turn_ende
   ]);
 });
 
-test("claude: progress pings and mid-turn output carry no state edge", () => {
+test("claude: progress pings carry no state edge; assistant output OPENS a turn (self-woken turns — driver dedupes mid-turn)", () => {
   const [, thinking, textLine, toolLine] = fixtureLines();
   assert.deepEqual(parseClaudeLine(thinking!), []);
-  assert.deepEqual(parseClaudeLine(textLine!), []);
-  assert.deepEqual(parseClaudeLine(toolLine!), []);
+  // A self-woken turn (background-task notification inside the harness) has
+  // no delivery and no user message: assistant output is its only opening
+  // edge. The driver's phase check makes this a no-op while already running.
+  assert.deepEqual(parseClaudeLine(textLine!), [{ kind: "turn_started" }]);
+  assert.deepEqual(parseClaudeLine(toolLine!), [{ kind: "turn_started" }]);
 });
 
 test("claude: successful result → contrary-evidence clears + turn_ended", () => {
