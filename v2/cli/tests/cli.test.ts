@@ -719,3 +719,11 @@ test("cli.urgency: send --urgency passes through to the row; the mailbox read su
     cleanup();
   }
 });
+
+test("cli.version: --version answers (Apiary's Doctor gates local runs on it)", async () => {
+  for (const argv of [["--version"], ["-v"], ["version"]]) {
+    const c = capture();
+    assert.equal(await runV2Cli(argv, c.io), 0);
+    assert.match(c.out[0] ?? "", /^honeybee \S+$/);
+  }
+});
