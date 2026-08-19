@@ -298,9 +298,29 @@ async function readPath<T>(
     if (!existsSync(ctx.cfg.storePath)) {
       throw new Error(`daemon not running and no store at ${ctx.cfg.storePath}`);
     }
-    const store = new ReadOnlyStore(ctx.cfg.storePath);
+    let store: ReadOnlyStore;
+    try {
+      store = new ReadOnlyStore(ctx.cfg.storePath);
+    } catch (openErr) {
+      // The store is exclusively locked → a live daemon holds it (B9), so
+      // "daemon down" was a misdiagnosis — the rpc failed some other way
+      // (slow verb past its timeout, mid-restart socket). Surfacing SQLite's
+      // bare "database is locked" here sent the 2026-08-19 soak down the
+      // wrong trail; report what actually happened instead.
+      if (openErr instanceof Error && /locked|busy/i.test(openErr.message)) {
+        throw new Error(`daemon appears to be running (store is locked) but the request failed: ${err.message}`);
+      }
+      throw openErr;
+    }
     try {
       return { result: fallback(store), stale: true };
+    } catch (readErr) {
+      // Same misdiagnosis, later symptom: the open can succeed and the first
+      // query hit the exclusive lock instead.
+      if (readErr instanceof Error && /locked|busy/i.test(readErr.message)) {
+        throw new Error(`daemon appears to be running (store is locked) but the request failed: ${err.message}`);
+      }
+      throw readErr;
     } finally {
       store.close();
     }
@@ -1937,7 +1957,9 @@ async function cmdUsage(ctx: CliContext, parsed: Parsed): Promise<number> {
   const id = parsed.positional[1];
   const { result, stale } = await readPath(
     ctx,
-    (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}),
+    // Sweep-sized timeout: the daemon probes every account live (serialized,
+    // one bounded fetch each) — the default 10s rpc timeout fires mid-sweep.
+    (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}, 120_000),
     (store) => ({ limits: store.accountLimits().filter((l) => id === undefined || l.account === id) }),
   );
   if (result.limits.length === 0) {

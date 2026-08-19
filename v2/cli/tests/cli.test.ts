@@ -58,6 +58,20 @@ test("cli.2: reads fall back to the read-only store when the daemon is down — 
     assert.equal(await runV2Cli(["mailbox", "alpha", "--data-dir", dir, "--json"], m.io), 0);
     const mail = JSON.parse(m.out[0] ?? "{}") as { stale?: boolean; messages: Array<{ body: string }> };
     assert.equal(mail.stale, true);
+
+    // A LOCKED store means a live daemon holds it (B9): the fallback must
+    // report the rpc failure honestly, never SQLite's bare "database is
+    // locked" (2026-08-19 soak misdirection).
+    const writer = openCoreStore(join(dir, "core.sqlite3"));
+    try {
+      const locked = capture();
+      assert.equal(await runV2Cli(["list", "--all", "--data-dir", dir], locked.io), 1);
+      const msg = [...locked.err, ...locked.out].join("\n");
+      assert.match(msg, /daemon appears to be running .* but the request failed/);
+      assert.doesNotMatch(msg, /^database is locked$/m);
+    } finally {
+      writer.close();
+    }
     assert.equal(mail.messages[0]?.body, "queued while down");
   } finally {
     rmSync(dir, { recursive: true, force: true });
