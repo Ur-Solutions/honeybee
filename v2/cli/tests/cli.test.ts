@@ -95,6 +95,42 @@ test("cli.3: mutations NEVER fall back — daemon down means a loud, typed failu
   }
 });
 
+test("cli.3b: a misspelled flag is a LOUD error (never a silent no-op), and spawn takes the agent positionally", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-cli-"));
+  try {
+    // The 2026-08-19 soak: `--substarte cell` parsed as an unknown boolean
+    // plus a stray positional, so an hsr claude spawned where a codex cell
+    // was asked for — silently.
+    const a = capture();
+    assert.equal(await runV2Cli(["spawn", "x", "codex", "--substarte", "cell", "--data-dir", dir], a.io), 1);
+    const aMsg = [...a.err, ...a.out].join("\n");
+    assert.match(aMsg, /unknown flag: --substarte/);
+    assert.match(aMsg, /did you mean --substrate\?/);
+
+    // Unknown flags that are nowhere near a real one still refuse, without a hint.
+    const b = capture();
+    assert.equal(await runV2Cli(["spawn", "x", "--frobnicate", "--data-dir", dir], b.io), 1);
+    assert.match([...b.err, ...b.out].join("\n"), /unknown flag: --frobnicate/);
+
+    // A stray extra positional is refused rather than ignored.
+    const c = capture();
+    assert.equal(await runV2Cli(["spawn", "x", "codex", "cell", "--data-dir", dir], c.io), 1);
+    assert.match([...c.err, ...c.out].join("\n"), /unexpected argument 'cell'/);
+
+    // Two disagreeing agent forms refuse instead of silently picking one.
+    const d = capture();
+    assert.equal(await runV2Cli(["spawn", "x", "codex", "--agent", "claude", "--data-dir", dir], d.io), 1);
+    assert.match([...d.err, ...d.out].join("\n"), /agent given twice and they disagree/);
+
+    // Short aliases still resolve (they expand before the known-flag check).
+    const e = capture();
+    assert.equal(await runV2Cli(["tail", "nope", "-n", "5", "--data-dir", dir], e.io), 1);
+    assert.doesNotMatch([...e.err, ...e.out].join("\n"), /unknown flag/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("cli.4: against a live daemon — spawn, list (not stale), send --wait blocks on the delivery mark", async () => {
   const { dir, cleanup } = makeDaemonDir();
   let daemon: DaemonHandle | null = null;
