@@ -183,6 +183,8 @@ export interface DedupMarkers {
 
 export interface SpawnResult extends DedupMarkers {
   beeId: string;
+  /** v10 — the minted display handle (`CL.a3f2`); what humans use from here on. */
+  handle?: string | null;
   commandId: number;
   /**
    * v7: the account the bee was bound to (null = unbound: no accounts for the

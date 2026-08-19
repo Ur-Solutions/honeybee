@@ -34,7 +34,7 @@
  */
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { CoreStore } from "./store.ts";
+import { HANDLE_RE, type CoreStore } from "./store.ts";
 
 /** Marker file `hive v2 freeze` writes at the frozen root (B3). */
 export const FROZEN_MARKER = "FROZEN";
@@ -937,6 +937,11 @@ export function importFromFrozen(store: CoreStore, frozenRoot: string, opts: Fro
         args: b.args,
         importedFrom: "frozen",
         createdAt: b.createdAt,
+        // v10: an old-world id IS a pretty handle (CL.7920) — keep it as the
+        // display handle so the operator's known references survive the
+        // cutover. If a v2-born bee somehow minted it first, fall back to a
+        // fresh mint rather than failing the import.
+        ...(HANDLE_RE.test(b.id) && !store.listBees().some((x) => x.handle === b.id) ? { handle: b.id } : {}),
       });
       // The old runtime is not migrated (contract: runtime death is uninteresting).
       // Generation 1 exists only so revive-on-message mints generation 2 cleanly.

@@ -121,8 +121,10 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       accounts: [account],
       accountLimits: [limits],
     };
-    // Neutralize the one nondeterministic value (bee uuid) then freeze.
-    const text = JSON.stringify(snapshot, null, 2).replaceAll(bee.id, "BEE_ID");
+    // Neutralize the nondeterministic values (bee uuid, minted handle) then freeze.
+    const text = JSON.stringify(snapshot, null, 2)
+      .replaceAll(bee.id, "BEE_ID")
+      .replaceAll(bee.handle as string, "BEE_HANDLE");
     assert.equal(
       text,
       `{
@@ -164,7 +166,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "parentId": null,
         "forkedFrom": null,
         "forkSeed": null,
-        "account": null
+        "account": null,
+        "handle": "BEE_HANDLE"
       },
       "runtime": {
         "beeId": "BEE_ID",

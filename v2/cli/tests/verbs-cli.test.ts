@@ -516,3 +516,67 @@ test("verbs.help: the grouped v1-style overview lists the new verbs under their 
     assert.ok(text.includes(verb), `help mentions ${verb}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// v10 — pretty handles: the resolution ladder (id → handle → name → unique
+// prefix), unit-level over synthetic views + live handle display.
+// ---------------------------------------------------------------------------
+
+test("handles.ladder: exact id → exact handle (case-insensitive) → exact name → unique prefix; ambiguity lists candidates", async () => {
+  const { resolveBeeIn } = await import("../src/main.ts");
+  const mk = (id: string, handle: string | null, name: string) =>
+    ({ bee: { id, handle, name }, view: { beeId: id }, runtime: null }) as never;
+  const views = [
+    mk("aaaa1111-0000-0000-0000-000000000001", "CL.a3f2", "reviewer"),
+    mk("bbbb2222-0000-0000-0000-000000000002", "CO.a401", "builder"),
+    mk("cccc3333-0000-0000-0000-000000000003", "CL.b7c9", "builder-2"),
+  ];
+  // exact id
+  assert.equal(resolveBeeIn(views, "aaaa1111-0000-0000-0000-000000000001"), "aaaa1111-0000-0000-0000-000000000001");
+  // exact handle, case-insensitive
+  assert.equal(resolveBeeIn(views, "CL.a3f2"), "aaaa1111-0000-0000-0000-000000000001");
+  assert.equal(resolveBeeIn(views, "cl.a3f2"), "aaaa1111-0000-0000-0000-000000000001");
+  // exact name
+  assert.equal(resolveBeeIn(views, "reviewer"), "aaaa1111-0000-0000-0000-000000000001");
+  // unique prefix over handle and name
+  assert.equal(resolveBeeIn(views, "CL.b"), "cccc3333-0000-0000-0000-000000000003");
+  assert.equal(resolveBeeIn(views, "builder-"), "cccc3333-0000-0000-0000-000000000003");
+  assert.equal(resolveBeeIn(views, "bbbb"), "bbbb2222-0000-0000-0000-000000000002");
+  // ambiguous prefix: loud error listing candidates
+  assert.throws(
+    () => resolveBeeIn(views, "CL."),
+    (err: unknown) => err instanceof Error && /ambiguous/.test(err.message) && /CL\.a3f2/.test(err.message) && /CL\.b7c9/.test(err.message),
+  );
+  // 'builder' is an exact name AND a prefix of builder-2 — exact wins, no ambiguity
+  assert.equal(resolveBeeIn(views, "builder"), "bbbb2222-0000-0000-0000-000000000002");
+  // sub-3-char non-exact needles never prefix-match
+  assert.throws(() => resolveBeeIn(views, "CL"), (err: unknown) => err instanceof Error && /not found/.test(err.message));
+});
+
+test("handles.live: spawn returns the minted handle; ls leads with it and keeps id= tail; every verb takes the handle", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const s = capture();
+    assert.equal(await runV2Cli(["spawn", "prettybee", "--agent", "stub", "--cwd", dir, "--data-dir", dir, "--socket", daemon.socketPath], s.io), 0);
+    const m = /spawned (ST\.[0-9a-f]{4,8}) \(([0-9a-f-]{36});/.exec(s.out[0] ?? "");
+    assert.ok(m, `spawn output leads with the handle: ${s.out[0]}`);
+    const handle = m![1] as string;
+    const uuid = m![2] as string;
+    const ls = capture();
+    assert.equal(await runV2Cli(["ls", "--data-dir", dir, "--socket", daemon.socketPath], ls.io), 0);
+    const row = ls.out.find((l) => l.includes("prettybee")) ?? "";
+    assert.ok(row.startsWith(handle), `ls leads with handle: ${row}`);
+    assert.ok(row.includes(`id=${uuid}`), `ls keeps the uuid tail: ${row}`);
+    // the handle resolves in a mutation verb round-trip
+    const v = capture();
+    assert.equal(await runV2Cli(["view", handle.toLowerCase(), "--data-dir", dir, "--socket", daemon.socketPath], v.io), 0);
+    assert.ok(v.out[0]?.includes("prettybee"));
+    const st = capture();
+    assert.equal(await runV2Cli(["stop", handle, "--data-dir", dir, "--socket", daemon.socketPath], st.io), 0);
+  } finally {
+    await daemon?.stop();
+    cleanup();
+  }
+});

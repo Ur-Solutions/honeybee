@@ -383,10 +383,13 @@ export class DaemonCore {
       }
       if (ev.action === "set") {
         this.store.setFlag(ev.beeId, ev.flag, ev.detail);
+        this.log(`flag.set bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
       } else {
-        this.store.clearFlag(ev.beeId, ev.flag, ev.detail);
+        // Every clean turn re-emits contrary evidence; clearing an unset flag
+        // is a store no-op — logging it too was pure noise (soak day-2).
+        const { applied } = this.store.clearFlag(ev.beeId, ev.flag, ev.detail);
+        if (applied) this.log(`flag.clear bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
       }
-      this.log(`flag.${ev.action} bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
       // v7: account policy (spec 08) rides the same evidence — never throws
       // into the loop (a policy bug must not stall observation drain).
       if (this.onFlagEvidence) {

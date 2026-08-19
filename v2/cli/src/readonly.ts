@@ -54,6 +54,8 @@ function mapBee(r: Row): BeeRow {
     forkSeed: (r.fork_seed as string | null | undefined) ?? null,
     // v7 column; same tolerance.
     account: (r.account as string | null | undefined) ?? null,
+    // v10 column; same tolerance.
+    handle: (r.handle as string | null | undefined) ?? null,
   };
 }
 

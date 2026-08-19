@@ -160,6 +160,8 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "forkSeed",
   // v7: additive — the account binding (accounts.id | null).
   "account",
+  // v10: additive — the pretty display handle (CL.a3f2 | null pre-backfill).
+  "handle",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",

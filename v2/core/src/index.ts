@@ -7,6 +7,8 @@ export * from "./types.ts";
 export {
   CoreStore,
   openCoreStore,
+  HANDLE_RE,
+  handlePrefix,
   type CoreStoreOptions,
   type CreateBeeInput,
   type SendResult,

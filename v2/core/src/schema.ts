@@ -63,8 +63,18 @@
  *        resets the budget. Additive; migration = ALTER TABLE ADD COLUMN ×1;
  *        existing live rows migrate as NULL, which counts as real for exit
  *        accounting (never punish a pre-migration runtime).
+ *  v10 — pretty handles (operator ruling 2026-08-19): adds `bees.handle` —
+ *        a short human display id (`CL.a3f2`: harness prefix + hex), minted
+ *        by the owning node at spawn. UNIQUE per node (partial index; the
+ *        daemon is the sole writer, so minting is a local check + retry —
+ *        no distributed coordination). The UUID stays the one canonical id
+ *        in tables/RPC; handles are the human tier of the resolution ladder
+ *        (exact id → exact handle → exact name → unique prefix). Additive;
+ *        migration = ALTER TABLE ADD COLUMN ×1 + backfill mint for existing
+ *        rows (an imported bee whose old id already looks like a handle
+ *        keeps it as its handle).
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -119,7 +129,11 @@ CREATE TABLE IF NOT EXISTS bees (
   -- concrete at spawn ('auto' is resolved BEFORE the row is written; never
   -- stored). Soft reference: account.remove refuses while any bee carries
   -- it. The mechanism stays bees.env[HOME_ENV[harness]] = accounts.home_path.
-  account          TEXT
+  account          TEXT,
+  -- v10: short human display id (CL.a3f2 — harness prefix + hex), minted by
+  -- the owning node at spawn; unique per node (partial index below). The
+  -- UUID above stays the canonical id everywhere machines talk.
+  handle           TEXT
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
@@ -363,7 +377,15 @@ export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: s
   ["forked_from", "forked_from TEXT"],
   ["fork_seed", "fork_seed TEXT"],
   ["account", "account TEXT"],
+  ["handle", "handle TEXT"],
 ];
+
+/**
+ * v10 — handle uniqueness per node. Partial (NULL allowed mid-migration);
+ * created after the column migration, like the idempotency index.
+ */
+export const HANDLE_INDEX_SQL =
+  "CREATE UNIQUE INDEX IF NOT EXISTS bees_handle ON bees(handle) WHERE handle IS NOT NULL;";
 
 /**
  * Additive columns on `mailbox` since v7 — same add-iff-missing discipline as
