@@ -954,7 +954,7 @@ export class CoreStore {
     beeId: string,
     generation: number,
     state: RuntimeState,
-    opts: { exitCause?: ExitCause; pid?: number; pidStartedAt?: number; synthetic?: boolean } = {},
+    opts: { exitCause?: ExitCause; exitDetail?: string; pid?: number; pidStartedAt?: number; synthetic?: boolean } = {},
   ): { applied: boolean } {
     if (!RUNTIME_TRANSITIONS[state]) {
       throw new IllegalTransitionError(`unknown runtime state: ${state}`);
@@ -1015,7 +1015,7 @@ export class CoreStore {
       // contrary evidence that resets the budget.
       if (state === "stopped" && (opts.exitCause === "crashed" || opts.exitCause === "clean")) {
         if (current.state === "booting" || current.bootEvidence === "synthetic") {
-          this.applySpawnFailure(beeId, generation, opts.exitCause);
+          this.applySpawnFailure(beeId, generation, opts.exitCause, opts.exitDetail);
         }
       } else if (current.state === "booting" && state === "running" && bootEvidence === "real") {
         this.applySpawnFailuresReset(beeId, `runtime booted (generation ${generation})`);
@@ -1060,7 +1060,7 @@ export class CoreStore {
    * budget the `spawn_failed` flag is set — visibly blocked — and no further
    * wakes are enqueued until contrary evidence clears it.
    */
-  private applySpawnFailure(beeId: string, generation: number, exitCause: ExitCause): void {
+  private applySpawnFailure(beeId: string, generation: number, exitCause: ExitCause, detail?: string): void {
     const failures = this.mustGetBee(beeId).spawnFailures + 1;
     this.db.prepare("UPDATE bees SET spawn_failures = ? WHERE id = ?").run(failures, beeId);
     this.audit("bee.spawn_failures", beeId, {
@@ -1070,12 +1070,14 @@ export class CoreStore {
       generation,
       exitCause,
       budget: this.maxAttempts,
+      ...(detail ? { detail } : {}),
     });
     if (failures >= this.maxAttempts) {
       this.applySetFlag(
         beeId,
         "spawn_failed",
-        `runtime exited during boot ${failures} times in a row (generation ${generation}, ${exitCause}); ` +
+        `runtime exited during boot ${failures} times in a row (generation ${generation}, ${exitCause}` +
+          `${detail ? `: ${detail}` : ""}); ` +
           "not reviving again until it boots or an operator revives it",
       );
     }

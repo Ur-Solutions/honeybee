@@ -2115,6 +2115,18 @@ export function serviceLabel(env: Record<string, string | undefined> = process.e
   return env.HIVE_V2_SERVICE_LABEL ?? "dev.honeybee.hive.v2";
 }
 
+export function serviceEnv(
+  dataDir: string,
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  // launchd/systemd start services with a bare PATH (/usr/bin:/bin:…) that
+  // cannot resolve the harness binaries (claude/codex/…) living in
+  // user-managed dirs — every spawn would die instantly with a mute ENOENT
+  // (2026-08-19 soak finding). Bake the installing shell's PATH into the
+  // unit, exactly like the v1 daemon install does.
+  return { HIVE_V2_DATA_DIR: dataDir, ...(env.PATH ? { PATH: env.PATH } : {}) };
+}
+
 export function serviceExecArgs(dataDir: string, env: Record<string, string | undefined> = process.env): string[] {
   if (env.HIVE_V2_SERVICE_ARGS) return JSON.parse(env.HIVE_V2_SERVICE_ARGS) as string[];
   const entry = resolve(process.argv[1] ?? "");
@@ -2135,7 +2147,7 @@ function buildServiceManager(ctx: CliContext): ServiceManager {
       label: serviceLabel(),
       execArgs: serviceExecArgs(ctx.cfg.dataDir),
       logPath: ctx.cfg.logPath,
-      env: { HIVE_V2_DATA_DIR: ctx.cfg.dataDir },
+      env: serviceEnv(ctx.cfg.dataDir),
     },
     { exec: realExec, dir, uid: process.getuid?.() ?? 0 },
   );

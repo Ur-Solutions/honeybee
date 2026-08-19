@@ -121,6 +121,8 @@ interface ManagedProcess {
   killTimer: NodeJS.Timeout | null;
   stdoutRest: string;
   exited: boolean;
+  /** The OS spawn/process error message, when the child emitted `error` (e.g. ENOENT). */
+  spawnError: string | null;
   /**
    * v9: whether the adapter has parsed at least one signal from this
    * process's actual output. A readyAtSpawn runtime opens its accept point on
@@ -209,6 +211,7 @@ export class HsrDriver implements RuntimeDriver {
       killTimer: null,
       stdoutRest: "",
       exited: false,
+      spawnError: null,
       realEvidence: false,
     };
     this.procs.set(beeId, proc);
@@ -222,7 +225,13 @@ export class HsrDriver implements RuntimeDriver {
     });
     // Spawn failure (missing binary, EACCES): surface as exited(crashed) so it
     // flows through the daemon's spawn-retry path, never as a driver throw.
-    child.on("error", () => this.onExit(proc, null, null));
+    // The error message is the only witness to WHY (there is no stderr from a
+    // process that never ran) — keep it for the exit observation + sidecar.
+    child.on("error", (err) => {
+      proc.spawnError = String(err?.message ?? err);
+      this.appendSidecar(beeId, `spawn error: ${proc.spawnError}\n`);
+      this.onExit(proc, null, null);
+    });
     child.on("exit", (code, signal) => this.onExit(proc, code, signal));
     // stdin errors (EPIPE against a dying child) must not crash the daemon.
     child.stdin?.on("error", () => undefined);
@@ -408,6 +417,7 @@ export class HsrDriver implements RuntimeDriver {
       killTimer: null,
       stdoutRest: "",
       exited: false,
+      spawnError: null,
       // Degraded: no event stream, so no evidence can ever be parsed. The
       // store's persisted boot_evidence for the row (from before the daemon
       // restart) governs its exit accounting; this field is driver-local.
@@ -678,6 +688,7 @@ export class HsrDriver implements RuntimeDriver {
       generation: p.generation,
       kind: "exited",
       exitCause: cause,
+      ...(p.spawnError ? { detail: `spawn error: ${p.spawnError}` } : {}),
     });
     // A start deferred behind this death can now actually spawn.
     const pending = this.pendingStarts.get(p.beeId);
