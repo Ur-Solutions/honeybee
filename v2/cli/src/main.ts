@@ -1810,20 +1810,34 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
 }
 
 /**
- * `hive v2 tail <bee> [-n lines] [--no-follow]` — follow the raw session log
- * like `tail -f` (v1's tail followed the pane; v2's ground truth is the log).
+ * `hive v2 tail <bee> [-n lines] [--raw] [--no-follow]` — follow recent output
+ * like `tail -f`. v1's tail followed the PANE (readable text); v2's ground
+ * truth is the session log, so it renders that log by default and keeps the
+ * verbatim stream behind --raw. `transcript` is the same rendering with
+ * history/roles; tail is the live tail of it.
  */
 async function cmdTail(ctx: CliContext, parsed: Parsed): Promise<number> {
   const needle = parsed.positional[1];
-  if (!needle) throw new Error("usage: hive v2 tail <bee> [-n lines] [--no-follow]");
+  if (!needle) throw new Error("usage: hive v2 tail <bee> [-n lines] [--raw] [--no-follow]");
   const { result, stale } = await readBee(ctx, needle);
   const path = sessionLogOf(result.bee, needle);
+  const harness = result.bee?.agent ?? "";
+  // v1 `tail` showed the PANE — readable recent output. A pane-less bee
+  // (hsr/cell) has only the structured session log, and dumping it verbatim
+  // made `tail` mean something different per substrate (contract §6 says it
+  // must not). Render by default; --raw is the verbatim stream.
+  const raw = parsed.flags.get("--raw") === true;
   const backlog = numFlag(parsed, "--tail", 40);
   if (stale) ctx.io.err(`STALE: daemon not running — read directly from ${ctx.cfg.storePath}`);
-  ctx.io.err(`# session log ${path}`);
-  for (const line of readSessionLogLines(path).slice(-backlog)) ctx.io.out(line);
+  ctx.io.err(`# session log ${path} (${harness})`);
+  const lines = readSessionLogLines(path);
+  if (raw) for (const line of lines.slice(-backlog)) ctx.io.out(line);
+  else for (const line of turnLines(renderTranscriptLines(harness, lines)).slice(-backlog)) ctx.io.out(line);
   if (parsed.flags.get("--no-follow") === true) return 0;
-  await followFileLines(path, statSync(path).size, (line) => ctx.io.out(line));
+  await followFileLines(path, statSync(path).size, (line) => {
+    if (raw) ctx.io.out(line);
+    else for (const l of turnLines(renderTranscriptLines(harness, [line]))) ctx.io.out(l);
+  });
   return 0;
 }
 
@@ -2406,7 +2420,7 @@ Observe:
   list [--all|--archived]                     all bees with state (aliases: ls, ps)
   view <bee> · mailbox <bee> · commands <bee> · children <bee>
   transcript <bee> [--tail n] [--raw] [--follow]   the session log rendered as readable turns (alias: tx)
-  tail <bee> [-n lines] [--no-follow]         follow the raw session log (like tail -f)
+  tail <bee> [-n lines] [--raw] [--no-follow] follow recent output (rendered; --raw = verbatim log)
   last <bee> [--seal]                         the most recent assistant message (fallback: latest seal)
   wait <bee> [--timeout ms] [--idle-ms ms]    block until the bee is idle/stopped with no queued mail
   events [--bee b] [--kind glob] [--tail n] [--follow]   audit-row tail (the ledger of every write)
