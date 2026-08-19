@@ -17,6 +17,7 @@ import { DaemonCore, type DaemonPolicy, type I1ViolationEvent } from "../src/loo
 import { HsrDriver } from "../../driver-hsr/src/index.ts";
 import { stubAdapter } from "../../adapters/src/index.ts";
 import { AGENT_PATH, FakeDriver, sleep } from "./helpers.ts";
+import { BUZ_INJECTION_MARKER } from "../src/envelope.ts";
 
 interface Rig {
   dir: string;
@@ -921,6 +922,28 @@ test("urgency.d6: I1 telemetry — an `idle` message's deadline clock starts at 
     assert.equal(rig.violations.length, 1, "breach recorded once eligible + overdue");
     assert.equal(rig.violations[0]?.messageId, res.message.id);
     assert.ok((rig.violations[0]?.deadline ?? 0) >= eligibleAt + 200, "deadline base is eligibility, not enqueue");
+  } finally {
+    rig.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B4a sender attribution: the delivery loop envelopes bee-sent mail.
+// ---------------------------------------------------------------------------
+
+test("envelope.d1: bee-sent mail is delivered ENVELOPED; operator mail is delivered bare", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    rig.store.send("bee-1", "from the operator");
+    rig.core.step();
+    rig.store.send("bee-1", "from a peer", { sender: "CL.9999" });
+    rig.core.step();
+    assert.equal(rig.driver.deliveredBodies[0], "from the operator");
+    const enveloped = rig.driver.deliveredBodies[1] as string;
+    assert.ok(enveloped.startsWith(BUZ_INJECTION_MARKER), "peer mail carries the marker");
+    assert.ok(enveloped.includes('"from":"CL.9999"'), "meta names the sender");
+    assert.ok(enveloped.endsWith("\n\nfrom a peer"), "body verbatim after the blank line");
   } finally {
     rig.cleanup();
   }

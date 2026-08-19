@@ -53,6 +53,8 @@ export class FakeDriver implements RuntimeDriver {
   evidence: FlagEvidenceLike[] = [];
   sessions: SessionEvidenceLike[] = [];
   readonly deliveredIds: number[] = [];
+  /** The exact text handed over per delivery (envelope assertions). */
+  readonly deliveredBodies: string[] = [];
   /** When false, deliver refuses not_ready (I1-breach scenarios). */
   acceptDeliveries = true;
   /** When true, start immediately queues booted + turn_ended (idle runtime). */
@@ -122,11 +124,12 @@ export class FakeDriver implements RuntimeDriver {
     }
   }
 
-  deliver(beeId: string, generation: number, messageId: number, _body: string): { accepted: boolean; reason?: "no_process" | "not_ready" } {
+  deliver(beeId: string, generation: number, messageId: number, body: string): { accepted: boolean; reason?: "no_process" | "not_ready" } {
     const p = this.procs.get(beeId);
     if (!p || p.generation !== generation) return { accepted: false, reason: "no_process" };
     if (p.degraded || !this.acceptDeliveries) return { accepted: false, reason: "not_ready" };
     this.deliveredIds.push(messageId);
+    this.deliveredBodies.push(body);
     return { accepted: true };
   }
 

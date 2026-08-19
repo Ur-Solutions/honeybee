@@ -48,6 +48,7 @@ import {
   type CoreStore,
   type RuntimeState,
 } from "../../core/src/index.ts";
+import { deliveryText, isPeerSender } from "./envelope.ts";
 import type { DriverObservation, RuntimeDriver, StopCause } from "../../harness/src/driver.ts";
 
 /** Where the (injected) executor-crash fault hits, if it does. */
@@ -724,7 +725,11 @@ export class DaemonCore {
         }
       }
       const msg = eligible[0] as (typeof eligible)[number];
-      const outcome = this.driver.deliver(bee.id, rt.generation, msg.id, msg.body);
+      // Peer-sent mail carries the sender-attribution envelope (envelope.ts);
+      // operator/human mail is delivered bare. The mailbox row stays the
+      // durable truth — the envelope is delivery-time rendering only.
+      const peer = isPeerSender(msg.sender, (id) => this.store.getBee(id) != null);
+      const outcome = this.driver.deliver(bee.id, rt.generation, msg.id, deliveryText(msg, peer));
       if (outcome.accepted) {
         this.store.markDelivered(msg.id, rt.generation);
         this.interruptRequested.delete(msg.id);
