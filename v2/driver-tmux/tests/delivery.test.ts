@@ -19,7 +19,7 @@ test("delivery.unconfirmed: no observed turn start within grace → retryable no
 
     // Shorten the grace via a second bee? No — reconfigure is per-bee env;
     // grace lives in the observation spec. Use the driver's default spec
-    // (4000ms) — the note must appear after it.
+    // (800ms in this fixture) — the note must appear after it.
     const outcome = rig.driver.deliver("bee-1", 1, 7, "hello?");
     assert.equal(outcome.accepted, true, "assume-best: the send itself is accepted");
     assert.deepEqual(rig.driver.observeDeliveryNotes(), [], "no note before the grace elapses");

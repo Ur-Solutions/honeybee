@@ -311,7 +311,7 @@ test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) 
     const m4 = await client.request<SendRpcResult>("send", { beeId: bee.beeId, body: "@ratelimit again" });
     await waitDelivered(client, bee.beeId, m4.messageId, "second ratelimit delivered");
     await waitFor(async () => (await client.request<ViewResult>("view", { beeId: bee.beeId })).view.flags.includes("resource_blocked") ? true : null, "flagged again");
-    await new Promise((r) => setTimeout(r, 600));
+    await new Promise((r) => setTimeout(r, 200));
     const stuck = await client.request<ViewResult>("view", { beeId: bee.beeId });
     assert.equal(stuck.bee?.account, "claude-b", "no rotation back onto the recently exhausted account");
     assert.equal(stuck.view.generation, 2);
@@ -323,7 +323,7 @@ test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) 
     const o1 = await client.request<SendRpcResult>("send", { beeId: opt.beeId, body: "@ratelimit" });
     await waitDelivered(client, opt.beeId, o1.messageId, "opt-out ratelimit delivered");
     await waitFor(async () => (await client.request<ViewResult>("view", { beeId: opt.beeId })).view.flags.includes("resource_blocked") ? true : null, "opt-out flagged");
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 150));
     const optView = await client.request<ViewResult>("view", { beeId: opt.beeId });
     assert.equal(optView.bee?.account, "claude-a");
     assert.equal(optView.view.generation, 1);

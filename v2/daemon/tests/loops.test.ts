@@ -34,7 +34,7 @@ function makeRig(policy: Partial<DaemonPolicy> = {}): Rig {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-loops-"));
   const clock = { now: 1000 };
   const now = (): number => clock.now;
-  const store = openCoreStore(join(dir, "core.sqlite3"), { now, maxAttempts: 3, backoffBaseMs: 1 });
+  const store = openCoreStore(join(dir, "core.sqlite3"), { now, maxAttempts: 3, backoffBaseMs: 1, ephemeral: true });
   const driver = new FakeDriver(now);
   const violations: I1ViolationEvent[] = [];
   const ops: string[] = [];
@@ -610,7 +610,7 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
   // real OS processes and the real HsrDriver.
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-synthboot-"));
   const ops: string[] = [];
-  const store = openCoreStore(join(dir, "core.sqlite3"), { maxAttempts: 3, backoffBaseMs: 30 });
+  const store = openCoreStore(join(dir, "core.sqlite3"), { maxAttempts: 3, backoffBaseMs: 30, ephemeral: true });
   let fixed = false;
   const driver = new HsrDriver({
     sessionLogDir: join(dir, "logs"),
@@ -657,11 +657,11 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
       const parked = stopped && store.undeliveredMessages("bee-x").length === 0;
       if ((flagged && stopped) || parked) break;
       assert.ok(Date.now() < deadline, `never bounded; ops tail: ${ops.slice(-25).join(" | ")}`);
-      await sleep(150);
+      await sleep(40);
     }
     // Settle: nothing further may start.
     for (let i = 0; i < 5; i++) {
-      await sleep(150);
+      await sleep(40);
       core.step();
     }
     const runtimes = store.listRuntimes("bee-x");
@@ -706,7 +706,7 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
       core.step();
       if (store.undeliveredMessages("bee-x").length === 0 && store.currentRuntime("bee-x")?.state === "idle") break;
       assert.ok(Date.now() < ok, `revive did not recover; ops tail: ${ops.slice(-25).join(" | ")}`);
-      await sleep(50);
+      await sleep(20);
     }
     assert.deepEqual(store.activeFlags("bee-x"), []);
     assert.equal(store.getBee("bee-x")?.spawnFailures, 0);
@@ -767,7 +767,7 @@ test("unit.10 (spec 08): the onFlagEvidence hook fires after each applied eviden
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-loops-"));
   const clock = { now: 1000 };
   const now = (): number => clock.now;
-  const store = openCoreStore(join(dir, "core.sqlite3"), { now });
+  const store = openCoreStore(join(dir, "core.sqlite3"), { now, ephemeral: true });
   const driver = new FakeDriver(now);
   const seen: string[] = [];
   const ops: string[] = [];

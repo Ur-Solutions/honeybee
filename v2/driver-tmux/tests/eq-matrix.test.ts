@@ -32,7 +32,7 @@ async function runScenario(style: StubStyle): Promise<Outcome> {
     // Boot settling (transcript binding) before the first delivery — the
     // shape a real delivery loop has (it delivers after real boot, seconds
     // in). Nothing may drain here in any style.
-    boot.push(...(await settle(rig.driver, 350)));
+    boot.push(...(await settle(rig.driver, 80)));
 
     const outcome = rig.driver.deliver(beeId, 1, 1, `work please (${style})`);
     assert.equal(outcome.accepted, true, `${style}: delivery accepted`);

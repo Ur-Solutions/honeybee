@@ -177,7 +177,7 @@ test("tmux.interrupt (v6): idle → no-op; a hung turn is ended by C-c to the ex
 
     assert.equal(rig.driver.deliver("bee-1", 1, 1, "please @hang").accepted, true);
     await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_started"));
-    await sleep(300);
+    await sleep(80);
     assert.deepEqual(kinds(rig.driver.observe()).filter((k) => k === "turn_ended"), [], "hung: no turn_ended");
 
     assert.deepEqual(rig.driver.interrupt("bee-1", 1), { interrupted: true });

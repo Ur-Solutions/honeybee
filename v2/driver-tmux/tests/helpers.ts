@@ -20,8 +20,8 @@ export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
 
 /** The per-style observation spec — mirrors the harness each style models. */
 export function observationFor(style: StubStyle, transcriptDir: string): ObservationSpec {
-  const quiesceMs = 250;
-  const deliveryGraceMs = 4000;
+  const quiesceMs = 80;
+  const deliveryGraceMs = 800;
   switch (style) {
     case "hooks": // claude-shaped: hook events + claude transcript baseline
       return {
@@ -79,7 +79,7 @@ export function makeRig(): TmuxRig {
       env: {
         TMUX_STUB_STYLE: cfg.style,
         TMUX_STUB_TRANSCRIPT_DIR: transcriptDirOf(beeId),
-        TMUX_STUB_TURN_MS: "40",
+        TMUX_STUB_TURN_MS: "20",
         ...cfg.env,
       },
       ...(cfg.deliveryMode ? { deliveryMode: cfg.deliveryMode } : {}),
@@ -126,7 +126,7 @@ export async function drainUntil(
     acc.push(...driver.observe());
     if (pred(acc)) return acc;
     if (Date.now() > deadline) throw new Error(`drainUntil timeout; saw: ${JSON.stringify(acc)}`);
-    await sleep(15);
+    await sleep(8);
   }
 }
 
@@ -144,7 +144,7 @@ export async function settle(driver: TmuxDriver, ms: number): Promise<DriverObse
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     acc.push(...driver.observe());
-    await sleep(20);
+    await sleep(10);
   }
   return acc;
 }

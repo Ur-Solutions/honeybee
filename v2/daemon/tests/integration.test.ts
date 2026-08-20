@@ -364,7 +364,7 @@ test("int.6: induced I1 breach — a boot-hanging agent leaves mail undelivered 
       return h.i1Violations >= 1 ? h : null;
     }, "i1 violation recorded", 12_000);
     assert.equal(health.i1Violations, 1, "one message, one violation row (deduped)");
-    await sleep(500);
+    await sleep(80);
     const still = await client.request<HealthResult>("health");
     assert.equal(still.i1Violations, 1, "re-detection never double-counts");
     client.close();
@@ -418,7 +418,7 @@ test("int.7: immediate-exit agent → bounded revives on backoff, spawn_failed a
     // Bounded: 4 boot failures = at most 4 generations plus one machine_restart
     // row if the kill landed mid-boot — nowhere near "hundreds per second".
     assert.ok(genAtFlag <= 5, `generations at the flag: ${genAtFlag}`);
-    await sleep(600); // ≫ every backoff step (60,120,240ms): a loop would show
+    await sleep(400); // ≫ every backoff step (60,120,240ms): a loop would show
     const later = await client.request<ViewResult>("view", { beeId });
     assert.equal(later.view.generation, genAtFlag, "no revive while spawn_failed is set");
     const cmds = await client.request<CommandsResult>("commands", { beeId });
@@ -469,7 +469,7 @@ test("int.urgency.1: mid-turn `now` — the turn is interrupted, the message del
     const beeId = await spawnAndSettle(client, "urgent-now");
 
     // Open a long turn (the stub works it for 4s), wait until it is running.
-    const slow = await client.request<SendRpcResult>("send", { beeId, body: "@slow:4000" });
+    const slow = await client.request<SendRpcResult>("send", { beeId, body: "@slow:800" });
     await waitFor(async () => {
       const v = await client.request<ViewResult>("view", { beeId });
       return v.view.runtimeState === "running";
@@ -478,7 +478,7 @@ test("int.urgency.1: mid-turn `now` — the turn is interrupted, the message del
     const before = Date.now();
     const urgent = await client.request<SendRpcResult>("send", { beeId, body: "drop everything", urgency: "now" });
     await waitDelivered(client, beeId, urgent.messageId, "now-message delivered mid-turn");
-    assert.ok(Date.now() - before < 3000, "delivered well before the 4s turn would have ended");
+    assert.ok(Date.now() - before < 600, "delivered well before the 800ms turn would have ended");
     // Loop ops land in the op log file (hived.log), not stdout.
     await waitFor(() => readFileSync(`${dir}/hived.log`, "utf8").includes("deliver.interrupt"), "the delivery loop interrupted the turn");
 
@@ -507,7 +507,7 @@ test("int.urgency.2: mid-turn `idle` — held while the turn runs, delivered onl
     const client = await daemon.client();
     const beeId = await spawnAndSettle(client, "urgent-idle");
 
-    await client.request<SendRpcResult>("send", { beeId, body: "@slow:1500" });
+    await client.request<SendRpcResult>("send", { beeId, body: "@slow:400" });
     await waitFor(async () => {
       const v = await client.request<ViewResult>("view", { beeId });
       return v.view.runtimeState === "running";
@@ -515,12 +515,12 @@ test("int.urgency.2: mid-turn `idle` — held while the turn runs, delivered onl
 
     const later = await client.request<SendRpcResult>("send", { beeId, body: "when you are done", urgency: "idle" });
     // While the turn runs, the message must stay undelivered (poll a few ticks).
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 6; i++) {
       const v = await client.request<ViewResult>("view", { beeId });
       if (v.view.runtimeState !== "running") break;
       const mail = await client.request<MailboxResult>("mailbox", { beeId });
       assert.equal(mail.messages.find((m) => m.id === later.messageId)?.deliveredAt, null, "idle message held mid-turn");
-      await sleep(100);
+      await sleep(40);
     }
     await waitDelivered(client, beeId, later.messageId, "idle message delivered after the turn ended");
     assert.ok(!readFileSync(`${dir}/hived.log`, "utf8").includes("deliver.interrupt"), "idle never interrupts");

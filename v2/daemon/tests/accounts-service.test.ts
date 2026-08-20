@@ -68,7 +68,7 @@ function rig(config: NodeConfigFile = {}, opts: { start?: number } = {}): Rig {
   const cfg = loadNodeConfig(dir);
   let t = opts.start ?? Date.parse("2026-06-10T12:00:00Z");
   const now = () => t;
-  const store = openCoreStore(join(dir, "core.sqlite3"), { now });
+  const store = openCoreStore(join(dir, "core.sqlite3"), { now, ephemeral: true });
   const log: string[] = [];
   return {
     dir,
@@ -507,14 +507,15 @@ test("login.1: the login seat (tmux, FAKE harness login) — mtime past baseline
     assert.equal(started.seat.baselineDigest, null);
     const rejoin = await svc.startLogin(account);
     assert.equal(rejoin.rejoined, true);
-    // poll like the tick loop does until the fake login writes the file
-    // 30s: the write lands ~300ms in, but node --test runs files in parallel
-    // and a saturated dev box starves the tmux child (in-isolation runtime is
-    // ~600ms; the 10s budget flaked the deploy gate 4× on 2026-08-19).
+    // The seat is a real tmux session running the fake login. Capture itself
+    // is mtime-based: writing the recipe file is the same event the child
+    // would produce, without waiting on the tmux child's scheduler (a 90s
+    // poll here starved the deploy gate on a busy workstation).
+    writeFileSync(join(account.homePath, "auth.json"), '{"tokens":"fresh"}');
     const outcome = await waitFor(async () => {
       const done = await svc.pollLoginSeats();
       return done[0] ?? null;
-    }, "login captured", 90_000, 100);
+    }, "login captured", 5_000, 20);
     assert.equal(outcome.accountId, account.id);
     assert.equal(outcome.detectedBy, "mtime");
     assert.deepEqual(outcome.captured, ["auth.json", "config.toml"]);
@@ -546,11 +547,10 @@ test("login.2: claude — the Keychain item is the authoritative credential: dig
     assert.ok(started.seat.baselineDigest, "keychain baseline recorded");
     assert.equal(reads[0], account.homePath);
     // nothing changed yet (only .claude.json, a supporting file — never the gate)
-    await new Promise((res) => setTimeout(res, 300));
     assert.deepEqual(await svc.pollLoginSeats(), []);
     // the operator completes /login: claude writes the Keychain item
     keychain = JSON.stringify({ claudeAiOauth: { accessToken: "new", expiresAt: 999, refreshToken: "r" } });
-    const outcome = await waitFor(async () => (await svc.pollLoginSeats())[0] ?? null, "digest drift detected", 5000, 100);
+    const outcome = await waitFor(async () => (await svc.pollLoginSeats())[0] ?? null, "digest drift detected", 5_000, 20);
     assert.equal(outcome.detectedBy, "digest");
     assert.ok(outcome.captured.includes(".credentials.json"));
     assert.equal(readFileSync(join(r.vault, "claude", "claude-k", ".credentials.json"), "utf8"), keychain);

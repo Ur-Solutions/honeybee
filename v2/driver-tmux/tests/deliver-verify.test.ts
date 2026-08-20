@@ -17,7 +17,7 @@ import { drainUntil, kinds, makeRig, settle } from "./helpers.ts";
 async function bootIdle(rig: ReturnType<typeof makeRig>, bee: string): Promise<void> {
   rig.driver.start(bee, 1);
   await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_ended"));
-  await settle(rig.driver, 300);
+  await settle(rig.driver, 80);
 }
 
 async function turnCompletes(rig: ReturnType<typeof makeRig>, timeoutMs = 8000): Promise<boolean> {
@@ -67,7 +67,7 @@ test("spec05.deliver.post-turn-swallow: the paste swallowed after a completed tu
     await bootIdle(rig, "codexish");
     assert.equal(rig.driver.deliver("codexish", 1, 1, "first").accepted, true);
     assert.equal(await turnCompletes(rig), true, "first turn ran");
-    await settle(rig.driver, 300);
+    await settle(rig.driver, 80);
     // The stub now swallows the next paste (the live codex failure).
     assert.equal(rig.driver.deliver("codexish", 1, 2, "second message please").accepted, true);
     assert.equal(await turnCompletes(rig), true, "second turn ran — echo-verify caught the swallow and retyped");

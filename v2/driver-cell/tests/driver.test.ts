@@ -93,7 +93,7 @@ test("cell-driver.roundtrip: start provisions the cell, runtime runs in the spac
     assert.equal(driver.hasProcess("bee-1", 1), false);
   } finally {
     driver.disposeAll();
-    await sleep(50);
+    await sleep(10);
     rig.cleanup();
   }
 });
@@ -122,7 +122,7 @@ test("cell-driver.exit-path: work committed in the live cell captures out; remov
     assert.ok(!existsSync(cell.paths.wrapperDir));
   } finally {
     driver.disposeAll();
-    await sleep(50);
+    await sleep(10);
     rig.cleanup();
   }
 });
@@ -150,7 +150,7 @@ test("cell-driver.restart-hydration: a fresh driver re-hydrates cells from cell.
     assert.equal(driver2.removeCell("bee-1").deleted, true);
   } finally {
     driver.disposeAll();
-    await sleep(50);
+    await sleep(10);
     rig.cleanup();
   }
 });
@@ -186,7 +186,7 @@ test("cell-driver.reserved-only: a cell reserved (seed ledger) but never started
     await drainUntil(driver, (e) => e.some((x) => x.kind === "exited"));
   } finally {
     driver.disposeAll();
-    await sleep(50);
+    await sleep(10);
     rig.cleanup();
   }
 });
@@ -229,7 +229,7 @@ test("cell-driver.workstation-default: sandbox stays OFF without an override (A4
     await drainUntil(driver, (e) => e.some((x) => x.kind === "exited"));
   } finally {
     driver.disposeAll();
-    await sleep(50);
+    await sleep(10);
     rig.cleanup();
   }
 });
