@@ -159,6 +159,48 @@ export const grokTranscriptParser: TranscriptParser = {
   parseLine(line: string): TranscriptEvent[] {
     const row = jsonLine(line);
     if (!row) return [];
+    if (typeof row.method === "string") {
+      if (row.method === "session/prompt") {
+        const params = row.params as { prompt?: unknown } | undefined;
+        return hasUserText(params?.prompt) ? [{ kind: "turn_started" }] : [];
+      }
+      if (
+        row.method !== "session/update"
+        && row.method !== "_x.ai/session/update"
+        && row.method !== "x.ai/session/update"
+        && row.method !== "_x.ai/session_notification"
+        && row.method !== "x.ai/session_notification"
+      ) {
+        return [];
+      }
+      const params = row.params as Record<string, unknown> | undefined;
+      const update = (params?.update as Record<string, unknown> | undefined) ?? params;
+      if (!update) return [];
+      const kind = update.sessionUpdate ?? update.session_update ?? update.type;
+      const content = update.content ?? update.text;
+      if (row.synthetic_reason != null || params?.synthetic_reason != null || update.synthetic_reason != null) return [];
+      const contentObject = content != null && typeof content === "object" && !Array.isArray(content)
+        ? content as { text?: unknown }
+        : undefined;
+      if (
+        (kind === "user_message_chunk" || kind === "user_message")
+        && hasUserText(contentObject?.text ?? content)
+      ) {
+        return [{ kind: "turn_started" }];
+      }
+      // Chunk rows are output-recency observations. Coalescing them into one
+      // readable assistant message belongs to the stateful Grok projector.
+      if (
+        kind === "agent_message_chunk"
+        || kind === "agent_message"
+        || kind === "agent_thought_chunk"
+        || kind === "tool_call"
+        || kind === "tool_call_update"
+      ) {
+        return [{ kind: "output" }];
+      }
+      return [];
+    }
     const message = row.message as { role?: unknown; content?: unknown } | undefined;
     const role = typeof message?.role === "string" ? message.role : row.type;
     const content = message?.content ?? row.content;
@@ -316,8 +358,8 @@ export const grokTranscriptRenderer: TranscriptRenderer = {
     const row = jsonLine(line);
     if (!row) return [];
     // hsr substrate: the session log is Grok ACP JSON-RPC (`grok agent stdio`),
-    // not chat_history.jsonl. `session/update` carries the same turns as
-    // chunks; `session/prompt` is stdin and is not logged.
+    // not chat_history.jsonl. `session/update` carries streamed chunks and
+    // the logged client→server `session/prompt` carries the operator input.
     if (typeof row.method === "string") {
       // Client→server session/prompt (logged from stdin) is the operator's turn.
       if (row.method === "session/prompt") {
@@ -346,13 +388,19 @@ export const grokTranscriptRenderer: TranscriptRenderer = {
       const text = (content && typeof content === "object" && !Array.isArray(content)
         ? (content as { text?: unknown }).text
         : undefined) ?? update.text;
-      if (kind === "agent_message_chunk" || kind === "agent_message") {
+      // ACP deltas require cross-line state and are intentionally handled by
+      // createGrokProjector. Rendering one turn here would recreate the
+      // one-word-per-line transcript bug.
+      if (kind === "agent_message_chunk" || kind === "user_message_chunk" || kind === "agent_thought_chunk") {
+        return [];
+      }
+      if (kind === "agent_message") {
         return typeof text === "string" && text.trim().length > 0 ? [{ role: "assistant", text }] : [];
       }
-      if (kind === "user_message_chunk" || kind === "user_message") {
+      if (kind === "user_message") {
         return typeof text === "string" && text.trim().length > 0 ? [{ role: "user", text }] : [];
       }
-      if (kind === "tool_call" || kind === "tool_call_update") {
+      if (kind === "tool_call") {
         const title = typeof update.title === "string" ? update.title
           : typeof update.kind === "string" ? update.kind : "tool";
         return [{ role: "tool", text: `[tool_use: ${title}]` }];
