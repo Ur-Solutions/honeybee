@@ -171,13 +171,58 @@ test("parsers.grok: chat_history rows (v1 fixture shapes) — user starts, assis
   assert.deepEqual(p.parseLine(j({ type: "reasoning", summary: [{ type: "summary_text", text: "…" }] })), []);
 });
 
-test("renderers.grok: hsr ACP session/update chunks render as assistant text", () => {
+test("parsers.grok: ACP prompt starts a turn and agent chunks are output recency", () => {
+  const p = grokTranscriptParser;
+  assert.deepEqual(p.parseLine(j({
+    jsonrpc: "2.0",
+    id: 1001,
+    method: "session/prompt",
+    params: { sessionId: "s", prompt: [{ type: "text", text: "do the thing" }] },
+  })), [{ kind: "turn_started" }]);
+  assert.deepEqual(p.parseLine(j({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+  })), [{ kind: "output" }]);
+  assert.deepEqual(p.parseLine(j({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId: "s", update: { sessionUpdate: "tool_call", toolCallId: "call-1", title: "Read" } },
+  })), [{ kind: "output" }]);
+  assert.deepEqual(p.parseLine(j({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId: "s", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "hello" } } },
+  })), [{ kind: "turn_started" }]);
+  assert.deepEqual(p.parseLine(j({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId: "s",
+      update: {
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "injected" },
+        synthetic_reason: "system_reminder",
+      },
+    },
+  })), []);
+});
+
+test("renderers.grok: ACP deltas defer to the stateful projector", () => {
   const r = grokTranscriptRenderer;
   assert.deepEqual(
     r.renderLine(j({
       jsonrpc: "2.0",
       method: "session/update",
       params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+    })),
+    [],
+  );
+  assert.deepEqual(
+    r.renderLine(j({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "s", update: { sessionUpdate: "agent_message", content: { type: "text", text: "hello" } } },
     })),
     [{ role: "assistant", text: "hello" }],
   );

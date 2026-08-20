@@ -1,7 +1,7 @@
 import { createCodexProjector } from "./codex-projection.ts";
+import { createGrokProjector } from "./grok-projection.ts";
 import {
   claudeTranscriptRenderer,
-  grokTranscriptRenderer,
   stubTranscriptRenderer,
   type TranscriptRenderer,
 } from "./transcripts.ts";
@@ -122,7 +122,7 @@ export function createTranscriptProjector(harness: string): TranscriptProjector 
     case "codex":
       return createCodexProjector();
     case "grok":
-      return projectorFromRenderer(grokTranscriptRenderer);
+      return createGrokProjector();
     case "stub":
       return projectorFromRenderer(stubTranscriptRenderer);
     case "claude":
