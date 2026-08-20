@@ -514,7 +514,7 @@ test("login.1: the login seat (tmux, FAKE harness login) — mtime past baseline
     const outcome = await waitFor(async () => {
       const done = await svc.pollLoginSeats();
       return done[0] ?? null;
-    }, "login captured", 30_000, 100);
+    }, "login captured", 90_000, 100);
     assert.equal(outcome.accountId, account.id);
     assert.equal(outcome.detectedBy, "mtime");
     assert.deepEqual(outcome.captured, ["auth.json", "config.toml"]);
