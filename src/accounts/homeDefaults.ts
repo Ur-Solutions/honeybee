@@ -14,6 +14,10 @@ import { atomicWriteFile } from "../fsx.js";
 // Opus 4.8, 1M-context). Seeded into settings.json only when no model is set.
 const CLAUDE_HOME_DEFAULT_MODEL = "opus[1m]";
 
+// Claude 2.1.237 built-in output style: lead with results, skip preamble/narration.
+// Seeded only when ABSENT so an explicit vault/operator style is left untouched.
+const CLAUDE_HOME_DEFAULT_OUTPUT_STYLE = "Concise";
+
 const CODEX_HOME_DEFAULTS: Record<string, string> = {
   model: `"gpt-5.5"`,
   model_reasoning_effort: `"xhigh"`,
@@ -64,6 +68,10 @@ function withClaudeSettingsDefaults(input: string): string {
   // model the operator/vault set is left untouched. Mirrors CODEX_HOME_DEFAULTS.
   if (typeof parsed.model !== "string" || parsed.model.trim().length === 0) {
     parsed.model = CLAUDE_HOME_DEFAULT_MODEL;
+    changed = true;
+  }
+  if (typeof parsed.outputStyle !== "string" || parsed.outputStyle.trim().length === 0) {
+    parsed.outputStyle = CLAUDE_HOME_DEFAULT_OUTPUT_STYLE;
     changed = true;
   }
   if (!changed) return input;

@@ -744,6 +744,7 @@ test("claude activation seeds skipDangerousModePermissionPrompt without clobberi
     // ...and the vault's own keys are preserved (merged, not replaced).
     assert.equal(settings.model, "claude-fable-5");
     assert.equal(settings.theme, "dark");
+    assert.equal(settings.outputStyle, "Concise");
   });
 });
 
@@ -763,6 +764,7 @@ test("claude activation re-asserts the bypass flag every time, surviving a vault
     const settings = JSON.parse(await readFile(join(home, "settings.json"), "utf8"));
     assert.equal(settings.skipDangerousModePermissionPrompt, true);
     assert.equal(settings.theme, "dark");
+    assert.equal(settings.outputStyle, "Concise");
   });
 });
 
