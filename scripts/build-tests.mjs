@@ -1,24 +1,73 @@
-import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { stageRunnerHostArtifact } from "./runner-host-artifact.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const outDir = join(root, ".test-dist");
+const stampPath = join(outDir, "build-stamp.json");
 
-async function typescriptFiles(dir) {
+async function listedFiles(dir, predicate) {
   const entries = await readdir(dir, { withFileTypes: true });
   const files = await Promise.all(entries.map(async (entry) => {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) return typescriptFiles(path);
-    return entry.isFile() && entry.name.endsWith(".ts") ? [path] : [];
+    if (entry.isDirectory()) return listedFiles(path, predicate);
+    return entry.isFile() && predicate(entry.name) ? [path] : [];
   }));
   return files.flat();
 }
 
+async function typescriptFiles(dir) {
+  return listedFiles(dir, (name) => name.endsWith(".ts"));
+}
+
+async function fingerprint(paths) {
+  const hash = createHash("sha1");
+  for (const path of [...paths].sort()) {
+    try {
+      const info = await stat(path);
+      hash.update(path);
+      hash.update("\0");
+      hash.update(String(info.size));
+      hash.update("\0");
+      hash.update(String(Math.round(info.mtimeMs)));
+      hash.update("\n");
+    } catch {
+      hash.update(`missing:${path}\n`);
+    }
+  }
+  return hash.digest("hex");
+}
+
 const sourceFiles = await typescriptFiles(join(root, "src"));
 const testFiles = await typescriptFiles(join(root, "tests"));
+const assetFiles = [
+  ...(await listedFiles(join(root, "tests", "fixtures"), () => true)),
+  ...(await listedFiles(join(root, "contracts"), () => true)),
+  ...(await listedFiles(join(root, "docs"), () => true)),
+];
+const stampInputs = [
+  ...sourceFiles,
+  ...testFiles,
+  ...assetFiles,
+  join(root, "package.json"),
+  join(root, "scripts", "build-tests.mjs"),
+  join(root, "scripts", "runner-host-artifact.mjs"),
+];
+const stamp = await fingerprint(stampInputs);
+if (process.env.FORCE_TEST_BUILD !== "1") {
+  try {
+    const previous = JSON.parse(await readFile(stampPath, "utf8"));
+    if (previous.fingerprint === stamp) {
+      process.stderr.write("build:test: up to date\n");
+      process.exit(0);
+    }
+  } catch {
+    // no stamp or unreadable — build
+  }
+}
 
 // Transpile the whole graph once instead of starting a tsx/esbuild service in
 // every Node test worker. Each file remains a separate ESM module, preserving
@@ -70,3 +119,4 @@ await writeFile(
   join(outDir, "test-files.json"),
   `${JSON.stringify(compiledTests, null, 2)}\n`,
 );
+await writeFile(stampPath, `${JSON.stringify({ fingerprint: stamp }, null, 2)}\n`);

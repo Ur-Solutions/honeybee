@@ -5,6 +5,13 @@ import { test } from "node:test";
 
 const controls = await import(pathToFileURL(join(process.cwd(), "scripts", "test-process-control.mjs")).href) as {
   signalExitCode: (signal: NodeJS.Signals) => number;
+  nodeTestCliFlags: (options?: {
+    concurrency?: string;
+    reporter?: string;
+    timeout?: string;
+    forceExit?: boolean;
+    extra?: string[];
+  }) => string[];
   terminateTestProcessTree: (
     child: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean },
     signal: NodeJS.Signals,
@@ -21,6 +28,23 @@ test("test runner maps forwarded termination signals to shell exit codes", () =>
   assert.equal(controls.signalExitCode("SIGINT"), 130);
   assert.equal(controls.signalExitCode("SIGTERM"), 143);
   assert.equal(controls.signalExitCode("SIGHUP"), 1);
+});
+
+test("test runner forces worker exit and bounds hung tests so leaked sockets cannot stall npm test", () => {
+  const flags = controls.nodeTestCliFlags();
+  assert.ok(flags.includes("--test"));
+  assert.ok(flags.includes("--test-force-exit"));
+  assert.ok(flags.includes("--test-timeout=60000"));
+  assert.equal(flags.filter((flag) => flag.startsWith("--test-timeout")).length, 1);
+});
+
+test("forwarded --test-timeout is preserved without duplicating the default", () => {
+  const flags = controls.nodeTestCliFlags({ extra: ["--test-timeout=120000"] });
+  assert.deepEqual(
+    flags.filter((flag) => flag.startsWith("--test-timeout")),
+    ["--test-timeout=120000"],
+  );
+  assert.ok(flags.includes("--test-force-exit"));
 });
 
 test("test runner terminates the complete POSIX worker process group", async () => {

@@ -3,6 +3,31 @@ const SIGNAL_EXIT_CODES = new Map([
   ["SIGTERM", 143],
 ]);
 
+/**
+ * Flags for `node --test` workers. Open unix sockets / fake HSR `done`
+ * promises otherwise keep isolation=process workers alive forever
+ * (`--test-timeout=0` is Node's default).
+ */
+export function nodeTestCliFlags(options = {}) {
+  const concurrency = options.concurrency ?? "8";
+  const reporter = options.reporter ?? "dot";
+  const timeout = options.timeout ?? "60000";
+  const extra = options.extra ?? [];
+  const flags = [
+    "--test",
+    `--test-concurrency=${concurrency}`,
+    `--test-reporter=${reporter}`,
+  ];
+  if (options.forceExit !== false && !extra.includes("--test-force-exit")) {
+    flags.push("--test-force-exit");
+  }
+  if (!extra.some((arg) => typeof arg === "string" && arg.startsWith("--test-timeout"))) {
+    flags.push(`--test-timeout=${timeout}`);
+  }
+  flags.push(...extra);
+  return flags;
+}
+
 export function signalExitCode(signal) {
   return SIGNAL_EXIT_CODES.get(signal) ?? 1;
 }

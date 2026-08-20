@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .test-dist/
+.cache/
 .DS_Store
 stress-reports/
 .local/

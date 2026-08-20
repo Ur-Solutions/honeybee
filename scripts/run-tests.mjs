@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { signalExitCode, terminateTestProcessTree } from "./test-process-control.mjs";
+import { nodeTestCliFlags, signalExitCode, terminateTestProcessTree } from "./test-process-control.mjs";
+import { testEnv } from "./test-env.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const manifestPath = resolve(root, ".test-dist", "test-files.json");
@@ -14,6 +15,7 @@ if (!Array.isArray(testFiles) || testFiles.some((path) => typeof path !== "strin
 
 const concurrency = process.env.HIVE_TEST_CONCURRENCY?.trim() || "8";
 const reporter = process.env.HIVE_TEST_REPORTER?.trim() || "dot";
+const timeout = process.env.HIVE_TEST_TIMEOUT?.trim() || "60000";
 const forwarded = process.argv.slice(2);
 const requestedFiles = forwarded.filter((arg) => /\.(?:[cm]?[jt]s)$/.test(arg));
 const nodeArgs = forwarded.filter((arg) => !requestedFiles.includes(arg));
@@ -41,10 +43,7 @@ async function runGroup(files, execArgv = []) {
     process.execPath,
     [
       ...execArgv,
-      "--test",
-      `--test-concurrency=${concurrency}`,
-      `--test-reporter=${reporter}`,
-      ...nodeArgs,
+      ...nodeTestCliFlags({ concurrency, reporter, timeout, extra: nodeArgs }),
       ...files,
     ],
     {
@@ -53,7 +52,7 @@ async function runGroup(files, execArgv = []) {
       // `node --test` starts worker descendants. A dedicated process group lets
       // Ctrl-C/termination reap the whole tree instead of orphaning workers.
       detached: process.platform !== "win32",
-      env: { ...process.env, HIVE_TEST_BUILT_CLI: "1" },
+      env: testEnv({ HIVE_TEST_BUILT_CLI: "1" }),
     },
   );
 
