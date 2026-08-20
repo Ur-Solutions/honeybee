@@ -2,6 +2,7 @@
 // seeded from its state, with account-safety resolution.
 // Extracted from cli.ts (HIVE-15).
 import { activateAccountIntoHome, defaultHomeForAccount, listAccounts, type AccountRecord } from "../accounts.js";
+import { seedGatewayMcpForAgent } from "../accounts/gatewayMcp.js";
 import { adoptInheritedHome, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { agentKinds, forkCapabilityForAgent, sessionPinnedInArgs, sessionPinResumeExtrasForAgent } from "../drivers.js";
 import { assertExecutableAvailable } from "../execCheck.js";
@@ -342,6 +343,7 @@ export async function cmdFork(parsed: Parsed): Promise<SessionRecord> {
     }
   }
   if (!isRemote) {
+    await seedGatewayMcpForAgent(spec.kind, spec.homePath);
     await assertExecutableAvailable(spec.command);
     await assertAgentAuthFreshForSpawn(spec, account?.id);
   }

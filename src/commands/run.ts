@@ -7,6 +7,7 @@ import {
   seedClaudeHomeAcceptance,
   withReadyActivationHomeOwner,
 } from "../accounts.js";
+import { seedGatewayMcpForAgent } from "../accounts/gatewayMcp.js";
 import { assertAgentAuthFreshForSpawn, canonicalAgentKind, refreshIdentityEnv, resolveAgent, shellCommand } from "../agents.js";
 import { bootMsForAgent } from "../drivers.js";
 import { deliverSessionText } from "../delivery.js";
@@ -412,6 +413,7 @@ export async function cmdOpenRaw(parsed: Parsed) {
     await activateAccountIntoHome(account, spec.homePath, { onWarn: (message) => console.error(note(message)) });
     refreshIdentityEnv(spec);
   }
+  await seedGatewayMcpForAgent(spec.kind, spec.homePath);
   const cwd = await resolveSpawnCwd(parsed, profile?.cwd);
   // Re-merge the startup acceptances activation just clobbered (and seed them
   // for fresh homes), so claude does not re-ask the bypass-permissions and

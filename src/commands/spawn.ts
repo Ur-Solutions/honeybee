@@ -2,6 +2,7 @@
 // account/profile resolution, homogeneous swarms, and frame-driven cohorts.
 // Extracted from cli.ts (HIVE-15).
 import { AUTO_ACCOUNT_QUERY, RR_ACCOUNT_QUERY, accountHasCredentials, activateAccountIntoHome, autoAccountTool, clearAccountBootFailure, defaultHomeForAccount, findAccount, listAccounts, recordAccountBootFailure, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord, type SpawnAgentSpec } from "../accounts.js";
+import { seedGatewayMcpForAgent } from "../accounts/gatewayMcp.js";
 import { mintCellBrokerCapability } from "../cellBrokerCapability.js";
 import { adoptInheritedHome, agentDefaultsToYolo, assertAgentAuthFreshForSpawn, canonicalAgentKind, forcedSessionIdArgs, refreshIdentityEnv, resolveAgent, shellCommand, stampBeeIdentityEnv } from "../agents.js";
 import { syncBeesSidebarLayout } from "../beesSidebar.js";
@@ -476,6 +477,9 @@ export async function spawnBee(opts: SpawnOptions, runtimeDeps: SpawnRuntimeDepe
     throw new Error(
       `kit profile ${opts.kitProfile} did not converge for ${spec.homePath}: manifest reports profile ${kitStamp.kitProfile ?? "(missing)"}, version ${kitStamp.kitVersion ?? "(missing)"}`,
     );
+  }
+  if (!isRemoteSpawn) {
+    await seedGatewayMcpForAgent(spec.kind, spec.homePath);
   }
   // "activate" folds in resolveAgent + account activation (the OAuth-refresh
   // network call and accounts-lock wait live here); near-zero without --account.

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { seedGatewayMcp, type GatewayMcpStamp } from "../src/accounts/gatewayMcp.js";
+import { nativeGatewayHome, seedGatewayMcp, seedGatewayMcpForAgent, type GatewayMcpStamp } from "../src/accounts/gatewayMcp.js";
 import type { GatewayRecord } from "../src/gateways.js";
 
 function gateway(overrides: Partial<GatewayRecord> = {}): GatewayRecord {
@@ -241,6 +241,40 @@ test("grok seeder uses Codex TOML tables without env_vars", async () => {
   });
 });
 
+test("pi seeder writes mcp.json in Claude mcpServers shape", async () => {
+  await withHome(async (home) => {
+    const statePath = join(home, "mcp.json");
+    await writeFile(statePath, JSON.stringify({
+      mcpServers: { user: { command: "/usr/bin/user-mcp", args: [] } },
+    }));
+
+    const first = await seedGatewayMcp(home, "pi", { gateways: [gateway()] });
+    assert.deepEqual(first.written.sort(), [".hive-gateways.json", "mcp.json"]);
+    const state = await json(statePath) as { mcpServers?: Record<string, unknown> };
+    assert.deepEqual(state.mcpServers?.user, { command: "/usr/bin/user-mcp", args: [] });
+    assert.deepEqual(state.mcpServers?.apiary, { command: "/opt/apiary-mcp", args: [] });
+    assert.deepEqual((await seedGatewayMcp(home, "pi", { gateways: [gateway()] })).written, []);
+
+    await seedGatewayMcp(home, "pi", { gateways: [] });
+    const after = await json(statePath) as { mcpServers?: Record<string, unknown> };
+    assert.equal(after.mcpServers?.apiary, undefined);
+    assert.deepEqual(after.mcpServers?.user, { command: "/usr/bin/user-mcp", args: [] });
+  });
+});
+
+test("pi native gateway home is PI_CODING_AGENT_DIR or ~/.pi/agent", async () => {
+  const { homedir } = await import("node:os");
+  assert.equal(nativeGatewayHome("pi", { PI_CODING_AGENT_DIR: "/tmp/pi-agent" }), "/tmp/pi-agent");
+  assert.equal(nativeGatewayHome("pi", { PI_CODING_AGENT_DIR: "  " }), join(homedir(), ".pi", "agent"));
+  assert.equal(nativeGatewayHome("grok", { PI_CODING_AGENT_DIR: "/tmp/pi-agent" }), undefined);
+  await withHome(async (home) => {
+    const targeted = await seedGatewayMcpForAgent("pi", home, { gateways: [gateway()] });
+    assert.ok(targeted.written.includes("mcp.json"));
+    const state = await json(join(home, "mcp.json")) as { mcpServers?: Record<string, unknown> };
+    assert.deepEqual(state.mcpServers?.apiary, { command: "/opt/apiary-mcp", args: [] });
+  });
+});
+
 test("opencode seeder merges local mcp entries and forwards identity env by template", async () => {
   await withHome(async (home) => {
     const configPath = join(home, "opencode.json");
@@ -294,6 +328,7 @@ test("kit ownership manifest makes honeybee defer the whole target file", async 
     ["codex", "config.toml"],
     ["grok", "config.toml"],
     ["opencode", "opencode.json"],
+    ["pi", "mcp.json"],
   ] as const) {
     await withHome(async (home) => {
       const targetPath = join(home, target);
@@ -317,7 +352,7 @@ test("empty registry is a no-op and unsupported harnesses skip", async () => {
   await withHome(async (home) => {
     assert.deepEqual(await seedGatewayMcp(home, "claude", { gateways: [] }), { status: "seeded", written: [] });
     assert.equal(await stat(join(home, ".hive-gateways.json")).catch(() => null), null);
-    const unsupported = await seedGatewayMcp(home, "pi", { gateways: [gateway()] });
+    const unsupported = await seedGatewayMcp(home, "kimi", { gateways: [gateway()] });
     assert.equal(unsupported.status, "skipped");
     assert.match(unsupported.reason ?? "", /no MCP config dialect/);
   });

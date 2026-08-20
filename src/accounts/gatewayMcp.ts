@@ -1,4 +1,5 @@
 import { readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { atomicWriteFile } from "../fsx.js";
 import { gatewaysAreDisabled, liveGateways, type GatewayRecord } from "../gateways.js";
@@ -40,7 +41,19 @@ function dialectForHarness(harness: string): McpDialect | undefined {
   if (harness === "codex") return { file: "config.toml", kind: "toml-mcp-servers", forwardEnvVars: true };
   if (harness === "grok") return { file: "config.toml", kind: "toml-mcp-servers", forwardEnvVars: false };
   if (harness === "opencode") return { file: "opencode.json", kind: "opencode-json", forwardEnvVars: true };
+  if (harness === "pi") return { file: "mcp.json", kind: "claude-json", forwardEnvVars: false };
   return undefined;
+}
+
+/**
+ * Harnesses with no `homeEnv` still have a native config dir the operator
+ * process actually reads. Pi's is `$PI_CODING_AGENT_DIR` or `~/.pi/agent`.
+ * Relocating that via a hive home would drop auth/extensions; seed in place.
+ */
+export function nativeGatewayHome(harness: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (harness !== "pi") return undefined;
+  const override = env.PI_CODING_AGENT_DIR?.trim();
+  return override && override.length > 0 ? override : join(homedir(), ".pi", "agent");
 }
 
 function desiredEntries(gateways: GatewayRecord[], dialect: McpDialect): Record<string, McpEntry> {
@@ -608,6 +621,20 @@ async function reconcileLocked(
     written.push(STAMP_FILE);
   }
   return { status: "seeded", written };
+}
+
+export async function seedGatewayMcpForAgent(
+  harness: string,
+  homePath?: string,
+  options: SeedGatewayMcpOptions = {},
+): Promise<GatewayMcpSeedResult> {
+  const home = homePath ?? nativeGatewayHome(harness);
+  if (!home) {
+    const reason = `no gateway MCP home for ${harness}`;
+    gatewayMcpDebug(`skipping: ${reason}`);
+    return { status: "skipped", reason, written: [] };
+  }
+  return seedGatewayMcp(home, harness, options);
 }
 
 export async function seedGatewayMcp(

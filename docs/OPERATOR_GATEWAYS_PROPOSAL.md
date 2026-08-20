@@ -241,7 +241,8 @@ Per-harness dialects, keyed off the driver registry (`drivers.ts:160-303`):
 | codex | `config.toml` `[mcp_servers.<name>]` | `command`, `args`, `env_vars` for the gateway advertisement env plus `HIVE_BEE`/`HIVE_BEE_ID` (Codex does not otherwise forward those variables to STDIO MCP children) |
 | grok | `config.toml` `[mcp_servers.<name>]` (`GROK_HOME` relocates this file) | `command`, `args`. No `env_vars` — Grok's documented field is literal `env = {K=V}`, which cannot carry per-bee identity in a shared home. The shim adopts via inherited `HIVE_BEE`/`HIVE_BEE_ID`, and defaults `APIARY_GATEWAY` to `~/.hive/gateways/apiary.json`. |
 | opencode | `opencode.json` `mcp` (`OPENCODE_CONFIG_DIR`) | `"<name>": { type: "local", command: [shim, ...args], enabled: true, environment: { VAR: "{env:VAR}" } }` for gateway env plus `HIVE_BEE`/`HIVE_BEE_ID` |
-| kimi / cursor / pi / droid | per driver, as each grows MCP support | absent entry = skipped, logged at debug. Pi has no `homeEnv` / isolated home, so a global `~/.pi/agent/mcp.json` write would not be per-account. |
+| pi | `mcp.json` in `$PI_CODING_AGENT_DIR` or `~/.pi/agent` (Claude `mcpServers` shape). Seeded at local spawn, not via account homes — Pi has no `homeEnv`; relocating the agent dir would drop auth/extensions. Requires the optional `pi-mcp-adapter` package to load. | `"<name>": { command, args }` |
+| kimi / cursor / droid | per driver, as each grows MCP support | absent entry = skipped, logged at debug |
 
 Ownership rules:
 

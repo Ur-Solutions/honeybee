@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { activateAccountIntoHome, assertCursorHomeAuthFresh, assertGrokHomeAuthFresh, autoAccountTool, defaultHomeForAccount, resolveSpawnAgent, roundRobinAccountTool, type AccountRecord } from "./accounts.js";
+import { seedGatewayMcpForAgent } from "./accounts/gatewayMcp.js";
 import { beeConfig } from "./config.js";
 import { driverDefaultsToYolo, forcedSessionIdArgsForAgent, homeEnvForAgent, identityEnvForAgent, modelArgsForAgent, secretEnvKeysForAgent, sessionPinnedInArgs } from "./drivers.js";
 import { assertExecutableAvailable } from "./execCheck.js";
@@ -487,6 +488,9 @@ export async function spawnBeeForFlow(opts: SpawnBeeOptions): Promise<SessionRec
     if (!spec.homePath) throw new Error(`Agent ${spec.kind} has no home env; cannot bind account ${account.id}`);
     await activateAccountIntoHome(account, spec.homePath);
     refreshIdentityEnv(spec, opts.env);
+  }
+  if (!(opts.node && opts.node.kind === "ssh-tmux")) {
+    await seedGatewayMcpForAgent(spec.kind, spec.homePath);
   }
   // Keep the original resolved argv independent from Hive's generated provider
   // session pin so revive can resume (or start fresh) without rebuilding flags.
