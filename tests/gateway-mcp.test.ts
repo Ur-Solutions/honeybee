@@ -212,11 +212,92 @@ test("malformed target configs and stamps are untouched", async () => {
   });
 });
 
+test("grok seeder uses Codex TOML tables without env_vars", async () => {
+  await withHome(async (home) => {
+    const configPath = join(home, "config.toml");
+    await writeFile(configPath, [
+      'default = "grok-4.6"',
+      "",
+      "[mcp_servers.user]",
+      'command = "/usr/bin/user-mcp"',
+      "args = []",
+      "",
+    ].join("\n"));
+
+    await seedGatewayMcp(home, "grok", { gateways: [gateway()] });
+    let config = await readFile(configPath, "utf8");
+    assert.match(config, /default = "grok-4\.6"/);
+    assert.match(config, /\[mcp_servers\.user\]/);
+    assert.match(config, /\[mcp_servers\.apiary\]\ncommand = "\/opt\/apiary-mcp"\nargs = \[\]\n/);
+    assert.doesNotMatch(config, /env_vars/);
+    const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
+    assert.deepEqual(stamp.files["config.toml"]?.apiary, { command: "/opt/apiary-mcp", args: [] });
+    assert.deepEqual((await seedGatewayMcp(home, "grok", { gateways: [gateway()] })).written, []);
+
+    await seedGatewayMcp(home, "grok", { gateways: [] });
+    config = await readFile(configPath, "utf8");
+    assert.doesNotMatch(config, /mcp_servers\.apiary/);
+    assert.match(config, /mcp_servers\.user/);
+  });
+});
+
+test("opencode seeder merges local mcp entries and forwards identity env by template", async () => {
+  await withHome(async (home) => {
+    const configPath = join(home, "opencode.json");
+    await writeFile(configPath, `${JSON.stringify({
+      model: "anthropic/claude-sonnet-4-5",
+      mcp: {
+        user: { type: "local", command: ["/usr/bin/user-mcp"], enabled: true },
+      },
+    }, null, 2)}\n`);
+
+    const first = await seedGatewayMcp(home, "opencode", { gateways: [gateway()] });
+    assert.deepEqual(first.written.sort(), [".hive-gateways.json", "opencode.json"]);
+    let config = await json(configPath) as {
+      model?: string;
+      mcp?: Record<string, unknown>;
+    };
+    assert.equal(config.model, "anthropic/claude-sonnet-4-5");
+    assert.deepEqual(config.mcp?.user, { type: "local", command: ["/usr/bin/user-mcp"], enabled: true });
+    assert.deepEqual(config.mcp?.apiary, {
+      type: "local",
+      command: ["/opt/apiary-mcp"],
+      enabled: true,
+      environment: {
+        APIARY_GATEWAY: "{env:APIARY_GATEWAY}",
+        HIVE_BEE: "{env:HIVE_BEE}",
+        HIVE_BEE_ID: "{env:HIVE_BEE_ID}",
+      },
+    });
+    const stamp = await json(join(home, ".hive-gateways.json")) as GatewayMcpStamp;
+    assert.deepEqual(stamp.files["opencode.json"]?.apiary, {
+      command: "/opt/apiary-mcp",
+      args: [],
+      envVars: ["APIARY_GATEWAY", "HIVE_BEE", "HIVE_BEE_ID"],
+    });
+    assert.deepEqual((await seedGatewayMcp(home, "opencode", { gateways: [gateway()] })).written, []);
+
+    await seedGatewayMcp(home, "opencode", { gateways: [gateway({ shim: { command: "/opt/apiary-mcp-v2", args: ["serve"] } })] });
+    config = await json(configPath) as { mcp?: Record<string, { command?: string[] }> };
+    assert.deepEqual(config.mcp?.apiary?.command, ["/opt/apiary-mcp-v2", "serve"]);
+
+    await seedGatewayMcp(home, "opencode", { gateways: [] });
+    config = await json(configPath) as { mcp?: Record<string, unknown> };
+    assert.equal(config.mcp?.apiary, undefined);
+    assert.deepEqual(config.mcp?.user, { type: "local", command: ["/usr/bin/user-mcp"], enabled: true });
+  });
+});
+
 test("kit ownership manifest makes honeybee defer the whole target file", async () => {
-  for (const [harness, target] of [["claude", ".claude.json"], ["codex", "config.toml"]] as const) {
+  for (const [harness, target] of [
+    ["claude", ".claude.json"],
+    ["codex", "config.toml"],
+    ["grok", "config.toml"],
+    ["opencode", "opencode.json"],
+  ] as const) {
     await withHome(async (home) => {
       const targetPath = join(home, target);
-      const original = harness === "claude" ? '{"theme":"dark"}\n' : 'model = "gpt-5.5"\n';
+      const original = target.endsWith(".json") ? '{"theme":"dark"}\n' : 'model = "gpt-5.5"\n';
       await writeFile(targetPath, original);
       await mkdir(join(home, ".kit"), { recursive: true });
       await writeFile(join(home, ".kit", "manifest.json"), JSON.stringify({
@@ -236,7 +317,7 @@ test("empty registry is a no-op and unsupported harnesses skip", async () => {
   await withHome(async (home) => {
     assert.deepEqual(await seedGatewayMcp(home, "claude", { gateways: [] }), { status: "seeded", written: [] });
     assert.equal(await stat(join(home, ".hive-gateways.json")).catch(() => null), null);
-    const unsupported = await seedGatewayMcp(home, "opencode", { gateways: [gateway()] });
+    const unsupported = await seedGatewayMcp(home, "pi", { gateways: [gateway()] });
     assert.equal(unsupported.status, "skipped");
     assert.match(unsupported.reason ?? "", /no MCP config dialect/);
   });

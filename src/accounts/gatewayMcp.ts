@@ -7,9 +7,11 @@ import { tomlLines } from "./homeDefaults.js";
 
 const STAMP_FILE = ".hive-gateways.json";
 const STAMP_SCHEMA = 1;
-const CODEX_GATEWAY_IDENTITY_ENV_VARS = ["HIVE_BEE", "HIVE_BEE_ID"] as const;
+const GATEWAY_IDENTITY_ENV_VARS = ["HIVE_BEE", "HIVE_BEE_ID"] as const;
 
 type McpEntry = { command: string; args: string[]; envVars?: string[] };
+type McpDialectKind = "claude-json" | "toml-mcp-servers" | "opencode-json";
+type McpDialect = { file: string; kind: McpDialectKind; forwardEnvVars: boolean };
 
 export type GatewayMcpStamp = {
   schema: 1;
@@ -33,18 +35,20 @@ function gatewayMcpDebug(message: string): void {
   if (process.env.HIVE_DEBUG_GATEWAYS === "1") console.error(`[hive gateways] ${message}`);
 }
 
-function targetFileForHarness(harness: string): string | undefined {
-  if (harness === "claude") return ".claude.json";
-  if (harness === "codex") return "config.toml";
+function dialectForHarness(harness: string): McpDialect | undefined {
+  if (harness === "claude") return { file: ".claude.json", kind: "claude-json", forwardEnvVars: false };
+  if (harness === "codex") return { file: "config.toml", kind: "toml-mcp-servers", forwardEnvVars: true };
+  if (harness === "grok") return { file: "config.toml", kind: "toml-mcp-servers", forwardEnvVars: false };
+  if (harness === "opencode") return { file: "opencode.json", kind: "opencode-json", forwardEnvVars: true };
   return undefined;
 }
 
-function desiredEntries(gateways: GatewayRecord[], harness: string): Record<string, McpEntry> {
+function desiredEntries(gateways: GatewayRecord[], dialect: McpDialect): Record<string, McpEntry> {
   return Object.fromEntries(gateways.map((gateway) => [gateway.name, {
     command: gateway.shim.command,
     args: [...gateway.shim.args],
-    ...(harness === "codex"
-      ? { envVars: [...new Set([...Object.keys(gateway.env).sort(), ...CODEX_GATEWAY_IDENTITY_ENV_VARS])] }
+    ...(dialect.forwardEnvVars
+      ? { envVars: [...new Set([...Object.keys(gateway.env).sort(), ...GATEWAY_IDENTITY_ENV_VARS])] }
       : {}),
   }]));
 }
@@ -302,6 +306,89 @@ function reconcileClaude(
   return rewritten === null ? null : { text: rewritten, owned: nextOwned };
 }
 
+function opencodeEnvTemplate(name: string): string {
+  return `{env:${name}}`;
+}
+
+function opencodeOnDisk(entry: McpEntry): Record<string, unknown> {
+  const command = [entry.command, ...entry.args];
+  const environment = entry.envVars
+    ? Object.fromEntries(entry.envVars.map((name) => [name, opencodeEnvTemplate(name)]))
+    : undefined;
+  return {
+    type: "local",
+    command,
+    enabled: true,
+    ...(environment ? { environment } : {}),
+  };
+}
+
+function opencodeFromDisk(value: unknown): McpEntry | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.type !== "local" || !Array.isArray(record.command) || record.command.length === 0) return null;
+  if (!record.command.every((part) => typeof part === "string")) return null;
+  const command = record.command[0] as string;
+  const args = record.command.slice(1) as string[];
+  if (record.environment === undefined) return { command, args };
+  if (!record.environment || typeof record.environment !== "object" || Array.isArray(record.environment)) return null;
+  const envVars: string[] = [];
+  for (const [name, envValue] of Object.entries(record.environment as Record<string, unknown>)) {
+    if (envValue !== opencodeEnvTemplate(name)) return null;
+    envVars.push(name);
+  }
+  return { command, args, ...(envVars.length > 0 ? { envVars } : {}) };
+}
+
+function reconcileOpenCode(
+  input: string,
+  desired: Record<string, McpEntry>,
+  owned: Record<string, McpEntry>,
+): { text: string; owned: Record<string, McpEntry> } | null {
+  let config: Record<string, unknown> = {};
+  if (input.trim()) {
+    try {
+      const value = JSON.parse(input) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      config = value as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  const rawServers = config.mcp;
+  if (rawServers !== undefined && (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers))) return null;
+  const servers = { ...((rawServers as Record<string, unknown> | undefined) ?? {}) };
+  const nextOwned: Record<string, McpEntry> = {};
+  let changed = false;
+
+  for (const [name, prior] of Object.entries(owned)) {
+    const current = servers[name];
+    const next = desired[name];
+    if (next) {
+      if (!sameEntry(opencodeFromDisk(current), next)) changed = true;
+      servers[name] = opencodeOnDisk(next);
+      nextOwned[name] = next;
+      continue;
+    }
+    if (current === undefined) continue;
+    if (!sameEntry(opencodeFromDisk(current), prior)) continue;
+    delete servers[name];
+    changed = true;
+  }
+
+  for (const [name, entry] of Object.entries(desired)) {
+    if (name in owned || sameEntry(opencodeFromDisk(servers[name]), entry)) continue;
+    servers[name] = opencodeOnDisk(entry);
+    nextOwned[name] = entry;
+    changed = true;
+  }
+
+  if (!changed) return { text: input, owned: nextOwned };
+  if (!input.trim()) return { text: `${JSON.stringify({ mcp: servers }, null, 2)}\n`, owned: nextOwned };
+  const rewritten = rewriteTopLevelJsonProperty(input, "mcp", servers);
+  return rewritten === null ? null : { text: rewritten, owned: nextOwned };
+}
+
 function tomlKey(name: string): string {
   return /^[A-Za-z0-9_-]+$/u.test(name) ? name : JSON.stringify(name);
 }
@@ -464,13 +551,24 @@ function reconcileCodex(
   return { text: lines.length > 0 ? `${lines.join("\n")}\n` : "", owned: nextOwned };
 }
 
+function reconcileDialect(
+  dialect: McpDialect,
+  input: string,
+  desired: Record<string, McpEntry>,
+  owned: Record<string, McpEntry>,
+): { text: string; owned: Record<string, McpEntry> } | null {
+  if (dialect.kind === "claude-json") return reconcileClaude(input, desired, owned);
+  if (dialect.kind === "opencode-json") return reconcileOpenCode(input, desired, owned);
+  return reconcileCodex(input, desired, owned);
+}
+
 async function reconcileLocked(
   homePath: string,
-  harness: string,
-  targetFile: string,
+  dialect: McpDialect,
   gateways: GatewayRecord[],
   initialStamp: GatewayMcpStamp,
 ): Promise<GatewayMcpSeedResult> {
+  const targetFile = dialect.file;
   const kitClaim = await kitClaimsTarget(homePath, targetFile);
   if (kitClaim !== "unclaimed") {
     const reason = kitClaim === "claimed" ? `kit owns ${targetFile}` : "kit manifest is malformed or unreadable";
@@ -484,11 +582,9 @@ async function reconcileLocked(
     gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
     return { status: "skipped", reason, written: [] };
   }
-  const desired = desiredEntries(gateways, harness);
+  const desired = desiredEntries(gateways, dialect);
   const owned = initialStamp.files[targetFile] ?? {};
-  const reconciled = harness === "claude"
-    ? reconcileClaude(target.text, desired, owned)
-    : reconcileCodex(target.text, desired, owned);
+  const reconciled = reconcileDialect(dialect, target.text, desired, owned);
   if (!reconciled) {
     const reason = `${targetFile} is malformed; left untouched`;
     gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
@@ -519,8 +615,8 @@ export async function seedGatewayMcp(
   harness: string,
   options: SeedGatewayMcpOptions = {},
 ): Promise<GatewayMcpSeedResult> {
-  const targetFile = targetFileForHarness(harness);
-  if (!targetFile) {
+  const dialect = dialectForHarness(harness);
+  if (!dialect) {
     const reason = `no MCP config dialect for ${harness}`;
     gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
     return { status: "skipped", reason, written: [] };
@@ -541,7 +637,7 @@ export async function seedGatewayMcp(
         gatewayMcpDebug(`skipping ${homePath}: ${reason}`);
         return { status: "skipped" as const, reason, written: [] };
       }
-      return reconcileLocked(homePath, harness, targetFile, gateways, stampRead.stamp);
+      return reconcileLocked(homePath, dialect, gateways, stampRead.stamp);
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
