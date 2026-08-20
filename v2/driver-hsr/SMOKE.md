@@ -56,6 +56,7 @@ Result log:
 |---|---|---|---|---|
 | 2026-08-17 | claude | trmd | ALL 11 PASS | after readyAtSpawn fix (4a8c6c42); 6 log lines |
 | 2026-08-17 | codex | trmd | ALL 11 PASS | codex-cli app-server; 53 log lines |
+| 2026-08-20 | grok | trmd | ALL 11 PASS | grok 1.0.5 ACP stdio; grok-4.6; 82 log lines; authMethods cached_token+grok.com; loadSession=true; step 6 still manual |
 
 ---
 

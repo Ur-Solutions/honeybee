@@ -1,16 +1,25 @@
 /**
  * Grok ACP adapter unit tests (spec 03 test tier 1).
  *
- * Fixture provenance: message shapes reconstructed from the previous system's
- * adapter (src/hsr/adapters/grok.ts + acpRpc.ts) — initialize/authenticate/
- * session/new handshake, session/prompt result, permission auto-allow.
- * Reconstructed, not captured — the manual smoke must verify against live
- * `grok agent stdio`.
+ * Fixture provenance: `fixtures/grok-acp-live.jsonl` is a redacted slice of
+ * the 2026-08-20 `v2:smoke -- grok` session log (grok 1.0.5 ACP stdio,
+ * grok-4.6, ALL 11 PASS). Handshake / permission cases that the smoke did
+ * not hit stay reconstructed from the previous system's adapter.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { grokAdapter, grokAllowPermissionResult } from "../src/grok.ts";
 import type { AdapterSignal } from "../src/types.ts";
+
+const here = dirname(fileURLToPath(import.meta.url));
+function liveFixtureLines(): string[] {
+  return readFileSync(join(here, "fixtures", "grok-acp-live.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0);
+}
 
 const adapter = grokAdapter({ cwd: "/tmp/work" });
 
@@ -20,6 +29,29 @@ function onlyRespond(signals: AdapterSignal[]): string[] {
   assert.equal(s.kind, "respond");
   return s.kind === "respond" ? s.lines : [];
 }
+
+test("grok: live smoke fixture — initialize prefers cached_token, session/new boots, prompt ends the turn", () => {
+  const [init, , authOk, sessionNew, chunk, promptDone] = liveFixtureLines();
+  const auth = onlyRespond(adapter.parseLine(init!));
+  assert.deepEqual(JSON.parse(auth[0]!), {
+    jsonrpc: "2.0",
+    id: 2,
+    method: "authenticate",
+    params: { methodId: "cached_token" },
+  });
+  assert.equal(JSON.parse(onlyRespond(adapter.parseLine(authOk!))[0]!).method, "session/new");
+  assert.deepEqual(adapter.parseLine(sessionNew!), [
+    { kind: "booted", sessionId: "sess-live" },
+    { kind: "flag", flag: "spawn_failed", action: "clear", detail: "runtime booted" },
+    { kind: "turn_ended" },
+  ]);
+  assert.deepEqual(adapter.parseLine(chunk!), [{ kind: "turn_started" }]);
+  assert.deepEqual(adapter.parseLine(promptDone!), [
+    { kind: "flag", flag: "auth_needed", action: "clear", detail: "successful authenticated turn" },
+    { kind: "flag", flag: "resource_blocked", action: "clear", detail: "successful turn served" },
+    { kind: "turn_ended" },
+  ]);
+});
 
 test("grok: bootLines is a single initialize request", () => {
   const lines = adapter.bootLines();
