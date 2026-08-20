@@ -29,8 +29,7 @@ test("codex projector: captured HSR sequence projects one native turn and folded
   assert.ok(messages.some((event) => event.role === "user" && event.text.includes("the transcript of the codex agent")));
   const assistant = messages.find((event) => event.role === "assistant" && event.text.startsWith("I’ll trace those three bees"));
   assert.ok(assistant);
-  assert.equal(assistant.itemId, "msg_0c5e5e6009141f68016a86edb7158c8191b91915e2832d962d");
-  assert.equal(assistant.providerEventId, assistant.itemId);
+  assert.equal(assistant.providerEventId, "msg_0c5e5e6009141f68016a86edb7158c8191b91915e2832d962d");
 
   const shells = events.filter((event) => event.kind === "shell");
   assert.equal(shells.length, 2);
@@ -138,7 +137,7 @@ test("codex projector: item folding covers MCP, files, thinking, compaction, web
     callId: "edit-1",
     files: [
       { path: "src/a.ts", changeKind: "update", diff: "@@ diff" },
-      { path: "src/b.ts", changeKind: "move", movePath: "src/c.ts" },
+      { path: "src/b.ts", changeKind: "move", oldPath: "src/c.ts" },
     ],
   }]);
 
@@ -161,13 +160,21 @@ test("codex projector: item folding covers MCP, files, thinking, compaction, web
     method: "item/completed",
     params: { item: { type: "webSearch", id: "web-1", query: "Honeybee" } },
     emittedAtMs: 1_787_227_578_150,
-  })), [{
-    kind: "web_search",
-    ts: new Date(1_787_227_578_150).toISOString(),
-    itemId: "web-1",
-    providerEventId: "web-1",
-    query: "Honeybee",
-  }]);
+  })), [
+    {
+      kind: "tool_call",
+      ts: new Date(1_787_227_578_150).toISOString(),
+      callId: "web-1",
+      name: "web_search",
+      input: { query: "Honeybee" },
+    },
+    {
+      kind: "tool_result",
+      ts: new Date(1_787_227_578_150).toISOString(),
+      callId: "web-1",
+      isError: false,
+    },
+  ]);
   assert.deepEqual(projector.pushLine(j({
     method: "item/completed",
     params: { item: { type: "futureCodexItem", id: "future-1" } },
@@ -179,12 +186,37 @@ test("codex projector: item folding covers MCP, files, thinking, compaction, web
   }]);
 });
 
+test("codex projector: MCP completion without a start emits call then result", () => {
+  const projector = createCodexProjector();
+  assert.deepEqual(projector.pushLine(j({
+    method: "item/completed",
+    params: {
+      item: { type: "mcpToolCall", id: "orphan-1", tool: "lookup", arguments: { q: "x" }, result: "hit" },
+      completedAtMs: 1_787_227_578_180,
+    },
+  })), [
+    {
+      kind: "tool_call",
+      ts: new Date(1_787_227_578_180).toISOString(),
+      callId: "orphan-1",
+      name: "lookup",
+      input: { q: "x" },
+    },
+    {
+      kind: "tool_result",
+      ts: new Date(1_787_227_578_180).toISOString(),
+      callId: "orphan-1",
+      isError: false,
+      output: "hit",
+    },
+  ]);
+});
+
 test("codex projector: empty commentary and app-server protocol noise emit nothing", () => {
   const projector = createCodexProjector();
   const noise = [
     { method: "account/rateLimits/updated", params: { rateLimits: {} }, emittedAtMs: 1 },
     { method: "item/agentMessage/delta", params: { delta: "partial" }, emittedAtMs: 2 },
-    { method: "thread/tokenUsage/updated", params: {}, emittedAtMs: 3 },
     { method: "item/completed", params: { item: { type: "agentMessage", id: "empty", text: "   ", phase: "commentary" } }, emittedAtMs: 4 },
   ];
   for (const row of noise) assert.deepEqual(projector.pushLine(j(row)), []);
@@ -209,7 +241,6 @@ test("codex projector: interrupted turn completion is an end only and never re-r
     turnId: "turn-interrupted",
     durationMs: 42,
     finishReason: "interrupted",
-    interrupted: true,
   }]);
 });
 

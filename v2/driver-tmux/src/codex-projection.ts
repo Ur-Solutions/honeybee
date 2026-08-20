@@ -1,8 +1,10 @@
 import type {
   TranscriptFileChange,
   TranscriptIsoTs,
+  TranscriptMessageRole,
   TranscriptProjectedEvent,
   TranscriptProjector,
+  TranscriptTokenUsage,
 } from "./transcript-projection.ts";
 
 type JsonObject = Record<string, unknown>;
@@ -107,15 +109,19 @@ function fileChanges(item: JsonObject): TranscriptFileChange[] {
     const kind = asObject(change.kind);
     const changeKind = nonEmptyString(kind?.type) ?? nonEmptyString(change.kind);
     const move = asObject(change.move);
-    const movePath = nonEmptyString(change.move)
+    const oldPath = nonEmptyString(change.oldPath)
+      ?? nonEmptyString(change.move)
       ?? nonEmptyString(move?.path)
+      ?? nonEmptyString(move?.from)
       ?? nonEmptyString(move?.to)
       ?? nonEmptyString(move?.toPath);
     files.push({
       path,
       ...(changeKind ? { changeKind } : {}),
       ...(typeof change.diff === "string" ? { diff: change.diff } : {}),
-      ...(movePath ? { movePath } : {}),
+      ...(oldPath ? { oldPath } : {}),
+      ...(finiteNumber(change.addedLines) !== undefined ? { addedLines: finiteNumber(change.addedLines) } : {}),
+      ...(finiteNumber(change.removedLines) !== undefined ? { removedLines: finiteNumber(change.removedLines) } : {}),
     });
   }
   return files;
@@ -159,7 +165,48 @@ function withThreadId(events: TranscriptProjectedEvent[], threadId: string | und
   return threadId ? events.map((event) => ({ ...event, threadId })) : events;
 }
 
-function completedItemEvent(item: JsonObject, ts: TranscriptIsoTs): TranscriptProjectedEvent[] {
+function tokenUsageFrom(source: JsonObject | null | undefined): TranscriptTokenUsage | undefined {
+  if (!source) return undefined;
+  const raw = asObject(source.usage)
+    ?? asObject(source.tokenUsage)
+    ?? asObject(source.tokens)
+    ?? asObject(source.total_token_usage)
+    ?? asObject(source.last_token_usage)
+    ?? source;
+  const usage: TranscriptTokenUsage = {
+    ...(finiteNumber(raw.input ?? raw.input_tokens) !== undefined
+      ? { input: finiteNumber(raw.input ?? raw.input_tokens) }
+      : {}),
+    ...(finiteNumber(raw.output ?? raw.output_tokens) !== undefined
+      ? { output: finiteNumber(raw.output ?? raw.output_tokens) }
+      : {}),
+    ...(finiteNumber(raw.cacheRead ?? raw.cached_input_tokens ?? raw.cache_read) !== undefined
+      ? { cacheRead: finiteNumber(raw.cacheRead ?? raw.cached_input_tokens ?? raw.cache_read) }
+      : {}),
+    ...(finiteNumber(raw.cacheWrite ?? raw.cache_write) !== undefined
+      ? { cacheWrite: finiteNumber(raw.cacheWrite ?? raw.cache_write) }
+      : {}),
+    ...(finiteNumber(raw.reasoning ?? raw.reasoning_output_tokens) !== undefined
+      ? { reasoning: finiteNumber(raw.reasoning ?? raw.reasoning_output_tokens) }
+      : {}),
+    ...(finiteNumber(raw.total ?? raw.total_tokens) !== undefined
+      ? { total: finiteNumber(raw.total ?? raw.total_tokens) }
+      : {}),
+  };
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+function messageRole(item: JsonObject, fallback: TranscriptMessageRole): TranscriptMessageRole {
+  const role = item.role;
+  if (role === "user" || role === "assistant" || role === "system" || role === "developer") return role;
+  return fallback;
+}
+
+function completedItemEvent(
+  item: JsonObject,
+  ts: TranscriptIsoTs,
+  startSeen: boolean,
+): TranscriptProjectedEvent[] {
   const nativeType = nonEmptyString(item.type);
   if (!nativeType) return [];
   const itemId = idString(item.id);
@@ -167,13 +214,25 @@ function completedItemEvent(item: JsonObject, ts: TranscriptIsoTs): TranscriptPr
     case "agentMessage": {
       const text = nonEmptyString(item.text);
       return text
-        ? [{ kind: "message", ts, role: "assistant", text, ...(itemId ? { itemId, providerEventId: itemId } : {}) }]
+        ? [{
+          kind: "message",
+          ts,
+          role: messageRole(item, "assistant"),
+          text,
+          ...(itemId ? { providerEventId: itemId } : {}),
+        }]
         : [];
     }
     case "userMessage": {
       const text = textFromContent(item.content) ?? nonEmptyString(item.text);
       return text
-        ? [{ kind: "message", ts, role: "user", text, ...(itemId ? { itemId, providerEventId: itemId } : {}) }]
+        ? [{
+          kind: "message",
+          ts,
+          role: messageRole(item, "user"),
+          text,
+          ...(itemId ? { providerEventId: itemId } : {}),
+        }]
         : [];
     }
     case "commandExecution":
@@ -184,6 +243,7 @@ function completedItemEvent(item: JsonObject, ts: TranscriptIsoTs): TranscriptPr
         ...(nonEmptyString(item.command) ? { command: nonEmptyString(item.command) } : {}),
         ...(nonEmptyString(item.cwd) ? { cwd: nonEmptyString(item.cwd) } : {}),
         ...(typeof item.aggregatedOutput === "string" ? { stdout: item.aggregatedOutput } : {}),
+        ...(typeof item.stderr === "string" ? { stderr: item.stderr } : {}),
         ...(finiteNumber(item.exitCode) !== undefined ? { exitCode: finiteNumber(item.exitCode) } : {}),
         ...(finiteNumber(item.durationMs) !== undefined ? { durationMs: finiteNumber(item.durationMs) } : {}),
         status: "completed",
@@ -192,13 +252,26 @@ function completedItemEvent(item: JsonObject, ts: TranscriptIsoTs): TranscriptPr
       const status = nonEmptyString(item.status);
       const isError = item.error != null || status === "failed" || status === "error";
       const output = mcpOutput(item);
-      return [{
+      const callId = itemCallId(item, nativeType);
+      const result: TranscriptProjectedEvent = {
         kind: "tool_result",
         ts,
-        callId: itemCallId(item, nativeType),
+        callId,
         isError,
         ...(output !== undefined ? { output } : {}),
-      }];
+      };
+      if (startSeen) return [result];
+      const input = mcpInput(item);
+      return [
+        {
+          kind: "tool_call",
+          ts,
+          callId,
+          name: mcpName(item),
+          ...(input !== undefined ? { input } : {}),
+        },
+        result,
+      ];
     }
     case "reasoning": {
       const text = textFromContent(item.summary) ?? nonEmptyString(item.summary);
@@ -215,12 +288,24 @@ function completedItemEvent(item: JsonObject, ts: TranscriptIsoTs): TranscriptPr
     case "webSearch": {
       const action = asObject(item.action);
       const query = nonEmptyString(item.query) ?? nonEmptyString(action?.query);
-      return [{
-        kind: "web_search",
+      const callId = itemCallId(item, nativeType);
+      const call: TranscriptProjectedEvent = {
+        kind: "tool_call",
         ts,
-        ...(itemId ? { itemId, providerEventId: itemId } : {}),
-        ...(query ? { query } : {}),
-      }];
+        callId,
+        name: "web_search",
+        ...(query ? { input: { query } } : {}),
+      };
+      const result: TranscriptProjectedEvent = {
+        kind: "tool_result",
+        ts,
+        callId,
+        isError: false,
+        ...(serialized(item.result ?? item.output) !== undefined
+          ? { output: serialized(item.result ?? item.output) }
+          : {}),
+      };
+      return startSeen ? [result] : [call, result];
     }
     default:
       return [{ kind: "unknown", ts, nativeType }];
@@ -246,7 +331,7 @@ export function createCodexProjector(): TranscriptProjector {
     const identity = normalizeMessageIdentity(role, text);
     if (rolloutMessages.has(identity)) return [];
     rolloutMessages.add(identity);
-    return [{ kind: "message", ts, role, text, ...(itemId ? { itemId, providerEventId: itemId } : {}) }];
+    return [{ kind: "message", ts, role, text, ...(itemId ? { providerEventId: itemId } : {}) }];
   };
 
   const pushRollout = (row: JsonObject): TranscriptProjectedEvent[] => {
@@ -350,15 +435,35 @@ export function createCodexProjector(): TranscriptProjector {
           const threadId = idString(params.threadId);
           const durationMs = finiteNumber(turn?.durationMs);
           const finishReason = nonEmptyString(turn?.status);
-          const interrupted = turn?.status === "interrupted";
-          return [{
+          const usage = tokenUsageFrom(turn);
+          const ts = firstIso(row.emittedAtMs);
+          const events: TranscriptProjectedEvent[] = [{
             kind: "turn_end",
-            ts: firstIso(row.emittedAtMs),
+            ts,
             ...(turnId ? { turnId } : {}),
             ...(threadId ? { threadId } : {}),
             ...(durationMs !== undefined ? { durationMs } : {}),
             ...(finishReason ? { finishReason } : {}),
-            ...(interrupted ? { interrupted: true } : {}),
+          }];
+          if (usage) {
+            events.push({
+              kind: "token_usage",
+              ts,
+              usage,
+              scope: "turn",
+              ...(turnId ? { providerTurnId: turnId } : {}),
+              ...(threadId ? { threadId } : {}),
+            });
+          }
+          return events;
+        }
+        case "turn/interrupt": {
+          const threadId = idString(params.threadId);
+          return [{
+            kind: "interrupt",
+            ts: firstIso(row.emittedAtMs),
+            ...(nonEmptyString(params.reason) ? { reason: nonEmptyString(params.reason) } : {}),
+            ...(threadId ? { threadId } : {}),
           }];
         }
         case "item/started": {
@@ -388,18 +493,42 @@ export function createCodexProjector(): TranscriptProjector {
               ...(input !== undefined ? { input } : {}),
             }], threadId);
           }
+          if (item.type === "webSearch") {
+            const action = asObject(item.action);
+            const query = nonEmptyString(item.query) ?? nonEmptyString(action?.query);
+            return withThreadId([{
+              kind: "tool_call",
+              ts,
+              callId: itemCallId(item, "webSearch"),
+              name: "web_search",
+              ...(query ? { input: { query } } : {}),
+            }], threadId);
+          }
           return [];
         }
         case "item/completed": {
           const completed = asObject(params.item);
           if (!completed) return [];
           const itemId = idString(completed.id);
+          const startSeen = itemId != null && startedItems.has(itemId);
           const item = mergeItems(itemId ? startedItems.get(itemId) : undefined, completed);
           if (itemId) startedItems.delete(itemId);
           return withThreadId(
-            completedItemEvent(item, firstIso(params.completedAtMs, row.emittedAtMs)),
+            completedItemEvent(item, firstIso(params.completedAtMs, row.emittedAtMs), startSeen),
             idString(params.threadId),
           );
+        }
+        case "thread/tokenUsage/updated": {
+          const usage = tokenUsageFrom(params) ?? tokenUsageFrom(asObject(params.rateLimits) ?? params);
+          if (!usage) return [];
+          const threadId = idString(params.threadId);
+          return [{
+            kind: "token_usage",
+            ts: firstIso(row.emittedAtMs),
+            usage,
+            scope: nonEmptyString(params.scope) ?? "cumulative",
+            ...(threadId ? { threadId } : {}),
+          }];
         }
         default:
           // Deltas, usage/account notifications, and server protocol chatter
