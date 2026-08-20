@@ -312,8 +312,8 @@ test("opencode seeder merges local mcp entries and forwards identity env by temp
     assert.deepEqual((await seedGatewayMcp(home, "opencode", { gateways: [gateway()] })).written, []);
 
     await seedGatewayMcp(home, "opencode", { gateways: [gateway({ shim: { command: "/opt/apiary-mcp-v2", args: ["serve"] } })] });
-    config = await json(configPath) as { mcp?: Record<string, { command?: string[] }> };
-    assert.deepEqual(config.mcp?.apiary?.command, ["/opt/apiary-mcp-v2", "serve"]);
+    const updated = await json(configPath) as { mcp?: Record<string, { command?: string[] }> };
+    assert.deepEqual(updated.mcp?.apiary?.command, ["/opt/apiary-mcp-v2", "serve"]);
 
     await seedGatewayMcp(home, "opencode", { gateways: [] });
     config = await json(configPath) as { mcp?: Record<string, unknown> };
