@@ -74,7 +74,7 @@ import {
 } from "../../daemon/src/protocol.ts";
 import { DaemonDownError, RpcClient } from "./client.ts";
 import { ReadOnlyStore } from "./readonly.ts";
-import { freezeRoot, type AuditRow, type FrozenImportReport, type ImportPlanEntry } from "../../core/src/index.ts";
+import { freezeRoot, type AuditRow, type CommandRow, type FrozenImportReport, type ImportPlanEntry } from "../../core/src/index.ts";
 import { realPreflightProbes } from "../../daemon/src/import-probes.ts";
 import { hostname } from "node:os";
 import type { AuditTailResult } from "../../daemon/src/protocol.ts";
@@ -446,7 +446,7 @@ const SPAWN_USAGE =
   "       hive v2 spawn <name> [agent] --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]\n" +
   "       (agent may be positional — v1 ergonomics — or --agent; default claude)";
 
-/** The spawn RPC path (name = positional[1]) — shared by spawn and the x/run sugar. */
+/** The spawn RPC path (name = positional[1]) — shared by spawn and the x/run/xa sugar. */
 async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & { agent: string; substrate: string }> {
   const name = parsed.positional[1];
   if (!name) throw new Error(SPAWN_USAGE);
@@ -1596,7 +1596,7 @@ async function cmdPackages(ctx: CliContext, parsed: Parsed): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// v1-alignment: sugar verbs (x, run, wait, here) + reading verbs
+// v1-alignment: sugar verbs (x, xa, run, wait, here) + reading verbs
 // (transcript, tail, last, events) + set-model / usage / attach sugar
 // ---------------------------------------------------------------------------
 
@@ -1650,6 +1650,89 @@ async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
     false,
   );
   return 0;
+}
+
+const XA_USAGE =
+  "usage: hive v2 xa <agent> [--name n] [--cwd d] [--account id|auto|none] [--print] [--timeout ms]\n" +
+  "       spawn one tmux bee and attach (the v1 shape). pane-less substrates: use `x` + `tail`.";
+
+/**
+ * Wait until a command leaves queued/running. Spawn creates the runtime row
+ * (generation 1, booting) before the driver has a session, so xa cannot attach
+ * on the RPC return — it has to wait for this settle.
+ */
+async function waitForCommandSettled(
+  ctx: CliContext,
+  beeId: string,
+  commandId: number,
+  timeoutMs: number,
+): Promise<CommandRow> {
+  const deadline = Date.now() + timeoutMs;
+  return withClient(ctx, async (c) => {
+    for (;;) {
+      const { commands } = await c.request<CommandsResult>("commands", { beeId });
+      const cmd = commands.find((row) => row.id === commandId);
+      if (cmd && (cmd.status === "done" || cmd.status === "failed")) return cmd;
+      if (Date.now() > deadline) {
+        throw new Error(
+          `timeout: command ${commandId} still ${cmd?.status ?? "missing"} after ${timeoutMs}ms`,
+        );
+      }
+      await sleep(50);
+    }
+  });
+}
+
+/**
+ * `hive v2 xa <agent>` — spawn + attach (the v1 interactive front door).
+ * First positional is the harness, not a bee name (`hive xa claude`). `--name`
+ * sets the label; otherwise the agent string is the name (handles distinguish
+ * repeats). HSR/cell have no pane: refuse them and force tmux when substrate
+ * is omitted so the node default never produces a pane-less bee.
+ */
+async function cmdXa(ctx: CliContext, parsed: Parsed): Promise<number> {
+  const positionalAgent = parsed.positional[1];
+  const flagAgent = parsed.flags.get("--agent") as string | undefined;
+  if (positionalAgent && flagAgent && positionalAgent !== flagAgent) {
+    throw new Error(`${XA_USAGE}\n(agent given twice and they disagree: '${positionalAgent}' vs --agent ${flagAgent})`);
+  }
+  const agent = positionalAgent ?? flagAgent;
+  if (!agent) throw new Error(XA_USAGE);
+  const stray = parsed.positional[2];
+  if (stray !== undefined) {
+    throw new Error(`${XA_USAGE}\n(unexpected argument '${stray}' — xa takes <agent> and optional --name)`);
+  }
+
+  const substrate = parsed.flags.get("--substrate") as string | undefined;
+  if (substrate === "hsr" || substrate === "cell") {
+    ctx.io.err(
+      `hive v2 xa attaches to a terminal, which ${substrate} bees don't have.\n` +
+        `use: hive v2 x <name> <prompt> --agent ${agent} --substrate ${substrate}\n` +
+        `then: hive v2 tail <name>  |  hive v2 send <name> <message…>`,
+    );
+    return 1;
+  }
+
+  const name = (parsed.flags.get("--name") as string | undefined) ?? agent;
+  const flags = new Map(parsed.flags);
+  if (!flags.has("--substrate")) flags.set("--substrate", "tmux");
+
+  const spawned = await spawnBee(ctx, {
+    ...parsed,
+    positional: ["spawn", name, agent],
+    flags,
+  });
+  const timeoutMs = numFlag(parsed, "--timeout", 60_000);
+  const cmd = await waitForCommandSettled(ctx, spawned.beeId, spawned.commandId, timeoutMs);
+  if (cmd.status === "failed") {
+    ctx.io.err(
+      `spawn failed: ${spawned.handle ?? spawned.beeId} (${cmd.failureCause ?? "unknown"}) — inspect with: hive v2 view ${spawned.handle ?? spawned.beeId}`,
+    );
+    return 1;
+  }
+  return attachToBee(ctx, parsed, spawned.beeId, {
+    print: parsed.flags.get("--print") === true || ctx.json || process.stdout.isTTY !== true,
+  });
 }
 
 /**
@@ -2225,6 +2308,15 @@ async function cmdUsage(ctx: CliContext, parsed: Parsed): Promise<number> {
 async function cmdAttach(ctx: CliContext, parsed: Parsed): Promise<number> {
   const needle = parsed.positional[1];
   if (!needle) throw new Error("usage: hive v2 attach <bee> [--print]");
+  return attachToBee(ctx, parsed, needle);
+}
+
+async function attachToBee(
+  ctx: CliContext,
+  parsed: Parsed,
+  needle: string,
+  opts: { print?: boolean } = {},
+): Promise<number> {
   const { result } = await readBee(ctx, needle);
   const bee = result.bee;
   if (!bee) throw new RpcError("bee_not_found", `bee not found: ${needle}`);
@@ -2242,7 +2334,7 @@ async function cmdAttach(ctx: CliContext, parsed: Parsed): Promise<number> {
   const session = sessionNameFor(bee.id, generation);
   const socket = join(ctx.cfg.dataDir, "tmux.sock");
   const command = `tmux -S ${socket} attach-session -t =${session}`;
-  if (parsed.flags.get("--print") === true || ctx.json) {
+  if (opts.print || parsed.flags.get("--print") === true || ctx.json) {
     emit(ctx, [command], { beeId: bee.id, session, socket, command }, false);
     return 0;
   }
@@ -2507,6 +2599,7 @@ Spawn & run:
   spawn <name> --agent <a> --substrate cell --origin <repo> [--sha s] [--warm [d,d]] [--sandbox|--no-sandbox]
                                               spawn into a provisioned cell (the bee's cwd is the checkout)
   x <name> <prompt…>                          spawn + first send, fire-and-forget (--agent/--account/--cwd…)
+  xa <agent> [--name n] [--print]             spawn a tmux bee and attach (v1: hive xa claude)
   run <name> -p <prompt> [--keep] [--timeout ms]   spawn, send, wait, print the reply, archive (--keep skips)
   fork <bee> [--name n] [--prompt p|prompt…]  new bee, same shape, continues the source's conversation
 
@@ -2652,6 +2745,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdAccount(ctx, parsed);
       case "x":
         return await cmdX(ctx, parsed);
+      case "xa":
+        return await cmdXa(ctx, parsed);
       case "run":
         return await cmdRun(ctx, parsed);
       case "wait":

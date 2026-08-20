@@ -1,11 +1,12 @@
 /**
- * CLI v1-alignment tier (reset/cli-v1-alignment): the sugar verbs (x, run,
+ * CLI v1-alignment tier (reset/cli-v1-alignment): the sugar verbs (x, xa, run,
  * wait, here), the reading verbs (transcript, tail, last, events), and the
  * v1-shaped sugar (set-model, ls/ps aliases, usage, attach, login/swap-account
  * top-level). Temp dirs only; stub agent only.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -496,6 +497,59 @@ test("verbs.usage: renders the cached account_limits rows (stale, read-only) wit
   }
 });
 
+const tmuxAvailable = spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
+
+test("verbs.xa: v1 shape is <agent> (not a bee name); refuses pane-less substrates; tmux spawn + --print", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const usage = capture();
+    assert.equal(await runV2Cli(["xa", "--data-dir", dir], usage.io), 1);
+    assert.ok(usage.err[0]?.includes("usage: hive v2 xa"), usage.err[0]);
+
+    const clash = capture();
+    assert.equal(await runV2Cli(["xa", "stub", "--agent", "claude", "--data-dir", dir], clash.io), 1);
+    assert.ok(clash.err[0]?.includes("disagree"), clash.err[0]);
+
+    const hsr = capture();
+    assert.equal(await runV2Cli(["xa", "stub", "--substrate", "hsr", "--data-dir", dir], hsr.io), 1);
+    const hsrMsg = hsr.err.join("\n");
+    assert.ok(hsrMsg.includes("hsr bees don't have"), hsrMsg);
+    assert.ok(hsrMsg.includes("hive v2 x"), hsrMsg);
+
+    const cell = capture();
+    assert.equal(await runV2Cli(["xa", "stub", "--substrate", "cell", "--data-dir", dir], cell.io), 1);
+    assert.ok(cell.err.join("\n").includes("cell bees don't have"), cell.err.join("\n"));
+
+    if (!tmuxAvailable) return;
+
+    const printed = capture();
+    assert.equal(
+      await runV2Cli(
+        ["xa", "stub", "--name", "screenful", "--cwd", "/tmp", "--print", "--timeout", "10000", "--data-dir", dir, "--json"],
+        printed.io,
+      ),
+      0,
+    );
+    const attach = JSON.parse(printed.out[0] ?? "{}") as { beeId: string; session: string; socket: string; command: string };
+    assert.ok(attach.beeId.length > 0);
+    assert.equal(attach.socket, join(dir, "tmux.sock"));
+    assert.equal(attach.session, `hive-v2-${attach.beeId}-g1`);
+    assert.equal(attach.command, `tmux -S ${attach.socket} attach-session -t =${attach.session}`);
+
+    const view = capture();
+    assert.equal(await runV2Cli(["view", "screenful", "--data-dir", dir, "--json"], view.io), 0);
+    const listed = JSON.parse(view.out[0] ?? "{}") as { bee?: { name: string; agent: string; substrate: string } };
+    assert.equal(listed.bee?.name, "screenful");
+    assert.equal(listed.bee?.agent, "stub");
+    assert.equal(listed.bee?.substrate, "tmux");
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
 test("verbs.attach: refuses hsr/cell bees with the v2 guidance; tmux bees get the recorded session (via --print)", async () => {
   const { dir, cleanup } = makeDaemonDir();
   let daemon: DaemonHandle | null = null;
@@ -532,7 +586,7 @@ test("verbs.help: the grouped v1-style overview lists the new verbs under their 
   for (const section of ["Spawn & run:", "Message:", "Observe:", "Manage bees:", "Accounts:", "Daemon:"]) {
     assert.ok(text.includes(section), `help has section ${section}`);
   }
-  for (const verb of ["x <name>", "run <name> -p", "transcript <bee>", "tail <bee>", "last <bee>", "wait <bee>", "events [", "here [", "usage [", "set-model <bee>", "attach <bee>", "swap-account <bee>"]) {
+  for (const verb of ["x <name>", "xa <agent>", "run <name> -p", "transcript <bee>", "tail <bee>", "last <bee>", "wait <bee>", "events [", "here [", "usage [", "set-model <bee>", "attach <bee>", "swap-account <bee>"]) {
     assert.ok(text.includes(verb), `help mentions ${verb}`);
   }
 });
