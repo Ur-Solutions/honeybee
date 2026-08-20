@@ -573,6 +573,15 @@ test("cli.4e: v6 verbs — rename, tag, interrupt, fork, children, spawn --paren
   }
 });
 
+test("cli.daemon: usage lists restart as a stop+start alias", async () => {
+  const a = capture();
+  assert.equal(await runV2Cli(["daemon", "nope"], a.io), 1);
+  assert.match(a.err.join("\n"), /restart/);
+  const help = capture();
+  assert.equal(await runV2Cli(["help"], help.io), 0);
+  assert.match(help.out.join("\n"), /daemon install\|uninstall\|start\|stop\|restart\|status/);
+});
+
 test("cli.5: daemon status when nothing runs and no service is installed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-cli-"));
   try {

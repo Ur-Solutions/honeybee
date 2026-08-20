@@ -542,7 +542,7 @@ test("cells.4: spawn param validation (typed invalid_request), explicit sha/warm
     const client = await daemon.client();
     const bad = async (params: Record<string, unknown>) =>
       assert.rejects(() => client.request("spawn", { name: "b", agent: "cellstub", cwd: "/tmp", ...params }), rpcCode("invalid_request"));
-    await bad({ substrate: "tmux" });
+    await bad({ substrate: "nope" });
     await bad({ substrate: "cell" });
     await bad({ substrate: "cell", cell: { originRepo: "relative/path" } });
     await bad({ substrate: "cell", cell: { originRepo: join(rig.dir, "not-a-repo") } });

@@ -9,17 +9,25 @@
 // unit-tested) in src/deploySettle.ts; this orchestrator imports the copy the
 // build it just ran emitted.
 //
+// Post-WP7 freeze: the live runtime is ~/.hive/runtime/current, not the npm
+// global tree. On a frozen node this script hands off to `hive deploy`
+// instead of `npm i -g` + restart.
+//
 //   npm run deploy
 //   HIVE_DEPLOY_SETTLE_TIMEOUT_MS=120000 npm run deploy   # slow disks/NFS
 //
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const localDist = join(repoRoot, "dist");
+
+function hiveStoreRoot() {
+  return process.env.HIVE_STORE_ROOT ?? join(homedir(), ".hive");
+}
 
 function run(command, args) {
   console.log(`deploy-settle: ${command} ${args.join(" ")}`);
@@ -28,6 +36,18 @@ function run(command, args) {
   if (outcome.status !== 0) {
     throw new Error(`deploy-settle: '${command} ${args.join(" ")}' exited with ${outcome.status}`);
   }
+}
+
+if (existsSync(join(hiveStoreRoot(), "FROZEN"))) {
+  // Spec 00 / WP7: never npm i -g on a frozen node. That clobbers the
+  // runtime/current symlink (hive deploy --init) and never retargets the
+  // live daemon, which runs out of ~/.hive/runtime/current.
+  const extra = process.argv.slice(2);
+  console.log(
+    "deploy-settle: frozen node — live runtime is ~/.hive/runtime/current; handing off to hive deploy",
+  );
+  run("hive", ["deploy", ...extra]);
+  process.exit(0);
 }
 
 run("npm", ["run", "build"]);

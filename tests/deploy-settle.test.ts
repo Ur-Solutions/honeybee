@@ -4,6 +4,7 @@
 // stamp AND re-hash — with bounded retries.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { chmod } from "node:fs/promises";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -144,6 +145,39 @@ test("deploy orchestrator rebinds launchd to the verified installed CLI before r
   assert.match(source, /\[installedCli, "daemon", "install", "--force"\]/);
   assert.match(source, /\[installedCli, "daemon", "restart"\]/);
   assert.doesNotMatch(source, /run\("hive", \["daemon", "restart"\]\)/);
+});
+
+test("frozen node hands npm deploy off to hive deploy before any global install", async () => {
+  const source = await readFile(join(process.cwd(), "scripts", "deploy-settle.mjs"), "utf8");
+  assert.match(source, /existsSync\(join\(hiveStoreRoot\(\), "FROZEN"\)\)/);
+  assert.match(source, /run\("hive", \["deploy", \.\.\.extra\]\)/);
+  assert.ok(
+    source.indexOf('run("hive", ["deploy"') < source.indexOf('run("npm", ["run", "build"])'),
+    "frozen handoff must precede the local build / npm i -g path",
+  );
+  assert.ok(
+    source.indexOf('run("hive", ["deploy"') < source.indexOf('[installedCli, "daemon", "restart"]'),
+    "frozen handoff must never reach the v1 daemon-restart step",
+  );
+
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "FROZEN"), "{}\n");
+    const bin = join(dir, "bin");
+    await mkdir(bin);
+    const hive = join(bin, "hive");
+    await writeFile(hive, "#!/bin/sh\necho hive-stub \"$@\"\n");
+    await chmod(hive, 0o755);
+    const output = execFileSync(process.execPath, [join(process.cwd(), "scripts", "deploy-settle.mjs"), "--list"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, HIVE_STORE_ROOT: dir, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+    assert.match(output, /handing off to hive deploy/);
+    assert.match(output, /hive deploy --list/);
+    assert.match(output, /hive-stub deploy --list/);
+    assert.doesNotMatch(output, /npm run build/);
+    assert.doesNotMatch(output, /npm i -g/);
+  });
 });
 
 test("deploy installs an immutable package archive, never a worktree symlink", async () => {

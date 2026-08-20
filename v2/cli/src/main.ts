@@ -8,7 +8,7 @@
  *   a `stale:` prefix column; json: `"stale": true`).
  * - `send --wait` (Q3 resolution): send returns the command/message ids
  *   immediately by default; --wait blocks until the delivery mark.
- * - `daemon install|start|stop|status` wraps the platform service layer.
+ * - `daemon install|start|stop|restart|status` wraps the platform service layer.
  */
 import { execFile, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -2438,6 +2438,19 @@ async function cmdDaemon(ctx: CliContext, parsed: Parsed): Promise<number> {
       emit(ctx, [`stopped ${serviceLabel()}`], { label: serviceLabel() }, false);
       return 0;
     }
+    case "restart": {
+      // Compatibility alias at the CLI edge (v1 `hive daemon restart`).
+      // Stop may fail when nothing is loaded; start still bootstraps.
+      const mgr = buildServiceManager(ctx);
+      try {
+        await mgr.stop();
+      } catch {
+        // not loaded
+      }
+      await mgr.start();
+      emit(ctx, [`restarted ${serviceLabel()}`], { label: serviceLabel() }, false);
+      return 0;
+    }
     case "status": {
       // The daemon's own word first; the service manager's second.
       try {
@@ -2472,7 +2485,7 @@ async function cmdDaemon(ctx: CliContext, parsed: Parsed): Promise<number> {
       return 0;
     }
     default:
-      throw new Error("usage: hive v2 daemon <run|install|uninstall|start|stop|status>");
+      throw new Error("usage: hive v2 daemon <run|install|uninstall|start|stop|restart|status>");
   }
 }
 
@@ -2559,7 +2572,7 @@ Cutover (freeze the old world, import its active bees):
 
 Daemon:
   daemon run                                  run the daemon in the foreground
-  daemon install|uninstall|start|stop|status`;
+  daemon install|uninstall|start|stop|restart|status`;
 
 /**
  * The package version, resolved relative to this module: works from the
