@@ -87,6 +87,10 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         mustBee(p.beeId as string).name = p.name as string;
         break;
       }
+      case "bee.titled": {
+        mustBee(p.beeId as string).title = p.title as string;
+        break;
+      }
       case "bee.tagged": {
         mustBee(p.beeId as string).tags = [...(p.tags as string[])];
         break;

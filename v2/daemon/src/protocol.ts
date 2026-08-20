@@ -144,6 +144,10 @@ export const RPC_VERBS = [
   "account.importRegistry",
   "account.backfill",
   "bee.swapAccount",
+  // Auto-titler node config (additive): `config.get` is a read; `config.patch`
+  // writes `naming` in the node's config.json.
+  "config.get",
+  "config.patch",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -330,6 +334,26 @@ export interface SwapAccountResult extends DedupMarkers {
 export interface RenameResult extends DedupMarkers {
   bee: BeeRow;
   applied: boolean;
+}
+
+/** `config.get` — resolved auto-titler settings (defaults applied). */
+export interface NamingConfigView {
+  auto: boolean;
+  tool: "codex" | "claude";
+  model: string;
+  effort: string;
+  command?: string;
+}
+
+export interface ConfigGetResult {
+  naming: NamingConfigView;
+  configPath: string;
+}
+
+/** `config.patch {naming}` — last-write-wins merge of naming keys. */
+export interface ConfigPatchResult extends DedupMarkers {
+  naming: NamingConfigView;
+  configPath: string;
 }
 
 /**

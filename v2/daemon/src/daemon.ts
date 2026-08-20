@@ -78,7 +78,17 @@ import {
   type HarnessAdapter,
 } from "../../adapters/src/index.ts";
 import { DaemonCore, type BootReport, type I1ViolationEvent } from "./loops.ts";
-import type { AgentSpecConfig, ResolvedNodeConfig } from "./config.ts";
+import {
+  ConfigError,
+  loadNodeConfig,
+  patchNamingConfig,
+  publicNamingConfig,
+  type AgentSpecConfig,
+  type NamingConfig,
+  type ResolvedNamingConfig,
+  type ResolvedNodeConfig,
+} from "./config.ts";
+import { createStoreAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.ts";
 import { TelemetryStore, formatI1Violation } from "./telemetry.ts";
 import { RpcServer, type RpcConn } from "./rpc.ts";
 import {
@@ -102,6 +112,8 @@ import {
   type CellCaptureResult,
   type CellRemoveResult,
   type ChildrenResult,
+  type ConfigGetResult,
+  type ConfigPatchResult,
   type DeployInfoResult,
   type ForkResult,
   type HealthResult,
@@ -288,10 +300,13 @@ export class HiveDaemon {
   private readonly deps: HiveDaemonDeps;
   /** v7 rotation bound: one attempt per (bee, generation) exhaustion event. */
   private readonly rotatedGenerations = new Map<string, number>();
+  private naming: ResolvedNamingConfig;
+  private autoTitle: ((bees?: BeeRow[]) => Promise<AutoTitleOutcome[]>) | null = null;
 
   constructor(cfg: ResolvedNodeConfig, deps: HiveDaemonDeps = {}) {
     this.cfg = cfg;
     this.deps = deps;
+    this.naming = cfg.naming;
   }
 
   /** The account plane (tests reach the selector / login seat / importer through it). */
@@ -316,6 +331,11 @@ export class HiveDaemon {
       backoffBaseMs: this.cfg.backoffBaseMs,
     });
     this.store = store;
+    this.autoTitle = createStoreAutoTitleDispatcher(store, {
+      naming: () => this.naming,
+      statePath: join(this.cfg.dataDir, "auto-title.json"),
+      log: (op) => this.log(op),
+    });
     this.accounts = new AccountsService({
       store,
       cfg: this.cfg,
@@ -416,6 +436,15 @@ export class HiveDaemon {
       // v7: bounded in-daemon limits refresh + login-seat watch (no forks).
       this.accounts?.periodicRefreshTick();
       void this.pollLoginSeats();
+      void this.autoTitle?.()
+        .then((outcomes) => {
+          for (const outcome of outcomes) {
+            if (outcome.error) this.log(`autoTitle.error bee=${outcome.beeId} ${outcome.error}`);
+          }
+        })
+        .catch((error) => {
+          this.log(`autoTitle.error ${error instanceof Error ? error.message : String(error)}`);
+        });
     } catch (err) {
       // A tick error is a bug, never a reason to abandon the node: the loops
       // are idempotent over durable state, so the next tick retries.
@@ -584,6 +613,10 @@ export class HiveDaemon {
         return this.rpcSpawnWithAccount(params);
       case "bee.swapAccount":
         return this.withIdempotency(verb, params, () => this.rpcSwapAccount(params));
+      case "config.get":
+        return this.rpcConfigGet();
+      case "config.patch":
+        return this.withIdempotency(verb, params, () => this.rpcConfigPatch(params));
       case "account.list":
         return this.rpcAccountList(params);
       case "account.get":
@@ -1149,6 +1182,63 @@ export class HiveDaemon {
     const res = this.mustStore().renameBee(beeId, name);
     this.log(`bee.rename bee=${beeId} applied=${res.applied} name=${JSON.stringify(name)}`);
     return { bee: res.bee, applied: res.applied };
+  }
+
+  private rpcConfigGet(): ConfigGetResult {
+    try {
+      this.naming = loadNodeConfig(this.cfg.dataDir, this.cfg.configPath).naming;
+    } catch (err) {
+      if (!(err instanceof ConfigError)) throw err;
+      throw new RpcError("invalid_request", err.message);
+    }
+    return { naming: publicNamingConfig(this.naming), configPath: this.cfg.configPath };
+  }
+
+  private rpcConfigPatch(params: Record<string, unknown>): ConfigPatchResult {
+    const namingRaw = params.naming;
+    if (namingRaw === null || typeof namingRaw !== "object" || Array.isArray(namingRaw)) {
+      throw new RpcError("invalid_request", "config.patch: naming must be an object");
+    }
+    const raw = namingRaw as Record<string, unknown>;
+    const patch: NamingConfig = {};
+    if (raw.auto !== undefined) {
+      if (typeof raw.auto !== "boolean") throw new RpcError("invalid_request", "config.patch: naming.auto must be a boolean");
+      patch.auto = raw.auto;
+    }
+    if (raw.tool !== undefined) {
+      if (raw.tool !== "codex" && raw.tool !== "claude") {
+        throw new RpcError("invalid_request", 'config.patch: naming.tool must be "codex" or "claude"');
+      }
+      patch.tool = raw.tool;
+    }
+    if (raw.model !== undefined) {
+      if (typeof raw.model !== "string" || raw.model.length === 0) {
+        throw new RpcError("invalid_request", "config.patch: naming.model must be a non-empty string");
+      }
+      patch.model = raw.model;
+    }
+    if (raw.effort !== undefined) {
+      if (typeof raw.effort !== "string" || raw.effort.length === 0) {
+        throw new RpcError("invalid_request", "config.patch: naming.effort must be a non-empty string");
+      }
+      patch.effort = raw.effort as NamingConfig["effort"];
+    }
+    if (raw.command !== undefined) {
+      if (typeof raw.command !== "string") {
+        throw new RpcError("invalid_request", "config.patch: naming.command must be a string");
+      }
+      patch.command = raw.command;
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new RpcError("invalid_request", "config.patch: give at least one naming field");
+    }
+    try {
+      this.naming = patchNamingConfig(this.cfg.configPath, this.cfg.dataDir, patch);
+    } catch (err) {
+      throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
+    }
+    this.log(`config.patch naming=${JSON.stringify(publicNamingConfig(this.naming))}`);
+    return { naming: publicNamingConfig(this.naming), configPath: this.cfg.configPath };
   }
 
   private rpcTag(params: Record<string, unknown>): TagResult {

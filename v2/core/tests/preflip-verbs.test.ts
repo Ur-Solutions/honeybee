@@ -18,6 +18,33 @@ import {
 } from "../src/index.ts";
 import { harness, makeBee } from "./helpers.ts";
 
+test("setBeeTitle: sets title, audits bee.titled with previous, replays; identical = silent no-op; empty refused", () => {
+  const h = harness();
+  try {
+    const store = h.open();
+    const { bee } = makeBee(store, "apiary-waggle-1");
+    const r1 = store.setBeeTitle(bee.id, "Fix auto-titling");
+    assert.equal(r1.applied, true);
+    assert.equal(r1.bee.title, "Fix auto-titling");
+    const r2 = store.setBeeTitle(bee.id, "Fix auto-titling");
+    assert.equal(r2.applied, false);
+    const rows = store.auditRows().filter((r) => r.kind === "bee.titled");
+    assert.equal(rows.length, 1, "no audit row for the no-op");
+    assert.deepEqual(rows[0]?.payload, {
+      beeId: bee.id,
+      title: "Fix auto-titling",
+      previous: null,
+      source: "auto",
+    });
+    assert.throws(() => store.setBeeTitle(bee.id, ""), CoreError);
+    assert.throws(() => store.setBeeTitle("nope", "x"), CoreError);
+    assert.deepEqual(replayAudit(store.auditRows()), store.dumpState());
+    store.close();
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("v6.rename: renames, audits bee.renamed with previous, replays; identical = silent no-op; empty refused", () => {
   const h = harness();
   try {

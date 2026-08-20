@@ -79,6 +79,7 @@ export type MirrorDelta = AuditRow;
  * payload { beeId, args: string[] | null, previous }).
  * v6 (pre-flip verbs) adds, all additive:
  *   bee.renamed        → { beeId, name, previous }                     (bee row: name)
+ *   bee.titled         → { beeId, title, previous, source }            (bee row: title)
  *   bee.tagged         → { beeId, tags, previous, added, removed }     (bee row: tags)
  *   bee.orphaned       → { beeId, parentId, reason }                   (bee row: parentId → null)
  *   bee.forked         → { beeId, forkedFrom, forkSeed }               (informational; row via bee.created)

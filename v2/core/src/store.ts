@@ -92,6 +92,12 @@ export interface CoreStoreOptions {
    * insert. Default 10 000.
    */
   maxRpcIdempotencyRows?: number;
+  /**
+   * Test-only: keep WAL + EXCLUSIVE (B9 / second-writer) but skip fsync and
+   * keep temp/pager in memory. Crash/reopen in the same process still works;
+   * an OS crash is allowed to lose the file. Production never sets this.
+   */
+  ephemeral?: boolean;
 }
 
 export interface CreateBeeInput {
@@ -561,6 +567,7 @@ export class CoreStore {
   private readonly maxAttempts: number;
   private readonly backoffBaseMs: number;
   private readonly maxRpcIdempotencyRows: number;
+  private readonly stmts = new Map<string, ReturnType<DatabaseSync["prepare"]>>();
   private txDepth = 0;
   private closed = false;
   /** Commands requeued running→queued by open() (B5 boot replay); reported by reconcileAtBoot. */
@@ -581,7 +588,13 @@ export class CoreStore {
       // held until close(); any second connection's first access throws SQLITE_BUSY.
       this.db.exec("PRAGMA locking_mode = EXCLUSIVE");
       this.db.exec("PRAGMA journal_mode = WAL");
-      this.db.exec("PRAGMA synchronous = NORMAL");
+      // Production durability. Tests pass `ephemeral` to skip fsync; B9 locking
+      // and crash/reopen-in-process semantics stay intact.
+      this.db.exec(opts.ephemeral ? "PRAGMA synchronous = OFF" : "PRAGMA synchronous = NORMAL");
+      if (opts.ephemeral) {
+        this.db.exec("PRAGMA temp_store = MEMORY");
+        this.db.exec("PRAGMA cache_size = -8000");
+      }
       this.db.exec("PRAGMA foreign_keys = ON");
       this.db.exec(SCHEMA_SQL);
       this.tx(() => {
@@ -589,12 +602,13 @@ export class CoreStore {
         // touches possibly-old tables), atomically with the stamp.
         this.ensureSchemaVersion();
         // Guaranteed write on open: takes the exclusive lock now, not lazily.
-        this.db
-          .prepare("INSERT INTO meta(key, value) VALUES('opened_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-          .run(String(this.now()));
+        this.stmt(
+          "INSERT INTO meta(key, value) VALUES('opened_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ).run(String(this.now()));
         this.bootRequeueRunningCommands();
       });
     } catch (err) {
+      this.stmts.clear();
       try {
         this.db.close();
       } catch {
@@ -608,7 +622,17 @@ export class CoreStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.stmts.clear();
     this.db.close();
+  }
+
+  /** Reuse StatementSync objects. `prepare()` on every dumpState/getBee is the sim hot path. */
+  private stmt(sql: string): ReturnType<DatabaseSync["prepare"]> {
+    const cached = this.stmts.get(sql);
+    if (cached) return cached;
+    const created = this.db.prepare(sql);
+    this.stmts.set(sql, created);
+    return created;
   }
 
   // -------------------------------------------------------------------------
@@ -667,7 +691,7 @@ export class CoreStore {
       // already has the column from SCHEMA_SQL (also unstamped, so it takes
       // this path too) — the pragma check makes the ALTER apply only to real
       // v1 stores.
-      const cols = this.db.prepare("SELECT name FROM pragma_table_info('commands')").all() as Row[];
+      const cols = this.stmt("SELECT name FROM pragma_table_info('commands')").all() as Row[];
       if (!cols.some((c) => c.name === "idempotency_key")) {
         this.db.exec("ALTER TABLE commands ADD COLUMN idempotency_key TEXT");
       }
@@ -676,14 +700,14 @@ export class CoreStore {
       // missing, so fresh and v1 stores (whose bees table was just created in
       // full) are untouched.
       const beeCols = new Set(
-        (this.db.prepare("SELECT name FROM pragma_table_info('bees')").all() as Row[]).map((c) => String(c.name)),
+        (this.stmt("SELECT name FROM pragma_table_info('bees')").all() as Row[]).map((c) => String(c.name)),
       );
       for (const [name, ddl] of BEES_ADDITIVE_COLUMNS) {
         if (!beeCols.has(name)) this.db.exec(`ALTER TABLE bees ADD COLUMN ${ddl}`);
       }
       // v7 → v8: additive urgency column on mailbox (spec 01 Q2 amendment).
       const mailCols = new Set(
-        (this.db.prepare("SELECT name FROM pragma_table_info('mailbox')").all() as Row[]).map((c) => String(c.name)),
+        (this.stmt("SELECT name FROM pragma_table_info('mailbox')").all() as Row[]).map((c) => String(c.name)),
       );
       for (const [name, ddl] of MAILBOX_ADDITIVE_COLUMNS) {
         if (!mailCols.has(name)) this.db.exec(`ALTER TABLE mailbox ADD COLUMN ${ddl}`);
@@ -692,7 +716,7 @@ export class CoreStore {
       // budget). Existing rows migrate as NULL — never treated as synthetic,
       // so a pre-migration live runtime is never punished retroactively.
       const runtimeCols = new Set(
-        (this.db.prepare("SELECT name FROM pragma_table_info('runtimes')").all() as Row[]).map((c) => String(c.name)),
+        (this.stmt("SELECT name FROM pragma_table_info('runtimes')").all() as Row[]).map((c) => String(c.name)),
       );
       for (const [name, ddl] of RUNTIMES_ADDITIVE_COLUMNS) {
         if (!runtimeCols.has(name)) this.db.exec(`ALTER TABLE runtimes ADD COLUMN ${ddl}`);
@@ -700,14 +724,14 @@ export class CoreStore {
       // v9 → v10: mint display handles for existing bees. An imported bee
       // whose old id already IS a pretty handle (CL.7920-style) keeps it —
       // the operator's known references survive the cutover.
-      const unhandled = this.db.prepare("SELECT id, agent FROM bees WHERE handle IS NULL").all() as Row[];
+      const unhandled = this.stmt("SELECT id, agent FROM bees WHERE handle IS NULL").all() as Row[];
       for (const b of unhandled) {
         const id = String(b.id);
         const keepOldId =
           HANDLE_RE.test(id) &&
-          this.db.prepare("SELECT 1 FROM bees WHERE handle = ?").get(id) === undefined;
+          this.stmt("SELECT 1 FROM bees WHERE handle = ?").get(id) === undefined;
         const handle = keepOldId ? id : this.mintHandle(String(b.agent));
-        this.db.prepare("UPDATE bees SET handle = ? WHERE id = ?").run(handle, id);
+        this.stmt("UPDATE bees SET handle = ? WHERE id = ?").run(handle, id);
       }
     }
     // The partial UNIQUE indexes need their columns, so they are created here
@@ -763,7 +787,7 @@ export class CoreStore {
    */
   private mintHandle(agent: string): string {
     const prefix = handlePrefix(agent);
-    const taken = this.db.prepare("SELECT 1 FROM bees WHERE handle = ?");
+    const taken = this.stmt("SELECT 1 FROM bees WHERE handle = ?");
     for (let attempt = 0; attempt < 64; attempt++) {
       const len = attempt < 16 ? 4 : attempt < 40 ? 5 : 6;
       let suffix = "";
@@ -781,7 +805,7 @@ export class CoreStore {
       let handle: string;
       if (input.handle !== undefined) {
         requireNonEmpty(input.handle, "createBee: handle");
-        if (this.db.prepare("SELECT 1 FROM bees WHERE handle = ?").get(input.handle)) {
+        if (this.stmt("SELECT 1 FROM bees WHERE handle = ?").get(input.handle)) {
           throw new CoreError(`createBee: handle already taken: ${input.handle}`);
         }
         handle = input.handle;
@@ -833,12 +857,12 @@ export class CoreStore {
   }
 
   getBee(beeId: string): BeeRow | null {
-    const row = this.db.prepare("SELECT * FROM bees WHERE id = ?").get(beeId) as Row | undefined;
+    const row = this.stmt("SELECT * FROM bees WHERE id = ?").get(beeId) as Row | undefined;
     return row ? mapBee(row) : null;
   }
 
   listBees(): BeeRow[] {
-    const rows = this.db.prepare("SELECT * FROM bees ORDER BY id").all() as Row[];
+    const rows = this.stmt("SELECT * FROM bees ORDER BY id").all() as Row[];
     return rows.map(mapBee);
   }
 
@@ -853,8 +877,24 @@ export class CoreStore {
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       if (bee.name === name) return { bee, applied: false };
-      this.db.prepare("UPDATE bees SET name = ? WHERE id = ?").run(name, beeId);
+      this.stmt("UPDATE bees SET name = ? WHERE id = ?").run(name, beeId);
       this.audit("bee.renamed", beeId, { beeId, name, previous: bee.name });
+      return { bee: this.mustGetBee(beeId), applied: true };
+    });
+  }
+
+  /**
+   * Display title (the Apiary tab/list label when `name` is a generated slug).
+   * Identity stays on id/handle/name. Identical title is a silent no-op.
+   * Audit `bee.titled` so the mirror fold updates `bee.title`.
+   */
+  setBeeTitle(beeId: string, title: string, source = "auto"): { bee: BeeRow; applied: boolean } {
+    requireNonEmpty(title, "setBeeTitle: title");
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      if (bee.title === title) return { bee, applied: false };
+      this.stmt("UPDATE bees SET title = ? WHERE id = ?").run(title, beeId);
+      this.audit("bee.titled", beeId, { beeId, title, previous: bee.title, source });
       return { bee: this.mustGetBee(beeId), applied: true };
     });
   }
@@ -879,7 +919,7 @@ export class CoreStore {
       const added = next.filter((t) => !bee.tags.includes(t));
       const applied = next.length !== bee.tags.length || next.some((t, i) => bee.tags[i] !== t);
       if (!applied) return { bee, applied: false, added: [], removed: [] };
-      this.db.prepare("UPDATE bees SET tags = ? WHERE id = ?").run(JSON.stringify(next), beeId);
+      this.stmt("UPDATE bees SET tags = ? WHERE id = ?").run(JSON.stringify(next), beeId);
       this.audit("bee.tagged", beeId, { beeId, tags: next, previous: bee.tags, added, removed });
       return { bee: this.mustGetBee(beeId), applied: true, added, removed };
     });
@@ -887,7 +927,7 @@ export class CoreStore {
 
   /** v6 — the bees whose parent_id is this bee (any lifecycle), by id. */
   listChildren(beeId: string): BeeRow[] {
-    const rows = this.db.prepare("SELECT * FROM bees WHERE parent_id = ? ORDER BY id").all(beeId) as Row[];
+    const rows = this.stmt("SELECT * FROM bees WHERE parent_id = ? ORDER BY id").all(beeId) as Row[];
     return rows.map(mapBee);
   }
 
@@ -905,7 +945,7 @@ export class CoreStore {
 
   private applyArchive(beeId: string): BeeRow {
     const at = this.now();
-    this.db.prepare("UPDATE bees SET lifecycle = 'archived', archived_at = ? WHERE id = ?").run(at, beeId);
+    this.stmt("UPDATE bees SET lifecycle = 'archived', archived_at = ? WHERE id = ?").run(at, beeId);
     this.audit("bee.archived", beeId, { beeId, archivedAt: at });
     return this.mustGetBee(beeId);
   }
@@ -923,7 +963,7 @@ export class CoreStore {
   }
 
   private applyUnarchive(beeId: string): BeeRow {
-    this.db.prepare("UPDATE bees SET lifecycle = 'active', archived_at = NULL WHERE id = ?").run(beeId);
+    this.stmt("UPDATE bees SET lifecycle = 'active', archived_at = NULL WHERE id = ?").run(beeId);
     this.audit("bee.unarchived", beeId, { beeId });
     return this.mustGetBee(beeId);
   }
@@ -954,11 +994,11 @@ export class CoreStore {
       // audited per child), never cascades. Archive touches no child at all.
       const orphanedChildIds = this.listChildren(beeId).map((c) => c.id);
       for (const childId of orphanedChildIds) {
-        this.db.prepare("UPDATE bees SET parent_id = NULL WHERE id = ?").run(childId);
+        this.stmt("UPDATE bees SET parent_id = NULL WHERE id = ?").run(childId);
         this.audit("bee.orphaned", childId, { beeId: childId, parentId: beeId, reason: "parent_deleted" });
       }
       // ON DELETE CASCADE removes runtimes, flags, mailbox, questions, seals.
-      this.db.prepare("DELETE FROM bees WHERE id = ?").run(beeId);
+      this.stmt("DELETE FROM bees WHERE id = ?").run(beeId);
       this.audit("bee.deleted", beeId, {
         beeId,
         deletedAt: at,
@@ -1130,7 +1170,7 @@ export class CoreStore {
    */
   private applySpawnFailure(beeId: string, generation: number, exitCause: ExitCause, detail?: string): void {
     const failures = this.mustGetBee(beeId).spawnFailures + 1;
-    this.db.prepare("UPDATE bees SET spawn_failures = ? WHERE id = ?").run(failures, beeId);
+    this.stmt("UPDATE bees SET spawn_failures = ? WHERE id = ?").run(failures, beeId);
     this.audit("bee.spawn_failures", beeId, {
       beeId,
       spawnFailures: failures,
@@ -1155,7 +1195,7 @@ export class CoreStore {
     const bee = this.mustGetBee(beeId);
     let applied = false;
     if (bee.spawnFailures !== 0) {
-      this.db.prepare("UPDATE bees SET spawn_failures = 0 WHERE id = ?").run(beeId);
+      this.stmt("UPDATE bees SET spawn_failures = 0 WHERE id = ?").run(beeId);
       this.audit("bee.spawn_failures", beeId, { beeId, spawnFailures: 0, reason });
       applied = true;
     }
@@ -1310,7 +1350,7 @@ export class CoreStore {
   private applyArgs(beeId: string, next: string[] | null): boolean {
     const bee = this.mustGetBee(beeId);
     if (sameArgs(bee.args, next)) return false;
-    this.db.prepare("UPDATE bees SET args = ? WHERE id = ?").run(next === null ? null : JSON.stringify(next), beeId);
+    this.stmt("UPDATE bees SET args = ? WHERE id = ?").run(next === null ? null : JSON.stringify(next), beeId);
     this.audit("bee.args_set", beeId, { beeId, args: next, previous: bee.args });
     return true;
   }
@@ -1403,7 +1443,7 @@ export class CoreStore {
       .prepare("SELECT * FROM flags WHERE bee_id = ? AND flag = ? AND cleared_at IS NULL")
       .get(beeId, flag) as Row | undefined;
     if (existing) {
-      this.db.prepare("UPDATE flags SET detail = ? WHERE id = ?").run(detail, Number(existing.id));
+      this.stmt("UPDATE flags SET detail = ? WHERE id = ?").run(detail, Number(existing.id));
       const row = mapFlag({ ...existing, detail });
       this.audit("flag.set", beeId, { flag: row });
       return row;
@@ -1446,7 +1486,7 @@ export class CoreStore {
       return { applied: false };
     }
     const at = this.now();
-    this.db.prepare("UPDATE flags SET cleared_at = ? WHERE id = ?").run(at, Number(existing.id));
+    this.stmt("UPDATE flags SET cleared_at = ? WHERE id = ?").run(at, Number(existing.id));
     this.audit("flag.cleared", beeId, {
       flagId: Number(existing.id),
       beeId,
@@ -1525,7 +1565,7 @@ export class CoreStore {
   }
 
   getMessage(messageId: number): MessageRow | null {
-    const row = this.db.prepare("SELECT * FROM mailbox WHERE id = ?").get(messageId) as Row | undefined;
+    const row = this.stmt("SELECT * FROM mailbox WHERE id = ?").get(messageId) as Row | undefined;
     return row ? mapMessage(row) : null;
   }
 
@@ -1539,7 +1579,7 @@ export class CoreStore {
       const message = this.getMessage(messageId);
       if (!message) return { canceled: false, reason: "not_found" };
       if (message.deliveredAt != null) return { canceled: false, reason: "delivered" };
-      this.db.prepare("DELETE FROM mailbox WHERE id = ?").run(messageId);
+      this.stmt("DELETE FROM mailbox WHERE id = ?").run(messageId);
       this.audit("mail.canceled", message.beeId, { messageId, urgency: message.urgency });
       return { canceled: true };
     });
@@ -1556,7 +1596,7 @@ export class CoreStore {
       const message = this.getMessage(messageId);
       if (!message) return { applied: false, reason: "not_found" };
       if (message.deliveredAt != null) return { applied: false, reason: "delivered" };
-      this.db.prepare("UPDATE mailbox SET urgency = ? WHERE id = ?").run(urgency, messageId);
+      this.stmt("UPDATE mailbox SET urgency = ? WHERE id = ?").run(urgency, messageId);
       this.audit("mail.expedited", message.beeId, { messageId, from: message.urgency, to: urgency });
       return { applied: true };
     });
@@ -1606,7 +1646,7 @@ export class CoreStore {
     this.tx(() => {
       this.mustGetBee(beeId);
       const at = this.now();
-      this.db.prepare("UPDATE bees SET last_output_at = ? WHERE id = ?").run(at, beeId);
+      this.stmt("UPDATE bees SET last_output_at = ? WHERE id = ?").run(at, beeId);
       this.audit("output.recorded", beeId, { beeId, at });
     });
   }
@@ -1697,7 +1737,7 @@ export class CoreStore {
   }
 
   getCommand(id: number): CommandRow | null {
-    const row = this.db.prepare("SELECT * FROM commands WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM commands WHERE id = ?").get(id) as Row | undefined;
     return row ? mapCommand(row) : null;
   }
 
@@ -1715,7 +1755,7 @@ export class CoreStore {
     }
     if (where.length > 0) sql += ` WHERE ${where.join(" AND ")}`;
     sql += " ORDER BY id";
-    return (this.db.prepare(sql).all(...params) as Row[]).map(mapCommand);
+    return (this.stmt(sql).all(...params) as Row[]).map(mapCommand);
   }
 
   /**
@@ -1751,7 +1791,7 @@ export class CoreStore {
             continue;
           }
         }
-        this.db.prepare("UPDATE commands SET status = 'running' WHERE id = ?").run(command.id);
+        this.stmt("UPDATE commands SET status = 'running' WHERE id = ?").run(command.id);
         this.audit("command.claimed", command.beeId, { commandId: command.id });
         return { ...command, status: "running" };
       }
@@ -1771,7 +1811,7 @@ export class CoreStore {
         throw new CommandProtocolError(`command ${id} is ${command.status}; claim before completing`);
       }
       const at = this.now();
-      this.db.prepare("UPDATE commands SET status = 'done', finished_at = ? WHERE id = ?").run(at, id);
+      this.stmt("UPDATE commands SET status = 'done', finished_at = ? WHERE id = ?").run(at, id);
       this.audit("command.completed", command.beeId, { commandId: id, finishedAt: at });
       return { applied: true };
     });
@@ -1872,7 +1912,7 @@ export class CoreStore {
         .prepare("INSERT INTO rpc_idempotency(key, verb, command_id, result, created_at) VALUES(?, ?, ?, ?, ?)")
         .run(key, verb, commandId, JSON.stringify(result ?? null), this.now());
       const count = Number(
-        (this.db.prepare("SELECT COUNT(*) AS n FROM rpc_idempotency").get() as Row).n,
+        (this.stmt("SELECT COUNT(*) AS n FROM rpc_idempotency").get() as Row).n,
       );
       const excess = count - this.maxRpcIdempotencyRows;
       if (excess > 0) {
@@ -1956,12 +1996,12 @@ export class CoreStore {
   // -------------------------------------------------------------------------
 
   getTemplate(id: string): TemplateRow | null {
-    const row = this.db.prepare("SELECT * FROM templates WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM templates WHERE id = ?").get(id) as Row | undefined;
     return row ? mapTemplate(row) : null;
   }
 
   getTemplateByName(scope: TemplateRow["scope"], name: string): TemplateRow | null {
-    const row = this.db.prepare("SELECT * FROM templates WHERE scope = ? AND name = ?").get(scope, name) as
+    const row = this.stmt("SELECT * FROM templates WHERE scope = ? AND name = ?").get(scope, name) as
       | Row
       | undefined;
     return row ? mapTemplate(row) : null;
@@ -1970,8 +2010,8 @@ export class CoreStore {
   listTemplates(filter: { scope?: TemplateRow["scope"] } = {}): TemplateRow[] {
     const rows = (
       filter.scope
-        ? this.db.prepare("SELECT * FROM templates WHERE scope = ? ORDER BY id").all(filter.scope)
-        : this.db.prepare("SELECT * FROM templates ORDER BY id").all()
+        ? this.stmt("SELECT * FROM templates WHERE scope = ? ORDER BY id").all(filter.scope)
+        : this.stmt("SELECT * FROM templates ORDER BY id").all()
     ) as Row[];
     return rows.map(mapTemplate);
   }
@@ -2023,27 +2063,27 @@ export class CoreStore {
     return this.tx(() => {
       const template = this.getTemplate(id);
       if (!template) throw new TemplateNotFoundError(id);
-      this.db.prepare("DELETE FROM templates WHERE id = ?").run(id);
+      this.stmt("DELETE FROM templates WHERE id = ?").run(id);
       this.audit("template.deleted", null, { templateId: id, deletedAt: this.now() });
       return template;
     });
   }
 
   getTrack(id: string): TrackRow | null {
-    const row = this.db.prepare("SELECT * FROM tracks WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM tracks WHERE id = ?").get(id) as Row | undefined;
     return row ? mapTrack(row) : null;
   }
 
   getTrackByName(scope: TrackRow["scope"], name: string): TrackRow | null {
-    const row = this.db.prepare("SELECT * FROM tracks WHERE scope = ? AND name = ?").get(scope, name) as Row | undefined;
+    const row = this.stmt("SELECT * FROM tracks WHERE scope = ? AND name = ?").get(scope, name) as Row | undefined;
     return row ? mapTrack(row) : null;
   }
 
   listTracks(filter: { scope?: TrackRow["scope"] } = {}): TrackRow[] {
     const rows = (
       filter.scope
-        ? this.db.prepare("SELECT * FROM tracks WHERE scope = ? ORDER BY id").all(filter.scope)
-        : this.db.prepare("SELECT * FROM tracks ORDER BY id").all()
+        ? this.stmt("SELECT * FROM tracks WHERE scope = ? ORDER BY id").all(filter.scope)
+        : this.stmt("SELECT * FROM tracks ORDER BY id").all()
     ) as Row[];
     return rows.map(mapTrack);
   }
@@ -2086,7 +2126,7 @@ export class CoreStore {
     return this.tx(() => {
       const track = this.getTrack(id);
       if (!track) throw new TrackNotFoundError(id);
-      this.db.prepare("DELETE FROM tracks WHERE id = ?").run(id);
+      this.stmt("DELETE FROM tracks WHERE id = ?").run(id);
       this.audit("track.deleted", null, { trackId: id, deletedAt: this.now() });
       return track;
     });
@@ -2180,7 +2220,7 @@ export class CoreStore {
   }
 
   getQuestion(id: string): QuestionRow | null {
-    const row = this.db.prepare("SELECT * FROM questions WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM questions WHERE id = ?").get(id) as Row | undefined;
     return row ? mapQuestion(row) : null;
   }
 
@@ -2194,7 +2234,7 @@ export class CoreStore {
     if (filter.open === true) where.push("status = 'open'");
     else if (filter.open === false) where.push("status = 'answered'");
     const sql = `SELECT * FROM questions${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY asked_at, rowid`;
-    return (this.db.prepare(sql).all(...params) as Row[]).map(mapQuestion);
+    return (this.stmt(sql).all(...params) as Row[]).map(mapQuestion);
   }
 
   // -------------------------------------------------------------------------
@@ -2221,7 +2261,7 @@ export class CoreStore {
   }
 
   getSeal(id: string): SealRow | null {
-    const row = this.db.prepare("SELECT * FROM seals WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM seals WHERE id = ?").get(id) as Row | undefined;
     return row ? mapSeal(row) : null;
   }
 
@@ -2234,8 +2274,8 @@ export class CoreStore {
   listSeals(filter: { beeId?: string } = {}): SealRow[] {
     const rows = (
       filter.beeId !== undefined
-        ? this.db.prepare("SELECT * FROM seals WHERE bee_id = ? ORDER BY created_at, rowid").all(filter.beeId)
-        : this.db.prepare("SELECT * FROM seals ORDER BY created_at, rowid").all()
+        ? this.stmt("SELECT * FROM seals WHERE bee_id = ? ORDER BY created_at, rowid").all(filter.beeId)
+        : this.stmt("SELECT * FROM seals ORDER BY created_at, rowid").all()
     ) as Row[];
     return rows.map(mapSeal);
   }
@@ -2251,7 +2291,7 @@ export class CoreStore {
   }
 
   getAccount(id: string): AccountRow | null {
-    const row = this.db.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as Row | undefined;
+    const row = this.stmt("SELECT * FROM accounts WHERE id = ?").get(id) as Row | undefined;
     return row ? mapAccount(row) : null;
   }
 
@@ -2259,8 +2299,8 @@ export class CoreStore {
   listAccounts(filter: { harness?: string } = {}): AccountRow[] {
     const rows = (
       filter.harness !== undefined
-        ? this.db.prepare("SELECT * FROM accounts WHERE harness = ? ORDER BY added_at, id").all(filter.harness)
-        : this.db.prepare("SELECT * FROM accounts ORDER BY added_at, id").all()
+        ? this.stmt("SELECT * FROM accounts WHERE harness = ? ORDER BY added_at, id").all(filter.harness)
+        : this.stmt("SELECT * FROM accounts ORDER BY added_at, id").all()
     ) as Row[];
     return rows.map(mapAccount);
   }
@@ -2299,7 +2339,7 @@ export class CoreStore {
 
   /** Bees (any lifecycle) bound to the account, by id. */
   beesOnAccount(accountId: string): BeeRow[] {
-    const rows = this.db.prepare("SELECT * FROM bees WHERE account = ? ORDER BY id").all(accountId) as Row[];
+    const rows = this.stmt("SELECT * FROM bees WHERE account = ? ORDER BY id").all(accountId) as Row[];
     return rows.map(mapBee);
   }
 
@@ -2312,13 +2352,13 @@ export class CoreStore {
       const account = this.mustGetAccount(id);
       const referenced = this.beesOnAccount(id).map((b) => b.id);
       if (referenced.length > 0) throw new AccountReferencedError(id, referenced);
-      this.db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
+      this.stmt("DELETE FROM accounts WHERE id = ?").run(id);
       // A cursor pointing at the removed account is stale but harmless (the
       // rotation treats an unknown last id as "start over"); drop it anyway
       // so the dump stays tidy.
       const cursor = this.getSelectionCursor(account.harness);
       if (cursor && cursor.lastAccountId === id) {
-        this.db.prepare("DELETE FROM selection_cursors WHERE harness = ?").run(account.harness);
+        this.stmt("DELETE FROM selection_cursors WHERE harness = ?").run(account.harness);
       }
       this.audit("account.removed", null, {
         accountId: id,
@@ -2397,7 +2437,7 @@ export class CoreStore {
       const bee = this.mustGetBee(beeId);
       if (account !== null) this.mustGetAccount(account);
       if (bee.account === account) return { bee, applied: false };
-      this.db.prepare("UPDATE bees SET account = ? WHERE id = ?").run(account, beeId);
+      this.stmt("UPDATE bees SET account = ? WHERE id = ?").run(account, beeId);
       this.audit("bee.account_set", beeId, { beeId, account, previous: bee.account });
       return { bee: this.mustGetBee(beeId), applied: true };
     });
@@ -2416,7 +2456,7 @@ export class CoreStore {
       const bee = this.mustGetBee(beeId);
       const next = { ...env };
       if (JSON.stringify(bee.env) === JSON.stringify(next)) return { bee, applied: false };
-      this.db.prepare("UPDATE bees SET env = ? WHERE id = ?").run(JSON.stringify(next), beeId);
+      this.stmt("UPDATE bees SET env = ? WHERE id = ?").run(JSON.stringify(next), beeId);
       this.audit("bee.env_set", beeId, { beeId, env: next, previous: bee.env });
       return { bee: this.mustGetBee(beeId), applied: true };
     });
@@ -2432,19 +2472,19 @@ export class CoreStore {
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       if (!bee.providerSessionId) return { bee, applied: false };
-      this.db.prepare("UPDATE bees SET fork_seed = ?, provider_session_id = NULL WHERE id = ?").run(bee.providerSessionId, beeId);
+      this.stmt("UPDATE bees SET fork_seed = ?, provider_session_id = NULL WHERE id = ?").run(bee.providerSessionId, beeId);
       this.audit("bee.session_rekeyed", beeId, { beeId, forkSeed: bee.providerSessionId, previousProviderSessionId: bee.providerSessionId });
       return { bee: this.mustGetBee(beeId), applied: true };
     });
   }
 
   getAccountLimits(accountId: string): AccountLimitsRow | null {
-    const row = this.db.prepare("SELECT * FROM account_limits WHERE account = ?").get(accountId) as Row | undefined;
+    const row = this.stmt("SELECT * FROM account_limits WHERE account = ?").get(accountId) as Row | undefined;
     return row ? mapAccountLimits(row) : null;
   }
 
   listAccountLimits(): AccountLimitsRow[] {
-    return (this.db.prepare("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimits);
+    return (this.stmt("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimits);
   }
 
   /** v7 — replace the account's limits snapshot (one row per account). Audited `account_limits.put {limits}`. */
@@ -2484,12 +2524,12 @@ export class CoreStore {
   }
 
   getSelectionCursor(harness: string): SelectionCursorRow | null {
-    const row = this.db.prepare("SELECT * FROM selection_cursors WHERE harness = ?").get(harness) as Row | undefined;
+    const row = this.stmt("SELECT * FROM selection_cursors WHERE harness = ?").get(harness) as Row | undefined;
     return row ? mapSelectionCursor(row) : null;
   }
 
   listSelectionCursors(): SelectionCursorRow[] {
-    return (this.db.prepare("SELECT * FROM selection_cursors ORDER BY harness").all() as Row[]).map(mapSelectionCursor);
+    return (this.stmt("SELECT * FROM selection_cursors ORDER BY harness").all() as Row[]).map(mapSelectionCursor);
   }
 
   /** v7 — advance the per-harness near-tie rotation cursor. Audited `selection_cursor.set`. */
@@ -2515,7 +2555,7 @@ export class CoreStore {
 
   /** Highest audit seq written so far (0 for an empty log) — the store's change version. */
   lastAuditSeq(): number {
-    const row = this.db.prepare("SELECT MAX(seq) AS seq FROM audit").get() as Row | undefined;
+    const row = this.stmt("SELECT MAX(seq) AS seq FROM audit").get() as Row | undefined;
     return row?.seq == null ? 0 : Number(row.seq);
   }
 
@@ -2530,16 +2570,16 @@ export class CoreStore {
   dumpState(): StateDump {
     return {
       bees: this.listBees(),
-      runtimes: (this.db.prepare("SELECT * FROM runtimes ORDER BY bee_id, generation").all() as Row[]).map(
+      runtimes: (this.stmt("SELECT * FROM runtimes ORDER BY bee_id, generation").all() as Row[]).map(
         mapRuntime,
       ),
-      flags: (this.db.prepare("SELECT * FROM flags ORDER BY id").all() as Row[]).map(mapFlag),
-      mailbox: (this.db.prepare("SELECT * FROM mailbox ORDER BY id").all() as Row[]).map(mapMessage),
-      commands: (this.db.prepare("SELECT * FROM commands ORDER BY id").all() as Row[]).map(mapCommand),
+      flags: (this.stmt("SELECT * FROM flags ORDER BY id").all() as Row[]).map(mapFlag),
+      mailbox: (this.stmt("SELECT * FROM mailbox ORDER BY id").all() as Row[]).map(mapMessage),
+      commands: (this.stmt("SELECT * FROM commands ORDER BY id").all() as Row[]).map(mapCommand),
       templates: this.listTemplates(),
       tracks: this.listTracks(),
-      questions: (this.db.prepare("SELECT * FROM questions ORDER BY id").all() as Row[]).map(mapQuestion),
-      seals: (this.db.prepare("SELECT * FROM seals ORDER BY id").all() as Row[]).map(mapSeal),
+      questions: (this.stmt("SELECT * FROM questions ORDER BY id").all() as Row[]).map(mapQuestion),
+      seals: (this.stmt("SELECT * FROM seals ORDER BY id").all() as Row[]).map(mapSeal),
       accounts: this.listAccounts(),
       accountLimits: this.listAccountLimits(),
       selectionCursors: this.listSelectionCursors(),

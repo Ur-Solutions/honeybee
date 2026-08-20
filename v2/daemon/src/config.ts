@@ -6,9 +6,9 @@
  * malformed json or wrongly-typed values fail loudly — a half-read config is
  * worse than no config.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** How to spawn one agent CLI (keyed by the bee's `agent` field). */
 export interface AgentSpecConfig {
@@ -32,6 +32,43 @@ export interface AgentSpecConfig {
    */
   login?: { command: string; args?: string[] };
 }
+
+export const NAMING_TOOLS = ["codex", "claude"] as const;
+export type NamingTool = (typeof NAMING_TOOLS)[number];
+
+export const NAMING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export type NamingEffort = (typeof NAMING_EFFORTS)[number];
+
+/** Daemon auto-titler (untitled bees → semantic `title` from the mailbox). */
+export interface NamingConfig {
+  /** Default true. */
+  auto?: boolean;
+  /** Builtin generator CLI. Default "codex". */
+  tool?: NamingTool;
+  /** Model passed to the generator. Default "gpt-5.6-luna". */
+  model?: string;
+  /** Reasoning effort for the Codex generator. Default "medium". Ignored by Claude. */
+  effort?: NamingEffort;
+  /** Custom generator command (prompt on stdin, title on stdout). Overrides tool/model. */
+  command?: string;
+}
+
+export interface ResolvedNamingConfig {
+  auto: boolean;
+  tool: NamingTool;
+  model: string;
+  effort: NamingEffort;
+  command?: string;
+  /** Dedicated cwd so title-gen sessions never pollute a bee's transcript folder. */
+  generatorCwd: string;
+}
+
+export const NAMING_DEFAULTS = {
+  auto: true,
+  tool: "codex" as NamingTool,
+  model: "gpt-5.6-luna",
+  effort: "medium" as NamingEffort,
+};
 
 /** v7 (spec 08): accounts + vault settings. */
 export interface AccountsConfig {
@@ -110,6 +147,8 @@ export interface NodeConfigFile {
   agents?: Record<string, AgentSpecConfig>;
   /** v7 (spec 08). */
   accounts?: AccountsConfig;
+  /** Auto-titler. Default on, Codex GPT-5.6 Luna medium. */
+  naming?: NamingConfig;
 }
 
 export interface ResolvedNodeConfig {
@@ -145,6 +184,7 @@ export interface ResolvedNodeConfig {
   agents: Record<string, AgentSpecConfig>;
   /** v7 (spec 08): resolved accounts settings (every field defaulted). */
   accounts: Required<Omit<AccountsConfig, "tmuxSocket">> & { tmuxSocket: string | null };
+  naming: ResolvedNamingConfig;
 }
 
 export class ConfigError extends Error {
@@ -316,6 +356,92 @@ function agentsOf(raw: Record<string, unknown>): Record<string, AgentSpecConfig>
   return out;
 }
 
+export function namingOf(raw: Record<string, unknown>, dataDir: string): ResolvedNamingConfig {
+  const v = raw.naming;
+  if (v !== undefined && (v === null || typeof v !== "object" || Array.isArray(v))) {
+    throw new ConfigError("config: naming must be an object");
+  }
+  const n = (v ?? {}) as Record<string, unknown>;
+  if (n.auto !== undefined && typeof n.auto !== "boolean") {
+    throw new ConfigError("config: naming.auto must be a boolean");
+  }
+  if (n.tool !== undefined && (n.tool !== "codex" && n.tool !== "claude")) {
+    throw new ConfigError('config: naming.tool must be "codex" or "claude"');
+  }
+  if (n.model !== undefined && (typeof n.model !== "string" || n.model.length === 0)) {
+    throw new ConfigError("config: naming.model must be a non-empty string");
+  }
+  if (n.effort !== undefined && (typeof n.effort !== "string" || !(NAMING_EFFORTS as readonly string[]).includes(n.effort))) {
+    throw new ConfigError(`config: naming.effort must be one of ${NAMING_EFFORTS.join("|")}`);
+  }
+  if (n.command !== undefined && (typeof n.command !== "string" || n.command.length === 0)) {
+    throw new ConfigError("config: naming.command must be a non-empty string when given");
+  }
+  return {
+    auto: n.auto !== false,
+    tool: (n.tool as NamingTool | undefined) ?? NAMING_DEFAULTS.tool,
+    model: (n.model as string | undefined) ?? NAMING_DEFAULTS.model,
+    effort: (n.effort as NamingEffort | undefined) ?? NAMING_DEFAULTS.effort,
+    ...(typeof n.command === "string" ? { command: n.command } : {}),
+    generatorCwd: join(dataDir, "naming"),
+  };
+}
+
+export function publicNamingConfig(naming: ResolvedNamingConfig): {
+  auto: boolean;
+  tool: NamingTool;
+  model: string;
+  effort: NamingEffort;
+  command?: string;
+} {
+  return {
+    auto: naming.auto,
+    tool: naming.tool,
+    model: naming.model,
+    effort: naming.effort,
+    ...(naming.command ? { command: naming.command } : {}),
+  };
+}
+
+/**
+ * Merge a naming patch into config.json and return the resolved naming.
+ * Unknown top-level keys in the existing file are preserved.
+ */
+export function patchNamingConfig(configPath: string, dataDir: string, patch: NamingConfig): ResolvedNamingConfig {
+  let raw: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(configPath, "utf8"));
+    } catch (err) {
+      throw new ConfigError(`config: ${configPath} is not valid json: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new ConfigError(`config: ${configPath} must contain a json object`);
+    }
+    raw = parsed as Record<string, unknown>;
+  }
+  const current = (raw.naming && typeof raw.naming === "object" && !Array.isArray(raw.naming)
+    ? (raw.naming as Record<string, unknown>)
+    : {}) as NamingConfig;
+  const next: NamingConfig = { ...current };
+  if (patch.auto !== undefined) next.auto = patch.auto;
+  if (patch.tool !== undefined) next.tool = patch.tool;
+  if (patch.model !== undefined) next.model = patch.model;
+  if (patch.effort !== undefined) next.effort = patch.effort;
+  if (patch.command !== undefined) {
+    if (patch.command.length === 0) delete next.command;
+    else next.command = patch.command;
+  }
+  raw.naming = next;
+  const resolved = namingOf(raw, dataDir);
+  const tmp = `${configPath}.${process.pid}.tmp`;
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`);
+  renameSync(tmp, configPath);
+  return resolved;
+}
+
 function accountsOf(raw: Record<string, unknown>): ResolvedNodeConfig["accounts"] {
   const v = raw.accounts;
   if (v !== undefined && (v === null || typeof v !== "object" || Array.isArray(v))) {
@@ -406,5 +532,6 @@ export function loadNodeConfig(dataDir: string, configPath?: string): ResolvedNo
     sessionLogDir: str(raw, "sessionLogDir", join(dataDir, "session-logs")),
     agents: { ...BUILTIN_AGENTS, ...agentsOf(raw) },
     accounts: accountsOf(raw),
+    naming: namingOf(raw, dataDir),
   };
 }

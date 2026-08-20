@@ -25,7 +25,7 @@ export async function waitFor<T>(
   fn: () => Promise<T | null | undefined | false> | T | null | undefined | false,
   what: string,
   timeoutMs = 8000,
-  intervalMs = 40,
+  intervalMs = 15,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -240,7 +240,7 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-daemon-"));
   const { stubEnv, ...file } = overrides;
   const config: NodeConfigFile = {
-    tickMs: 40,
+    tickMs: 20,
     bootHangTimeoutMs: 4000,
     turnHangTimeoutMs: 4000,
     bootAllowanceMs: 1000,
@@ -268,6 +268,8 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
       },
       ...(file.agents ?? {}),
     },
+    // Tests never shell out to Codex/Claude for titles unless they opt in.
+    naming: { auto: false, ...(file.naming ?? {}) },
   };
   writeFileSync(join(dir, "config.json"), JSON.stringify(config, null, 2));
   return {
@@ -320,7 +322,7 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
     },
     `daemon socket ${socketPath}`,
     10_000,
-    60,
+    20,
   );
   return handle;
 }
