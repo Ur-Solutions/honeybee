@@ -160,21 +160,13 @@ test("codex projector: item folding covers MCP, files, thinking, compaction, web
     method: "item/completed",
     params: { item: { type: "webSearch", id: "web-1", query: "Honeybee" } },
     emittedAtMs: 1_787_227_578_150,
-  })), [
-    {
-      kind: "tool_call",
-      ts: new Date(1_787_227_578_150).toISOString(),
-      callId: "web-1",
-      name: "web_search",
-      input: { query: "Honeybee" },
-    },
-    {
-      kind: "tool_result",
-      ts: new Date(1_787_227_578_150).toISOString(),
-      callId: "web-1",
-      isError: false,
-    },
-  ]);
+  })), [{
+    kind: "web_search",
+    ts: new Date(1_787_227_578_150).toISOString(),
+    itemId: "web-1",
+    providerEventId: "web-1",
+    query: "Honeybee",
+  }]);
   assert.deepEqual(projector.pushLine(j({
     method: "item/completed",
     params: { item: { type: "futureCodexItem", id: "future-1" } },
@@ -241,6 +233,7 @@ test("codex projector: interrupted turn completion is an end only and never re-r
     turnId: "turn-interrupted",
     durationMs: 42,
     finishReason: "interrupted",
+    interrupted: true,
   }]);
 });
 

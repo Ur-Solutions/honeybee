@@ -260,6 +260,9 @@ function completedItemEvent(
         isError,
         ...(output !== undefined ? { output } : {}),
       };
+      // History windows can start at a completed item with no matching
+      // item/started. The pane cannot pair an orphan result — emit the call
+      // from the merged completed item in that case.
       if (startSeen) return [result];
       const input = mcpInput(item);
       return [
@@ -288,24 +291,12 @@ function completedItemEvent(
     case "webSearch": {
       const action = asObject(item.action);
       const query = nonEmptyString(item.query) ?? nonEmptyString(action?.query);
-      const callId = itemCallId(item, nativeType);
-      const call: TranscriptProjectedEvent = {
-        kind: "tool_call",
+      return [{
+        kind: "web_search",
         ts,
-        callId,
-        name: "web_search",
-        ...(query ? { input: { query } } : {}),
-      };
-      const result: TranscriptProjectedEvent = {
-        kind: "tool_result",
-        ts,
-        callId,
-        isError: false,
-        ...(serialized(item.result ?? item.output) !== undefined
-          ? { output: serialized(item.result ?? item.output) }
-          : {}),
-      };
-      return startSeen ? [result] : [call, result];
+        ...(itemId ? { itemId, providerEventId: itemId } : {}),
+        ...(query ? { query } : {}),
+      }];
     }
     default:
       return [{ kind: "unknown", ts, nativeType }];
@@ -435,6 +426,7 @@ export function createCodexProjector(): TranscriptProjector {
           const threadId = idString(params.threadId);
           const durationMs = finiteNumber(turn?.durationMs);
           const finishReason = nonEmptyString(turn?.status);
+          const interrupted = turn?.status === "interrupted";
           const usage = tokenUsageFrom(turn);
           const ts = firstIso(row.emittedAtMs);
           const events: TranscriptProjectedEvent[] = [{
@@ -444,6 +436,7 @@ export function createCodexProjector(): TranscriptProjector {
             ...(threadId ? { threadId } : {}),
             ...(durationMs !== undefined ? { durationMs } : {}),
             ...(finishReason ? { finishReason } : {}),
+            ...(interrupted ? { interrupted: true } : {}),
           }];
           if (usage) {
             events.push({
@@ -491,17 +484,6 @@ export function createCodexProjector(): TranscriptProjector {
               callId: itemCallId(item, "mcpToolCall"),
               name: mcpName(item),
               ...(input !== undefined ? { input } : {}),
-            }], threadId);
-          }
-          if (item.type === "webSearch") {
-            const action = asObject(item.action);
-            const query = nonEmptyString(item.query) ?? nonEmptyString(action?.query);
-            return withThreadId([{
-              kind: "tool_call",
-              ts,
-              callId: itemCallId(item, "webSearch"),
-              name: "web_search",
-              ...(query ? { input: { query } } : {}),
             }], threadId);
           }
           return [];

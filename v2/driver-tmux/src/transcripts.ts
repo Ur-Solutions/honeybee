@@ -473,6 +473,8 @@ function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTur
       const paths = event.files.map((file) => file.path);
       return [{ role: "tool", text: paths.length > 0 ? `[file_change: ${paths.join(", ")}]` : "[file_change]" }];
     }
+    case "web_search":
+      return [{ role: "tool", text: `[web_search${event.query ? `: ${event.query}` : ""}]` }];
     case "compaction":
       return [{ role: "system", text: `[compaction${event.trigger ? `: ${event.trigger}` : ""}]` }];
     case "interrupt":
