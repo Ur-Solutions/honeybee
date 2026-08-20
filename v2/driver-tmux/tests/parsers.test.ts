@@ -113,6 +113,36 @@ test("parsers.codex: turn_context/task_started start, task_complete ends explici
   assert.deepEqual(p.parseLine(j({ type: "session_meta", payload: { id: "s" } })), []);
 });
 
+test("parsers.codex: HSR app-server uses explicit notifications as observation evidence", () => {
+  const p = codexTranscriptParser;
+  // turn/start is a client request and has no native turn id. It is not the
+  // protocol's explicit turn boundary.
+  assert.deepEqual(p.parseLine(j({
+    jsonrpc: "2.0",
+    id: 1104,
+    method: "turn/start",
+    params: { threadId: "thread-1", input: [{ type: "text", text: "do it" }] },
+  })), []);
+  assert.deepEqual(p.parseLine(j({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+    emittedAtMs: 1_787_227_566_971,
+  })), [{ kind: "turn_started" }]);
+
+  for (const type of ["agentMessage", "commandExecution", "mcpToolCall", "fileChange", "webSearch"]) {
+    assert.deepEqual(p.parseLine(j({ method: "item/completed", params: { item: { type, id: `${type}-1` } } })), [
+      { kind: "output" },
+    ]);
+  }
+  assert.deepEqual(p.parseLine(j({ method: "item/completed", params: { item: { type: "userMessage", id: "u1" } } })), []);
+  assert.deepEqual(p.parseLine(j({ method: "turn/completed", params: { turn: { id: "turn-1", items: [] } } })), [
+    { kind: "turn_ended" },
+  ]);
+  for (const method of ["account/rateLimits/updated", "item/agentMessage/delta", "item/started"]) {
+    assert.deepEqual(p.parseLine(j({ method, params: {} })), []);
+  }
+});
+
 test("parsers.grok: chat_history rows (v1 fixture shapes) — user starts, assistant is output", () => {
   const p = grokTranscriptParser;
   assert.equal(p.explicitTurnEnd, false);
