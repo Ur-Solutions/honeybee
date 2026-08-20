@@ -12,6 +12,7 @@ import {
   codexTranscriptParser,
   codexTranscriptRenderer,
   grokTranscriptParser,
+  grokTranscriptRenderer,
 } from "../src/transcripts.ts";
 
 const j = (o: unknown): string => JSON.stringify(o);
@@ -138,6 +139,29 @@ test("parsers.grok: chat_history rows (v1 fixture shapes) — user starts, assis
   );
   // reasoning rows (live shape) are neither user nor assistant — ignored.
   assert.deepEqual(p.parseLine(j({ type: "reasoning", summary: [{ type: "summary_text", text: "…" }] })), []);
+});
+
+test("renderers.grok: hsr ACP session/update chunks render as assistant text", () => {
+  const r = grokTranscriptRenderer;
+  assert.deepEqual(
+    r.renderLine(j({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "s", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } } },
+    })),
+    [{ role: "assistant", text: "hello" }],
+  );
+  assert.deepEqual(
+    r.renderLine(j({
+      jsonrpc: "2.0",
+      method: "session/prompt",
+      params: { sessionId: "s", prompt: [{ type: "text", text: "do the thing" }] },
+    })),
+    [{ role: "user", text: "do the thing" }],
+  );
+  assert.deepEqual(r.renderLine(j({ type: "assistant", content: "from chat_history" })), [
+    { role: "assistant", text: "from chat_history" },
+  ]);
 });
 
 test("parsers.events-file: claude-hook, codex-notify and generic shapes normalize identically", () => {

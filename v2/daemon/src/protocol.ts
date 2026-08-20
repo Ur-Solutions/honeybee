@@ -437,15 +437,16 @@ export interface SealGetResult {
 }
 
 /**
- * The substrates the daemon can spawn onto (contract §1: tmux | hsr | cell;
- * tmux is not wired into the daemon yet). `spawn` takes `substrate?`
- * (default `hsr`) and, for `cell`, a `cell` object (SpawnCellParams).
+ * The substrates the daemon can spawn onto (contract §1: tmux | hsr | cell).
+ * `spawn` takes `substrate?` (default `hsr`) and, for `cell`, a `cell`
+ * object (SpawnCellParams). Tmux runs the interactive TUI; hsr/cell run the
+ * headless adapter protocol.
  * v6: `spawn` also takes `parentId?` — the calling bee (the CLI fills it from
  * HIVE_BEE_ID; apiary passes it explicitly). The parent must exist
  * (`bee_not_found` otherwise); the child's runtime env is stamped
  * HIVE_BEE / HIVE_BEE_ID / HIVE_PARENT.
  */
-export const SPAWN_SUBSTRATES = ["hsr", "cell"] as const;
+export const SPAWN_SUBSTRATES = ["hsr", "cell", "tmux"] as const;
 export type SpawnSubstrate = (typeof SPAWN_SUBSTRATES)[number];
 
 /**

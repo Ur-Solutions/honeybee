@@ -2240,12 +2240,13 @@ async function cmdAttach(ctx: CliContext, parsed: Parsed): Promise<number> {
   const generation = result.view.generation;
   if (generation == null) throw new Error(`hive v2 attach: ${bee.id} has no recorded runtime generation`);
   const session = sessionNameFor(bee.id, generation);
-  const command = `tmux attach-session -t =${session}`;
+  const socket = join(ctx.cfg.dataDir, "tmux.sock");
+  const command = `tmux -S ${socket} attach-session -t =${session}`;
   if (parsed.flags.get("--print") === true || ctx.json) {
-    emit(ctx, [command], { beeId: bee.id, session, command }, false);
+    emit(ctx, [command], { beeId: bee.id, session, socket, command }, false);
     return 0;
   }
-  const res = spawnSync("tmux", ["attach-session", "-t", `=${session}`], { stdio: "inherit" });
+  const res = spawnSync("tmux", ["-S", socket, "attach-session", "-t", `=${session}`], { stdio: "inherit" });
   if (res.error) throw new Error(`tmux attach failed: ${res.error.message}`);
   return res.status ?? 0;
 }

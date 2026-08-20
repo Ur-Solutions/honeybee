@@ -60,6 +60,17 @@ test("args.daemon.2: composeSpawn codex — model lifted into thread/start|resum
   assert.equal(plain.model, undefined);
 });
 
+test("args.daemon.2b: composeSpawn grok — --model/--effort lifted in front of stdio", () => {
+  const spec = BUILTIN_AGENTS.grok!;
+  const r = composeSpawn(spec, "grok", bee({ args: ["--model", "grok-4.6", "--effort", "high"] }));
+  assert.deepEqual(r.args, ["--no-auto-update", "agent", "--no-leader", "--always-approve", "--model", "grok-4.6", "--effort", "high", "stdio"]);
+  assert.equal(r.model, "grok-4.6");
+  assert.equal(r.adapter?.harness, "grok");
+  const resume = composeSpawn(spec, "grok", bee({ providerSessionId: "sess-1" }));
+  assert.deepEqual(resume.args, spec.args);
+  assert.equal(resume.adapter?.harness, "grok");
+});
+
 test("args.daemon.3: composeSpawn stub/unknown — verbatim concatenation, no de-dup, no resume; unknown adapter → null", () => {
   const spec = { command: "node", args: ["agent.mjs", "--x"], defaultArgs: ["--x"] };
   const r = composeSpawn(spec, "stub", bee({ args: ["--x", "--y"], providerSessionId: "ignored" }));

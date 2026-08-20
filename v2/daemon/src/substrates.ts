@@ -2,7 +2,7 @@
  * SubstrateRouter — one RuntimeDriver over the node's substrate drivers.
  *
  * DaemonCore drives exactly one driver; the node runs bees on more than one
- * substrate (contract §1: hsr | cell today). The router is the seam: every
+ * substrate (contract §1: tmux | hsr | cell). The router is the seam: every
  * per-bee call is forwarded to the driver that owns that bee, decided by
  * the bee's recorded substrate (the store row is the truth; a process the
  * driver already holds wins over a row that has since been deleted, so a
@@ -23,14 +23,16 @@ import type {
 } from "../../harness/src/driver.ts";
 import type { HsrDriver, FlagEvidence, SessionEvidence } from "../../driver-hsr/src/index.ts";
 import type { CellDriver } from "../../driver-cell/src/index.ts";
+import type { TmuxDriver } from "../../driver-tmux/src/index.ts";
 
-export type Substrate = "hsr" | "cell";
+export type Substrate = "hsr" | "cell" | "tmux";
 
-type SubstrateDriver = HsrDriver | CellDriver;
+type SubstrateDriver = HsrDriver | CellDriver | TmuxDriver;
 
 export interface SubstrateRouterConfig {
   hsr: HsrDriver;
   cell: CellDriver;
+  tmux: TmuxDriver;
   /** The bee's recorded substrate; null when the bee row is gone. */
   substrateOf(beeId: string): string | null;
 }
@@ -38,21 +40,27 @@ export interface SubstrateRouterConfig {
 export class SubstrateRouter implements RuntimeDriver {
   readonly hsr: HsrDriver;
   readonly cell: CellDriver;
+  readonly tmux: TmuxDriver;
   private readonly substrateOf: (beeId: string) => string | null;
 
   constructor(cfg: SubstrateRouterConfig) {
     this.hsr = cfg.hsr;
     this.cell = cfg.cell;
+    this.tmux = cfg.tmux;
     this.substrateOf = cfg.substrateOf;
   }
 
   /** The driver that owns (bee, generation): whoever holds its process, else the recorded substrate. */
   driverFor(beeId: string, generation?: number): SubstrateDriver {
     if (generation != null) {
+      if (this.tmux.hasProcess(beeId, generation)) return this.tmux;
       if (this.cell.hasProcess(beeId, generation)) return this.cell;
       if (this.hsr.hasProcess(beeId, generation)) return this.hsr;
     }
-    return this.substrateOf(beeId) === "cell" ? this.cell : this.hsr;
+    const substrate = this.substrateOf(beeId);
+    if (substrate === "tmux") return this.tmux;
+    if (substrate === "cell") return this.cell;
+    return this.hsr;
   }
 
   // -------------------------------------------------------------------------
@@ -76,15 +84,15 @@ export class SubstrateRouter implements RuntimeDriver {
   }
 
   observe(): DriverObservation[] {
-    return [...this.hsr.observe(), ...this.cell.observe()];
+    return [...this.hsr.observe(), ...this.cell.observe(), ...this.tmux.observe()];
   }
 
   hasProcess(beeId: string, generation: number): boolean {
-    return this.hsr.hasProcess(beeId, generation) || this.cell.hasProcess(beeId, generation);
+    return this.hsr.hasProcess(beeId, generation) || this.cell.hasProcess(beeId, generation) || this.tmux.hasProcess(beeId, generation);
   }
 
   snapshotLive(): LiveProcess[] {
-    return [...this.hsr.snapshotLive(), ...this.cell.snapshotLive()];
+    return [...this.hsr.snapshotLive(), ...this.cell.snapshotLive(), ...this.tmux.snapshotLive()];
   }
 
   // -------------------------------------------------------------------------
@@ -104,11 +112,11 @@ export class SubstrateRouter implements RuntimeDriver {
   }
 
   observeEvidence(): FlagEvidence[] {
-    return [...this.hsr.observeEvidence(), ...this.cell.observeEvidence()];
+    return [...this.hsr.observeEvidence(), ...this.cell.observeEvidence(), ...this.tmux.observeEvidence()];
   }
 
   observeSessions(): SessionEvidence[] {
-    return [...this.hsr.observeSessions(), ...this.cell.observeSessions()];
+    return [...this.hsr.observeSessions(), ...this.cell.observeSessions(), ...this.tmux.observeSessions()];
   }
 
   /** Session logs share one directory across substrates (one `<beeId>.jsonl` per bee). */
@@ -123,10 +131,12 @@ export class SubstrateRouter implements RuntimeDriver {
   detachAll(): void {
     this.hsr.detachAll();
     this.cell.detachAll();
+    this.tmux.detachAll();
   }
 
   disposeAll(): void {
     this.hsr.disposeAll();
     this.cell.disposeAll();
+    this.tmux.disposeAll();
   }
 }

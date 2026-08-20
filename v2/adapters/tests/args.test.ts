@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { claudeArgGrammar, codexArgGrammar, codexSpawnPlan, composeArgv, parseArgUnits } from "../src/index.ts";
+import { claudeArgGrammar, codexArgGrammar, grokArgGrammar, grokSpawnPlan, composeArgv, parseArgUnits, codexSpawnPlan } from "../src/index.ts";
 
 const CLAUDE_BASE = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
 
@@ -67,4 +67,15 @@ test("args.compose.5: codexSpawnPlan lifts --model + approval/sandbox flags into
   const none = codexSpawnPlan(["app-server"]);
   assert.deepEqual(none, { argv: ["app-server"], model: undefined, absorbed: [] });
   assert.equal(codexSpawnPlan(["-m", "x", "--model=y"]).model, "y", "last model wins (already composed input)");
+});
+
+test("args.compose.6: grokSpawnPlan lifts --model/--effort in front of stdio", () => {
+  const composed = composeArgv(grokArgGrammar, [
+    ["--no-auto-update", "agent", "--no-leader", "--always-approve", "stdio"],
+    ["--model", "grok-4.6", "--effort", "high"],
+  ]);
+  assert.deepEqual(composed, ["--no-auto-update", "agent", "--no-leader", "--always-approve", "stdio", "--model", "grok-4.6", "--effort", "high"]);
+  const plan = grokSpawnPlan(composed);
+  assert.deepEqual(plan.argv, ["--no-auto-update", "agent", "--no-leader", "--always-approve", "--model", "grok-4.6", "--effort", "high", "stdio"]);
+  assert.equal(plan.model, "grok-4.6");
 });

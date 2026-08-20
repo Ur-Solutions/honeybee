@@ -9,6 +9,7 @@ Setup: none — the runner is checked in. From the repo root:
 npm run v2:smoke -- stub     # wiring proof, no tokens (run first)
 npm run v2:smoke -- claude   # real claude from PATH   [--model <m>]
 npm run v2:smoke -- codex    # real codex from PATH    [--model <m>]
+npm run v2:smoke -- grok     # real grok agent stdio   [--model <m>]
 ```
 
 The runner automates steps 1–5 below and prints a ✓/✗ checklist plus the session-log
@@ -24,7 +25,7 @@ that forced this: grok ignores the tmux paste buffer entirely (now `deliveryMode
 paste during its post-turn redraw. Claude's transcript locator now realpaths the cwd
 (`/var` → `/private/var`), matching where claude actually writes.
 
-## Per harness (claude, then codex)
+## Per harness (claude, then codex, then grok)
 
 1. **Spawn** — `start()` a bee running the real CLI with a trivial prompt.
    - [ ] `booted` observation arrives; pid + start-time recorded at spawn

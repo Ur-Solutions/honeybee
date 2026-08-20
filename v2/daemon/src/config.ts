@@ -22,7 +22,7 @@ export interface AgentSpecConfig {
    * valued flag overrides an earlier one, boolean flags are idempotent).
    */
   defaultArgs?: string[];
-  /** Adapter name: claude | codex | stub. Defaults to the agent key itself. */
+  /** Adapter name: claude | codex | grok | stub. Defaults to the agent key itself. */
   adapter?: string;
   env?: Record<string, string>;
   /**
@@ -165,6 +165,11 @@ export const BUILTIN_AGENTS: Record<string, AgentSpecConfig> = {
     command: "codex",
     args: ["app-server"],
     adapter: "codex",
+  },
+  grok: {
+    command: "grok",
+    args: ["--no-auto-update", "agent", "--no-leader", "--always-approve", "stdio"],
+    adapter: "grok",
   },
 };
 

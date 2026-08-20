@@ -181,6 +181,44 @@ export const codexArgGrammar: ArgGrammar = {
   aliases: { "-m": "--model", "-c": "--config", "-a": "--ask-for-approval", "-s": "--sandbox", "-p": "--profile", "-C": "--cd", "-i": "--image" },
 };
 
+/** `grok` / `grok agent` flags the composer knows. */
+export const grokArgGrammar: ArgGrammar = {
+  valueFlags: new Set(["--model", "--effort", "--permission-mode", "--debug-file", "--leader-socket", "--agent-profile"]),
+  booleanFlags: new Set(["--no-auto-update", "--no-leader", "--always-approve", "--debug", "--leader"]),
+  keyedFlags: new Set(),
+  aliases: { "-m": "--model", "--reasoning-effort": "--effort" },
+};
+
+/**
+ * `grok agent … stdio` only accepts a few flags on the `stdio` subcommand.
+ * Model/effort belong on `grok agent` *before* `stdio`. Bee args that
+ * compose after `stdio` are lifted in front of it.
+ */
+export function grokSpawnPlan(argv: readonly string[]): { argv: string[]; model: string | undefined } {
+  const before: string[] = [];
+  const after: string[] = [];
+  const lifted: string[] = [];
+  let model: string | undefined;
+  let seenStdio = false;
+  for (const u of parseArgUnits(grokArgGrammar, argv)) {
+    if (u.flag === "--model" && u.value !== null) {
+      model = u.value;
+      lifted.push("--model", u.value);
+      continue;
+    }
+    if (u.flag === "--effort" && u.value !== null) {
+      lifted.push("--effort", u.value);
+      continue;
+    }
+    if (!seenStdio && u.kind === "verbatim" && u.tokens.length === 1 && u.tokens[0] === "stdio") {
+      seenStdio = true;
+      continue;
+    }
+    (seenStdio ? after : before).push(...u.tokens);
+  }
+  return { argv: [...before, ...lifted, ...(seenStdio ? ["stdio"] : []), ...after], model };
+}
+
 /**
  * What a composed codex argv means for the v2 codex adapter, which drives
  * `codex app-server` (JSON-RPC) rather than the TUI: the app-server ignores

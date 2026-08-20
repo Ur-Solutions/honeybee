@@ -518,7 +518,7 @@ test("verbs.attach: refuses hsr/cell bees with the v2 guidance; tmux bees get th
     store.close();
     const p = capture();
     assert.equal(await runV2Cli(["attach", "screenful", "--print", "--data-dir", dir], p.io), 0);
-    assert.equal(p.out[0], "tmux attach-session -t =hive-v2-tm-1-g1");
+    assert.equal(p.out[0], `tmux -S ${join(dir, "tmux.sock")} attach-session -t =hive-v2-tm-1-g1`);
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();

@@ -315,6 +315,50 @@ export const grokTranscriptRenderer: TranscriptRenderer = {
   renderLine(line: string): TranscriptTurn[] {
     const row = jsonLine(line);
     if (!row) return [];
+    // hsr substrate: the session log is Grok ACP JSON-RPC (`grok agent stdio`),
+    // not chat_history.jsonl. `session/update` carries the same turns as
+    // chunks; `session/prompt` is stdin and is not logged.
+    if (typeof row.method === "string") {
+      // Client→server session/prompt (logged from stdin) is the operator's turn.
+      if (row.method === "session/prompt") {
+        const params = row.params as { prompt?: unknown } | undefined;
+        const prompt = params?.prompt;
+        const texts: string[] = [];
+        if (typeof prompt === "string" && prompt.trim()) texts.push(prompt);
+        else if (Array.isArray(prompt)) {
+          for (const block of prompt) {
+            if (block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string") {
+              const text = (block as { text: string }).text.trim();
+              if (text) texts.push(text);
+            }
+          }
+        }
+        return texts.map((text) => ({ role: "user" as const, text }));
+      }
+      if (row.method !== "session/update" && row.method !== "_x.ai/session/update" && row.method !== "x.ai/session/update") {
+        return [];
+      }
+      const params = row.params as Record<string, unknown> | undefined;
+      const update = (params?.update as Record<string, unknown> | undefined) ?? params;
+      if (!update) return [];
+      const kind = update.sessionUpdate ?? update.session_update ?? update.type;
+      const content = update.content;
+      const text = (content && typeof content === "object" && !Array.isArray(content)
+        ? (content as { text?: unknown }).text
+        : undefined) ?? update.text;
+      if (kind === "agent_message_chunk" || kind === "agent_message") {
+        return typeof text === "string" && text.trim().length > 0 ? [{ role: "assistant", text }] : [];
+      }
+      if (kind === "user_message_chunk" || kind === "user_message") {
+        return typeof text === "string" && text.trim().length > 0 ? [{ role: "user", text }] : [];
+      }
+      if (kind === "tool_call" || kind === "tool_call_update") {
+        const title = typeof update.title === "string" ? update.title
+          : typeof update.kind === "string" ? update.kind : "tool";
+        return [{ role: "tool", text: `[tool_use: ${title}]` }];
+      }
+      return [];
+    }
     if (row.synthetic_reason != null) return [];
     const message = row.message as { role?: unknown; content?: unknown } | undefined;
     const role = typeof message?.role === "string" ? message.role : row.type;

@@ -530,6 +530,10 @@ export class HsrDriver implements RuntimeDriver {
     if (process.env.HIVE_SPAWN_TRACE) {
       appendFileSync(process.env.HIVE_SPAWN_TRACE, JSON.stringify({ write: line.slice(0, 160), at: Date.now(), stack: new Error().stack?.split("\n").slice(2, 6).join(" | ") }) + "\n");
     }
+    // Bidirectional JSON-RPC (codex/grok ACP) and claude stream-json user
+    // lines live on stdin; the session log is the verbatim native stream in
+    // BOTH directions so panes can render the operator's prompt.
+    this.appendSessionLog(p.beeId, line);
     try {
       p.child?.stdin?.write(`${line}\n`);
     } catch {

@@ -34,7 +34,7 @@
  *    session by verified pid and re-attaches observers at EOF — the runtime
  *    stays fully deliverable (tmux runtimes are never "degraded").
  */
-import { mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type {
@@ -93,6 +93,12 @@ export interface TmuxDriverConfig {
   socketPath: string;
   /** Driver-owned dir for per-bee hook/notify events files. */
   eventsDir: string;
+  /**
+   * When set, transcript lines are mirrored into `<sessionLogDir>/<beeId>.jsonl`
+   * so Apiary's session-log follower (and `hive transcript`) see TUI bees the
+   * same way they see HSR bees.
+   */
+  sessionLogDir?: string;
   resolve(beeId: string): TmuxSpawnSpec;
   stopKillGraceMs?: number;
   adoptToleranceMs?: number;
@@ -547,6 +553,23 @@ export class TmuxDriver implements RuntimeDriver {
   }
 
   /** Drain delivery annotations (visible, retryable; never a state/fence). */
+  /** Tmux adopted runtimes keep their pane pipes — never degraded. */
+  isDegraded(_beeId: string, _generation: number): boolean {
+    return false;
+  }
+
+  observeEvidence(): [] {
+    return [];
+  }
+
+  observeSessions(): [] {
+    return [];
+  }
+
+  sessionLogPath(beeId: string): string | null {
+    return this.cfg.sessionLogDir ? join(this.cfg.sessionLogDir, `${beeId}.jsonl`) : null;
+  }
+
   observeDeliveryNotes(): DeliveryNote[] {
     const out = this.notes;
     this.notes = [];
@@ -681,6 +704,7 @@ export class TmuxDriver implements RuntimeDriver {
       if (p.transcriptTail != null) {
         for (const line of p.transcriptTail.poll()) {
           p.lastActivityAt = now;
+          this.mirrorSessionLog(p.beeId, line);
           for (const ev of p.transcriptParser.parseLine(line)) this.fold(p, ev);
         }
       }
@@ -770,6 +794,16 @@ export class TmuxDriver implements RuntimeDriver {
         p.sawOutputThisTurn = true;
         return;
       }
+    }
+  }
+
+  private mirrorSessionLog(beeId: string, line: string): void {
+    const dir = this.cfg.sessionLogDir;
+    if (!dir) return;
+    try {
+      appendFileSync(join(dir, `${beeId}.jsonl`), `${line}\n`);
+    } catch {
+      // Diagnostics only — observation still folds the line.
     }
   }
 

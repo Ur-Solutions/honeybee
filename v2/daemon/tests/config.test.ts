@@ -29,6 +29,7 @@ test("config.1: absent file resolves to pure defaults (the file may be absent)",
     assert.equal(cfg.telemetryPath, join(dir, "telemetry.sqlite3"));
     assert.ok(cfg.agents.claude, "builtin agent table present");
     assert.ok(cfg.agents.codex);
+    assert.ok(cfg.agents.grok);
   });
 });
 

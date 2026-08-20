@@ -61,11 +61,16 @@ import {
   type ReserveRequest,
 } from "../../driver-cell/src/index.ts";
 import { SubstrateRouter } from "./substrates.ts";
+import { TmuxDriver } from "../../driver-tmux/src/index.ts";
+import { tmuxSpawnSpec } from "./tmuxHarness.ts";
 import {
   claudeAdapter,
   claudeArgGrammar,
   codexAdapter,
   codexArgGrammar,
+  grokAdapter,
+  grokArgGrammar,
+  grokSpawnPlan,
   codexSpawnPlan,
   composeArgv,
   stubAdapter,
@@ -135,7 +140,7 @@ import {
   type ViewResult,
 } from "./protocol.ts";
 
-const ADAPTER_NAMES = ["claude", "codex", "stub"] as const;
+const ADAPTER_NAMES = ["claude", "codex", "grok", "stub"] as const;
 
 /**
  * Adapter for a bee. `providerSessionId` (bee row, spec 07 §F) selects the
@@ -157,6 +162,11 @@ function adapterFor(name: string, cwd: string, providerSessionId: string | null,
         ...(providerSessionId ? { resumeThreadId: providerSessionId } : forkSeed ? { forkThreadId: forkSeed } : {}),
         ...(model ? { model } : {}),
       });
+    case "grok":
+      return grokAdapter({
+        cwd,
+        ...(providerSessionId ? { resumeSessionId: providerSessionId } : {}),
+      });
     case "stub":
       return stubAdapter;
     default:
@@ -172,6 +182,8 @@ function grammarFor(adapterName: string): ArgGrammar {
       return claudeArgGrammar;
     case "codex":
       return codexArgGrammar;
+    case "grok":
+      return grokArgGrammar;
     default:
       return NO_GRAMMAR;
   }
@@ -207,6 +219,10 @@ export function composeSpawn(
   if (adapterName === "codex") {
     const plan = codexSpawnPlan(composed);
     return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, plan.model, forkSeed), args: plan.argv, model: plan.model };
+  }
+  if (adapterName === "grok") {
+    const plan = grokSpawnPlan(composed);
+    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, undefined, forkSeed), args: plan.argv, model: plan.model };
   }
   return { adapter: base, args: composed, model: undefined };
 }
@@ -254,7 +270,7 @@ const OWN_STATUS_VERBS: ReadonlySet<RpcVerb> = new Set<RpcVerb>(["cell.capture",
 export class HiveDaemon {
   readonly cfg: ResolvedNodeConfig;
   private store: CoreStore | null = null;
-  /** The substrate router DaemonCore drives; `.hsr` / `.cell` are the substrate drivers. */
+  /** The substrate router DaemonCore drives; `.hsr` / `.cell` / `.tmux` are the substrate drivers. */
   private driver: SubstrateRouter | null = null;
   private core: DaemonCore | null = null;
   private telemetry: TelemetryStore | null = null;
@@ -324,9 +340,19 @@ export class HiveDaemon {
       resolveCell: (beeId: string) => this.resolveCellSpec(beeId),
       hsr: hsrConfig,
     });
+    mkdirSync(join(this.cfg.dataDir, "tmux-events"), { recursive: true });
+    const tmux = new TmuxDriver({
+      socketPath: join(this.cfg.dataDir, "tmux.sock"),
+      eventsDir: join(this.cfg.dataDir, "tmux-events"),
+      sessionLogDir: this.cfg.sessionLogDir,
+      resolve: (beeId: string) => this.resolveTmuxSpec(beeId),
+      stopKillGraceMs: this.cfg.stopKillGraceMs,
+      adoptToleranceMs: this.cfg.adoptToleranceMs,
+    });
     const driver = new SubstrateRouter({
       hsr,
       cell,
+      tmux,
       substrateOf: (beeId: string) => store.getBee(beeId)?.substrate ?? null,
     });
     this.driver = driver;
@@ -475,6 +501,27 @@ export class HiveDaemon {
       throw new Error(`resolveCell: bee ${beeId} cell ${bee.cwd} is outside cells root ${this.cfg.cellsRoot} (cells.root changed?)`);
     }
     return { provision, sandbox: ledger.sandbox ?? this.cfg.cellSandbox };
+  }
+
+  /**
+   * Tmux TUI spawn: same account/home env as HSR, but the interactive CLI
+   * (no headless plumbing args) plus the harness transcript locator.
+   */
+  private resolveTmuxSpec(beeId: string): ReturnType<typeof tmuxSpawnSpec> {
+    const store = this.mustStore();
+    const bee = store.getBee(beeId);
+    if (!bee) throw new Error(`resolveTmux: bee ${beeId} not found`);
+    const spec = this.cfg.agents[bee.agent];
+    if (!spec) throw new Error(`resolveTmux: no agent spec for '${bee.agent}'`);
+    let accountEnv: Record<string, string> = {};
+    if (bee.account && this.accounts) {
+      const account = store.getAccount(bee.account);
+      if (!account) throw new Error(`resolveTmux: bee ${beeId} is bound to unknown account ${bee.account}`);
+      accountEnv = this.accounts.homeEnvOf(account);
+      this.accounts.activateForSpawn(account, bee);
+    }
+    const env = { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...accountEnv, ...beeIdentityEnv(bee) };
+    return tmuxSpawnSpec(spec, { agent: bee.agent, cwd: bee.cwd, args: bee.args, env });
   }
 
   private adoptSurvivors(store: CoreStore, driver: SubstrateRouter): void {

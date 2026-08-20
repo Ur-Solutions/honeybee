@@ -4,6 +4,7 @@
  *   npm run v2:smoke -- stub                 # wiring proof, no tokens
  *   npm run v2:smoke -- claude [--model m]   # real claude CLI from PATH
  *   npm run v2:smoke -- codex  [--model m]   # real codex app-server from PATH
+ *   npm run v2:smoke -- grok   [--model m]   # real grok agent stdio from PATH
  *
  * Spawns ONE real bee (plus one short-lived boot-delivery bee), runs two short
  * turns, stops it, and prints a ✓/✗ checklist. Delivery uses daemon semantics:
@@ -11,12 +12,12 @@
  * failure where the contract says it must not happen. Everything lives in a
  * fresh temp dir; ~/.hive is never touched.
  */
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HsrDriver, type SpawnSpec } from "./src/index.ts";
-import { claudeAdapter, codexAdapter, stubAdapter } from "../adapters/src/index.ts";
+import { claudeAdapter, codexAdapter, grokAdapter, grokSpawnPlan, stubAdapter } from "../adapters/src/index.ts";
 import type { DeliverOutcome, DriverObservation } from "../harness/src/driver.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -24,8 +25,8 @@ const harness = process.argv[2];
 const modelFlag = process.argv.indexOf("--model");
 const model = modelFlag > 0 ? process.argv[modelFlag + 1] : undefined;
 
-if (!harness || !["stub", "claude", "codex"].includes(harness)) {
-  console.error("usage: npm run v2:smoke -- <stub|claude|codex> [--model <m>]");
+if (!harness || !["stub", "claude", "codex", "grok"].includes(harness)) {
+  console.error("usage: npm run v2:smoke -- <stub|claude|codex|grok> [--model <m>]");
   process.exit(2);
 }
 
@@ -55,6 +56,23 @@ function specFor(): SpawnSpec {
         args: ["app-server"],
         cwd,
       };
+    case "grok": {
+      const home = join(dir, "grok-home");
+      mkdirSync(home, { recursive: true });
+      const realAuth = join(homedir(), ".grok", "auth.json");
+      if (existsSync(realAuth)) copyFileSync(realAuth, join(home, "auth.json"));
+      const planned = grokSpawnPlan([
+        "--no-auto-update", "agent", "--no-leader", "--always-approve", "stdio",
+        ...(model ? ["--model", model] : []),
+      ]);
+      return {
+        adapter: grokAdapter({ cwd }),
+        command: "grok",
+        args: planned.argv,
+        cwd,
+        env: { ...(process.env as Record<string, string>), GROK_HOME: home },
+      };
+    }
     default:
       return {
         adapter: stubAdapter,

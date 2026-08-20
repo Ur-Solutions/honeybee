@@ -12,6 +12,7 @@ export {
 } from "./driver.ts";
 export { TmuxServer, TmuxError, exactSession, shQuote, type TmuxServerConfig, type TmuxResult } from "./tmux.ts";
 export {
+  canonicalCwd,
   claudeProjectKey,
   claudeTranscriptParser,
   claudeTranscriptRenderer,
