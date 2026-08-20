@@ -1,0 +1,6 @@
+interface:
+  display_name: "Honeybee Core Work"
+  short_description: "Apply the Honeybee v2 core contract"
+  default_prompt: "Use $honeybee-core-work to make this Honeybee core change safely."
+policy:
+  allow_implicit_invocation: true
