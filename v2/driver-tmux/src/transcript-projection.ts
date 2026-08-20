@@ -41,7 +41,7 @@ type Base = { ts: TranscriptIsoTs; threadId?: string };
 
 export type TranscriptProjectedEvent =
   | (Base & { kind: "turn_start"; turnId?: string })
-  | (Base & { kind: "turn_end"; turnId?: string; durationMs?: number; finishReason?: string })
+  | (Base & { kind: "turn_end"; turnId?: string; durationMs?: number; finishReason?: string; interrupted?: boolean })
   | (Base & { kind: "interrupt"; reason?: string })
   | (Base & {
       kind: "message";
@@ -64,6 +64,7 @@ export type TranscriptProjectedEvent =
       durationMs?: number;
     })
   | (Base & { kind: "file_edit"; callId?: string; files: TranscriptFileChange[] })
+  | (Base & { kind: "web_search"; itemId?: string; providerEventId?: string; query?: string })
   | (Base & {
       kind: "token_usage";
       usage: TranscriptTokenUsage;
