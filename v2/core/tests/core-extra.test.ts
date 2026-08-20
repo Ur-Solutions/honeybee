@@ -8,6 +8,7 @@ import {
   CommandProtocolError,
   CoreError,
   IllegalTransitionError,
+  SecondWriterError,
   UnknownFailureCauseError,
   UnknownVerbError,
   openCoreStore,
@@ -80,7 +81,7 @@ test("backoff doubles per attempt", (t) => {
   t.after(() => h.cleanup());
   // Hold the clock still during each call so backoff deltas are exact.
   let tick = 5_000_000;
-  const store = openCoreStore(h.path, { now: () => tick, maxAttempts: 5, backoffBaseMs: 8 });
+  const store = openCoreStore(h.path, { now: () => tick, maxAttempts: 5, backoffBaseMs: 8, ephemeral: true });
   const { bee } = makeBee(store);
   const cmd = store.enqueueCommand("stop", bee.id);
   const deltas: number[] = [];
@@ -92,6 +93,22 @@ test("backoff doubles per attempt", (t) => {
     deltas.push(res.nextAttemptAt - tick);
   }
   assert.deepEqual(deltas, [8, 16, 32]);
+  store.close();
+});
+
+test("ephemeral: skip fsync but keep B9 exclusive locking and in-process crash/reopen", (t) => {
+  const h = harness();
+  t.after(() => h.cleanup());
+  let store = openCoreStore(h.path, { now: h.now, ephemeral: true });
+  const { bee } = makeBee(store);
+  store.send(bee.id, "keep me");
+  assert.throws(() => openCoreStore(h.path, { now: h.now, ephemeral: true }), SecondWriterError);
+  store.close();
+  store = openCoreStore(h.path, { now: h.now, ephemeral: true });
+  assert.equal(store.getBee(bee.id)?.name, "worker");
+  assert.equal(store.undeliveredMessages(bee.id).length, 1);
+  const dumped = store.dumpState();
+  assert.equal(dumped.mailbox.length, 1);
   store.close();
 });
 

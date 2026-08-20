@@ -207,6 +207,7 @@ export function runSim(
     random: () => storePrng.next(),
     maxAttempts: config.policy.maxAttempts,
     backoffBaseMs: config.policy.backoffBaseSteps,
+    ephemeral: true,
   };
 
   let store: CoreStore | null = openCoreStore(dbPath, storeOpts);

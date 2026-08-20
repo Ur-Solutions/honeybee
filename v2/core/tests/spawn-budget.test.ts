@@ -27,7 +27,7 @@ test("budget.1: exits during booting count on ONE per-bee budget; the next wake 
   t.after(() => h.cleanup());
   // A clock the test advances by hand, so the backoff arithmetic is exact.
   const clock = { now: 1_000_000 };
-  const store = openCoreStore(h.path, { now: () => clock.now, maxAttempts: 4, backoffBaseMs: 100 });
+  const store = openCoreStore(h.path, { now: () => clock.now, maxAttempts: 4, backoffBaseMs: 100, ephemeral: true });
   const { bee } = makeBee(store);
   assert.equal(bee.spawnFailures, 0);
   // gen 1 is booting (live) so this send enqueues no wake; the pending mail is

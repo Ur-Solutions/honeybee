@@ -27,7 +27,7 @@ export function harness(): Harness {
   return {
     path,
     now,
-    open: (opts = {}) => openCoreStore(path, { now, ...opts }),
+    open: (opts = {}) => openCoreStore(path, { now, ephemeral: true, ...opts }),
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }
