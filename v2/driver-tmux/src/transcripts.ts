@@ -40,7 +40,7 @@
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
 import { createCodexProjector } from "./codex-projection.ts";
-import { createGrokProjector } from "./grok-projection.ts";
+import { createGrokProjector, isGrokCompactionSummary } from "./grok-projection.ts";
 import type { TranscriptProjectedEvent, TranscriptProjector } from "./transcript-projection.ts";
 
 export type TranscriptEvent =
@@ -232,6 +232,8 @@ export const grokTranscriptParser: TranscriptParser = {
     // arrive while idle with no response following, so treating them as turn
     // starts would open a turn that never ends (quiescence needs output).
     if (role === "user" && row.synthetic_reason != null) return [];
+    const text = turnsFromBlocks("user", content).find((turn) => turn.role === "user")?.text;
+    if (role === "user" && text && isGrokCompactionSummary(text)) return [];
     if (role === "user" && hasUserText(content)) return [{ kind: "turn_started" }];
     if (role === "assistant") return [{ kind: "output" }];
     return [];

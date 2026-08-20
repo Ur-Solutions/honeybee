@@ -152,6 +152,77 @@ test("grok projector: session/update turn_completed ends the turn after flushing
   ]);
 });
 
+test("grok projector: auto compaction flushes the prior chunk and preserves token counts", () => {
+  const projector = createGrokProjector();
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "before" } } },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    method: "_x.ai/session_notification",
+    params: {
+      update: {
+        sessionUpdate: "auto_compact_started",
+        tokens_used: 400_799,
+        context_window: 500_000,
+      },
+    },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    method: "_x.ai/session_notification",
+    params: {
+      update: {
+        sessionUpdate: "auto_compact_completed",
+        tokens_before: 400_799,
+        tokens_after: 17_202,
+      },
+      _meta: { agentTimestampMs: 1_000, eventId: "compact-1" },
+    },
+  })), [
+    { kind: "message", ts: null, role: "assistant", text: "before" },
+    {
+      kind: "compaction",
+      ts: "1970-01-01T00:00:01.000Z",
+      tokensBefore: 400_799,
+      tokensAfter: 17_202,
+    },
+  ]);
+  assert.deepEqual(projector.pushLine(j({
+    method: "_x.ai/session/update",
+    params: {
+      update: {
+        sessionUpdate: "auto_compact_completed",
+        tokens_before: 400_799,
+        tokens_after: 17_202,
+      },
+      _meta: { agentTimestampMs: 1_000, eventId: "compact-1" },
+    },
+  })), []);
+});
+
+test("grok projector: generated continuation summary is a boundary, not a user message", () => {
+  const continuation = [
+    "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.",
+    "",
+    "Summary:",
+    "1. The user asked to fix Grok compaction rendering.",
+  ].join("\n");
+  const events = project([
+    j({ type: "user", content: [{ type: "text", text: continuation }] }),
+    j({ type: "user", content: `Please quote this phrase: ${continuation}` }),
+  ]);
+
+  assert.deepEqual(events, [
+    { kind: "compaction", ts: null },
+    {
+      kind: "message",
+      ts: null,
+      role: "user",
+      text: `Please quote this phrase: ${continuation}`,
+    },
+  ]);
+});
+
 test("grok projector: unrecognized methods and non-boundary updates do not flush open chunks", () => {
   const projector = createGrokProjector();
   assert.deepEqual(projector.pushLine(j({

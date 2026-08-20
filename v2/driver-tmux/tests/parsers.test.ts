@@ -167,6 +167,16 @@ test("parsers.grok: chat_history rows (v1 fixture shapes) — user starts, assis
     p.parseLine(j({ type: "user", content: [{ type: "text", text: "task done" }], synthetic_reason: "task_completed" })),
     [],
   );
+  assert.deepEqual(
+    p.parseLine(j({
+      type: "user",
+      content: [{
+        type: "text",
+        text: "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nEarlier work.",
+      }],
+    })),
+    [],
+  );
   // reasoning rows (live shape) are neither user nor assistant — ignored.
   assert.deepEqual(p.parseLine(j({ type: "reasoning", summary: [{ type: "summary_text", text: "…" }] })), []);
 });

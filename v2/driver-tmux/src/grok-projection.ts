@@ -184,6 +184,28 @@ function isErrorToolStatus(status: string | undefined): boolean {
   return status != null && ["failed", "error", "cancelled", "canceled"].includes(status.toLowerCase());
 }
 
+const GROK_COMPACTION_SUMMARY_PREFIX =
+  "This session is being continued from a previous conversation that ran out of context. "
+  + "The summary below covers the earlier portion of the conversation.";
+
+/**
+ * Grok persists its generated continuation summary as an otherwise-unmarked
+ * user chat-history row. Match the full provider scaffold, including the
+ * Summary heading, so quoted prose and ordinary user messages stay visible.
+ */
+export function isGrokCompactionSummary(text: string): boolean {
+  const normalized = text.trimStart().replace(/\r\n/g, "\n");
+  return normalized.startsWith(`${GROK_COMPACTION_SUMMARY_PREFIX}\n\nSummary:`);
+}
+
+function finiteNumberField(value: JsonObject, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 /**
  * Project Grok's published ACP session log and native chat_history rows.
  *
@@ -194,6 +216,7 @@ function isErrorToolStatus(status: string | undefined): boolean {
 export function createGrokProjector(): TranscriptProjector {
   let openChunk: OpenChunk | undefined;
   const tools = new Map<string, ToolState>();
+  const seenCompactions = new Set<string>();
 
   function flushOpenChunk(): TranscriptProjectedEvent[] {
     const chunk = openChunk;
@@ -290,6 +313,25 @@ export function createGrokProjector(): TranscriptProjector {
     const ts = isoTimestamp(update, params, row);
     const text = textContent(update.content) ?? textContent(update.text);
 
+    if (kind === "auto_compact_completed") {
+      const tokensBefore = finiteNumberField(update, "tokens_before", "tokensBefore");
+      const tokensAfter = finiteNumberField(update, "tokens_after", "tokensAfter");
+      const meta = asObject(params?._meta);
+      const eventId = stringField(update, "eventId", "event_id")
+        ?? (meta ? stringField(meta, "eventId", "event_id") : undefined);
+      const compactionKey = eventId ?? `${ts ?? "none"}:${tokensBefore ?? "?"}:${tokensAfter ?? "?"}`;
+      if (seenCompactions.has(compactionKey)) return [];
+      seenCompactions.add(compactionKey);
+      const events = flushOpenChunk();
+      events.push({
+        kind: "compaction",
+        ts,
+        ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+        ...(tokensAfter !== undefined ? { tokensAfter } : {}),
+      });
+      return events;
+    }
+
     if (kind === "agent_message_chunk") {
       return text !== undefined ? appendMessageChunk("assistant", text, ts) : [];
     }
@@ -343,6 +385,10 @@ export function createGrokProjector(): TranscriptProjector {
     const role = roleValue === "user" || roleValue === "assistant" ? roleValue : undefined;
     const text = textContent(message?.content ?? row.content);
     if (!role || text == null || text.trim().length === 0) return events;
+    if (role === "user" && isGrokCompactionSummary(text)) {
+      events.push({ kind: "compaction", ts: isoTimestamp(row, message) });
+      return events;
+    }
     const providerEventId = stringField(row, "id", "uuid", "messageId", "message_id");
     events.push({
       kind: "message",
