@@ -128,7 +128,7 @@ test("grok projector: thinking chunks coalesce and native chat_history shapes re
   const events = project([
     j({ method: "session/update", params: { update: { sessionUpdate: "agent_thought_chunk", content: { text: "think" } } } }),
     j({ method: "session/update", params: { update: { sessionUpdate: "agent_thought_chunk", content: { text: "ing" } } } }),
-    j({ type: "assistant", timestamp: "2026-08-20T10:00:00Z", content: [{ type: "text", text: "native" }] }),
+    j({ type: "assistant", uuid: "native-1", timestamp: "2026-08-20T10:00:00Z", content: [{ type: "text", text: "native" }] }),
     j({ type: "user", content: "hidden", synthetic_reason: "system_reminder" }),
   ]);
 
@@ -136,8 +136,32 @@ test("grok projector: thinking chunks coalesce and native chat_history shapes re
     { kind: "thinking", ts: null, redacted: false, text: "thinking" },
   ]);
   assert.deepEqual(events.filter((event) => event.kind === "message"), [
-    { kind: "message", ts: "2026-08-20T10:00:00.000Z", role: "assistant", text: "native" },
+    {
+      kind: "message",
+      ts: "2026-08-20T10:00:00.000Z",
+      role: "assistant",
+      text: "native",
+      providerEventId: "native-1",
+    },
   ]);
+});
+
+test("grok projector: redacted thinking requires redacted=true and omits text", () => {
+  const events = project([
+    j({
+      method: "session/update",
+      params: {
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          redacted: true,
+          content: { type: "text", text: "must not leak" },
+        },
+      },
+    }),
+  ]);
+
+  assert.deepEqual(events, [{ kind: "thinking", ts: null, redacted: true }]);
+  assert.equal("text" in (events[0] ?? {}), false);
 });
 
 test("grok projector: project-then-flatten preserves the full last assistant text", () => {
