@@ -22,6 +22,7 @@ export {
   grokTranscriptParser,
   grokTranscriptRenderer,
   lastAssistantText,
+  createTranscriptProjector,
   renderTranscriptLines,
   stubTranscriptRenderer,
   TRANSCRIPT_PARSERS,
@@ -33,5 +34,15 @@ export {
   type TranscriptTurn,
   type TranscriptTurnRole,
 } from "./transcripts.ts";
+export { createCodexProjector } from "./codex-projection.ts";
+export {
+  type TranscriptFileChange,
+  type TranscriptIsoTs,
+  type TranscriptMessageRole,
+  type TranscriptProjectedEvent,
+  type TranscriptProjector,
+  type TranscriptProjectorFactory,
+  type TranscriptTokenUsage,
+} from "./transcript-projection.ts";
 export { parseEventsFileLine } from "./events-file.ts";
 export { JsonlTail } from "./tail.ts";

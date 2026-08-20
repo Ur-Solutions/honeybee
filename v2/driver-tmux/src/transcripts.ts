@@ -39,6 +39,9 @@
  */
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
+import { createCodexProjector } from "./codex-projection.ts";
+import { createGrokProjector } from "./grok-projection.ts";
+import type { TranscriptProjectedEvent, TranscriptProjector } from "./transcript-projection.ts";
 
 export type TranscriptEvent =
   | { kind: "turn_started" }
@@ -133,6 +136,25 @@ export const codexTranscriptParser: TranscriptParser = {
   parseLine(line: string): TranscriptEvent[] {
     const row = jsonLine(line);
     if (!row) return [];
+    if (typeof row.method === "string") {
+      if (row.method === "turn/started") return [{ kind: "turn_started" }];
+      if (row.method === "turn/completed") return [{ kind: "turn_ended" }];
+      if (row.method === "item/completed") {
+        const item = (row.params as { item?: { type?: unknown } } | undefined)?.item;
+        if (
+          item?.type === "agentMessage"
+          || item?.type === "commandExecution"
+          || item?.type === "mcpToolCall"
+          || item?.type === "fileChange"
+          || item?.type === "webSearch"
+        ) {
+          return [{ kind: "output" }];
+        }
+      }
+      // turn/start is a client request without a native turn id. Deltas,
+      // account updates, and other app-server traffic are not state edges.
+      return [];
+    }
     const payload = row.payload as { type?: unknown; role?: unknown } | undefined;
     if (row.type === "turn_context") return [{ kind: "turn_started" }];
     if (row.type === "event_msg") {
@@ -159,6 +181,48 @@ export const grokTranscriptParser: TranscriptParser = {
   parseLine(line: string): TranscriptEvent[] {
     const row = jsonLine(line);
     if (!row) return [];
+    if (typeof row.method === "string") {
+      if (row.method === "session/prompt") {
+        const params = row.params as { prompt?: unknown } | undefined;
+        return hasUserText(params?.prompt) ? [{ kind: "turn_started" }] : [];
+      }
+      if (
+        row.method !== "session/update"
+        && row.method !== "_x.ai/session/update"
+        && row.method !== "x.ai/session/update"
+        && row.method !== "_x.ai/session_notification"
+        && row.method !== "x.ai/session_notification"
+      ) {
+        return [];
+      }
+      const params = row.params as Record<string, unknown> | undefined;
+      const update = (params?.update as Record<string, unknown> | undefined) ?? params;
+      if (!update) return [];
+      const kind = update.sessionUpdate ?? update.session_update ?? update.type;
+      const content = update.content ?? update.text;
+      if (row.synthetic_reason != null || params?.synthetic_reason != null || update.synthetic_reason != null) return [];
+      const contentObject = content != null && typeof content === "object" && !Array.isArray(content)
+        ? content as { text?: unknown }
+        : undefined;
+      if (
+        (kind === "user_message_chunk" || kind === "user_message")
+        && hasUserText(contentObject?.text ?? content)
+      ) {
+        return [{ kind: "turn_started" }];
+      }
+      // Chunk rows are output-recency observations. Coalescing them into one
+      // readable assistant message belongs to the stateful Grok projector.
+      if (
+        kind === "agent_message_chunk"
+        || kind === "agent_message"
+        || kind === "agent_thought_chunk"
+        || kind === "tool_call"
+        || kind === "tool_call_update"
+      ) {
+        return [{ kind: "output" }];
+      }
+      return [];
+    }
     const message = row.message as { role?: unknown; content?: unknown } | undefined;
     const role = typeof message?.role === "string" ? message.role : row.type;
     const content = message?.content ?? row.content;
@@ -316,8 +380,8 @@ export const grokTranscriptRenderer: TranscriptRenderer = {
     const row = jsonLine(line);
     if (!row) return [];
     // hsr substrate: the session log is Grok ACP JSON-RPC (`grok agent stdio`),
-    // not chat_history.jsonl. `session/update` carries the same turns as
-    // chunks; `session/prompt` is stdin and is not logged.
+    // not chat_history.jsonl. `session/update` carries streamed chunks and
+    // the logged client→server `session/prompt` carries the operator input.
     if (typeof row.method === "string") {
       // Client→server session/prompt (logged from stdin) is the operator's turn.
       if (row.method === "session/prompt") {
@@ -346,13 +410,19 @@ export const grokTranscriptRenderer: TranscriptRenderer = {
       const text = (content && typeof content === "object" && !Array.isArray(content)
         ? (content as { text?: unknown }).text
         : undefined) ?? update.text;
-      if (kind === "agent_message_chunk" || kind === "agent_message") {
+      // ACP deltas require cross-line state and are intentionally handled by
+      // createGrokProjector. Rendering one turn here would recreate the
+      // one-word-per-line transcript bug.
+      if (kind === "agent_message_chunk" || kind === "user_message_chunk" || kind === "agent_thought_chunk") {
+        return [];
+      }
+      if (kind === "agent_message") {
         return typeof text === "string" && text.trim().length > 0 ? [{ role: "assistant", text }] : [];
       }
-      if (kind === "user_message_chunk" || kind === "user_message") {
+      if (kind === "user_message") {
         return typeof text === "string" && text.trim().length > 0 ? [{ role: "user", text }] : [];
       }
-      if (kind === "tool_call" || kind === "tool_call_update") {
+      if (kind === "tool_call") {
         const title = typeof update.title === "string" ? update.title
           : typeof update.kind === "string" ? update.kind : "tool";
         return [{ role: "tool", text: `[tool_use: ${title}]` }];
@@ -390,12 +460,84 @@ export const TRANSCRIPT_RENDERERS: Record<string, TranscriptRenderer> = {
 
 /**
  * Render a batch of raw jsonl lines for a harness. An unknown harness falls
- * back to the claude-shaped renderer (the most common envelope) — callers can
- * always reach the verbatim lines with `--raw`.
+ * back to the claude-shaped projector (the most common envelope) — callers
+ * can always reach the verbatim lines with `--raw`.
  */
+function projectorFromRenderer(renderer: TranscriptRenderer): TranscriptProjector {
+  return {
+    harness: renderer.harness,
+    pushLine(line: string): TranscriptProjectedEvent[] {
+      return renderer.renderLine(line).map((turn): TranscriptProjectedEvent => {
+        if (turn.role === "tool") {
+          return { kind: "unknown", ts: null, nativeType: "rendered_tool", detail: turn.text };
+        }
+        return { kind: "message", ts: null, role: turn.role, text: turn.text };
+      });
+    },
+    flush(): TranscriptProjectedEvent[] {
+      return [];
+    },
+  };
+}
+
+/** The single harness registry for pane and CLI transcript projection. */
+export function createTranscriptProjector(harness: string): TranscriptProjector {
+  switch (harness) {
+    case "codex":
+      return createCodexProjector();
+    case "grok":
+      return createGrokProjector();
+    case "stub":
+      return projectorFromRenderer(stubTranscriptRenderer);
+    case "claude":
+    default:
+      return projectorFromRenderer(claudeTranscriptRenderer);
+  }
+}
+
 export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
-  const renderer = TRANSCRIPT_RENDERERS[harness] ?? claudeTranscriptRenderer;
-  return lines.flatMap((line) => renderer.renderLine(line));
+  const projector = createTranscriptProjector(harness);
+  const events = lines.flatMap((line) => projector.pushLine(line));
+  events.push(...projector.flush());
+  return events.flatMap(turnsFromProjectedEvent);
+}
+
+function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTurn[] {
+  switch (event.kind) {
+    case "message":
+      return event.role === "developer" ? [] : [{ role: event.role, text: event.text }];
+    case "shell":
+      if (event.status === "started") {
+        return [{ role: "tool", text: `[command: ${event.command ?? "?"}]` }];
+      }
+      return [{
+        role: "tool",
+        text: `[command_result: ${event.exitCode === undefined ? "?" : `exit ${event.exitCode}`}]`,
+      }];
+    case "tool_call":
+      return [{ role: "tool", text: `[tool_use: ${event.name}]` }];
+    case "tool_result":
+      return [{ role: "tool", text: `[tool_result]` }];
+    case "file_edit": {
+      const paths = event.files.map((file) => file.path);
+      return [{ role: "tool", text: paths.length > 0 ? `[file_change: ${paths.join(", ")}]` : "[file_change]" }];
+    }
+    case "web_search":
+      return [{ role: "tool", text: `[web_search${event.query ? `: ${event.query}` : ""}]` }];
+    case "compaction":
+      return [{ role: "system", text: `[compaction${event.trigger ? `: ${event.trigger}` : ""}]` }];
+    case "interrupt":
+      return [{ role: "system", text: `[interrupt${event.reason ? `: ${event.reason}` : ""}]` }];
+    case "unknown":
+      return event.nativeType === "rendered_tool" && event.detail
+        ? [{ role: "tool", text: event.detail }]
+        : [];
+    case "thinking":
+    case "token_usage":
+    case "turn_start":
+    case "turn_end":
+      return [];
+  }
 }
 
 /** The most recent assistant turn's text, or null. */
