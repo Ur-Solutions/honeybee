@@ -39,6 +39,7 @@
  */
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
+import { createTranscriptProjector, type TranscriptProjectedEvent } from "./transcript-projection.ts";
 
 export type TranscriptEvent =
   | { kind: "turn_started" }
@@ -133,6 +134,25 @@ export const codexTranscriptParser: TranscriptParser = {
   parseLine(line: string): TranscriptEvent[] {
     const row = jsonLine(line);
     if (!row) return [];
+    if (typeof row.method === "string") {
+      if (row.method === "turn/started") return [{ kind: "turn_started" }];
+      if (row.method === "turn/completed") return [{ kind: "turn_ended" }];
+      if (row.method === "item/completed") {
+        const item = (row.params as { item?: { type?: unknown } } | undefined)?.item;
+        if (
+          item?.type === "agentMessage"
+          || item?.type === "commandExecution"
+          || item?.type === "mcpToolCall"
+          || item?.type === "fileChange"
+          || item?.type === "webSearch"
+        ) {
+          return [{ kind: "output" }];
+        }
+      }
+      // turn/start is a client request without a native turn id. Deltas,
+      // account updates, and other app-server traffic are not state edges.
+      return [];
+    }
     const payload = row.payload as { type?: unknown; role?: unknown } | undefined;
     if (row.type === "turn_context") return [{ kind: "turn_started" }];
     if (row.type === "event_msg") {
@@ -381,21 +401,54 @@ export const stubTranscriptRenderer: TranscriptRenderer = {
   },
 };
 
-export const TRANSCRIPT_RENDERERS: Record<string, TranscriptRenderer> = {
-  claude: claudeTranscriptRenderer,
-  codex: codexTranscriptRenderer,
-  grok: grokTranscriptRenderer,
-  stub: stubTranscriptRenderer,
-};
-
 /**
  * Render a batch of raw jsonl lines for a harness. An unknown harness falls
- * back to the claude-shaped renderer (the most common envelope) — callers can
- * always reach the verbatim lines with `--raw`.
+ * back to the claude-shaped projector (the most common envelope) — callers
+ * can always reach the verbatim lines with `--raw`.
  */
 export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
-  const renderer = TRANSCRIPT_RENDERERS[harness] ?? claudeTranscriptRenderer;
-  return lines.flatMap((line) => renderer.renderLine(line));
+  const projector = createTranscriptProjector(harness);
+  const events = lines.flatMap((line) => projector.pushLine(line));
+  events.push(...projector.flush());
+  return events.flatMap(turnsFromProjectedEvent);
+}
+
+function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTurn[] {
+  switch (event.kind) {
+    case "message":
+      return event.role === "developer" ? [] : [{ role: event.role, text: event.text }];
+    case "shell":
+      if (event.status === "started") {
+        return [{ role: "tool", text: `[command: ${event.command ?? "?"}]` }];
+      }
+      return [{
+        role: "tool",
+        text: `[command_result: ${event.exitCode === undefined ? "?" : `exit ${event.exitCode}`}]`,
+      }];
+    case "tool_call":
+      return [{ role: "tool", text: `[tool_use: ${event.name}]` }];
+    case "tool_result":
+      return [{ role: "tool", text: `[tool_result]` }];
+    case "file_edit": {
+      const paths = event.files.map((file) => file.path);
+      return [{ role: "tool", text: paths.length > 0 ? `[file_change: ${paths.join(", ")}]` : "[file_change]" }];
+    }
+    case "web_search":
+      return [{ role: "tool", text: `[web_search${event.query ? `: ${event.query}` : ""}]` }];
+    case "compaction":
+      return [{ role: "system", text: `[compaction${event.trigger ? `: ${event.trigger}` : ""}]` }];
+    case "interrupt":
+      return [{ role: "system", text: `[interrupt${event.reason ? `: ${event.reason}` : ""}]` }];
+    case "unknown":
+      return event.nativeType === "rendered_tool" && event.detail
+        ? [{ role: "tool", text: event.detail }]
+        : [];
+    case "thinking":
+    case "token_usage":
+    case "turn_start":
+    case "turn_end":
+      return [];
+  }
 }
 
 /** The most recent assistant turn's text, or null. */
