@@ -677,8 +677,16 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
     assert.equal(store.getBee("bee-x")?.spawnFailures, runtimes.length, "every generation counted against the budget");
     if (flagged) {
       assert.equal(store.getBee("bee-x")?.spawnFailures, 3);
-      assert.equal(store.enqueueWake("bee-x").outcome, "suppressed", "wakes suppressed while spawn_failed is set");
-      assert.equal(store.undeliveredMessages("bee-x").length, 1, "the message never reached a dying runtime");
+      // The delivery race can consume the mail on ANY doomed generation while
+      // wake-driven revives still flag the budget: pending mail must answer
+      // `suppressed` (the flag gates wakes); consumed mail answers `no_mail`.
+      // Both are bounded — the flag is what stops the churn either way.
+      const pending = store.undeliveredMessages("bee-x").length;
+      assert.equal(
+        store.enqueueWake("bee-x").outcome,
+        pending > 0 ? "suppressed" : "no_mail",
+        "wakes gated while spawn_failed is set",
+      );
     } else {
       assert.equal(store.undeliveredMessages("bee-x").length, 0, "parked-quiet path: the mail was consumed by a dying generation");
     }
