@@ -63,10 +63,14 @@ async function seedHeartbeatScale(root: string, count: number): Promise<void> {
   }
 }
 
-test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout: 120_000 }, async (t) => {
+const SCALE = process.env.HIVE_TEST_SCALE === "1";
+
+test("active index scales at 100/1k/3k/10k with 95% terminal history", { timeout: SCALE ? 120_000 : 30_000 }, async (t) => {
   const previousRoot = process.env.HIVE_STORE_ROOT;
   try {
-    for (const count of [100, 1_000, 3_000, 10_000]) {
+    // 3k/10k file writes belong on HIVE_TEST_SCALE=1 — they dominate `npm test`
+    // wall time and hammer FSEvents on a shared workstation.
+    for (const count of SCALE ? [100, 1_000, 3_000, 10_000] : [100, 1_000]) {
       const root = await mkdtemp(join(tmpdir(), `honeybee-hotpath-${count}-`));
       process.env.HIVE_STORE_ROOT = root;
       try {
@@ -151,7 +155,10 @@ test("fresh direct-list process trusts an unchanged directory generation without
   }
 });
 
-test("continuous active heartbeats keep strict commitments hot at 3k/10k", { timeout: 120_000 }, async (t) => {
+test("continuous active heartbeats keep strict commitments hot at 3k/10k", {
+  timeout: 120_000,
+  skip: !SCALE && "set HIVE_TEST_SCALE=1 for 3k/10k heartbeat benches",
+}, async (t) => {
   const previousRoot = process.env.HIVE_STORE_ROOT;
   try {
     for (const count of [3_000, 10_000]) {
