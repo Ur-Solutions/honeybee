@@ -22,9 +22,11 @@ export {
   grokTranscriptParser,
   grokTranscriptRenderer,
   lastAssistantText,
+  createTranscriptProjector,
   renderTranscriptLines,
   stubTranscriptRenderer,
   TRANSCRIPT_PARSERS,
+  TRANSCRIPT_RENDERERS,
   type TranscriptEvent,
   type TranscriptLocator,
   type TranscriptParser,
@@ -34,7 +36,6 @@ export {
 } from "./transcripts.ts";
 export { createCodexProjector } from "./codex-projection.ts";
 export {
-  createTranscriptProjector,
   type TranscriptFileChange,
   type TranscriptIsoTs,
   type TranscriptMessageRole,

@@ -39,7 +39,8 @@
  */
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
-import { createTranscriptProjector, type TranscriptProjectedEvent } from "./transcript-projection.ts";
+import { createCodexProjector } from "./codex-projection.ts";
+import type { TranscriptProjectedEvent, TranscriptProjector } from "./transcript-projection.ts";
 
 export type TranscriptEvent =
   | { kind: "turn_started" }
@@ -401,11 +402,50 @@ export const stubTranscriptRenderer: TranscriptRenderer = {
   },
 };
 
+export const TRANSCRIPT_RENDERERS: Record<string, TranscriptRenderer> = {
+  claude: claudeTranscriptRenderer,
+  codex: codexTranscriptRenderer,
+  grok: grokTranscriptRenderer,
+  stub: stubTranscriptRenderer,
+};
+
 /**
  * Render a batch of raw jsonl lines for a harness. An unknown harness falls
  * back to the claude-shaped projector (the most common envelope) — callers
  * can always reach the verbatim lines with `--raw`.
  */
+function projectorFromRenderer(renderer: TranscriptRenderer): TranscriptProjector {
+  return {
+    harness: renderer.harness,
+    pushLine(line: string): TranscriptProjectedEvent[] {
+      return renderer.renderLine(line).map((turn): TranscriptProjectedEvent => {
+        if (turn.role === "tool") {
+          return { kind: "unknown", ts: null, nativeType: "rendered_tool", detail: turn.text };
+        }
+        return { kind: "message", ts: null, role: turn.role, text: turn.text };
+      });
+    },
+    flush(): TranscriptProjectedEvent[] {
+      return [];
+    },
+  };
+}
+
+/** The single harness registry for pane and CLI transcript projection. */
+export function createTranscriptProjector(harness: string): TranscriptProjector {
+  switch (harness) {
+    case "codex":
+      return createCodexProjector();
+    case "grok":
+      return projectorFromRenderer(grokTranscriptRenderer);
+    case "stub":
+      return projectorFromRenderer(stubTranscriptRenderer);
+    case "claude":
+    default:
+      return projectorFromRenderer(claudeTranscriptRenderer);
+  }
+}
+
 export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
   const projector = createTranscriptProjector(harness);
   const events = lines.flatMap((line) => projector.pushLine(line));
@@ -433,8 +473,6 @@ function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTur
       const paths = event.files.map((file) => file.path);
       return [{ role: "tool", text: paths.length > 0 ? `[file_change: ${paths.join(", ")}]` : "[file_change]" }];
     }
-    case "web_search":
-      return [{ role: "tool", text: `[web_search${event.query ? `: ${event.query}` : ""}]` }];
     case "compaction":
       return [{ role: "system", text: `[compaction${event.trigger ? `: ${event.trigger}` : ""}]` }];
     case "interrupt":

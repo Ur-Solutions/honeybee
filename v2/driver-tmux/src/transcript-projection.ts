@@ -1,11 +1,3 @@
-import { createCodexProjector } from "./codex-projection.ts";
-import {
-  claudeTranscriptRenderer,
-  grokTranscriptRenderer,
-  stubTranscriptRenderer,
-  type TranscriptRenderer,
-} from "./transcripts.ts";
-
 /**
  * Pane-ready transcript projection (G3).
  *
@@ -40,7 +32,6 @@ export type TranscriptFileChange = {
   path: string;
   changeKind?: string;
   oldPath?: string;
-  movePath?: string;
   diff?: string;
   addedLines?: number;
   removedLines?: number;
@@ -50,13 +41,12 @@ type Base = { ts: TranscriptIsoTs; threadId?: string };
 
 export type TranscriptProjectedEvent =
   | (Base & { kind: "turn_start"; turnId?: string })
-  | (Base & { kind: "turn_end"; turnId?: string; durationMs?: number; finishReason?: string; interrupted?: boolean })
+  | (Base & { kind: "turn_end"; turnId?: string; durationMs?: number; finishReason?: string })
   | (Base & { kind: "interrupt"; reason?: string })
   | (Base & {
       kind: "message";
       role: TranscriptMessageRole;
       text: string;
-      itemId?: string;
       providerEventId?: string;
     })
   | (Base & { kind: "thinking"; redacted: boolean; text?: string })
@@ -74,7 +64,6 @@ export type TranscriptProjectedEvent =
       durationMs?: number;
     })
   | (Base & { kind: "file_edit"; callId?: string; files: TranscriptFileChange[] })
-  | (Base & { kind: "web_search"; itemId?: string; providerEventId?: string; query?: string })
   | (Base & {
       kind: "token_usage";
       usage: TranscriptTokenUsage;
@@ -95,38 +84,3 @@ export interface TranscriptProjector {
 }
 
 export type TranscriptProjectorFactory = () => TranscriptProjector;
-
-function projectorFromRenderer(renderer: TranscriptRenderer): TranscriptProjector {
-  return {
-    harness: renderer.harness,
-    pushLine(line: string): TranscriptProjectedEvent[] {
-      return renderer.renderLine(line).map((turn): TranscriptProjectedEvent => {
-        if (turn.role === "tool") {
-          // Slice 1 keeps the existing stateless renderer for simple
-          // harnesses. Preserve its readable tool line without claiming a
-          // richer native tool shape that only the later projector can know.
-          return { kind: "unknown", ts: null, nativeType: "rendered_tool", detail: turn.text };
-        }
-        return { kind: "message", ts: null, role: turn.role, text: turn.text };
-      });
-    },
-    flush(): TranscriptProjectedEvent[] {
-      return [];
-    },
-  };
-}
-
-/** The single harness registry for pane and CLI transcript projection. */
-export function createTranscriptProjector(harness: string): TranscriptProjector {
-  switch (harness) {
-    case "codex":
-      return createCodexProjector();
-    case "grok":
-      return projectorFromRenderer(grokTranscriptRenderer);
-    case "stub":
-      return projectorFromRenderer(stubTranscriptRenderer);
-    case "claude":
-    default:
-      return projectorFromRenderer(claudeTranscriptRenderer);
-  }
-}
