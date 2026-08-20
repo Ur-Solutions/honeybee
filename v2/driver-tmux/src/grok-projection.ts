@@ -9,7 +9,7 @@ type MessageRole = "user" | "assistant";
 
 type OpenChunk =
   | { kind: "message"; role: MessageRole; text: string; ts: TranscriptIsoTs }
-  | { kind: "thinking"; text: string; ts: TranscriptIsoTs };
+  | { kind: "thinking"; redacted: boolean; text?: string; ts: TranscriptIsoTs };
 
 interface ToolState {
   name: string;
@@ -31,6 +31,21 @@ const PROMPT_COMPLETE_METHODS = new Set([
   "session/prompt_complete",
   "_x.ai/session/prompt_complete",
   "x.ai/session/prompt_complete",
+]);
+
+const TURN_END_METHODS = new Set([
+  ...PROMPT_COMPLETE_METHODS,
+  "session/turn_completed",
+  "_x.ai/session/turn_completed",
+  "x.ai/session/turn_completed",
+  "_x.ai/turn_completed",
+  "x.ai/turn_completed",
+]);
+
+const TURN_END_UPDATE_KINDS = new Set([
+  "turn_completed",
+  "turn_complete",
+  "prompt_complete",
 ]);
 
 function asObject(value: unknown): JsonObject | undefined {
@@ -119,6 +134,14 @@ function updateKind(update: JsonObject): string | undefined {
   return stringField(update, "sessionUpdate", "session_update", "type");
 }
 
+function isRedactedThinking(update: JsonObject): boolean {
+  const content = asObject(update.content);
+  return update.redacted === true
+    || content?.redacted === true
+    || content?.type === "redacted"
+    || content?.type === "redacted_thinking";
+}
+
 function updatePayload(row: JsonObject): { params?: JsonObject; update?: JsonObject } {
   const params = asObject(row.params);
   return { params, update: asObject(params?.update) ?? params };
@@ -175,11 +198,16 @@ export function createGrokProjector(): TranscriptProjector {
   function flushOpenChunk(): TranscriptProjectedEvent[] {
     const chunk = openChunk;
     openChunk = undefined;
-    if (!chunk || chunk.text.trim().length === 0) return [];
+    if (!chunk) return [];
     if (chunk.kind === "thinking") {
-      return [{ kind: "thinking", ts: chunk.ts, redacted: false, text: chunk.text }];
+      if (chunk.redacted) return [{ kind: "thinking", ts: chunk.ts, redacted: true }];
+      return chunk.text != null && chunk.text.trim().length > 0
+        ? [{ kind: "thinking", ts: chunk.ts, redacted: false, text: chunk.text }]
+        : [];
     }
-    return [{ kind: "message", ts: chunk.ts, role: chunk.role, text: chunk.text }];
+    return chunk.text.trim().length > 0
+      ? [{ kind: "message", ts: chunk.ts, role: chunk.role, text: chunk.text }]
+      : [];
   }
 
   function appendMessageChunk(role: MessageRole, text: string, ts: TranscriptIsoTs): TranscriptProjectedEvent[] {
@@ -192,13 +220,17 @@ export function createGrokProjector(): TranscriptProjector {
     return events;
   }
 
-  function appendThinkingChunk(text: string, ts: TranscriptIsoTs): TranscriptProjectedEvent[] {
-    if (openChunk?.kind === "thinking") {
-      openChunk.text += text;
+  function appendThinkingChunk(
+    text: string | undefined,
+    redacted: boolean,
+    ts: TranscriptIsoTs,
+  ): TranscriptProjectedEvent[] {
+    if (openChunk?.kind === "thinking" && openChunk.redacted === redacted) {
+      if (!redacted && text !== undefined) openChunk.text = `${openChunk.text ?? ""}${text}`;
       return [];
     }
     const events = flushOpenChunk();
-    openChunk = { kind: "thinking", text, ts };
+    openChunk = { kind: "thinking", redacted, ...(redacted || text === undefined ? {} : { text }), ts };
     return events;
   }
 
@@ -253,7 +285,7 @@ export function createGrokProjector(): TranscriptProjector {
 
   function projectUpdate(row: JsonObject): TranscriptProjectedEvent[] {
     const { params, update } = updatePayload(row);
-    if (!update) return flushOpenChunk();
+    if (!update) return [];
     const kind = updateKind(update);
     const ts = isoTimestamp(update, params, row);
     const text = textContent(update.content) ?? textContent(update.text);
@@ -265,11 +297,18 @@ export function createGrokProjector(): TranscriptProjector {
       return text !== undefined ? appendMessageChunk("user", text, ts) : [];
     }
     if (kind === "agent_thought_chunk") {
-      return text !== undefined ? appendThinkingChunk(text, ts) : [];
+      const redacted = isRedactedThinking(update);
+      return redacted || text !== undefined ? appendThinkingChunk(text, redacted, ts) : [];
     }
 
-    const events = flushOpenChunk();
+    if (kind && TURN_END_UPDATE_KINDS.has(kind)) {
+      const events = flushOpenChunk();
+      events.push({ kind: "turn_end", ts });
+      return events;
+    }
+
     if ((kind === "agent_message" || kind === "user_message") && text != null && text.trim().length > 0) {
+      const events = flushOpenChunk();
       events.push({
         kind: "message",
         ts,
@@ -278,18 +317,22 @@ export function createGrokProjector(): TranscriptProjector {
       });
       return events;
     }
-    if (kind === "agent_thought" && text != null && text.trim().length > 0) {
-      events.push({ kind: "thinking", ts, redacted: false, text });
+    if (kind === "agent_thought") {
+      const events = flushOpenChunk();
+      const redacted = isRedactedThinking(update);
+      if (redacted) events.push({ kind: "thinking", ts, redacted: true });
+      else if (text != null && text.trim().length > 0) {
+        events.push({ kind: "thinking", ts, redacted: false, text });
+      }
       return events;
     }
     if (kind === "tool_call" || kind === "tool_call_update") {
+      const events = flushOpenChunk();
       events.push(...projectTool(update, ts));
       return events;
     }
-    if (kind && kind !== "turn_completed") {
-      events.push({ kind: "unknown", ts, nativeType: kind });
-    }
-    return events;
+    // available_commands_update, plan, session_info_update, … — not boundaries.
+    return [];
   }
 
   function projectNativeRow(row: JsonObject): TranscriptProjectedEvent[] {
@@ -322,14 +365,22 @@ export function createGrokProjector(): TranscriptProjector {
       if (method === "session/prompt") {
         const events = flushOpenChunk();
         const params = asObject(row.params);
+        const ts = isoTimestamp(params, row);
+        events.push({ kind: "turn_start", ts });
         const text = promptText(params);
         if (text !== undefined) {
-          events.push({ kind: "message", ts: isoTimestamp(params, row), role: "user", text });
+          events.push({ kind: "message", ts, role: "user", text });
         }
         return events;
       }
-      if (PROMPT_COMPLETE_METHODS.has(method)) return flushOpenChunk();
-      return flushOpenChunk();
+      if (TURN_END_METHODS.has(method)) {
+        const events = flushOpenChunk();
+        events.push({ kind: "turn_end", ts: isoTimestamp(asObject(row.params), row) });
+        return events;
+      }
+      // Client requests (fs/read_text_file, permissions, initialize, …) sit
+      // between message chunks and must not fragment the open assistant turn.
+      return [];
     },
     flush(): TranscriptProjectedEvent[] {
       return flushOpenChunk();

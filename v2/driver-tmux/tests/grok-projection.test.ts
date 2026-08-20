@@ -40,7 +40,10 @@ test("grok projector: captured ACP chunks assemble into one assistant message", 
     "I'll start by loading the Apiary architecture contract and calling live",
   ]);
   assert.equal(events.filter((event) => event.kind === "tool_call").length, 1);
-  assert.equal(events.some((event) => event.kind === "turn_start" || event.kind === "turn_end"), false);
+  const starts = events.filter((event) => event.kind === "turn_start");
+  assert.equal(starts.length, 1);
+  assert.equal(events.findIndex((event) => event.kind === "turn_start")
+    < events.findIndex((event) => event.kind === "message" && event.role === "user"), true);
 });
 
 test("grok projector: user message chunks coalesce into one message", () => {
@@ -120,15 +123,70 @@ test("grok projector: prompt_complete flushes the open assistant message", () =>
     params: { sessionId: "s" },
   })), [
     { kind: "message", ts: null, role: "assistant", text: "done" },
+    { kind: "turn_end", ts: null },
   ]);
   assert.deepEqual(projector.flush(), []);
+});
+
+test("grok projector: session/prompt emits turn_start before the user message", () => {
+  assert.deepEqual(project([
+    j({ method: "session/prompt", params: { prompt: [{ type: "text", text: "do the thing" }] } }),
+  ]), [
+    { kind: "turn_start", ts: null },
+    { kind: "message", ts: null, role: "user", text: "do the thing" },
+  ]);
+});
+
+test("grok projector: session/update turn_completed ends the turn after flushing", () => {
+  const projector = createGrokProjector();
+  projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "ok" } } },
+  }));
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "turn_completed" } },
+  })), [
+    { kind: "message", ts: null, role: "assistant", text: "ok" },
+    { kind: "turn_end", ts: null },
+  ]);
+});
+
+test("grok projector: unrecognized methods and non-boundary updates do not flush open chunks", () => {
+  const projector = createGrokProjector();
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } } },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    jsonrpc: "2.0",
+    id: 9,
+    method: "fs/read_text_file",
+    params: { path: "/tmp/x" },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    jsonrpc: "2.0",
+    method: "initialize",
+    params: {},
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "available_commands_update", availableCommands: [] } },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " world" } } },
+  })), []);
+  assert.deepEqual(projector.flush(), [
+    { kind: "message", ts: null, role: "assistant", text: "Hello world" },
+  ]);
 });
 
 test("grok projector: thinking chunks coalesce and native chat_history shapes remain supported", () => {
   const events = project([
     j({ method: "session/update", params: { update: { sessionUpdate: "agent_thought_chunk", content: { text: "think" } } } }),
     j({ method: "session/update", params: { update: { sessionUpdate: "agent_thought_chunk", content: { text: "ing" } } } }),
-    j({ type: "assistant", timestamp: "2026-08-20T10:00:00Z", content: [{ type: "text", text: "native" }] }),
+    j({ type: "assistant", uuid: "native-1", timestamp: "2026-08-20T10:00:00Z", content: [{ type: "text", text: "native" }] }),
     j({ type: "user", content: "hidden", synthetic_reason: "system_reminder" }),
   ]);
 
@@ -136,8 +194,32 @@ test("grok projector: thinking chunks coalesce and native chat_history shapes re
     { kind: "thinking", ts: null, redacted: false, text: "thinking" },
   ]);
   assert.deepEqual(events.filter((event) => event.kind === "message"), [
-    { kind: "message", ts: "2026-08-20T10:00:00.000Z", role: "assistant", text: "native" },
+    {
+      kind: "message",
+      ts: "2026-08-20T10:00:00.000Z",
+      role: "assistant",
+      text: "native",
+      providerEventId: "native-1",
+    },
   ]);
+});
+
+test("grok projector: redacted thinking requires redacted=true and omits text", () => {
+  const events = project([
+    j({
+      method: "session/update",
+      params: {
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          redacted: true,
+          content: { type: "text", text: "must not leak" },
+        },
+      },
+    }),
+  ]);
+
+  assert.deepEqual(events, [{ kind: "thinking", ts: null, redacted: true }]);
+  assert.equal("text" in (events[0] ?? {}), false);
 });
 
 test("grok projector: project-then-flatten preserves the full last assistant text", () => {
