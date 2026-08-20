@@ -40,7 +40,10 @@ test("grok projector: captured ACP chunks assemble into one assistant message", 
     "I'll start by loading the Apiary architecture contract and calling live",
   ]);
   assert.equal(events.filter((event) => event.kind === "tool_call").length, 1);
-  assert.equal(events.some((event) => event.kind === "turn_start" || event.kind === "turn_end"), false);
+  const starts = events.filter((event) => event.kind === "turn_start");
+  assert.equal(starts.length, 1);
+  assert.equal(events.findIndex((event) => event.kind === "turn_start")
+    < events.findIndex((event) => event.kind === "message" && event.role === "user"), true);
 });
 
 test("grok projector: user message chunks coalesce into one message", () => {
@@ -120,8 +123,63 @@ test("grok projector: prompt_complete flushes the open assistant message", () =>
     params: { sessionId: "s" },
   })), [
     { kind: "message", ts: null, role: "assistant", text: "done" },
+    { kind: "turn_end", ts: null },
   ]);
   assert.deepEqual(projector.flush(), []);
+});
+
+test("grok projector: session/prompt emits turn_start before the user message", () => {
+  assert.deepEqual(project([
+    j({ method: "session/prompt", params: { prompt: [{ type: "text", text: "do the thing" }] } }),
+  ]), [
+    { kind: "turn_start", ts: null },
+    { kind: "message", ts: null, role: "user", text: "do the thing" },
+  ]);
+});
+
+test("grok projector: session/update turn_completed ends the turn after flushing", () => {
+  const projector = createGrokProjector();
+  projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "ok" } } },
+  }));
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "turn_completed" } },
+  })), [
+    { kind: "message", ts: null, role: "assistant", text: "ok" },
+    { kind: "turn_end", ts: null },
+  ]);
+});
+
+test("grok projector: unrecognized methods and non-boundary updates do not flush open chunks", () => {
+  const projector = createGrokProjector();
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } } },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    jsonrpc: "2.0",
+    id: 9,
+    method: "fs/read_text_file",
+    params: { path: "/tmp/x" },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    jsonrpc: "2.0",
+    method: "initialize",
+    params: {},
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "available_commands_update", availableCommands: [] } },
+  })), []);
+  assert.deepEqual(projector.pushLine(j({
+    method: "session/update",
+    params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " world" } } },
+  })), []);
+  assert.deepEqual(projector.flush(), [
+    { kind: "message", ts: null, role: "assistant", text: "Hello world" },
+  ]);
 });
 
 test("grok projector: thinking chunks coalesce and native chat_history shapes remain supported", () => {
