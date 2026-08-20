@@ -515,6 +515,14 @@ export class HiveDaemon {
     return this.store;
   }
 
+  private numberParam(params: Record<string, unknown>, key: string): number {
+    const v = params[key];
+    if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) {
+      throw new RpcError("invalid_request", `param '${key}' must be a positive integer`);
+    }
+    return v;
+  }
+
   private param(params: Record<string, unknown>, key: string): string {
     const v = params[key];
     if (typeof v !== "string" || v.length === 0) {
@@ -553,6 +561,21 @@ export class HiveDaemon {
         return this.withIdempotency(verb, params, () => this.rpcAccountBackfill(params));
       case "send":
         return this.withIdempotency(verb, params, () => this.rpcSend(params));
+      case "mail.cancel": {
+        // Direct mailbox mutation (like send): cancel an undelivered message.
+        const res = this.mustStore().cancelMessage(this.numberParam(params, "messageId"));
+        if (!res.canceled) throw new RpcError("invalid_request", `mail.cancel: message ${res.reason}`);
+        return res;
+      }
+      case "mail.expedite": {
+        const urgency = this.param(params, "urgency");
+        if (!(MESSAGE_URGENCIES as readonly string[]).includes(urgency)) {
+          throw new RpcError("invalid_request", `mail.expedite: urgency must be one of ${MESSAGE_URGENCIES.join("|")}`);
+        }
+        const res = this.mustStore().expediteMessage(this.numberParam(params, "messageId"), urgency as Urgency);
+        if (!res.applied) throw new RpcError("invalid_request", `mail.expedite: message ${res.reason}`);
+        return res;
+      }
       case "stop":
         return this.withIdempotency(verb, params, () =>
           this.rpcEnqueue("stop", this.param(params, "beeId"), { cause: "stopped_by_user" }, params),

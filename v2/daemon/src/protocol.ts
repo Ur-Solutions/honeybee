@@ -76,6 +76,8 @@ export const RPC_VERBS = [
   // the seven mutations — thin wrappers over store + queue
   "spawn",
   "send",
+  "mail.cancel",
+  "mail.expedite",
   "stop",
   "revive",
   "archive",

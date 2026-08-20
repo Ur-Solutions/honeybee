@@ -1530,6 +1530,39 @@ export class CoreStore {
   }
 
   /**
+   * Cancel an UNDELIVERED message: the row is removed before any runtime ever
+   * consumes it (the queued-steering "cancel" affordance). A delivered
+   * message is history, never cancelable — typed refusal, not an error.
+   */
+  cancelMessage(messageId: number): { canceled: boolean; reason?: "not_found" | "delivered" } {
+    return this.tx(() => {
+      const message = this.getMessage(messageId);
+      if (!message) return { canceled: false, reason: "not_found" };
+      if (message.deliveredAt != null) return { canceled: false, reason: "delivered" };
+      this.db.prepare("DELETE FROM mailbox WHERE id = ?").run(messageId);
+      this.audit("mail.canceled", message.beeId, { messageId, urgency: message.urgency });
+      return { canceled: true };
+    });
+  }
+
+  /**
+   * Change an UNDELIVERED message's urgency (the queued-steering "send now":
+   * idle → now). The delivery loop honors the new urgency on its next tick —
+   * `now` interrupts a running turn exactly like a fresh `--urgency now` send.
+   */
+  expediteMessage(messageId: number, urgency: Urgency): { applied: boolean; reason?: "not_found" | "delivered" } {
+    if (!MESSAGE_URGENCIES.includes(urgency)) throw new UnknownUrgencyError(urgency);
+    return this.tx(() => {
+      const message = this.getMessage(messageId);
+      if (!message) return { applied: false, reason: "not_found" };
+      if (message.deliveredAt != null) return { applied: false, reason: "delivered" };
+      this.db.prepare("UPDATE mailbox SET urgency = ? WHERE id = ?").run(urgency, messageId);
+      this.audit("mail.expedited", message.beeId, { messageId, from: message.urgency, to: urgency });
+      return { applied: true };
+    });
+  }
+
+  /**
    * B4 — delivery marks delivered_generation; never twice, and only to the bee's
    * CURRENT generation (a stale consumer's mark is a recorded no-op, mirroring B6).
    */
