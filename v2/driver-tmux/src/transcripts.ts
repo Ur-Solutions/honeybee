@@ -40,6 +40,7 @@
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
 import { createCodexProjector } from "./codex-projection.ts";
+import { createGrokProjector } from "./grok-projection.ts";
 import type { TranscriptProjectedEvent, TranscriptProjector } from "./transcript-projection.ts";
 
 export type TranscriptEvent =
@@ -485,7 +486,7 @@ export function createTranscriptProjector(harness: string): TranscriptProjector 
     case "codex":
       return createCodexProjector();
     case "grok":
-      return projectorFromRenderer(grokTranscriptRenderer);
+      return createGrokProjector();
     case "stub":
       return projectorFromRenderer(stubTranscriptRenderer);
     case "claude":
