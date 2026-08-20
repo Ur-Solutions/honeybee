@@ -181,6 +181,44 @@ test("grok: session/update agent output opens a turn (self-woken)", () => {
   );
 });
 
+test("grok: turn_completed notification ends a self-woken turn", () => {
+  const ended = [
+    { kind: "flag", flag: "auth_needed", action: "clear", detail: "successful authenticated turn" },
+    { kind: "flag", flag: "resource_blocked", action: "clear", detail: "successful turn served" },
+    { kind: "turn_ended" },
+  ];
+  assert.deepEqual(
+    adapter.parseLine(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "_x.ai/session_notification",
+      params: { update: { sessionUpdate: "turn_completed", prompt_id: "task-completed-1", stop_reason: "end_turn" } },
+    })),
+    ended,
+  );
+  assert.deepEqual(
+    adapter.parseLine(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "_x.ai/session/prompt_complete",
+      params: { promptId: "task-completed-1", stopReason: "end_turn" },
+    })),
+    ended,
+  );
+});
+
+test("grok: replayed turn_completed does not close the live turn", () => {
+  assert.deepEqual(
+    adapter.parseLine(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "_x.ai/session/update",
+      params: {
+        update: { sessionUpdate: "turn_completed", prompt_id: "old" },
+        _meta: { isReplay: true },
+      },
+    })),
+    [],
+  );
+});
+
 test("grok: encodeInterrupt is a session/cancel notification", () => {
   assert.equal(adapter.encodeInterrupt?.({ sessionId: null, turnId: null }) ?? null, null);
   assert.deepEqual(JSON.parse(adapter.encodeInterrupt!({ sessionId: "sess-abc", turnId: null })!), {

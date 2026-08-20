@@ -15,7 +15,10 @@
  *   server   : session/new|load result {sessionId} → booted (idle)
  *   we write : session/prompt {sessionId, prompt:[{type:"text",text}]}
  *   server   : session/prompt result → turn_ended
- *   server   : session/update notifications → no four-state edge
+ *   server   : session/update agent_* chunks → turn_started (self-woken turns:
+ *              background-task completions have no session/prompt result)
+ *   server   : _x.ai/session_notification turn_completed
+ *              / _x.ai/session/prompt_complete → turn_ended
  *   server   : session/request_permission → auto-allow (spawn uses --always-approve)
  *
  * The adapter is a factory: session/new needs cwd (and optionally a resume
@@ -76,6 +79,24 @@ function updateKind(params: unknown): string | undefined {
   const update = asObject(object?.update) ?? object;
   const kind = update?.sessionUpdate ?? update?.session_update ?? update?.type;
   return typeof kind === "string" ? kind : undefined;
+}
+
+function isReplay(params: unknown): boolean {
+  const meta = asObject(asObject(params)?._meta);
+  return meta?.isReplay === true;
+}
+
+function isGrokTurnCompleteMethod(method: string): boolean {
+  return method === "_x.ai/session/prompt_complete"
+    || method === "x.ai/session/prompt_complete";
+}
+
+function isSessionUpdateMethod(method: string): boolean {
+  return method === "session/update"
+    || method === "_x.ai/session/update"
+    || method === "x.ai/session/update"
+    || method === "_x.ai/session_notification"
+    || method === "x.ai/session_notification";
 }
 
 function authMethodId(initialized: Record<string, unknown> | undefined): string | undefined {
@@ -200,15 +221,22 @@ export function grokAdapter(opts: GrokAdapterOptions): HarnessAdapter {
         })],
       }];
     }
+    // Replayed historical updates must not reopen/close the live turn.
+    if (isReplay(msg.params)) return [];
+
     // Self-woken turns (background tasks, scheduled continuations): ACP has
-    // no delivery, so agent output is the only opening edge — same as claude
-    // assistant lines. The driver dedupes while already running.
-    if (
-      msg.method === "session/update"
-      || msg.method === "_x.ai/session/update"
-      || msg.method === "x.ai/session/update"
-    ) {
+    // no session/prompt JSON-RPC, so agent output is the opening edge and
+    // Grok's turn_completed / prompt_complete notifications are the close.
+    // Hive-delivered turns also emit those notifications; duplicate
+    // turn_ended is idle-idempotent in the driver.
+    if (typeof msg.method === "string" && isGrokTurnCompleteMethod(msg.method)) {
+      return [...successfulTurnClears(), { kind: "turn_ended" }];
+    }
+    if (typeof msg.method === "string" && isSessionUpdateMethod(msg.method)) {
       const kind = updateKind(msg.params);
+      if (kind === "turn_completed") {
+        return [...successfulTurnClears(), { kind: "turn_ended" }];
+      }
       if (
         kind === "agent_message_chunk"
         || kind === "agent_message"
