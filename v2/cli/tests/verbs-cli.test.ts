@@ -716,11 +716,12 @@ test("handles.live: spawn returns the minted handle; ls leads with it and keeps 
     assert.equal(await runV2Cli(["ls", "--data-dir", dir, "--socket", daemon.socketPath], ls.io), 0);
     const row = ls.out.find((l) => l.includes("prettybee")) ?? "";
     assert.ok(row.includes(handle), `ls shows handle: ${row}`);
-    assert.ok(row.includes(`id=${uuid}`), `ls keeps the uuid tail: ${row}`);
-    // the handle resolves in a mutation verb round-trip
+    assert.doesNotMatch(row, /args=/);
+    // the handle resolves in a mutation verb round-trip; uuid lives on view, not ls.
     const v = capture();
     assert.equal(await runV2Cli(["view", handle.toLowerCase(), "--data-dir", dir, "--socket", daemon.socketPath], v.io), 0);
     assert.ok(v.out[0]?.includes("prettybee"));
+    assert.ok(v.out.join("\n").includes(uuid), `view keeps the uuid: ${v.out.join(" | ")}`);
     const st = capture();
     assert.equal(await runV2Cli(["stop", handle, "--data-dir", dir, "--socket", daemon.socketPath], st.io), 0);
   } finally {

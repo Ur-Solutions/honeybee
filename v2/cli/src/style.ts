@@ -209,7 +209,11 @@ export type TableColumn = {
   align?: "left" | "right";
 };
 
-export function formatTable(columns: TableColumn[], rows: string[][]): string[] {
+export function formatTable(
+  columns: TableColumn[],
+  rows: string[][],
+  opts: { rule?: boolean } = {},
+): string[] {
   if (rows.length === 0) return [];
   const widths = columns.map((column, index) => {
     const headerLength = visibleLength(column.header);
@@ -231,11 +235,12 @@ export function formatTable(columns: TableColumn[], rows: string[][]): string[] 
     columns.map((c) => c.header),
     (value) => dim(value),
   );
+  const body = rows.map((row) => formatRow(row));
+  if (opts.rule === false) return [header, ...body];
   const rule = formatRow(
     columns.map((c, i) => "─".repeat(widths[i] ?? 0)),
     (value) => dim(value),
   );
-  const body = rows.map((row) => formatRow(row));
   return [header, rule, ...body];
 }
 

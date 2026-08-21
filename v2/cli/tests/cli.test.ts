@@ -254,7 +254,7 @@ test("cli.4c: per-bee args — `spawn --arg` (repeatable), `bee set-args <bee> -
     }, "argsy idle", 10_000);
     const v = capture();
     assert.equal(await runV2Cli(["view", "argsy", "--data-dir", dir], v.io), 0);
-    assert.ok(v.out[0]?.includes('args=["--model","fable"]'), `human view shows args: ${v.out[0]}`);
+    assert.ok(v.out.join("\n").includes('["--model","fable"]'), `human view shows args: ${v.out.join(" | ")}`);
     const a1 = capture();
     assert.equal(await runV2Cli(["bee", "args", "argsy", "--data-dir", dir, "--json"], a1.io), 0);
     assert.deepEqual(JSON.parse(a1.out[0] ?? "{}"), { beeId: spawned.beeId, args: ["--model", "fable"] });

@@ -3,7 +3,7 @@
  *
  * JSON stays a raw dump of the RPC result. These formatters are the operator
  * surface: aligned columns, status color, and the tokens tests/scripts grep
- * (`stale:`, `id=`, `stopped(crashed)`, `args=[...]`, `deduped:`).
+ * (`stale:`, `id=`, `stopped(crashed)`, `deduped:`). Full argv lives on `view`, not `ls`.
  */
 import type { AuditRow } from "../../core/src/index.ts";
 import type { TranscriptTurn } from "../../driver-tmux/src/transcripts.ts";
@@ -37,6 +37,7 @@ import {
   red,
   stalePrefix,
   tildify,
+  truncate,
   yellow,
   type ActionStatus,
 } from "./style.ts";
@@ -91,14 +92,40 @@ function extraTokens(v: ViewResult): string {
   const bits: string[] = [];
   if (v.view.flags.length > 0) bits.push(yellow(`flags=${v.view.flags.join(",")}`));
   if ((bee?.spawnFailures ?? 0) > 0) bits.push(yellow(`bootFailures=${bee?.spawnFailures}`));
-  if (bee?.args && bee.args.length > 0) bits.push(`args=${JSON.stringify(bee.args)}`);
-  if (bee?.parentId) bits.push(`parent=${bee.parentId}`);
-  if (bee?.tags && bee.tags.length > 0) bits.push(`tags=${bee.tags.join(",")}`);
-  if (bee?.handle) bits.push(dim(`id=${bee.id}`));
   return bits.join("  ");
 }
 
-/** One dense, greppable bee row (list / children / watch / wait). */
+/** Compact runtime for `ls`: the full `stopped(cause)` string stays on `view`. */
+export function listRuntimeLabel(v: ViewResult): string {
+  if (v.view.runtimeState === "stopped") {
+    if (v.view.exitCause === "crashed") return "crashed";
+    if (v.view.exitCause === "machine_restart") return "restart";
+    return "stopped";
+  }
+  return v.view.runtimeState ?? "—";
+}
+
+export function modelFromArgs(args: string[] | null | undefined): string {
+  if (!args) return "";
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i] as string;
+    if ((tok === "--model" || tok === "-m") && i + 1 < args.length) return args[i + 1] as string;
+    if (tok.startsWith("--model=")) return tok.slice("--model=".length);
+  }
+  return "";
+}
+
+function agentCell(v: ViewResult): string {
+  const bee = v.bee;
+  const agent = bee?.agent ?? "?";
+  const sub = bee?.substrate ? `/${bee.substrate}` : "";
+  return `${blue(agent)}${dim(sub)}`;
+}
+
+const LIST_NAME_MAX = 28;
+const LIST_MODEL_MAX = 18;
+
+/** One dense, greppable bee row (watch / wait / view headline). No argv dump. */
 export function viewLine(v: ViewResult, stale: boolean): string {
   const bee = v.bee;
   const status = runtimeLabel(v);
@@ -134,7 +161,46 @@ export function renderBeeList(views: ViewResult[], stale: boolean, noun = "bees"
     blocked > 0 ? yellow(`${blocked} blocked`) : null,
   ];
   const summary = `${stalePrefix(stale)}${joinParts(summaryBits)}`;
-  return [summary, ...views.map((v) => viewLine(v, stale))];
+
+  const showModel = views.some((v) => modelFromArgs(v.bee?.args).length > 0);
+  const showFlags = views.some((v) => v.view.flags.length > 0 || (v.bee?.spawnFailures ?? 0) > 0);
+  const mixedLife = new Set(views.map((v) => v.view.lifecycle ?? "deleted")).size > 1;
+
+  const columns: Array<{ header: string; align?: "left" | "right" }> = [
+    { header: "" },
+    { header: "HANDLE" },
+    { header: "NAME" },
+    { header: "AGENT" },
+    { header: "GEN", align: "right" },
+    { header: "RUNTIME" },
+    { header: "" },
+  ];
+  if (showModel) columns.push({ header: "MODEL" });
+  if (mixedLife) columns.push({ header: "LIFE" });
+  if (showFlags) columns.push({ header: "" });
+
+  const rows = views.map((v) => {
+    const bee = v.bee;
+    const runtime = listRuntimeLabel(v);
+    const derived = derivedLabel(v);
+    const row = [
+      statusDot(v),
+      honey(beeLead(v)),
+      bold(truncate(bee?.name ?? "?", LIST_NAME_MAX)),
+      agentCell(v),
+      magenta(String(v.view.generation ?? 0)),
+      colorRuntime(runtime, v),
+      colorDerived(derived, v),
+    ];
+    if (showModel) row.push(dim(truncate(modelFromArgs(bee?.args), LIST_MODEL_MAX)));
+    if (mixedLife) row.push(colorLifecycle(v.view.lifecycle ?? "deleted"));
+    if (showFlags) row.push(extraTokens(v));
+    return row;
+  });
+
+  const table = formatTable(columns, rows, { rule: false });
+  const prefix = stalePrefix(stale);
+  return [summary, ...table.map((line) => `${prefix}${line}`)];
 }
 
 export function renderBeeView(v: ViewResult, stale: boolean): string[] {
@@ -143,9 +209,13 @@ export function renderBeeView(v: ViewResult, stale: boolean): string[] {
   if (!bee) return lines;
   const prefix = stalePrefix(stale);
   const details: Array<[string, string]> = [];
+  if (bee.handle) details.push(["id", bee.id]);
   if (bee.title) details.push(["title", bee.title]);
   details.push(["cwd", tildify(bee.cwd)]);
   if (bee.account) details.push(["account", bee.account]);
+  if (bee.args && bee.args.length > 0) details.push(["args", JSON.stringify(bee.args)]);
+  if (bee.tags.length > 0) details.push(["tags", bee.tags.join(",")]);
+  if (bee.parentId) details.push(["parent", bee.parentId]);
   if (bee.lastOutputAt != null) details.push(["last out", `${formatRelativeTime(bee.lastOutputAt)} ago`]);
   if (bee.providerSessionId) details.push(["session", bee.providerSessionId]);
   if (bee.forkedFrom) details.push(["forked", bee.forkedFrom]);

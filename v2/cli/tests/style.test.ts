@@ -8,7 +8,7 @@ import {
   truncate,
   visibleLength,
 } from "../src/style.ts";
-import { derivedLabel, runtimeLabel, viewLine } from "../src/render.ts";
+import { derivedLabel, listRuntimeLabel, modelFromArgs, renderBeeList, renderBeeView, runtimeLabel, viewLine } from "../src/render.ts";
 import { helpText } from "../src/help.ts";
 import type { ViewResult } from "../../daemon/src/protocol.ts";
 
@@ -63,6 +63,7 @@ test("render.viewLine keeps the greppable tokens operators and tests rely on", (
       spawnFailures: 2,
       tags: ["apiary:workspace=ops"],
       parentId: "parent-1",
+      cwd: "/tmp",
     },
     runtime: null,
   } as unknown as ViewResult;
@@ -79,11 +80,89 @@ test("render.viewLine keeps the greppable tokens operators and tests rely on", (
   assert.ok(line.includes("active"));
   assert.ok(line.includes("flags=spawn_failed"));
   assert.ok(line.includes("bootFailures=2"));
-  assert.ok(line.includes('args=["--model","fable"]'));
-  assert.ok(line.includes("parent=parent-1"));
-  assert.ok(line.includes("tags=apiary:workspace=ops"));
-  assert.ok(line.includes("id=aaaa1111-0000-0000-0000-000000000001"));
+  assert.doesNotMatch(line, /args=/);
   assert.equal(stalePrefix(false), "");
+
+  const view = renderBeeView(v, true).map(stripAnsi);
+  assert.ok(view.some((l) => l.includes('["--model","fable"]')), view.join("\n"));
+  assert.ok(view.some((l) => l.includes("id") && l.includes(v.bee!.id)));
+  assert.ok(view.some((l) => l.includes("tags") && l.includes("apiary:workspace=ops")));
+  assert.ok(view.some((l) => l.includes("parent") && l.includes("parent-1")));
+});
+
+test("render.beeList is an aligned table: no argv dump, model column, compact runtime", () => {
+  const mk = (
+    over: Partial<NonNullable<ViewResult["bee"]>> & {
+      name: string;
+      handle: string;
+      runtimeState: string;
+      exitCause?: string;
+      waiting?: boolean;
+    },
+  ) =>
+    ({
+      view: {
+        beeId: over.handle,
+        exists: true,
+        lifecycle: "active",
+        generation: over.handle === "ST.ab12" ? 2 : 1,
+        runtimeState: over.runtimeState,
+        exitCause: over.exitCause ?? null,
+        working: false,
+        waitingForYou: Boolean(over.waiting),
+        lastOutputAt: null,
+        reachable: true,
+        blocked: false,
+        flags: [],
+      },
+      bee: {
+        id: "aaaa1111-0000-0000-0000-000000000001",
+        handle: over.handle,
+        name: over.name,
+        agent: over.agent ?? "stub",
+        substrate: "hsr",
+        args: over.args ?? null,
+        spawnFailures: 0,
+        tags: over.tags ?? [],
+        parentId: null,
+        cwd: "/tmp",
+      },
+      runtime: null,
+    }) as unknown as ViewResult;
+  const views = [
+    mk({
+      handle: "ST.ab12",
+      name: "prettybee",
+      runtimeState: "stopped",
+      exitCause: "crashed",
+      waiting: true,
+      args: ["--model", "fable", "--effort", "high"],
+    }),
+    mk({ handle: "CO.bb", name: "short", runtimeState: "idle", agent: "codex" }),
+  ];
+  const lines = renderBeeList(views, false).map(stripAnsi);
+  assert.ok(lines[0]?.includes("2 bees"));
+  const header = lines[1] ?? "";
+  assert.match(header, /HANDLE/);
+  assert.match(header, /NAME/);
+  assert.match(header, /AGENT/);
+  assert.match(header, /MODEL/);
+  const crashed = lines.find((l) => l.includes("prettybee")) ?? "";
+  assert.ok(crashed.includes("ST.ab12"));
+  assert.ok(crashed.includes("crashed"));
+  assert.ok(crashed.includes("waiting-for-you"));
+  assert.ok(crashed.includes("fable"));
+  assert.doesNotMatch(crashed, /args=/);
+  assert.doesNotMatch(crashed, /--effort/);
+  assert.doesNotMatch(crashed, /id=/);
+  assert.equal(listRuntimeLabel(views[0] as ViewResult), "crashed");
+  assert.equal(modelFromArgs(["--model", "fable"]), "fable");
+  // NAME and AGENT columns share a gutter: the shorter name still lines up with the header.
+  const nameIdx = header.indexOf("NAME");
+  const agentIdx = header.indexOf("AGENT");
+  assert.ok(nameIdx >= 0 && agentIdx > nameIdx);
+  const short = lines.find((l) => l.includes("short")) ?? "";
+  assert.equal(short.indexOf("codex"), crashed.indexOf("stub"));
 });
 
 test("helpText keeps the grouped v1-style overview tokens", () => {
