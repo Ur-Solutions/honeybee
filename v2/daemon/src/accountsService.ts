@@ -55,6 +55,11 @@ import {
 import type { ResolvedNodeConfig } from "./config.ts";
 import { credentialDigest, readClaudeKeychain, writeClaudeKeychainEntry, type KeychainReader, type KeychainWriter } from "./keychain.ts";
 import { atomicWriteFileSync } from "./homeDefaults.ts";
+import {
+  defaultProviderLimitsHttp,
+  fetchSecondaryProviderLimits,
+  type ProviderLimitsHttp,
+} from "./providerLimits.ts";
 
 // ---------------------------------------------------------------------------
 // injected transports
@@ -84,6 +89,8 @@ export interface AccountsServiceOptions {
   keychainReader?: KeychainReader;
   keychainWriter?: KeychainWriter;
   fetchers?: LimitsFetchers;
+  /** Injectable HTTP boundary for Grok, Kimi, Cursor, and OpenCode limits. */
+  providerHttp?: Partial<ProviderLimitsHttp>;
 }
 
 type ClaudeCredential = {
@@ -265,12 +272,15 @@ export class AccountsService {
   private readonly keychainReader: KeychainReader;
   private readonly keychainWriter: KeychainWriter;
   private readonly fetchers: Required<LimitsFetchers>;
+  private readonly providerHttp: ProviderLimitsHttp;
   private readonly seats = new Map<string, LoginSeat>();
   private pollingSeats = false;
   private lastPeriodicRefreshAt = 0;
   private refreshing: Promise<void> | null = null;
   /** Refresh tokens rotate on use: at most one refresh may run per account. */
   private readonly claudeRefreshes = new Map<string, Promise<ClaudeRefreshOutcome>>();
+  /** Grok/Kimi refresh tokens also rotate; share the whole provider read. */
+  private readonly secondaryProviderFetches = new Map<string, Promise<PutAccountLimitsInput>>();
 
   constructor(opts: AccountsServiceOptions) {
     this.store = opts.store;
@@ -283,6 +293,10 @@ export class AccountsService {
       claudeUsage: opts.fetchers?.claudeUsage ?? defaultClaudeUsage(this.cfg.accounts.limitsFetchTimeoutMs),
       claudeRefresh: opts.fetchers?.claudeRefresh ?? defaultClaudeRefresh(this.cfg.accounts.limitsFetchTimeoutMs),
       codexRateLimits: opts.fetchers?.codexRateLimits ?? defaultCodexRateLimits(this.cfg.accounts.limitsFetchTimeoutMs, this.cfg.agents.codex?.command ?? "codex"),
+    };
+    this.providerHttp = {
+      ...defaultProviderLimitsHttp(this.cfg.accounts.limitsFetchTimeoutMs),
+      ...opts.providerHttp,
     };
   }
 
@@ -521,8 +535,31 @@ export class AccountsService {
         if (!limits) return { readable: false, unreadableReason: "provider_error", error: "codex app-server did not answer account/rateLimits/read" };
         return parseCodexRateLimits(limits);
       }
+      case "grok":
+      case "kimi":
+      case "cursor":
+      case "opencode":
+        return this.fetchSecondaryProvider(account);
       default:
         return { readable: false, unreadableReason: "unsupported", error: `${account.harness} has no limits source` };
+    }
+  }
+
+  private async fetchSecondaryProvider(account: AccountRow): Promise<PutAccountLimitsInput> {
+    const joined = this.secondaryProviderFetches.get(account.id);
+    if (joined) return joined;
+    const pending = fetchSecondaryProviderLimits({
+      account,
+      vaultDir: this.vaultDirOf(account),
+      now: this.now(),
+      allowCredentialRefresh: !this.hasLiveRuntime(account.id),
+      http: this.providerHttp,
+    });
+    this.secondaryProviderFetches.set(account.id, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.secondaryProviderFetches.get(account.id) === pending) this.secondaryProviderFetches.delete(account.id);
     }
   }
 

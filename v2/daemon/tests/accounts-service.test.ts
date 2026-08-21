@@ -317,7 +317,8 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
     assert.equal(x.weeklyPct, 55);
     const g = byId.get(grok.id)!;
     assert.equal(g.readable, false);
-    assert.match(g.error ?? "", /no limits source/);
+    assert.equal(g.unreadableReason, "auth_expired");
+    assert.match(g.error ?? "", /no Grok OAuth credential/);
     assert.equal(r.store.getAccountLimits(claude.id)?.weeklyPct, 40, "table row written");
     // a REAL auth failure sets auth_needed; a later readable probe clears it
     claudeFail = "/api/oauth/usage: HTTP 401 — OAuth access token has been revoked";
@@ -426,6 +427,112 @@ test("limits.1b: expired Claude chains refresh once, persist home + keychain + v
     assert.equal(failed.unreadableReason, "auth_failed");
     assert.match(failed.error ?? "", /refresh failed/);
     assert.equal(r.store.getAccount(rejected.id)?.status, "auth_needed");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("limits.1c: Grok, Kimi, Cursor, MiniMax, and z.ai use their real provider windows; rotating OAuth chains persist", async () => {
+  const r = rig();
+  try {
+    const calls: string[] = [];
+    const svc = service(r, {
+      providerHttp: {
+        postForm: async (url, _headers, form) => {
+          calls.push(`form:${url}`);
+          if (url.includes("auth.x.ai")) {
+            assert.equal(form.client_id, "grok-client");
+            assert.equal(form.refresh_token, "grok-refresh");
+            return { access_token: "grok-new", refresh_token: "grok-refresh-new", expires_in: 3600 };
+          }
+          assert.match(url, /auth\.kimi\.com/);
+          assert.equal(form.refresh_token, "kimi-refresh");
+          return { access_token: "kimi-new", refresh_token: "kimi-refresh-new", expires_in: 900 };
+        },
+        getJson: async (url, headers) => {
+          calls.push(`get:${url}`);
+          if (url.includes("cli-chat-proxy.grok.com")) {
+            assert.equal(headers.Authorization, "Bearer grok-new");
+            return { config: { creditUsagePercent: 27, currentPeriod: { start: "2026-06-08T00:00:00Z", end: "2026-06-15T00:00:00Z" } } };
+          }
+          if (url.includes("api.kimi.com")) {
+            assert.equal(headers.Authorization, "Bearer kimi-new");
+            return {
+              user: { membership: { level: "LEVEL_MAX" } },
+              usage: { limit: "1000", used: "420", resetTime: "2026-06-15T00:00:00Z" },
+              limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", used: "11", resetTime: "2026-06-10T14:00:00Z" } }],
+            };
+          }
+          if (url.includes("minimax.io")) {
+            return { model_remains: [{ current_interval_total_count: 100, current_interval_usage_count: 8, end_time: r.now() + HOUR, current_weekly_total_count: 1000, current_weekly_usage_count: 90, weekly_end_time: r.now() + DAY }] };
+          }
+          assert.match(url, /api\.z\.ai/);
+          return { data: { level: "pro", limits: [{ type: "TOKENS_LIMIT", percentage: 14, nextResetTime: r.now() + 2 * HOUR }] } };
+        },
+        postJson: async (url, headers) => {
+          calls.push(`json:${url}`);
+          assert.match(url, /api2\.cursor\.sh/);
+          assert.equal(headers.Authorization, "Bearer cursor-access");
+          return { billingCycleStart: r.now(), billingCycleEnd: r.now() + 30 * DAY, planUsage: { totalSpend: "125", limit: "1000" } };
+        },
+      },
+    });
+    const grok = addAccount(r, "grok", "g", {
+      vault: { "auth.json": JSON.stringify({ issuer: { key: "grok-old", refresh_token: "grok-refresh", expires_at: new Date(r.now() - 1).toISOString(), oidc_client_id: "grok-client", sibling: true } }) },
+    });
+    const kimi = addAccount(r, "kimi", "k", {
+      vault: { "credentials/kimi-code.json": JSON.stringify({ access_token: "kimi-old", refresh_token: "kimi-refresh", expires_at: Math.floor(r.now() / 1000) - 1, sibling: true }) },
+    });
+    const cursor = addAccount(r, "cursor", "c", { vault: { "auth.json": JSON.stringify({ accessToken: "cursor-access" }) } });
+    const minimax = addAccount(r, "opencode", "minimax", { vault: { "xdg-data/opencode/auth.json": JSON.stringify({ "minimax-coding-plan": { type: "api", key: "mini-key" } }) } });
+    const zai = addAccount(r, "opencode", "glm", { vault: { "xdg-data/opencode/auth.json": JSON.stringify({ "zai-coding-plan": { type: "api", key: "zai-key" } }) } });
+
+    const rows = new Map((await svc.refreshLimits([grok.id, kimi.id, cursor.id, minimax.id, zai.id])).map((row) => [row.account, row]));
+    assert.equal(rows.get(grok.id)?.weeklyPct, 27);
+    assert.equal(rows.get(grok.id)?.weeklyMinutes, 10_080);
+    assert.equal(rows.get(kimi.id)?.plan, "max");
+    assert.equal(rows.get(kimi.id)?.fiveHourPct, 11);
+    assert.equal(rows.get(kimi.id)?.weeklyPct, 42);
+    assert.equal(rows.get(cursor.id)?.weeklyPct, 12.5);
+    assert.equal(rows.get(cursor.id)?.weeklyMinutes, 43_200);
+    assert.equal(rows.get(minimax.id)?.fiveHourPct, 8);
+    assert.equal(rows.get(minimax.id)?.weeklyPct, 9);
+    assert.equal(rows.get(zai.id)?.plan, "pro");
+    assert.equal(rows.get(zai.id)?.fiveHourPct, 14);
+    assert.equal(calls.length, 7);
+
+    for (const path of [join(grok.homePath, "auth.json"), join(r.vault, "grok", grok.id, "auth.json")]) {
+      const entry = (JSON.parse(readFileSync(path, "utf8")) as { issuer: { key: string; refresh_token: string; sibling: boolean } }).issuer;
+      assert.equal(entry.key, "grok-new");
+      assert.equal(entry.refresh_token, "grok-refresh-new");
+      assert.equal(entry.sibling, true);
+    }
+    for (const path of [join(kimi.homePath, "credentials", "kimi-code.json"), join(r.vault, "kimi", kimi.id, "credentials", "kimi-code.json")]) {
+      const credential = JSON.parse(readFileSync(path, "utf8")) as { access_token: string; refresh_token: string; sibling: boolean };
+      assert.equal(credential.access_token, "kimi-new");
+      assert.equal(credential.refresh_token, "kimi-refresh-new");
+      assert.equal(credential.sibling, true);
+    }
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("limits.1d: the daemon never races a live Grok runtime's rotating refresh token", async () => {
+  const r = rig();
+  try {
+    let refreshCalls = 0;
+    const account = addAccount(r, "grok", "live", {
+      vault: { "auth.json": JSON.stringify({ issuer: { key: "old", refresh_token: "refresh", expires_at: new Date(r.now() - 1).toISOString(), oidc_client_id: "client" } }) },
+    });
+    const { bee } = r.store.createBee({ name: "grok-owner", agent: "grok", substrate: "hsr", cwd: "/tmp", account: account.id });
+    r.store.updateRuntimeState(bee.id, 1, "running", { pid: 42, pidStartedAt: 1 });
+    const svc = service(r, { providerHttp: { postForm: async () => { refreshCalls += 1; return {}; } } });
+    const row = (await svc.refreshLimits([account.id]))[0]!;
+    assert.equal(refreshCalls, 0);
+    assert.equal(row.unreadableReason, "auth_expired");
+    assert.match(row.error ?? "", /running Grok owns refresh/);
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
   } finally {
     r.cleanup();
   }
