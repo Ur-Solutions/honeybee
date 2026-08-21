@@ -140,6 +140,19 @@ export function createClaudeProjector(): TranscriptProjector {
       if (type === "assistant") {
         const message = asObject(row.message);
         const content = message?.content;
+        // String-content assistant messages are legitimate API shape.
+        if (typeof content === "string") {
+          const text = nonEmptyString(content);
+          return text
+            ? [{
+                kind: "message",
+                ts: NO_TS,
+                role: "assistant",
+                text,
+                ...(providerEventId ? { providerEventId } : {}),
+              }]
+            : [];
+        }
         if (!Array.isArray(content)) return [];
         const events: TranscriptProjectedEvent[] = [];
         for (const value of content) {
