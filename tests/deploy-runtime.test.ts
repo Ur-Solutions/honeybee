@@ -328,3 +328,37 @@ test("deploy history tolerates a missing or foreign deploys.json", async () => {
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+// 10. ancestry guard (2026-08-21): a deploy that does not contain the running
+// commit is a silent revert of landed work — refuse it; descendants, explicit
+// overrides, and same-sha redeploys stay allowed.
+test("ancestry guard: non-descendant refused, descendant allowed, override honored", async () => {
+  await withDeployWorld(async ({ root, repoRoot, commit, hooks }) => {
+    const base = await commit("base");
+    const a = await commit("A");
+    await deployVersion({ repoRoot, ref: a, root, hooks });
+
+    // A sibling branched BELOW the deployed commit does not contain it.
+    await git(repoRoot, "checkout", "-q", "-B", "regress", base);
+    const b = await commit("B-sibling");
+    await assert.rejects(
+      deployVersion({ repoRoot, ref: b, root, hooks }),
+      /does not contain the currently deployed/,
+    );
+    assert.equal(await currentDeployTarget(root), a, "refused deploy must not move current");
+
+    // The override deploys it anyway (deliberate non-linear replacement).
+    await deployVersion({ repoRoot, ref: b, root, hooks, allowNonDescendant: true });
+    assert.equal(await currentDeployTarget(root), b);
+
+    // A descendant of the running commit deploys without ceremony.
+    await git(repoRoot, "checkout", "-q", "regress");
+    const c = await commit("C-descendant");
+    await deployVersion({ repoRoot, ref: c, root, hooks });
+    assert.equal(await currentDeployTarget(root), c);
+
+    // Redeploying the exact running sha is always allowed (idempotent repair).
+    await deployVersion({ repoRoot, ref: c, root, hooks });
+    assert.equal(await currentDeployTarget(root), c);
+  });
+});

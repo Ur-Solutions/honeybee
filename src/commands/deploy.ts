@@ -28,6 +28,7 @@ const execFileAsync = promisify(execFile);
 
 const USAGE = [
   "Usage: hive deploy [<sha>] [--keep <n>]   build+verify <sha> (default HEAD) in a temp checkout, install to ~/.hive/runtime/<sha>, retarget current, restart daemon",
+  "       refuses a <sha> that does not contain the deployed commit (silent-revert guard); --allow-non-descendant overrides",
   "       hive deploy --rollback             retarget current to the previous deploy and restart the daemon",
   "       hive deploy --list [--json]        show the deploy history",
   "       hive deploy --init                 print the manual steps that make the global `hive` resolve through ~/.hive/runtime/current",
@@ -167,6 +168,7 @@ async function deployRun(parsed: Parsed): Promise<void> {
     ...(ref !== undefined ? { ref } : {}),
     keep,
     log,
+    ...(parsed.flags.has("allow-non-descendant") ? { allowNonDescendant: true } : {}),
     hooks: { buildArtifact: buildDeployArtifact, restartDaemon: restartDeployedDaemon },
   });
   if (isPretty()) {

@@ -87,6 +87,14 @@ export type DeployOptions = {
   by?: string;
   now?: () => Date;
   log?: (line: string) => void;
+  /**
+   * Skip the ancestry guard. Deploys REFUSE when the target commit is not a
+   * descendant of the currently deployed one — 2026-08-21: a deploy cut from
+   * a stale checkout silently rolled back a landed fix for an hour. Explicit
+   * downgrades go through `hive deploy --rollback`, or this flag when a
+   * non-linear replacement is genuinely intended.
+   */
+  allowNonDescendant?: boolean;
 };
 
 export type DeployOutcome = {
@@ -104,6 +112,14 @@ export type RollbackOptions = {
   by?: string;
   now?: () => Date;
   log?: (line: string) => void;
+  /**
+   * Skip the ancestry guard. Deploys REFUSE when the target commit is not a
+   * descendant of the currently deployed one — 2026-08-21: a deploy cut from
+   * a stale checkout silently rolled back a landed fix for an hour. Explicit
+   * downgrades go through `hive deploy --rollback`, or this flag when a
+   * non-linear replacement is genuinely intended.
+   */
+  allowNonDescendant?: boolean;
 };
 
 export type RollbackOutcome = {
@@ -244,6 +260,35 @@ function deployedBy(): string {
  * renames happens in temp space; a failure at any point leaves `current`,
  * the history, and every installed version exactly as they were.
  */
+/**
+ * The ancestry guard: refuse to deploy a commit that does not contain the
+ * currently running one. Two crews deploying from different checkouts is the
+ * live failure mode — the second deploy silently reverts the first crew's
+ * landed work (observed 2026-08-21: the watcher-flush fix rolled back for an
+ * hour by a stale-checkout deploy). A current sha the checkout does not even
+ * know is the same failure with worse visibility, so it refuses too.
+ */
+async function verifyDescendantOfCurrent(
+  repoRoot: string,
+  root: string,
+  sha: string,
+  allowNonDescendant: boolean,
+): Promise<void> {
+  if (allowNonDescendant) return;
+  const currentSha = await currentDeployTarget(root);
+  if (currentSha === null || currentSha === sha) return;
+  try {
+    await execFileAsync("git", ["-C", repoRoot, "merge-base", "--is-ancestor", currentSha, sha]);
+  } catch {
+    throw new Error(
+      `deploy: ${sha.slice(0, 12)} does not contain the currently deployed ${currentSha.slice(0, 12)} — ` +
+        `deploying it would silently revert landed work. Fetch/rebase this checkout onto the deployed ` +
+        `commit first; use \`hive deploy --rollback\` for an intentional downgrade, or ` +
+        `--allow-non-descendant to override deliberately.`,
+    );
+  }
+}
+
 export async function deployVersion(options: DeployOptions): Promise<DeployOutcome> {
   const root = options.root ?? runtimeRoot();
   const keep = Math.max(1, Math.floor(options.keep ?? DEFAULT_KEEP_VERSIONS));
@@ -253,6 +298,7 @@ export async function deployVersion(options: DeployOptions): Promise<DeployOutco
 
   await verifyCleanWorkingTree(options.repoRoot);
   const sha = await resolveCommit(options.repoRoot, options.ref ?? "HEAD");
+  await verifyDescendantOfCurrent(options.repoRoot, root, sha, options.allowNonDescendant === true);
   log(`deploy: building ${sha.slice(0, 12)} in a clean temp checkout`);
 
   const workDir = await mkdtemp(join(tmpdir(), "hive-deploy-"));
