@@ -105,8 +105,10 @@ export function createClaudeProjector(): TranscriptProjector {
           for (const value of content) {
             const block = asObject(value);
             if (block?.type !== "tool_result") continue;
-            const callId = nonEmptyString(block.tool_use_id);
-            if (!callId) continue;
+            // Real claude blocks always carry ids; a missing one (synthetic
+            // or truncated logs) must not vanish — same fallback discipline
+            // as the codex projector's itemCallId.
+            const callId = nonEmptyString(block.tool_use_id) ?? "claude:tool_result:unknown";
             const output = textFromContent(block.content);
             events.push({
               kind: "tool_result",
@@ -172,16 +174,13 @@ export function createClaudeProjector(): TranscriptProjector {
               events.push({ kind: "thinking", ts: NO_TS, redacted: true });
               break;
             case "tool_use": {
-              const callId = nonEmptyString(block.id);
-              if (callId) {
-                events.push({
-                  kind: "tool_call",
-                  ts: NO_TS,
-                  callId,
-                  name: nonEmptyString(block.name) ?? "tool",
-                  ...(block.input !== undefined ? { input: block.input } : {}),
-                });
-              }
+              events.push({
+                kind: "tool_call",
+                ts: NO_TS,
+                callId: nonEmptyString(block.id) ?? "claude:tool_use:unknown",
+                name: nonEmptyString(block.name) ?? "tool",
+                ...(block.input !== undefined ? { input: block.input } : {}),
+              });
               break;
             }
             default:
