@@ -208,6 +208,8 @@ export interface SpawnResult extends DedupMarkers {
   /** v10 — the minted display handle (`CL.a3f2`); what humans use from here on. */
   handle?: string | null;
   commandId: number;
+  /** First mailbox message admitted atomically with the bee, when supplied. */
+  messageId?: number | null;
   /**
    * v7: the account the bee was bound to (null = unbound: no accounts for the
    * harness, or `account: null` requested) and, for an `auto` pick, the

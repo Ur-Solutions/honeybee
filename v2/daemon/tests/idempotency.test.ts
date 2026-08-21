@@ -80,6 +80,40 @@ test("idem-rpc.1: spawn replay returns the original bee/command — one bee, mar
   }
 });
 
+test("idem-rpc.1b: spawn atomically admits its first message and replays one receipt", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+    const first = await client.request<SpawnResult>("spawn", {
+      name: "briefed-worker",
+      agent: "stub",
+      cwd: "/tmp",
+      prompt: "hello exactly once",
+      idempotencyKey: "spawn-with-message-1",
+    });
+    assert.equal(typeof first.messageId, "number");
+    const replay = await client.request<SpawnResult>("spawn", {
+      name: "briefed-worker",
+      agent: "stub",
+      cwd: "/tmp",
+      prompt: "hello exactly once",
+      idempotencyKey: "spawn-with-message-1",
+    });
+    assert.equal(replay.deduped, true);
+    assert.equal(replay.beeId, first.beeId);
+    assert.equal(replay.commandId, first.commandId);
+    assert.equal(replay.messageId, first.messageId);
+    const { messages } = await client.request<MailboxResult>("mailbox", { beeId: first.beeId });
+    assert.equal(messages.filter((message) => message.body === "hello exactly once").length, 1);
+    client.close();
+  } finally {
+    await daemon?.stop();
+    cleanup();
+  }
+});
+
 test("idem-rpc.2: send replay returns the original message — mailbox has exactly one row", async () => {
   const { dir, cleanup } = makeDaemonDir();
   let daemon: DaemonHandle | null = null;

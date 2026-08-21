@@ -487,7 +487,11 @@ const SPAWN_USAGE =
   "       (agent may be positional — v1 ergonomics — or --agent; default claude)";
 
 /** The spawn RPC path (name = positional[1]) — shared by spawn and the x/run/xa sugar. */
-async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & { agent: string; substrate: string }> {
+async function spawnBee(
+  ctx: CliContext,
+  parsed: Parsed,
+  initialPrompt?: string,
+): Promise<SpawnResult & { agent: string; substrate: string }> {
   const name = parsed.positional[1];
   if (!name) throw new Error(SPAWN_USAGE);
   // Agent positionally (v1 took the harness as an argument: `hive spawn
@@ -555,6 +559,7 @@ async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & 
       ...(Object.keys(env).length > 0 ? { env } : {}),
       ...(parentId ? { parentId } : {}),
       ...(account !== undefined ? { account } : {}),
+      ...(initialPrompt !== undefined ? { prompt: initialPrompt } : {}),
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
   });
@@ -2246,20 +2251,18 @@ async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
   if (!name || prompt.length === 0) {
     throw new Error("usage: hive x <name> <prompt…> [--agent a] [--account id|auto|none] [--cwd d] [--tag t]... [--arg a]...");
   }
-  const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] });
-  const sent = await withClient(ctx, (c) =>
-    c.request<SendRpcResult>("send", { beeId: spawned.beeId, body: prompt, sender: "operator" }),
-  );
+  const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] }, prompt);
+  if (spawned.messageId == null) throw new Error("spawn returned no first-message receipt");
   emit(
     ctx,
     [
       confirm(
         "ok",
         "spawned",
-        `${spawned.handle ?? spawned.beeId} (${spawned.handle ? `${spawned.beeId}; ` : ""}command ${spawned.commandId}); sent message ${sent.messageId} (${prompt.length} chars) — inspect with: hive tail ${name} | wait ${name}`,
+        `${spawned.handle ?? spawned.beeId} (${spawned.handle ? `${spawned.beeId}; ` : ""}command ${spawned.commandId}); sent message ${spawned.messageId} (${prompt.length} chars) — inspect with: hive tail ${name} | wait ${name}`,
       ),
     ],
-    { ...spawned, messageId: sent.messageId },
+    spawned,
     false,
   );
   return 0;
@@ -2424,18 +2427,18 @@ async function cmdRun(ctx: CliContext, parsed: Parsed): Promise<number> {
   }
   const timeoutMs = numFlag(parsed, "--timeout", 600_000);
   const keep = parsed.flags.get("--keep") === true;
-  const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] });
+  const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] }, prompt);
+  if (spawned.messageId == null) throw new Error("spawn returned no first-message receipt");
   return withClient(ctx, async (c) => {
-    const sent = await c.request<SendRpcResult>("send", { beeId: spawned.beeId, body: prompt, sender: "operator" });
     // Delivery mark first (the mailbox row is the truth), then turn completion.
     const deadline = Date.now() + timeoutMs;
     let deliveredAt: number | null = null;
     while (deliveredAt == null) {
       const { messages } = await c.request<MailboxResult>("mailbox", { beeId: spawned.beeId });
-      deliveredAt = messages.find((m) => m.id === sent.messageId)?.deliveredAt ?? null;
+      deliveredAt = messages.find((m) => m.id === spawned.messageId)?.deliveredAt ?? null;
       if (deliveredAt == null) {
         if (Date.now() > deadline) {
-          ctx.io.err(`${red(bold("timeout:"))} message ${sent.messageId} not delivered within ${timeoutMs}ms — kept ${spawned.beeId} (it remains queued durably)`);
+          ctx.io.err(`${red(bold("timeout:"))} message ${spawned.messageId} not delivered within ${timeoutMs}ms — kept ${spawned.beeId} (it remains queued durably)`);
           return 1;
         }
         await sleep(100);
@@ -2460,7 +2463,7 @@ async function cmdRun(ctx: CliContext, parsed: Parsed): Promise<number> {
       archiveCommandId = r.commandId;
     }
     if (ctx.json) {
-      emit(ctx, [], { beeId: spawned.beeId, messageId: sent.messageId, reply, archived: !keep, archiveCommandId, blocked: view.view.blocked }, false);
+      emit(ctx, [], { beeId: spawned.beeId, messageId: spawned.messageId, reply, archived: !keep, archiveCommandId, blocked: view.view.blocked }, false);
     } else {
       ctx.io.out(reply ?? dim("(no assistant text in the session log)"));
       ctx.io.err(

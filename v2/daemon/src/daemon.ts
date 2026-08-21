@@ -987,7 +987,22 @@ export class HiveDaemon {
     // withIdempotency answers first.
     if (key != null) {
       const original = store.getCommandByIdempotencyKey(key);
-      if (original) return { beeId: original.beeId, handle: this.mustStore().getBee(original.beeId)?.handle ?? null, commandId: original.id, status: original.status, deduped: true };
+      if (original) {
+        const prompt = typeof params.prompt === "string" && params.prompt.length > 0 ? params.prompt : null;
+        const messageId = prompt == null
+          ? null
+          : store.listMessages(original.beeId).find((message) =>
+              message.sender === "operator" && message.body === prompt
+            )?.id ?? null;
+        return {
+          beeId: original.beeId,
+          handle: store.getBee(original.beeId)?.handle ?? null,
+          commandId: original.id,
+          messageId,
+          status: original.status,
+          deduped: true,
+        };
+      }
     }
     const name = this.param(params, "name");
     const agent = this.param(params, "agent");
@@ -1034,8 +1049,21 @@ export class HiveDaemon {
       this.log(`cell.reserve bee=${id} origin=${cell.reserve.originRepo} sha=${cell.reserve.sha} space=${cell.spaceDir}`);
     }
     const cmd = store.enqueueCommand("spawn", id, {}, key == null ? {} : { idempotencyKey: key });
+    const prompt = params.prompt === undefined || params.prompt === null
+      ? null
+      : this.param(params, "prompt");
+    const sent = prompt == null || prompt.length === 0
+      ? null
+      : store.send(id, prompt, { sender: "operator" });
     if (account) this.log(`spawn.account bee=${id} account=${account.id}${accountReason ? ` reason=${JSON.stringify(accountReason)}` : ""}`);
-    return { beeId: id, handle: created.handle, commandId: cmd.id, account: account?.id ?? null, ...(accountReason && accountReason !== "explicit" ? { accountReason } : {}) };
+    return {
+      beeId: id,
+      handle: created.handle,
+      commandId: cmd.id,
+      messageId: sent?.message.id ?? null,
+      account: account?.id ?? null,
+      ...(accountReason && accountReason !== "explicit" ? { accountReason } : {}),
+    };
   }
 
   private substrateParam(params: Record<string, unknown>): SpawnSubstrate {
