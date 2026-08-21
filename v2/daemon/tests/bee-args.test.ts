@@ -71,6 +71,23 @@ test("args.daemon.2b: composeSpawn grok — --model/--effort lifted in front of 
   assert.equal(resume.adapter?.harness, "grok");
 });
 
+test("args.daemon.2c: composeSpawn injects live gateways into Grok session setup", () => {
+  const mcpServers = [{
+    name: "apiary",
+    command: "/opt/apiary-mcp",
+    args: ["--stdio"],
+    env: [{ name: "APIARY_GATEWAY", value: "/tmp/apiary.json" }],
+  }];
+  const adapter = composeSpawn(BUILTIN_AGENTS.grok!, "grok", bee(), mcpServers).adapter;
+  assert.ok(adapter);
+  const setupSignal = adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: {} }));
+  assert.equal(setupSignal.length, 1);
+  assert.equal(setupSignal[0]?.kind, "respond");
+  if (setupSignal[0]?.kind !== "respond") return;
+  const setup = JSON.parse(setupSignal[0].lines[0]!) as { params: { mcpServers: unknown[] } };
+  assert.deepEqual(setup.params.mcpServers, mcpServers);
+});
+
 test("args.daemon.3: composeSpawn stub/unknown — verbatim concatenation, no de-dup, no resume; unknown adapter → null", () => {
   const spec = { command: "node", args: ["agent.mjs", "--x"], defaultArgs: ["--x"] };
   const r = composeSpawn(spec, "stub", bee({ args: ["--x", "--y"], providerSessionId: "ignored" }));

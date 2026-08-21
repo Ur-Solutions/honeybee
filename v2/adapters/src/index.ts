@@ -5,7 +5,7 @@
 export * from "./types.ts";
 export { claudeAdapter, claudeResumeArgs, claudeForkArgs, encodeClaudeInterrupt, parseClaudeLine, encodeClaudeMessage } from "./claude.ts";
 export { codexAdapter, codexRateLimitSignals, codexThreadRequest, type CodexAdapterOptions } from "./codex.ts";
-export { grokAdapter, grokAllowPermissionResult, type GrokAdapterOptions } from "./grok.ts";
+export { grokAdapter, grokAllowPermissionResult, type GrokAdapterOptions, type GrokMcpServerStdio } from "./grok.ts";
 export { stubAdapter, parseStubLine } from "./stub.ts";
 export {
   composeArgv,

@@ -137,6 +137,33 @@ test("grok projector: session/prompt emits turn_start before the user message", 
   ]);
 });
 
+test("grok projector: session/prompt suppresses Grok's echoed user chunks once", () => {
+  const prompt = "Apiary preamble\n\nPlease inspect the workspace.";
+  const events = project([
+    j({ method: "session/prompt", params: { prompt: [{ type: "text", text: prompt }] } }),
+    j({ method: "session/update", params: { update: { sessionUpdate: "user_message_chunk", content: { text: "Apiary preamble\n\n" } } } }),
+    j({ method: "session/update", params: { update: { sessionUpdate: "user_message_chunk", content: { text: "Please inspect the workspace." } } } }),
+    j({ method: "session/update", params: { update: { sessionUpdate: "user_message", content: { text: prompt } } } }),
+  ]);
+
+  assert.deepEqual(events.filter((event) => event.kind === "message"), [
+    { kind: "message", ts: null, role: "user", text: prompt },
+    { kind: "message", ts: null, role: "user", text: prompt },
+  ]);
+});
+
+test("grok projector: a mismatched user chunk is not mistaken for a prompt mirror", () => {
+  const events = project([
+    j({ method: "session/prompt", params: { prompt: [{ type: "text", text: "first" }] } }),
+    j({ method: "session/update", params: { update: { sessionUpdate: "user_message_chunk", content: { text: "second" } } } }),
+  ]);
+
+  assert.deepEqual(events.filter((event) => event.kind === "message"), [
+    { kind: "message", ts: null, role: "user", text: "first" },
+    { kind: "message", ts: null, role: "user", text: "second" },
+  ]);
+});
+
 test("grok projector: session/update turn_completed ends the turn after flushing", () => {
   const projector = createGrokProjector();
   projector.pushLine(j({

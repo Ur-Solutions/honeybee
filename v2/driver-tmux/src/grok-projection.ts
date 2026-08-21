@@ -215,6 +215,7 @@ function finiteNumberField(value: JsonObject, ...keys: string[]): number | undef
  */
 export function createGrokProjector(): TranscriptProjector {
   let openChunk: OpenChunk | undefined;
+  let pendingPromptMirror: string | undefined;
   const tools = new Map<string, ToolState>();
   const seenCompactions = new Set<string>();
 
@@ -241,6 +242,22 @@ export function createGrokProjector(): TranscriptProjector {
     const events = flushOpenChunk();
     openChunk = { kind: "message", role, text, ts };
     return events;
+  }
+
+  function withoutPromptMirror(text: string): string | undefined {
+    if (pendingPromptMirror === undefined) return text;
+    if (pendingPromptMirror.startsWith(text)) {
+      pendingPromptMirror = pendingPromptMirror.slice(text.length);
+      if (pendingPromptMirror.length === 0) pendingPromptMirror = undefined;
+      return undefined;
+    }
+    if (text.startsWith(pendingPromptMirror)) {
+      const remainder = text.slice(pendingPromptMirror.length);
+      pendingPromptMirror = undefined;
+      return remainder.length > 0 ? remainder : undefined;
+    }
+    pendingPromptMirror = undefined;
+    return text;
   }
 
   function appendThinkingChunk(
@@ -333,33 +350,41 @@ export function createGrokProjector(): TranscriptProjector {
     }
 
     if (kind === "agent_message_chunk") {
+      pendingPromptMirror = undefined;
       return text !== undefined ? appendMessageChunk("assistant", text, ts) : [];
     }
     if (kind === "user_message_chunk") {
-      return text !== undefined ? appendMessageChunk("user", text, ts) : [];
+      const projectedText = text !== undefined ? withoutPromptMirror(text) : undefined;
+      return projectedText !== undefined ? appendMessageChunk("user", projectedText, ts) : [];
     }
     if (kind === "agent_thought_chunk") {
+      pendingPromptMirror = undefined;
       const redacted = isRedactedThinking(update);
       return redacted || text !== undefined ? appendThinkingChunk(text, redacted, ts) : [];
     }
 
     if (kind && TURN_END_UPDATE_KINDS.has(kind)) {
+      pendingPromptMirror = undefined;
       const events = flushOpenChunk();
       events.push({ kind: "turn_end", ts });
       return events;
     }
 
     if ((kind === "agent_message" || kind === "user_message") && text != null && text.trim().length > 0) {
+      const projectedText = kind === "user_message" ? withoutPromptMirror(text) : text;
+      if (kind === "agent_message") pendingPromptMirror = undefined;
+      if (projectedText === undefined) return [];
       const events = flushOpenChunk();
       events.push({
         kind: "message",
         ts,
         role: kind === "agent_message" ? "assistant" : "user",
-        text,
+        text: projectedText,
       });
       return events;
     }
     if (kind === "agent_thought") {
+      pendingPromptMirror = undefined;
       const events = flushOpenChunk();
       const redacted = isRedactedThinking(update);
       if (redacted) events.push({ kind: "thinking", ts, redacted: true });
@@ -369,6 +394,7 @@ export function createGrokProjector(): TranscriptProjector {
       return events;
     }
     if (kind === "tool_call" || kind === "tool_call_update") {
+      pendingPromptMirror = undefined;
       const events = flushOpenChunk();
       events.push(...projectTool(update, ts));
       return events;
@@ -415,11 +441,13 @@ export function createGrokProjector(): TranscriptProjector {
         events.push({ kind: "turn_start", ts });
         const text = promptText(params);
         if (text !== undefined) {
+          pendingPromptMirror = text;
           events.push({ kind: "message", ts, role: "user", text });
         }
         return events;
       }
       if (TURN_END_METHODS.has(method)) {
+        pendingPromptMirror = undefined;
         const events = flushOpenChunk();
         events.push({ kind: "turn_end", ts: isoTimestamp(asObject(row.params), row) });
         return events;

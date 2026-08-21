@@ -11,7 +11,7 @@
  *   server   : initialize result {authMethods, agentCapabilities} → respond:
  *                authenticate {methodId: cached_token | xai.api_key}
  *   server   : authenticate result → respond:
- *                session/new {cwd, mcpServers:[]}  (or session/load {sessionId})
+ *                session/new {cwd, mcpServers}  (or session/load {sessionId})
  *   server   : session/new|load result {sessionId} → booted (idle)
  *   we write : session/prompt {sessionId, prompt:[{type:"text",text}]}
  *   server   : session/prompt result → turn_ended
@@ -47,12 +47,22 @@ const METHOD_NOT_FOUND = -32601;
 
 export interface GrokAdapterOptions {
   cwd: string;
+  /** Live operator gateways supplied by the daemon through ACP session setup. */
+  mcpServers?: readonly GrokMcpServerStdio[];
   /**
    * Harness-native resume (spec 07 §F): when set, the handshake sends
    * `session/load {sessionId}` instead of `session/new`. Grok has no argv
    * resume on `agent stdio` — the ACP method is the resume path.
    */
   resumeSessionId?: string;
+}
+
+/** ACP v1 stdio MCP server shape (all ACP agents must support this transport). */
+export interface GrokMcpServerStdio {
+  name: string;
+  command: string;
+  args: string[];
+  env: Array<{ name: string; value: string }>;
 }
 
 function errorSignals(message: string): AdapterSignal[] {
@@ -142,7 +152,11 @@ export function grokAdapter(opts: GrokAdapterOptions): HarnessAdapter {
     method: setupMethod,
     params: {
       cwd: opts.cwd,
-      mcpServers: [],
+      mcpServers: opts.mcpServers?.map((server) => ({
+        ...server,
+        args: [...server.args],
+        env: server.env.map((entry) => ({ ...entry })),
+      })) ?? [],
       ...(opts.resumeSessionId ? { sessionId: opts.resumeSessionId } : {}),
     },
   });

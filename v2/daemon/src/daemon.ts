@@ -80,7 +80,9 @@ import {
   stubAdapter,
   type ArgGrammar,
   type HarnessAdapter,
+  type GrokMcpServerStdio,
 } from "../../adapters/src/index.ts";
+import { liveGateways } from "./gateways.ts";
 import { DaemonCore, type BootReport, type I1ViolationEvent } from "./loops.ts";
 import {
   ConfigError,
@@ -178,7 +180,14 @@ const ADAPTER_NAMES = ["claude", "codex", "grok", "stub"] as const;
  * fork's first runtime, no session of its own yet) selects the fork path
  * instead: codex `thread/fork {threadId: seed}`; claude via `forkArgs`.
  */
-function adapterFor(name: string, cwd: string, providerSessionId: string | null, model?: string, forkSeed?: string | null): HarnessAdapter | null {
+function adapterFor(
+  name: string,
+  cwd: string,
+  providerSessionId: string | null,
+  model?: string,
+  forkSeed?: string | null,
+  grokMcpServers: readonly GrokMcpServerStdio[] = [],
+): HarnessAdapter | null {
   switch (name) {
     case "claude":
       return claudeAdapter;
@@ -191,6 +200,7 @@ function adapterFor(name: string, cwd: string, providerSessionId: string | null,
     case "grok":
       return grokAdapter({
         cwd,
+        mcpServers: grokMcpServers,
         ...(providerSessionId ? { resumeSessionId: providerSessionId } : {}),
       });
     case "stub":
@@ -228,6 +238,7 @@ export function composeSpawn(
   spec: AgentSpecConfig,
   adapterName: string,
   bee: { cwd: string; args: string[] | null; providerSessionId: string | null; forkSeed?: string | null },
+  grokMcpServers: readonly GrokMcpServerStdio[] = [],
 ): { adapter: HarnessAdapter | null; args: string[]; model: string | undefined } {
   const grammar = grammarFor(adapterName);
   // v6 fork: a fork with no session of its own yet forks the SOURCE's
@@ -235,7 +246,7 @@ export function composeSpawn(
   // one; once its own id is recorded the seed is consumed and plain resume
   // takes over. A recorded session always wins over a stale seed.
   const forkSeed = bee.providerSessionId ? null : (bee.forkSeed ?? null);
-  const base = adapterFor(adapterName, bee.cwd, bee.providerSessionId, undefined, forkSeed);
+  const base = adapterFor(adapterName, bee.cwd, bee.providerSessionId, undefined, forkSeed, grokMcpServers);
   const resume = bee.providerSessionId && base?.resumeArgs
     ? base.resumeArgs(bee.providerSessionId)
     : forkSeed && base?.forkArgs
@@ -244,11 +255,11 @@ export function composeSpawn(
   const composed = composeArgv(grammar, [spec.args, spec.defaultArgs, bee.args, resume]);
   if (adapterName === "codex") {
     const plan = codexSpawnPlan(composed);
-    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, plan.model, forkSeed), args: plan.argv, model: plan.model };
+    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, plan.model, forkSeed, grokMcpServers), args: plan.argv, model: plan.model };
   }
   if (adapterName === "grok") {
     const plan = grokSpawnPlan(composed);
-    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, undefined, forkSeed), args: plan.argv, model: plan.model };
+    return { adapter: adapterFor(adapterName, bee.cwd, bee.providerSessionId, undefined, forkSeed, grokMcpServers), args: plan.argv, model: plan.model };
   }
   return { adapter: base, args: composed, model: undefined };
 }
@@ -498,7 +509,16 @@ export class HiveDaemon {
     if (!bee) throw new Error(`resolve: bee ${beeId} not found`);
     const spec = this.cfg.agents[bee.agent];
     if (!spec) throw new Error(`resolve: no agent spec for '${bee.agent}'`);
-    const { adapter, args } = composeSpawn(spec, spec.adapter ?? bee.agent, bee);
+    const adapterName = spec.adapter ?? bee.agent;
+    const grokMcpServers: GrokMcpServerStdio[] = adapterName === "grok"
+      ? liveGateways(this.cfg.dataDir).map((gateway) => ({
+        name: gateway.name,
+        command: gateway.shim.command,
+        args: [...gateway.shim.args],
+        env: Object.entries(gateway.env).map(([name, value]) => ({ name, value })),
+      }))
+      : [];
+    const { adapter, args } = composeSpawn(spec, adapterName, bee, grokMcpServers);
     if (!adapter) throw new Error(`resolve: no adapter for agent '${bee.agent}'`);
     // v7 (spec 08): a bound bee runs in its account's home. The env is derived
     // from the account row (the mechanism), and an EMPTY home is activated

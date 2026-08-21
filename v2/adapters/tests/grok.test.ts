@@ -86,6 +86,29 @@ test("grok: authenticate response → session/new with cwd", () => {
   assert.deepEqual(setup.params, { cwd: "/tmp/work", mcpServers: [] });
 });
 
+test("grok: session setup passes daemon-supplied MCP servers through ACP", () => {
+  const withMcp = grokAdapter({
+    cwd: "/tmp/work",
+    mcpServers: [{
+      name: "apiary",
+      command: "/Applications/Apiary.app/Contents/Resources/apiary-mcp",
+      args: [],
+      env: [{ name: "APIARY_GATEWAY", value: "/tmp/apiary.json" }],
+    }],
+  });
+  const lines = onlyRespond(withMcp.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 2, result: {} })));
+  const setup = JSON.parse(lines[0]!) as { params: Record<string, unknown> };
+  assert.deepEqual(setup.params, {
+    cwd: "/tmp/work",
+    mcpServers: [{
+      name: "apiary",
+      command: "/Applications/Apiary.app/Contents/Resources/apiary-mcp",
+      args: [],
+      env: [{ name: "APIARY_GATEWAY", value: "/tmp/apiary.json" }],
+    }],
+  });
+});
+
 test("grok: session/new response → booted(sessionId) + spawn_failed clear + turn_ended", () => {
   assert.deepEqual(
     adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 3, result: { sessionId: "sess-abc" } })),
