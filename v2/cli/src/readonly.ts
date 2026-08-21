@@ -82,6 +82,16 @@ function numOrNull(v: unknown): number | null {
   return v == null ? null : Number(v);
 }
 
+function displayWindowsOrEmpty(value: unknown): AccountLimitsRow["displayWindows"] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed as AccountLimitsRow["displayWindows"] : [];
+  } catch {
+    return [];
+  }
+}
+
 function mapAccountLimitsRow(r: Row): AccountLimitsRow {
   return {
     account: r.account as string,
@@ -99,6 +109,7 @@ function mapAccountLimitsRow(r: Row): AccountLimitsRow {
     fableWeeklyPct: numOrNull(r.fable_weekly_pct),
     fableResetsAt: numOrNull(r.fable_resets_at),
     fableMinutes: numOrNull(r.fable_minutes),
+    displayWindows: displayWindowsOrEmpty(r.display_windows),
   };
 }
 

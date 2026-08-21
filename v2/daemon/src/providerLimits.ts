@@ -331,19 +331,52 @@ async function cursorLimits(options: ProviderLimitsOptions): Promise<PutAccountL
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
     { Authorization: `Bearer ${token}` },
     {},
-  ) as { billingCycleStart?: unknown; billingCycleEnd?: unknown; planUsage?: { totalSpend?: unknown; limit?: unknown } | null };
+  ) as {
+    billingCycleStart?: unknown;
+    billingCycleEnd?: unknown;
+    planUsage?: {
+      totalSpend?: unknown;
+      limit?: unknown;
+      apiPercentUsed?: unknown;
+      totalPercentUsed?: unknown;
+    } | null;
+  };
   const spend = numberField(body.planUsage?.totalSpend);
   const limit = numberField(body.planUsage?.limit);
-  if (spend === undefined || limit === undefined || limit <= 0) return unreadable("provider_error", "Cursor dashboard returned no plan usage");
+  const fallbackPercent = spend !== undefined && limit !== undefined && limit > 0
+    ? (spend / limit) * 100
+    : undefined;
+  // Cursor's current plan has two independently exhausted pools. These
+  // provider-authored percentages also drive Cursor's own display messages;
+  // raw totalSpend/limit are not one coherent denominator when bonus capacity
+  // is present, so use them only for older endpoint shapes.
+  const cursorModels = numberField(body.planUsage?.totalPercentUsed);
+  const otherModels = numberField(body.planUsage?.apiPercentUsed);
+  const percents = [cursorModels, otherModels].filter((value): value is number => value !== undefined);
+  const routingPercent = percents.length > 0 ? Math.max(...percents) : fallbackPercent;
+  if (routingPercent === undefined) return unreadable("provider_error", "Cursor dashboard returned no plan usage");
   const start = numberField(body.billingCycleStart);
   const end = numberField(body.billingCycleEnd);
+  const resetsAt = end !== undefined && end > 0 ? end : undefined;
+  const windowMinutes = start !== undefined && end !== undefined && end > start
+    ? Math.round((end - start) / 60_000)
+    : undefined;
+  const displayWindows = [
+    ...(cursorModels !== undefined ? [{
+      key: "cursor-models",
+      label: "cursor models",
+      ...percentWindow(cursorModels, resetsAt, windowMinutes),
+    }] : []),
+    ...(otherModels !== undefined ? [{
+      key: "other-models",
+      label: "other models",
+      ...percentWindow(otherModels, resetsAt, windowMinutes),
+    }] : []),
+  ];
   return {
     readable: true,
-    weekly: percentWindow(
-      (spend / limit) * 100,
-      end !== undefined && end > 0 ? end : undefined,
-      start !== undefined && end !== undefined && end > start ? Math.round((end - start) / 60_000) : undefined,
-    ),
+    weekly: percentWindow(routingPercent, resetsAt, windowMinutes),
+    ...(displayWindows.length > 0 ? { displayWindows } : {}),
   };
 }
 

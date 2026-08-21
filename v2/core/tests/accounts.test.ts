@@ -158,14 +158,21 @@ test("v7.limits+cursor: putAccountLimits replaces the one row per account (casca
       fiveHour: { usedPercent: 3, resetsAt: 100, windowMinutes: 300 },
       weekly: { usedPercent: 40.5, resetsAt: 200, windowMinutes: 10_080 },
       fableWeekly: { usedPercent: 16, resetsAt: 200, windowMinutes: 10_080 },
+      displayWindows: [
+        { key: "cursor-models", label: "cursor models", usedPercent: 9, resetsAt: 300, windowMinutes: 43_200 },
+      ],
       fetchedAt: 50,
     });
     assert.equal(l1.fetchedAt, 50);
     assert.equal(l1.weeklyPct, 40.5);
     assert.equal(l1.fableWeeklyPct, 16);
+    assert.deepEqual(l1.displayWindows, [
+      { key: "cursor-models", label: "cursor models", usedPercent: 9, resetsAt: 300, windowMinutes: 43_200 },
+    ]);
     const l2 = store.putAccountLimits("claude-a", { readable: false, error: "HTTP 401 revoked" });
     assert.equal(l2.readable, false);
     assert.equal(l2.weeklyPct, null, "replaced, not merged");
+    assert.deepEqual(l2.displayWindows, [], "display windows are replaced too");
     assert.equal(store.listAccountLimits().length, 1);
     assert.throws(() => store.putAccountLimits("nope", { readable: true }), AccountNotFoundError);
     // cursor
@@ -228,7 +235,7 @@ test("v7.migration: a v6 store opens as v7 — bees.account added, accounts/acco
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 12);
+    assert.equal(SCHEMA_VERSION, 13);
       const cols = (check.prepare("SELECT name FROM pragma_table_info('bees')").all() as Array<{ name: string }>).map((c) => c.name);
       assert.ok(cols.includes("account"));
       const tables = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name);
@@ -256,7 +263,7 @@ test("v7.dump: StateDump carries accounts + limits + cursors; a fresh store's re
   }
 });
 
-test("v12.migration: account_limits gains the closed unreadable reason without inventing a class for old rows", () => {
+test("v12+v13 migration: account_limits gains typed failures and display windows without inventing old data", () => {
   const h = harness();
   try {
     const db = new DatabaseSync(h.path);
@@ -292,7 +299,8 @@ test("v12.migration: account_limits gains the closed unreadable reason without i
     try {
       const columns = (check.prepare("SELECT name FROM pragma_table_info('account_limits')").all() as Array<{ name: string }>).map((row) => row.name);
       assert.ok(columns.includes("unreadable_reason"));
-      assert.equal((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value, "12");
+      assert.ok(columns.includes("display_windows"));
+      assert.equal((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value, "13");
     } finally {
       check.close();
     }

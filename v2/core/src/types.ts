@@ -294,6 +294,17 @@ export interface AccountLimitsRow {
   fableWeeklyPct: number | null;
   fableResetsAt: number | null;
   fableMinutes: number | null;
+  /** Provider-authored display buckets that do not fit the routing windows. */
+  displayWindows: AccountLimitsDisplayWindow[];
+}
+
+/** A named provider quota shown to operators but not used as a routing primitive. */
+export interface AccountLimitsDisplayWindow {
+  key: string;
+  label: string;
+  usedPercent: number;
+  resetsAt: number | null;
+  windowMinutes: number | null;
 }
 
 /** Per-harness near-tie rotation cursor. */

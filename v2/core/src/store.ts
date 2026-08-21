@@ -26,6 +26,7 @@ import {
   UnknownUrgencyError,
   UnknownVerbError,
   VERBS,
+  type AccountLimitsDisplayWindow,
   type AccountLimitsRow,
   type AccountLimitsUnreadableReason,
   type AccountRow,
@@ -207,6 +208,14 @@ export interface PutAccountLimitsInput {
   fiveHour?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
   weekly?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
   fableWeekly?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
+  /** Provider-authored display buckets; standard windows above remain routing truth. */
+  displayWindows?: Array<{
+    key: string;
+    label: string;
+    usedPercent: number;
+    resetsAt?: number | null;
+    windowMinutes?: number | null;
+  }>;
   /** Snapshot time override; defaults to the store clock. */
   fetchedAt?: number;
 }
@@ -402,6 +411,32 @@ function numOrNull(v: unknown): number | null {
   return v == null ? null : Number(v);
 }
 
+function displayWindowsOrEmpty(value: unknown): AccountLimitsDisplayWindow[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+      const row = entry as Record<string, unknown>;
+      if (
+        typeof row.key !== "string" || row.key.length === 0 ||
+        typeof row.label !== "string" || row.label.length === 0 ||
+        typeof row.usedPercent !== "number" || !Number.isFinite(row.usedPercent)
+      ) return [];
+      return [{
+        key: row.key,
+        label: row.label,
+        usedPercent: row.usedPercent,
+        resetsAt: row.resetsAt == null ? null : Number(row.resetsAt),
+        windowMinutes: row.windowMinutes == null ? null : Number(row.windowMinutes),
+      }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 function mapAccountLimits(r: Row): AccountLimitsRow {
   return {
     account: r.account as string,
@@ -419,6 +454,7 @@ function mapAccountLimits(r: Row): AccountLimitsRow {
     fableWeeklyPct: numOrNull(r.fable_weekly_pct),
     fableResetsAt: numOrNull(r.fable_resets_at),
     fableMinutes: numOrNull(r.fable_minutes),
+    displayWindows: displayWindowsOrEmpty(r.display_windows),
   };
 }
 
@@ -820,6 +856,11 @@ export class CoreStore {
         this.db.exec(
           "ALTER TABLE account_limits ADD COLUMN unreadable_reason TEXT CHECK (unreadable_reason IS NULL OR unreadable_reason IN ('unsupported','auth_expired','auth_failed','provider_error','timeout'))",
         );
+      }
+      // v12 → v13: provider-authored display buckets. Existing rows have no
+      // extra buckets; the standard routing windows remain untouched.
+      if (!accountLimitCols.has("display_windows")) {
+        this.db.exec("ALTER TABLE account_limits ADD COLUMN display_windows TEXT NOT NULL DEFAULT '[]'");
       }
       // v9 → v10: mint display handles for existing bees. An imported bee
       // whose old id already IS a pretty handle (CL.7920-style) keeps it —
@@ -2617,13 +2658,15 @@ export class CoreStore {
           `INSERT INTO account_limits(account, fetched_at, readable, unreadable_reason, error, plan,
              five_hour_pct, five_hour_resets_at, five_hour_minutes,
              weekly_pct, weekly_resets_at, weekly_minutes,
-             fable_weekly_pct, fable_resets_at, fable_minutes)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fable_weekly_pct, fable_resets_at, fable_minutes,
+             display_windows)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(account) DO UPDATE SET
              fetched_at = excluded.fetched_at, readable = excluded.readable, unreadable_reason = excluded.unreadable_reason, error = excluded.error, plan = excluded.plan,
              five_hour_pct = excluded.five_hour_pct, five_hour_resets_at = excluded.five_hour_resets_at, five_hour_minutes = excluded.five_hour_minutes,
              weekly_pct = excluded.weekly_pct, weekly_resets_at = excluded.weekly_resets_at, weekly_minutes = excluded.weekly_minutes,
-             fable_weekly_pct = excluded.fable_weekly_pct, fable_resets_at = excluded.fable_resets_at, fable_minutes = excluded.fable_minutes`,
+             fable_weekly_pct = excluded.fable_weekly_pct, fable_resets_at = excluded.fable_resets_at, fable_minutes = excluded.fable_minutes,
+             display_windows = excluded.display_windows`,
         )
         .run(
           accountId,
@@ -2635,6 +2678,13 @@ export class CoreStore {
           ...w(input.fiveHour),
           ...w(input.weekly),
           ...w(input.fableWeekly),
+          JSON.stringify((input.displayWindows ?? []).map((window) => ({
+            key: window.key,
+            label: window.label,
+            usedPercent: window.usedPercent,
+            resetsAt: window.resetsAt ?? null,
+            windowMinutes: window.windowMinutes ?? null,
+          }))),
         );
       const limits = this.getAccountLimits(accountId) as AccountLimitsRow;
       this.audit("account_limits.put", null, { limits });

@@ -473,7 +473,16 @@ test("limits.1c: Grok, Kimi, Cursor, MiniMax, and z.ai use their real provider w
           calls.push(`json:${url}`);
           assert.match(url, /api2\.cursor\.sh/);
           assert.equal(headers.Authorization, "Bearer cursor-access");
-          return { billingCycleStart: r.now(), billingCycleEnd: r.now() + 30 * DAY, planUsage: { totalSpend: "125", limit: "1000" } };
+          return {
+            billingCycleStart: r.now(),
+            billingCycleEnd: r.now() + 30 * DAY,
+            planUsage: {
+              totalSpend: "125",
+              limit: "1000",
+              totalPercentUsed: 9,
+              apiPercentUsed: 44,
+            },
+          };
         },
       },
     });
@@ -493,8 +502,12 @@ test("limits.1c: Grok, Kimi, Cursor, MiniMax, and z.ai use their real provider w
     assert.equal(rows.get(kimi.id)?.plan, "max");
     assert.equal(rows.get(kimi.id)?.fiveHourPct, 11);
     assert.equal(rows.get(kimi.id)?.weeklyPct, 42);
-    assert.equal(rows.get(cursor.id)?.weeklyPct, 12.5);
+    assert.equal(rows.get(cursor.id)?.weeklyPct, 44, "routing uses the tighter explicit pool");
     assert.equal(rows.get(cursor.id)?.weeklyMinutes, 43_200);
+    assert.deepEqual(rows.get(cursor.id)?.displayWindows, [
+      { key: "cursor-models", label: "cursor models", usedPercent: 9, resetsAt: r.now() + 30 * DAY, windowMinutes: 43_200 },
+      { key: "other-models", label: "other models", usedPercent: 44, resetsAt: r.now() + 30 * DAY, windowMinutes: 43_200 },
+    ]);
     assert.equal(rows.get(minimax.id)?.fiveHourPct, 8);
     assert.equal(rows.get(minimax.id)?.weeklyPct, 9);
     assert.equal(rows.get(zai.id)?.plan, "pro");

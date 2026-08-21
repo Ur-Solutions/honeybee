@@ -261,6 +261,7 @@ export const MIRROR_ACCOUNT_LIMITS_KEYS = [
   "fableWeeklyPct",
   "fableResetsAt",
   "fableMinutes",
+  "displayWindows",
 ] as const;
 export const MIRROR_TASK_KEYS = [
   "id",

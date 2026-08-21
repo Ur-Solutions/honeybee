@@ -83,8 +83,13 @@
  *        lets clients distinguish unsupported providers, expired/failed
  *        authentication, provider errors, and timeouts without parsing prose.
  *        Additive; migration = ALTER TABLE ADD COLUMN ×1.
+ *  v13 — provider-authored display windows: adds
+ *        `account_limits.display_windows` as a JSON array. Standard 5h/weekly
+ *        fields remain the routing contract; display windows preserve named
+ *        multi-pool plans such as Cursor Models vs Other Models.
+ *        Additive; migration = ALTER TABLE ADD COLUMN ×1.
  */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -307,7 +312,8 @@ CREATE TABLE IF NOT EXISTS account_limits (
   weekly_minutes       INTEGER,
   fable_weekly_pct     REAL,
   fable_resets_at      INTEGER,
-  fable_minutes        INTEGER
+  fable_minutes        INTEGER,
+  display_windows      TEXT NOT NULL DEFAULT '[]'
 ) STRICT;
 
 -- v7: per-harness near-tie rotation cursor (the old round-robin.json
