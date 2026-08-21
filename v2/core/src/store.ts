@@ -2974,11 +2974,33 @@ export class CoreStore {
     return row?.seq == null ? 0 : Number(row.seq);
   }
 
-  auditRows(fromSeq = 0): AuditRow[] {
-    const rows = this.db
-      .prepare("SELECT * FROM audit WHERE seq > ? ORDER BY seq")
-      .all(fromSeq) as Row[];
+  auditRows(fromSeq = 0, limit?: number): AuditRow[] {
+    // Bounded when the caller says so: the watch flush reads maxBatch+1 to
+    // detect a gap WITHOUT materializing the whole backlog — the unbounded
+    // read here was the 5.9s accept-loop stall of 2026-08-21 (every watcher
+    // with an old cursor triggered a full audit-table scan per tick).
+    const rows = (
+      limit !== undefined
+        ? this.db.prepare("SELECT * FROM audit WHERE seq > ? ORDER BY seq LIMIT ?").all(fromSeq, limit)
+        : this.db.prepare("SELECT * FROM audit WHERE seq > ? ORDER BY seq").all(fromSeq)
+    ) as Row[];
     return rows.map(mapAudit);
+  }
+
+  /** The LAST `limit` audit rows after `afterSeq` (optionally one bee's), in
+   * ascending order — the audit-tail RPC used to read the whole table and
+   * slice in JS. */
+  auditTail(afterSeq: number, limit: number, beeId?: string | null): AuditRow[] {
+    const rows = (
+      beeId
+        ? this.db
+            .prepare("SELECT * FROM audit WHERE seq > ? AND bee_id = ? ORDER BY seq DESC LIMIT ?")
+            .all(afterSeq, beeId, limit)
+        : this.db
+            .prepare("SELECT * FROM audit WHERE seq > ? ORDER BY seq DESC LIMIT ?")
+            .all(afterSeq, limit)
+    ) as Row[];
+    return rows.map(mapAudit).reverse();
   }
 
   /** Deterministic snapshot of all replayable state (meta and audit excluded). */
