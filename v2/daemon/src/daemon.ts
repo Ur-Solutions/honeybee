@@ -22,6 +22,7 @@ import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { monitorEventLoopDelay, type IntervalHistogram } from "node:perf_hooks";
 import {
   accountIdFor,
   homeEnvFor,
@@ -313,6 +314,9 @@ export class HiveDaemon {
   private telemetry: TelemetryStore | null = null;
   private rpc: RpcServer | null = null;
   private tickTimer: NodeJS.Timeout | null = null;
+  /** Event-loop delay histogram: stalls anywhere (tick, RPC handler, fs) starve the accept loop. */
+  private loopDelay: IntervalHistogram | null = null;
+  private loopDelayTimer: NodeJS.Timeout | null = null;
   private readonly startedAt = Date.now();
   private ticks = 0;
   private tickErrors = 0;
@@ -444,6 +448,20 @@ export class HiveDaemon {
     });
     await this.rpc.listen();
     this.tickTimer = setInterval(() => this.tick(), this.cfg.tickMs);
+    // Loop-delay watch (2026-08-21): tick.slow attributes stalls inside the
+    // tick; this catches the rest (sync RPC-handler work, keychain/tmux
+    // shell-outs) — at most one log line per minute, when the loop stalled.
+    this.loopDelay = monitorEventLoopDelay({ resolution: 20 });
+    this.loopDelay.enable();
+    this.loopDelayTimer = setInterval(() => {
+      const h = this.loopDelay;
+      if (!h) return;
+      const maxMs = Math.round(h.max / 1e6);
+      const p99Ms = Math.round(h.percentile(99) / 1e6);
+      if (maxMs >= 500) this.log(`loop.stall max=${maxMs}ms p99=${p99Ms}ms window=60s`);
+      h.reset();
+    }, 60_000);
+    this.loopDelayTimer.unref();
     this.log(`daemon.started pid=${process.pid} store=${this.cfg.storePath}`);
   }
 
@@ -452,6 +470,8 @@ export class HiveDaemon {
     this.stopping = true;
     this.log(`daemon.stopping pid=${process.pid}`);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.loopDelayTimer) clearInterval(this.loopDelayTimer);
+    this.loopDelay?.disable();
     this.tickTimer = null;
     await this.rpc?.close();
     this.store?.close();
@@ -468,12 +488,17 @@ export class HiveDaemon {
     const core = this.core;
     const store = this.store;
     if (!core || !store || this.stopping) return;
+    const t0 = Date.now();
+    let tStep = t0;
+    let tAccounts = t0;
     try {
       core.step();
+      tStep = Date.now();
       this.ticks += 1;
-      this.lastTickAt = Date.now();
+      this.lastTickAt = tStep;
       // v7: bounded in-daemon limits refresh + login-seat watch (no forks).
       this.accounts?.periodicRefreshTick();
+      tAccounts = Date.now();
       void this.pollLoginSeats();
       void this.autoTitle?.()
         .then((outcomes) => {
@@ -491,6 +516,15 @@ export class HiveDaemon {
       this.log(`tick.error ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
     }
     this.flushWatchers();
+    const tEnd = Date.now();
+    // Accept-loop starvation attribution (2026-08-21): the daemon is single-
+    // threaded, so any slow tick IS an RPC stall. Log the phase breakdown for
+    // every tick that would eat a visible slice of a client's timeout budget.
+    if (tEnd - t0 >= 250) {
+      this.log(
+        `tick.slow total=${tEnd - t0}ms step=${tStep - t0}ms accounts=${tAccounts - tStep}ms flush=${tEnd - tAccounts}ms`,
+      );
+    }
   }
 
   private flushWatchers(): void {
