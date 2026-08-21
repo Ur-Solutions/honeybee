@@ -989,6 +989,7 @@ export class HiveDaemon {
     // stored); the home env is derived from the account row.
     const { account, reason: accountReason } = this.resolveSpawnAccount(accountRequest, agent, params);
     const accountEnv = account && this.accounts ? this.accounts.homeEnvOf(account) : {};
+    const requestedEnv = this.spawnEnvParam(params);
     // Cell substrate: the cell owns the cwd (the space checkout). The seed
     // ledger is written in the same call, AFTER the row exists (createBee
     // is the id/name gate) and before the spawn command is enqueued —
@@ -1005,7 +1006,8 @@ export class HiveDaemon {
       sessionLogPath: driver ? driver.sessionLogPath(id) : undefined,
       args: params.args === undefined ? undefined : this.argsParam(params, "spawn", false),
       parentId,
-      ...(account ? { account: account.id, env: accountEnv } : {}),
+      env: { ...requestedEnv, ...accountEnv },
+      ...(account ? { account: account.id } : {}),
     });
     if (cell) {
       reserveCell(this.cfg.cellsRoot, cell.reserve);
@@ -1023,6 +1025,20 @@ export class HiveDaemon {
       throw new RpcError("invalid_request", `substrate must be one of ${SPAWN_SUBSTRATES.join("|")}`);
     }
     return v as SpawnSubstrate;
+  }
+
+  /** Optional per-bee environment supplied by versioned spawn/template RPC callers. */
+  private spawnEnvParam(params: Record<string, unknown>): Record<string, string> {
+    const value = params.env;
+    if (value === undefined) return {};
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new RpcError("invalid_request", "spawn: env must be an object of string values");
+    }
+    const entries = Object.entries(value);
+    if (entries.some(([, item]) => typeof item !== "string")) {
+      throw new RpcError("invalid_request", "spawn: env must be an object of string values");
+    }
+    return Object.fromEntries(entries) as Record<string, string>;
   }
 
   /** `spawn.cell` — validated shape (see SpawnCellParams). */

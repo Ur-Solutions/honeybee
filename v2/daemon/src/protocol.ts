@@ -553,7 +553,9 @@ export type SpawnSubstrate = (typeof SPAWN_SUBSTRATES)[number];
  * records the bee with `substrate = "cell"` and `cwd` = the space checkout
  * (`<cells-root>/<wrapper>/<repo>-space-<id>`); the first runtime start
  * provisions against that ledger. `cwd` in the spawn params is ignored for
- * cell spawns (the cell owns the cwd).
+ * cell spawns (the cell owns the cwd). All substrates also accept an optional
+ * `env: Record<string,string>`; the daemon validates and persists it on the
+ * bee, while account/home env remains daemon-owned and wins on reserved keys.
  */
 export interface SpawnCellParams {
   /** The origin repository (working-tree root) the cell is provisioned from. */

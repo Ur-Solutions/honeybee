@@ -9,8 +9,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
-import { makeDaemonDir, startDaemon, type DaemonHandle } from "../../daemon/tests/helpers.ts";
-import { runV2Cli, type CliIo } from "../src/main.ts";
+import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
+import type { MailboxResult, ViewResult } from "../../daemon/src/protocol.ts";
+import { interpolateTemplatePrompt, runV2Cli, type CliIo } from "../src/main.ts";
 import { stripAnsi } from "../src/style.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
@@ -42,6 +43,12 @@ test("regcli.1: template/track/packages against a live daemon — put, list, exp
     assert.equal(listed.templates[0]?.name, "commit");
     assert.equal(listed.templates[0]?.source, "api");
     const id = listed.templates[0]?.id as string;
+
+    // v1 compatibility: inspect emits the row itself (the commit() shell
+    // helper reads `.prompt` directly), while get keeps the v2 wrapper.
+    const inspect = capture();
+    assert.equal(await runV2Cli(["template", "inspect", "commit", "--data-dir", dir], inspect.io), 0);
+    assert.equal((JSON.parse(inspect.out[0] ?? "{}") as { prompt?: string }).prompt, "Commit the tree.");
 
     // export by name to a file; the file is a v1 package
     const pkgPath = join(scratch, "commit.pkg.json");
@@ -89,6 +96,68 @@ test("regcli.1: template/track/packages against a live daemon — put, list, exp
     cleanup();
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+test("regcli.3: template run and --template execute migrated presets through v2 spawn/send RPC", async () => {
+  const { dir, cleanup } = makeDaemonDir({ tickMs: 25 });
+  const scratch = mkdtempSync(join(tmpdir(), "hb-v2-template-run-"));
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const fields = join(scratch, "worker.json");
+    writeFileSync(fields, JSON.stringify({
+      name: "worker",
+      agent: "stub-auto",
+      prompt: "Do {{input}}",
+      env: { TEMPLATE_ENV: "from-template" },
+      tags: ["preset"],
+    }));
+    assert.equal(
+      await runV2Cli(["template", "put", "--file", fields, "--data-dir", dir], capture().io),
+      0,
+    );
+
+    const launched = capture();
+    assert.equal(
+      await runV2Cli([
+        "template", "run", "worker", "the commit", "--name", "committer", "--cwd", scratch,
+        "--env", "EXPLICIT_ENV=wins", "--data-dir", dir, "--json",
+      ], launched.io),
+      0,
+    );
+    const launch = JSON.parse(launched.out[0] ?? "{}") as { beeId: string; messageId: number; agent: string };
+    assert.equal(launch.agent, "stub", "legacy <agent>-auto token collapses to v2 agent + auto account");
+
+    const client = await daemon.client();
+    const view = await client.request<ViewResult>("view", { beeId: launch.beeId });
+    assert.equal(view.bee?.name, "committer");
+    assert.equal(view.bee?.cwd, scratch);
+    assert.deepEqual(view.bee?.tags, ["preset"]);
+    assert.equal(view.bee?.env.TEMPLATE_ENV, "from-template");
+    assert.equal(view.bee?.env.EXPLICIT_ENV, "wins");
+    await waitFor(async () => {
+      const mailbox = await client.request<MailboxResult>("mailbox", { beeId: launch.beeId });
+      return mailbox.messages.some((m) => m.id === launch.messageId && m.body === "Do the commit" && m.deliveredAt != null);
+    }, "template prompt delivered", 8_000, 25);
+
+    const shorthand = capture();
+    assert.equal(
+      await runV2Cli(["x", "more guidance", "--template", "worker", "--name", "committer-2", "--cwd", scratch, "--data-dir", dir, "--json"], shorthand.io),
+      0,
+    );
+    assert.ok((JSON.parse(shorthand.out[0] ?? "{}") as { beeId?: string }).beeId);
+    client.close();
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("regcli.template-prompt: interpolation replaces placeholders and otherwise appends input", () => {
+  assert.equal(interpolateTemplatePrompt("Do {{input}} / {{input}}", "it"), "Do it / it");
+  assert.equal(interpolateTemplatePrompt("Do it", "carefully"), "Do it\n\ncarefully");
+  assert.equal(interpolateTemplatePrompt("Do it", ""), "Do it");
 });
 
 test("regcli.2: template/track reads fall back to the read-only store labeled stale; mutations refuse", async () => {

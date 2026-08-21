@@ -84,7 +84,8 @@ const GROUPS: Group[] = [
   {
     title: "Templates & tracks",
     rows: [
-      ["template", "list|get|put|delete|…", "rows are truth, files are packages"],
+      ["template", "run <name> [input…]", "spawn from a daemon-owned preset (--wait or --attach)"],
+      ["template", "list|get|inspect|put|delete|…", "rows are truth, files are packages"],
       ["track", "list|get|put|delete|…", "expected step sequences"],
       ["packages", "import-local [--dir d]", "import ~/.hive templates & tracks"],
     ],

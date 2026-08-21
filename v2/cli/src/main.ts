@@ -95,6 +95,7 @@ import {
   type CommandRow,
   type FrozenImportReport,
   type ImportPlanEntry,
+  type TemplateRow,
 } from "../../core/src/index.ts";
 import { realPreflightProbes } from "../../daemon/src/import-probes.ts";
 import { hostname } from "node:os";
@@ -160,7 +161,7 @@ interface Parsed {
 }
 
 /** Repeatable value flags collected into `lists` (v6 verbs). */
-const LIST_FLAGS = new Set(["--add", "--remove", "--option", "--ref"]);
+const LIST_FLAGS = new Set(["--add", "--remove", "--option", "--ref", "--env"]);
 
 const VALUE_FLAGS = new Set([
   "--agent",
@@ -215,6 +216,8 @@ const VALUE_FLAGS = new Set([
   "--limit",
   "--status",
   "--reason",
+  "--template",
+  "--preamble",
   ...LIST_FLAGS,
 ]);
 
@@ -255,6 +258,10 @@ const BOOL_FLAGS = new Set([
   "--no-auto",
   "--on",
   "--off",
+  "--attach",
+  "--yolo",
+  "--no-yolo",
+  "--no-preamble",
 ]);
 
 const KNOWN_FLAGS = new Set([...VALUE_FLAGS, ...BOOL_FLAGS, ...OPTIONAL_VALUE_FLAGS]);
@@ -535,6 +542,7 @@ async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & 
     // v7: --account <id> | auto (default) | none (explicitly unbound).
     const accountFlag = parsed.flags.get("--account") as string | undefined;
     const account = accountFlag === undefined ? undefined : accountFlag === "none" ? null : accountFlag;
+    const env = envFrom(parsed.lists.get("--env") ?? []);
     return c.request<SpawnResult>("spawn", {
       name,
       agent,
@@ -544,6 +552,7 @@ async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & 
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
       ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
+      ...(Object.keys(env).length > 0 ? { env } : {}),
       ...(parentId ? { parentId } : {}),
       ...(account !== undefined ? { account } : {}),
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
@@ -552,7 +561,18 @@ async function spawnBee(ctx: CliContext, parsed: Parsed): Promise<SpawnResult & 
   return { ...result, agent, substrate };
 }
 
+function envFrom(entries: readonly string[]): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const entry of entries) {
+    const equals = entry.indexOf("=");
+    if (equals <= 0) throw new Error(`--env requires KEY=VALUE (got '${entry}')`);
+    env[entry.slice(0, equals)] = entry.slice(equals + 1);
+  }
+  return env;
+}
+
 async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
+  if (parsed.flags.has("--template")) return runTemplateInvocation(ctx, parsed, "spawn");
   const result = await spawnBee(ctx, parsed);
   const accountNote = result.account ? `; account ${result.account}${result.accountReason ? ` — ${result.accountReason}` : ""}` : "";
   emit(
@@ -1788,6 +1808,177 @@ function resolveRegistryRow<T extends RegistryRowLike>(rows: T[], needle: string
   throw new Error(`${what} not found: ${needle}`);
 }
 
+export function interpolateTemplatePrompt(prompt: string, input: string): string {
+  if (prompt.includes("{{input}}")) return prompt.replaceAll("{{input}}", input);
+  return input.length > 0 ? `${prompt}\n\n${input}` : prompt;
+}
+
+type TemplateRunMode = "template" | "spawn" | "x" | "run" | "xa";
+
+type TemplateInvocation = {
+  template: TemplateRow;
+  parsed: Parsed;
+  prompt: string;
+  attach: boolean;
+  wait: boolean;
+};
+
+/**
+ * Old template files stored spawn tokens such as `codex-auto`. V2 stores the
+ * harness and account selection separately, so collapse that legacy selector
+ * at this compatibility edge. The daemon remains the sole authority that
+ * chooses/validates the concrete account.
+ */
+function templateAgentSelection(token: string): { agent: string; account?: string } {
+  const suffix = "-auto";
+  if (token.endsWith(suffix) && token.length > suffix.length) {
+    return { agent: token.slice(0, -suffix.length), account: "auto" };
+  }
+  return { agent: token };
+}
+
+function templateHarnessArgs(template: TemplateRow, agent: string, parsed: Parsed): string[] {
+  const args = [...template.args];
+  if (template.model) args.push("--model", template.model);
+  if (template.effort) {
+    if (agent === "codex") args.push("-c", `model_reasoning_effort=${JSON.stringify(template.effort)}`);
+    else args.push("--effort", template.effort);
+  }
+
+  const yolo = parsed.flags.get("--yolo") === true
+    ? true
+    : parsed.flags.get("--no-yolo") === true
+      ? false
+      : template.yolo;
+  if (yolo) {
+    if (agent === "codex") args.push("--dangerously-bypass-approvals-and-sandbox");
+    else if (agent === "claude") args.push("--dangerously-skip-permissions");
+    else if (agent === "grok") args.push("--permission-mode", "bypassPermissions");
+  }
+
+  const explicitPreamble = parsed.flags.get("--preamble") as string | undefined;
+  const preamble = explicitPreamble ?? template.preamble;
+  const preambleEnabled = parsed.flags.get("--no-preamble") === true
+    ? false
+    : explicitPreamble !== undefined
+      ? true
+      : template.preambleEnabled;
+  if (preambleEnabled && preamble) {
+    if (agent !== "claude") {
+      throw new Error(`template ${template.name}: custom preamble execution is only supported for claude in v2`);
+    }
+    args.push("--append-system-prompt", preamble);
+  }
+
+  // Template fields are defaults; explicit per-invocation argv comes last and
+  // therefore wins in the daemon's adapter-aware argv composer.
+  args.push(...parsed.args, ...(parsed.rest ?? []));
+  return args;
+}
+
+async function loadTemplateForRun(ctx: CliContext, needle: string): Promise<TemplateRow> {
+  return withClient(ctx, async (c) => {
+    const { templates } = await c.request<TemplateListResult>("template.list");
+    const row = resolveRegistryRow(templates, needle, "template");
+    return (await c.request<TemplateGetResult>("template.get", { id: row.id })).template;
+  });
+}
+
+async function buildTemplateInvocation(
+  ctx: CliContext,
+  parsed: Parsed,
+  mode: TemplateRunMode,
+): Promise<TemplateInvocation> {
+  const templateName = mode === "template"
+    ? parsed.positional[2]
+    : parsed.flags.get("--template") as string | undefined;
+  if (!templateName) {
+    throw new Error(
+      mode === "template"
+        ? "usage: hive template run <name> [extra input] [--wait|--attach] [--cwd d] [--name n] [-- <agent-args…>]"
+        : "--template requires a template name",
+    );
+  }
+  if (parsed.flags.has("--agent")) throw new Error("--template cannot be combined with --agent; the template owns the agent");
+  if ((mode === "spawn" || mode === "xa") && parsed.positional.length > 1) {
+    throw new Error(`hive ${mode} --template cannot be combined with a positional agent/name`);
+  }
+  const attach = mode === "xa" || parsed.flags.get("--attach") === true;
+  const wait = mode === "run" || parsed.flags.get("--wait") === true;
+  if (attach && wait) throw new Error("--wait and --attach are mutually exclusive for template runs");
+
+  const template = await loadTemplateForRun(ctx, templateName);
+  const selected = templateAgentSelection(template.agent);
+  const flags = new Map(parsed.flags);
+  for (const control of ["--template", "--attach", "--wait", "--prompt", "--name", "--yolo", "--no-yolo", "--preamble", "--no-preamble"]) {
+    flags.delete(control);
+  }
+  flags.set("--agent", selected.agent);
+  if (!flags.has("--cwd")) {
+    flags.set("--cwd", template.cwdPolicy === "fixed" ? (template.cwd as string) : process.cwd());
+  }
+  if (!flags.has("--account")) {
+    if (template.account) flags.set("--account", template.account);
+    else if (selected.account) flags.set("--account", selected.account);
+  }
+  if (!flags.has("--substrate") && template.substrate) flags.set("--substrate", template.substrate);
+  if (attach && !flags.has("--substrate")) flags.set("--substrate", "tmux");
+
+  const input = (parsed.flags.get("--prompt") as string | undefined) ??
+    parsed.positional.slice(mode === "template" ? 3 : 1).join(" ");
+  const name = (parsed.flags.get("--name") as string | undefined) ?? template.name;
+  const lists = new Map(parsed.lists);
+  const explicitEnv = lists.get("--env") ?? [];
+  lists.set("--env", [
+    ...Object.entries(template.env).map(([key, value]) => `${key}=${value}`),
+    ...explicitEnv,
+  ]);
+  return {
+    template,
+    prompt: interpolateTemplatePrompt(template.prompt, input),
+    attach,
+    wait,
+    parsed: {
+      ...parsed,
+      positional: [wait ? "run" : "x", name],
+      flags,
+      tags: [...template.tags, ...parsed.tags],
+      args: templateHarnessArgs(template, selected.agent, parsed),
+      lists,
+      rest: null,
+    },
+  };
+}
+
+async function runTemplateInvocation(ctx: CliContext, parsed: Parsed, mode: TemplateRunMode): Promise<number> {
+  const plan = await buildTemplateInvocation(ctx, parsed, mode);
+  if (plan.wait) {
+    const flags = new Map(plan.parsed.flags);
+    // Legacy template --wait leaves the bee reachable for inspection.
+    flags.set("--keep", true);
+    return cmdRun(ctx, { ...plan.parsed, flags, positional: ["run", plan.parsed.positional[1] as string, plan.prompt] });
+  }
+  if (!plan.attach) {
+    return cmdX(ctx, { ...plan.parsed, positional: ["x", plan.parsed.positional[1] as string, plan.prompt] });
+  }
+
+  const name = plan.parsed.positional[1] as string;
+  const spawned = await spawnBee(ctx, { ...plan.parsed, positional: ["spawn", name] });
+  await withClient(ctx, (c) => c.request<SendRpcResult>("send", {
+    beeId: spawned.beeId,
+    body: plan.prompt,
+    sender: "operator",
+  }));
+  const command = await waitForCommandSettled(ctx, spawned.beeId, spawned.commandId, numFlag(parsed, "--timeout", 60_000));
+  if (command.status === "failed") {
+    ctx.io.err(`spawn failed: ${spawned.handle ?? spawned.beeId} (${command.failureCause ?? "unknown"})`);
+    return 1;
+  }
+  return attachToBee(ctx, plan.parsed, spawned.beeId, {
+    print: parsed.flags.get("--print") === true || ctx.json || process.stdout.isTTY !== true,
+  });
+}
+
 async function cmdTemplate(ctx: CliContext, parsed: Parsed): Promise<number> {
   const sub = parsed.positional[1] ?? "list";
   const scope = parsed.flags.get("--scope") as string | undefined;
@@ -1818,6 +2009,23 @@ async function cmdTemplate(ctx: CliContext, parsed: Parsed): Promise<number> {
       emit(ctx, [JSON.stringify(result.template, null, 2)], result, stale);
       return 0;
     }
+    case "inspect": {
+      const needle = parsed.positional[2];
+      if (!needle) throw new Error("usage: hive template inspect <id|name>");
+      const { result, stale } = await readPath(
+        ctx,
+        async (c) => {
+          const { templates } = await c.request<TemplateListResult>("template.list");
+          return c.request<TemplateGetResult>("template.get", { id: resolveRegistryRow(templates, needle, "template").id });
+        },
+        (store) => ({ template: resolveRegistryRow(store.listTemplates(), needle, "template") }),
+      );
+      if (stale) ctx.io.err(staleBanner(ctx.cfg.storePath));
+      ctx.io.out(JSON.stringify(result.template, null, 2));
+      return 0;
+    }
+    case "run":
+      return runTemplateInvocation(ctx, parsed, "template");
     case "put": {
       const file = parsed.flags.get("--file") as string | undefined;
       if (!file) throw new Error("usage: hive template put --file fields.json [--id id]");
@@ -1873,7 +2081,7 @@ async function cmdTemplate(ctx: CliContext, parsed: Parsed): Promise<number> {
       return 0;
     }
     default:
-      throw new Error("usage: hive template <list|get|put|delete|export|import>");
+      throw new Error("usage: hive template <list|get|inspect|run|put|delete|export|import>");
   }
 }
 
@@ -2032,6 +2240,7 @@ function promptOf(parsed: Parsed, fromIndex: number): string {
  * (--agent/--account/--cwd/--tag/--arg/--parent…).
  */
 async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
+  if (parsed.flags.has("--template")) return runTemplateInvocation(ctx, parsed, "x");
   const name = parsed.positional[1];
   const prompt = promptOf(parsed, 2);
   if (!name || prompt.length === 0) {
@@ -2095,6 +2304,7 @@ async function waitForCommandSettled(
  * is omitted so the node default never produces a pane-less bee.
  */
 async function cmdXa(ctx: CliContext, parsed: Parsed): Promise<number> {
+  if (parsed.flags.has("--template")) return runTemplateInvocation(ctx, parsed, "xa");
   const positionalAgent = parsed.positional[1];
   const flagAgent = parsed.flags.get("--agent") as string | undefined;
   if (positionalAgent && flagAgent && positionalAgent !== flagAgent) {
@@ -2206,6 +2416,7 @@ async function cmdWait(ctx: CliContext, parsed: Parsed): Promise<number> {
  * archive (--keep to leave the bee for inspection). The v1 one-shot shape.
  */
 async function cmdRun(ctx: CliContext, parsed: Parsed): Promise<number> {
+  if (parsed.flags.has("--template")) return runTemplateInvocation(ctx, parsed, "run");
   const name = parsed.positional[1];
   const prompt = promptOf(parsed, 2);
   if (!name || prompt.length === 0) {
