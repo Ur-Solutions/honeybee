@@ -364,12 +364,12 @@ async function cursorLimits(options: ProviderLimitsOptions): Promise<PutAccountL
   const displayWindows = [
     ...(cursorModels !== undefined ? [{
       key: "cursor-models",
-      label: "cursor models",
+      label: "grok + composer",
       ...percentWindow(cursorModels, resetsAt, windowMinutes),
     }] : []),
     ...(otherModels !== undefined ? [{
       key: "other-models",
-      label: "other models",
+      label: "third-party",
       ...percentWindow(otherModels, resetsAt, windowMinutes),
     }] : []),
   ];
