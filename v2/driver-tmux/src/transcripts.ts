@@ -39,6 +39,7 @@
  */
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
+import { createClaudeProjector } from "./claude-projection.ts";
 import { createCodexProjector } from "./codex-projection.ts";
 import { createGrokProjector, isGrokCompactionSummary } from "./grok-projection.ts";
 import type { TranscriptProjectedEvent, TranscriptProjector } from "./transcript-projection.ts";
@@ -492,6 +493,7 @@ export function createTranscriptProjector(harness: string): TranscriptProjector 
     case "stub":
       return projectorFromRenderer(stubTranscriptRenderer);
     case "claude":
+      return createClaudeProjector();
     default:
       return projectorFromRenderer(claudeTranscriptRenderer);
   }
