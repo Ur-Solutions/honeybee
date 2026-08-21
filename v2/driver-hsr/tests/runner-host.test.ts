@@ -51,19 +51,18 @@ test("daemon restart: the runtime survives and the successor daemon delivers at 
     assert.ok(pidAlive(proc.pid), "the runtime must survive the daemon");
 
     second = makeDriver(dir);
-    assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt), true);
+    // The store knew the runtime was idle at shutdown; the hint opens the
+    // accept point immediately AND keeps the adopted bee out of the
+    // turn-hang policy (the 2026-08-21 deploy-soak hang_stop lesson).
+    assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt, "idle"), true);
     assert.equal(second.isDegraded("bee-r", 1), false, "host adoption is never degraded");
     assert.ok(second.hasProcess("bee-r", 1));
 
-    // Full capability: the successor delivers and observes the turn. The
-    // adopted phase claim is "running", so wait for the socket + retry the
-    // way the daemon's delivery loop does.
+    // Full capability: an idle-adopted runtime accepts on the first attempt
+    // once the socket is up.
     const deadline = Date.now() + 4000;
     let accepted = false;
     while (!accepted && Date.now() < deadline) {
-      // The stub accepts mid-turn deliveries? It does not — drive the phase
-      // via observation first: the adopted claim corrects on real edges, and
-      // a stub turn takes ~5ms, so the runtime is genuinely idle.
       second.observe();
       accepted = second.deliver("bee-r", 1, 2, "hello after restart").accepted;
       if (!accepted) await sleep(20);

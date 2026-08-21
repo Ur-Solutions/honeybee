@@ -99,8 +99,14 @@ export class SubstrateRouter implements RuntimeDriver {
   // Extended surface (duck-typed by DaemonCore / used by the daemon)
   // -------------------------------------------------------------------------
 
-  adopt(beeId: string, generation: number, pid: number, pidStartedAt: number): boolean {
-    return this.driverFor(beeId).adopt(beeId, generation, pid, pidStartedAt);
+  adopt(
+    beeId: string,
+    generation: number,
+    pid: number,
+    pidStartedAt: number,
+    lastKnownState?: "booting" | "running" | "idle",
+  ): boolean {
+    return this.driverFor(beeId).adopt(beeId, generation, pid, pidStartedAt, lastKnownState);
   }
 
   isDegraded(beeId: string, generation: number): boolean {

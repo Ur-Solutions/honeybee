@@ -636,7 +636,13 @@ export class HsrDriver implements RuntimeDriver {
    * Returns false — never throws — when the pid is gone, unreadable, recycled
    * (start-time mismatch) or the bee already has a live process.
    */
-  adopt(beeId: string, generation: number, pid: number, pidStartedAt: number): boolean {
+  adopt(
+    beeId: string,
+    generation: number,
+    pid: number,
+    pidStartedAt: number,
+    lastKnownState?: "booting" | "running" | "idle",
+  ): boolean {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
     if (!verifyProcessIdentity(pid, pidStartedAt, this.adoptTolMs)) return false;
@@ -662,12 +668,15 @@ export class HsrDriver implements RuntimeDriver {
           child: null,
           adapter,
           degraded: false,
-          // Unknown phase — edges during the daemon gap were not observed.
-          // "running" is the safe claim: hang policy bounds it, and the next
-          // tailed turn_ended corrects it. acceptsMidTurn harnesses deliver
-          // immediately; the rest refuse until that edge, exactly like a
-          // genuinely mid-turn runtime.
-          phase: "running",
+          // The store's persisted runtime state is the phase truth at the
+          // moment the old daemon stopped (rows-are-truth): an idle runtime
+          // adopts with its accept point OPEN and, crucially, outside the
+          // turn-hang policy — the 2026-08-21 deploy soak saw every idle
+          // adopted bee hang-stopped minutes later because the blanket
+          // "running" claim promised a turn_ended that could never come.
+          // Without a hint, "running" stays the safe claim (hang policy
+          // bounds it; the next tailed edge corrects it).
+          phase: lastKnownState === "idle" ? "idle" : "running",
           sessionId: null,
           turnId: null,
           stopCause: null,
