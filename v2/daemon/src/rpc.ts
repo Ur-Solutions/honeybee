@@ -127,9 +127,16 @@ export class RpcServer {
    * frames, and the gap is detectable by construction.
    */
   flushWatch(latestSeq: number, eventsSince: (fromSeq: number) => AuditRow[], maxBatch: number): void {
+    // Steady-state watchers share a cursor: fetch each distinct cursor once
+    // per pass instead of once per connection.
+    const byCursor = new Map<number, AuditRow[]>();
     for (const conn of this.conns) {
       if (conn.watchCursor == null || conn.watchCursor >= latestSeq) continue;
-      const events = eventsSince(conn.watchCursor);
+      let events = byCursor.get(conn.watchCursor);
+      if (events === undefined) {
+        events = eventsSince(conn.watchCursor);
+        byCursor.set(conn.watchCursor, events);
+      }
       if (events.length === 0) continue;
       if (events.length > maxBatch) {
         const frame: WatchFrame = { type: "gap", seq: latestSeq };

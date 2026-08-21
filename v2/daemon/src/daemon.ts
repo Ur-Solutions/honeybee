@@ -533,7 +533,9 @@ export class HiveDaemon {
     if (!store || !rpc) return;
     const latest = store.lastAuditSeq();
     if (latest > this.publishedSeq) this.publishedSeq = latest;
-    rpc.flushWatch(latest, (fromSeq) => store.auditRows(fromSeq), this.cfg.watchMaxBatch);
+    // maxBatch+1: one extra row is exactly enough to detect a gap without
+    // materializing the backlog (the 2026-08-21 flush stall).
+    rpc.flushWatch(latest, (fromSeq) => store.auditRows(fromSeq, this.cfg.watchMaxBatch + 1), this.cfg.watchMaxBatch);
   }
 
   // -------------------------------------------------------------------------
@@ -1751,9 +1753,7 @@ export class HiveDaemon {
     const rawLimit = typeof params.limit === "number" && Number.isFinite(params.limit) ? Math.floor(params.limit) : 100;
     const limit = Math.max(1, Math.min(1000, rawLimit));
     const beeId = typeof params.beeId === "string" && params.beeId.length > 0 ? params.beeId : null;
-    let rows = store.auditRows(afterSeq);
-    if (beeId) rows = rows.filter((r) => r.beeId === beeId);
-    return { rows: rows.slice(-limit) };
+    return { rows: store.auditTail(afterSeq, limit, beeId) };
   }
 
   private rpcDeployInfo(): DeployInfoResult {

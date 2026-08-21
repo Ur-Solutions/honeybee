@@ -312,3 +312,37 @@ test("pid at spawn: a mid-boot runtime survives daemon restart via re-adoption (
   assert.equal(gen2.pid, 901);
   store.close();
 });
+
+test("audit reads are boundable: LIMIT'd ascending rows and a real SQL tail (2026-08-21 flush stall)", () => {
+  const store = openCoreStore(":memory:");
+  const a = makeBee(store, "aud-a").bee;
+  const b = makeBee(store, "aud-b").bee;
+  // A healthy spread of audit rows across two bees.
+  for (let i = 0; i < 6; i += 1) {
+    store.send(i % 2 === 0 ? a.id : b.id, `m${i}`, { sender: "operator" });
+  }
+  const all = store.auditRows();
+  assert.ok(all.length >= 8, `expected a real backlog, got ${all.length}`);
+
+  // Bounded ascending read returns exactly the first N past the cursor —
+  // the watch flush fetches maxBatch+1 to detect gaps without a full scan.
+  const bounded = store.auditRows(0, 3);
+  assert.equal(bounded.length, 3);
+  assert.deepEqual(bounded.map((r) => r.seq), all.slice(0, 3).map((r) => r.seq));
+
+  // Tail: the LAST n rows, ascending, equivalent to the old read-everything-
+  // then-slice(-n) — without materializing the table.
+  const tail = store.auditTail(0, 4);
+  assert.deepEqual(tail.map((r) => r.seq), all.slice(-4).map((r) => r.seq));
+
+  // Tail filtered to one bee matches the JS-filtered equivalent.
+  const beeTail = store.auditTail(0, 2, a.id);
+  const expected = all.filter((r) => r.beeId === a.id).slice(-2);
+  assert.deepEqual(beeTail.map((r) => r.seq), expected.map((r) => r.seq));
+
+  // afterSeq cursors bound both shapes.
+  const mid = all[Math.floor(all.length / 2)]!.seq;
+  assert.ok(store.auditRows(mid, 100).every((r) => r.seq > mid));
+  assert.ok(store.auditTail(mid, 100).every((r) => r.seq > mid));
+  store.close();
+});
