@@ -507,7 +507,17 @@ export class HsrDriver implements RuntimeDriver {
    * surface pumps first, keeping the pipe-era semantics where evidence
    * accumulated without an observe() call.
    */
+  private lastPumpAt = 0;
+
   private pumpAll(): void {
+    // The daemon drains all three observe surfaces inside one step(); pumping
+    // per surface tripled the per-tick stat/read pass over every runtime
+    // (2026-08-21 telemetry: step 200-480ms with a large fleet). One pump per
+    // 50ms keeps observation latency under any real tick while making the
+    // extra drains free.
+    const now = this.now();
+    if (now - this.lastPumpAt < 50) return;
+    this.lastPumpAt = now;
     for (const p of [...this.procs.values()]) {
       if (!p.hostStyle || p.exited) continue;
       this.pumpHost(p);
@@ -520,7 +530,12 @@ export class HsrDriver implements RuntimeDriver {
   /** One observation pass over a host-style runtime: status facts, log tail,
    * and (for adopted hosts with no exit callback) pid-liveness. */
   private pumpHost(p: ManagedProcess): void {
-    if (p.statusPath && (p.agentPid == null || p.spawnError == null)) {
+    // Read the status file only while it can still teach us something: the
+    // agent pid / spawnError before the OS confirms the spawn, and the
+    // socketError witness until the write lane is proven (connected). After
+    // that, exits arrive via the child callback (own spawns) or the pid probe
+    // + finishHost's status read (adopted hosts) — no per-tick read needed.
+    if (p.statusPath && (p.agentPid == null || (!p.socket && !p.socketBroken))) {
       const status = readRunnerStatus(p.statusPath);
       if (status) {
         if (status.socketError && !p.socketBroken) {
