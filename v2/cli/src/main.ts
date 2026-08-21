@@ -16,6 +16,7 @@ import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { defaultDataDir, loadNodeConfig, type ResolvedNodeConfig } from "../../daemon/src/config.ts";
 import { runDaemon } from "../../daemon/src/main.ts";
+import { runRunnerHost } from "../../driver-hsr/src/runner-host.ts";
 import {
   createServiceManager,
   type ExecRunner,
@@ -3304,6 +3305,19 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdImport(ctx, parsed);
       case "daemon":
         return await cmdDaemon(ctx, parsed);
+      case "runner-host": {
+        // Hidden plumbing verb (WP5): the per-runtime host the daemon spawns
+        // so agent runtimes survive daemon restarts. Never touches the daemon
+        // socket; argv is exactly one config path written by the driver.
+        const configPath = parsed.positional[1];
+        if (typeof configPath !== "string" || configPath.length === 0) {
+          io.err(errorLine("runner-host: missing config path"));
+          return 2;
+        }
+        runRunnerHost(configPath);
+        // The host stays alive until its agent exits; keep this promise open.
+        return await new Promise<number>(() => undefined);
+      }
       case "help":
       case "--help":
         io.out(helpText(hiveVersion()));

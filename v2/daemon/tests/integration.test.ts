@@ -289,18 +289,19 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
     assert.ok(cmds.commands.every((c) => c.status !== "failed"), "zero failed commands after restart");
     assert.deepEqual(after.view.flags, [], "zero flags after restart");
 
-    // Mail for the adopted (degraded) runtime rotates it out and gets consumed
-    // by generation 2 — delivery is never doomed by the restart.
+    // WP5 runner host: the adopted runtime is FULLY capable — mail delivers
+    // to the SAME generation over the reconnected host socket, and the
+    // surviving process keeps working. (Pre-host, this rotated to gen 2 via
+    // the degraded stop-on-mail policy; that policy now applies only to
+    // legacy host-less adoptions.)
     const sent2 = await client.request<SendRpcResult>("send", { beeId, body: "post-restart task" });
     const gen2 = await waitDelivered(client, beeId, sent2.messageId, "post-restart delivery", );
-    const rt2 = (await client.request<ViewResult>("view", { beeId })).runtime;
-    if (typeof rt2?.pid === "number" && rt2.pid > 0) agentPids.push(rt2.pid);
-    assert.equal(gen2, 2);
-    assert.equal(pidAlive(agentPid), false, "old survivor stopped by exact pid identity");
+    assert.equal(gen2, 1, "delivered to the ADOPTED generation — no rotation");
+    assert.equal(pidAlive(agentPid), true, "the survivor keeps running across the restart");
     const finalCmds = await client.request<CommandsResult>("commands", { beeId });
     assert.ok(finalCmds.commands.every((c) => c.status !== "failed"));
     const rt1 = (await client.request<ViewResult>("view", { beeId })).runtime;
-    assert.equal(rt1?.generation, 2);
+    assert.equal(rt1?.generation, 1);
     client.close();
   } finally {
     await daemon?.stop().catch(() => {});

@@ -46,8 +46,13 @@
  * the daemon's degraded-runtime policy rotates it out when mail arrives.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, closeSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { connect, type Socket } from "node:net";
+import { dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readRunnerStatus, type RunnerHostConfig } from "./runner-host.ts";
 import type {
   DeliverOutcome,
   DriverObservation,
@@ -78,6 +83,18 @@ export interface HsrDriverConfig {
   /** Start-time tolerance for cross-restart re-adoption identity checks. Default 5000ms. */
   adoptToleranceMs?: number;
   now?: () => number;
+  /**
+   * Directory for runner-host artifacts (config/socket/status per runtime
+   * generation). Default: `<sessionLogDir>/../runners`.
+   */
+  runnersDir?: string;
+  /**
+   * How to launch the runner host for a written config file. The default
+   * invokes the sibling TS entry under --experimental-strip-types (dev and
+   * tests); the daemon overrides it with its own CLI entry in production,
+   * where v2 ships as a bundle and the source path does not exist.
+   */
+  hostCommand?: (configPath: string) => { command: string; args: string[] };
 }
 
 /** Condition-flag evidence surfaced by adapters, stamped with process identity. */
@@ -121,6 +138,38 @@ interface ManagedProcess {
   killTimer: NodeJS.Timeout | null;
   stdoutRest: string;
   exited: boolean;
+  /**
+   * Runner-host runtime (WP5): `child` is the detached HOST process; the
+   * agent is the host's child in the same process group. The host owns the
+   * agent's pipes and writes the session log, so the runtime survives daemon
+   * restarts; the driver observes by tailing the log and delivers over the
+   * host's unix socket. False only for legacy degraded adoptions (runtimes
+   * spawned by a pre-host daemon).
+   */
+  hostStyle: boolean;
+  /** Agent pid learned from the host's status file (host pid is `pid`). */
+  agentPid: number | null;
+  socket: Socket | null;
+  socketRetry: NodeJS.Timeout | null;
+  socketPath: string | null;
+  statusPath: string | null;
+  /** Byte offset consumed from the session log by the observation tail. */
+  logOffset: number;
+  /**
+   * Outbound lines the driver sent through the host (deliver/interrupt/
+   * respond/boot). The host appends them to the session log in write order;
+   * the tail matches-and-skips them so adapters only parse agent output.
+   */
+  outboundPending: string[];
+  /**
+   * Lines accepted before the host socket finished connecting (the host
+   * needs a few ms to boot and listen). Flushed in order on connect — the
+   * accept-at-spawn contract the kernel-buffered stdin pipe used to give.
+   */
+  pendingWrites: string[];
+  /** The host reported its stdin lane could not be established: refuse
+   * deliveries instead of queueing into a black hole. */
+  socketBroken: boolean;
   /** The OS spawn/process error message, when the child emitted `error` (e.g. ENOENT). */
   spawnError: string | null;
   /**
@@ -161,6 +210,35 @@ export class HsrDriver implements RuntimeDriver {
     this.graceMs = cfg.stopKillGraceMs ?? 5000;
     this.adoptTolMs = cfg.adoptToleranceMs ?? 5000;
     mkdirSync(cfg.sessionLogDir, { recursive: true });
+    mkdirSync(this.runnersDir(), { recursive: true });
+  }
+
+  private runnersDir(): string {
+    return this.cfg.runnersDir ?? resolvePath(this.cfg.sessionLogDir, "..", "runners");
+  }
+
+  private runnerPaths(beeId: string, generation: number): { config: string; socket: string; status: string } {
+    const base = join(this.runnersDir(), `${beeId}.${generation}`);
+    // The unix socket CANNOT live beside the other artifacts: sun_path is
+    // capped (104 bytes on macOS) and runnersDir under a test tmpdir already
+    // blows it — listen fails silently and every delivery would black-hole.
+    // A short deterministic tmpdir name keeps the path tiny and derivable at
+    // adoption from the same identity inputs.
+    const digest = createHash("sha256")
+      .update(`${this.runnersDir()}\u0000${beeId}\u0000${generation}`)
+      .digest("hex")
+      .slice(0, 16);
+    return {
+      config: `${base}.json`,
+      socket: join(tmpdir(), `hb-rh-${digest}.sock`),
+      status: `${base}.status.json`,
+    };
+  }
+
+  private hostCommandFor(configPath: string): { command: string; args: string[] } {
+    if (this.cfg.hostCommand) return this.cfg.hostCommand(configPath);
+    const entry = fileURLToPath(new URL("./runner-host-main.ts", import.meta.url));
+    return { command: process.execPath, args: ["--experimental-strip-types", entry, configPath] };
   }
 
   // -------------------------------------------------------------------------
@@ -181,24 +259,41 @@ export class HsrDriver implements RuntimeDriver {
       );
     }
     const spec = this.cfg.resolve(beeId);
-    // Own process group (spec point 1): detached puts the child in a new
-    // group whose pgid is the child's pid, so group signals reach the whole
-    // agent process tree and never any sibling of ours.
     if (process.env.HIVE_SPAWN_TRACE) {
       // Diagnostics only: exact spawn shape for post-mortem replay.
       appendFileSync(process.env.HIVE_SPAWN_TRACE, JSON.stringify({ command: spec.command, args: spec.args, cwd: spec.cwd, envKeys: Object.keys(spec.env ?? {}).length, at: Date.now() }) + "\n");
     }
-    const child = spawn(spec.command, spec.args, {
-      cwd: spec.cwd,
-      env: spec.env ?? { ...process.env },
+    // WP5: spawn the runner HOST, not the agent. The host is detached in its
+    // own process group (spec point 1 — group signals reach host + agent and
+    // never a sibling of ours) and spawns the agent as ITS child in that same
+    // group, holding the agent's pipes. A daemon restart therefore takes no
+    // pipe down: the runtime survives, and boot re-adoption reconnects with
+    // full capability instead of the old degraded stop-on-mail rotation.
+    const paths = this.runnerPaths(beeId, generation);
+    const hostConfig: RunnerHostConfig = {
+      beeId,
+      command: spec.command,
+      args: spec.args,
+      ...(spec.cwd !== undefined ? { cwd: spec.cwd } : {}),
+      env: spec.env ?? ({ ...process.env } as Record<string, string>),
+      sessionLogPath: this.sessionLogPath(beeId),
+      sidecarPath: join(this.cfg.sessionLogDir, `${beeId}.stderr.log`),
+      socketPath: paths.socket,
+      statusPath: paths.status,
+      bootLines: spec.adapter.bootLines(),
+    };
+    writeFileSync(paths.config, JSON.stringify(hostConfig));
+    const launch = this.hostCommandFor(paths.config);
+    const child = spawn(launch.command, launch.args, {
       detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "ignore", "ignore"],
     });
     const proc: ManagedProcess = {
       beeId,
       generation,
-      // pid captured AT SPAWN (WP2 amendment); -1 only if the spawn itself
-      // failed, in which case the error handler below reports exited(crashed).
+      // pid captured AT SPAWN (WP2 amendment) — the HOST's pid: host liveness
+      // IS runtime liveness (the host exits when the agent exits), so the
+      // stored proc identity adopts across daemon restarts unchanged.
       pid: child.pid ?? -1,
       pidStartedAt: this.now(),
       child,
@@ -213,59 +308,93 @@ export class HsrDriver implements RuntimeDriver {
       exited: false,
       spawnError: null,
       realEvidence: false,
+      hostStyle: true,
+      agentPid: null,
+      socket: null,
+      socketRetry: null,
+      socketPath: paths.socket,
+      statusPath: paths.status,
+      // The session log may carry previous generations; only new bytes are
+      // this runtime's stream.
+      logOffset: this.sessionLogSize(beeId),
+      outboundPending: [...hostConfig.bootLines],
+      pendingWrites: [],
+      socketBroken: false,
     };
     this.procs.set(beeId, proc);
 
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => this.onStdout(proc, chunk));
-    // stderr is diagnostics, not the structured stream (Q1): keep it out of
-    // the session log but drain it so the child never blocks on a full pipe.
-    child.stderr?.on("data", (chunk: Buffer | string) => {
-      this.appendSidecar(beeId, String(chunk));
-    });
-    // Spawn failure (missing binary, EACCES): surface as exited(crashed) so it
-    // flows through the daemon's spawn-retry path, never as a driver throw.
-    // The error message is the only witness to WHY (there is no stderr from a
-    // process that never ran) — keep it for the exit observation + sidecar.
+    // Host spawn failure (missing node/CLI — configuration, not the agent):
+    // surface as exited(crashed) through the daemon's spawn-retry path.
     child.on("error", (err) => {
       proc.spawnError = String(err?.message ?? err);
-      this.appendSidecar(beeId, `spawn error: ${proc.spawnError}\n`);
-      this.onExit(proc, null, null);
+      this.appendSidecar(beeId, `runner host spawn error: ${proc.spawnError}\n`);
+      this.finishHost(proc);
     });
-    child.on("exit", (code, signal) => this.onExit(proc, code, signal));
-    // stdin errors (EPIPE against a dying child) must not crash the daemon.
-    child.stdin?.on("error", () => undefined);
+    // Host exit = runtime exit (the host outlives the agent by milliseconds
+    // to record the exit facts). Drain the tail before the exit observation
+    // so trailing output lands in stream order.
+    child.on("exit", () => this.finishHost(proc));
 
-    for (const line of spec.adapter.bootLines()) this.writeLine(proc, line);
+    this.connectSocket(proc);
 
     if (spec.adapter.readyAtSpawn) {
-      // claude stream-json emits nothing until the first stdin message; treat
-      // spawn as ready (stdin buffers safely) instead of deadlocking on init.
-      // The driver-side accept point opens now; the synthetic `booted`
-      // OBSERVATION waits for the OS to confirm the process exists (`spawn`
-      // event, milliseconds later). A spawn that fails outright (missing
-      // cwd/binary, EACCES) emits `error` and never `spawn`, so the store sees
-      // exited(crashed) while still booting — a boot failure that counts
-      // against the bee's spawn-failure budget, not a phantom
-      // running → crashed generation that revives forever.
-      // v9: the observation is marked `synthetic` — the OS confirming the
-      // spawn proves NOTHING about the agent (2026-08-18 soak: a claude that
-      // spawns fine but dies instantly looped crash → wake → revive unbounded
-      // because this booted reset the budget every generation). Only real
-      // parsed output (onSignal) is boot evidence.
+      // claude stream-json emits nothing until the first stdin message: the
+      // accept point opens now (stdin buffers safely in the host). The
+      // synthetic `booted` OBSERVATION waits for the host's status file to
+      // confirm the AGENT process exists — the same "OS confirmed the spawn"
+      // semantics the direct child's `spawn` event carried (v9: synthetic,
+      // never boot evidence; an agent that fails to spawn reports spawnError
+      // and exits while still booting, counting against the spawn budget).
       proc.phase = "idle";
-      child.on("spawn", () => {
-        if (proc.exited) return;
-        this.events.push({
-          beeId,
-          generation,
-          kind: "booted",
-          pid: proc.pid,
-          pidStartedAt: proc.pidStartedAt,
-          synthetic: true,
-        });
-      });
     }
+  }
+
+  /** Current session-log size — the tail baseline for a new generation. */
+  private sessionLogSize(beeId: string): number {
+    try {
+      return statSync(this.sessionLogPath(beeId)).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Connect (and keep reconnecting) the write lane to the runner host. The
+   * socket is fire-and-forget outbound only; deliver() refuses `not_ready`
+   * until it is connected and the daemon's delivery loop retries — the same
+   * bounded-refusal contract a booting runtime already has.
+   */
+  private connectSocket(p: ManagedProcess): void {
+    if (p.exited || p.socket || p.socketRetry || !p.socketPath) return;
+    const attempt = connect(p.socketPath);
+    attempt.on("connect", () => {
+      p.socket = attempt;
+      for (const line of p.pendingWrites.splice(0)) {
+        attempt.write(`${JSON.stringify({ op: "write", line })}\n`);
+      }
+    });
+    attempt.on("error", () => undefined);
+    attempt.on("close", () => {
+      if (p.socket === attempt) p.socket = null;
+      if (p.exited) return;
+      p.socketRetry = setTimeout(() => {
+        p.socketRetry = null;
+        this.connectSocket(p);
+      }, 200);
+      p.socketRetry.unref();
+    });
+  }
+
+  /** Host-style runtime finished (host exit observed or pid gone): drain the
+   * observation tail, fold the host's recorded exit facts, emit exited. */
+  private finishHost(p: ManagedProcess): void {
+    if (p.exited) return;
+    this.pumpHostTail(p);
+    const status = p.statusPath ? readRunnerStatus(p.statusPath) : null;
+    if (status?.spawnError && !p.spawnError) {
+      p.spawnError = status.spawnError;
+    }
+    this.onExit(p, status?.exited ? (status.exitCode ?? null) : null, null);
   }
 
   deliver(beeId: string, generation: number, messageId: number, body: string): DeliverOutcome {
@@ -290,10 +419,15 @@ export class HsrDriver implements RuntimeDriver {
     }
     const encoded = p.adapter.encodeMessage(body, { sessionId: p.sessionId, messageId });
     if (encoded == null) return { accepted: false, reason: "not_ready" };
-    if (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable) {
+    if (p.hostStyle && p.socketBroken) return { accepted: false, reason: "not_ready" };
+    if (!p.hostStyle && (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable)) {
       // stdin gone means the process is dying; its exit observation follows.
       return { accepted: false, reason: "no_process" };
     }
+    // Host-style: a still-connecting socket queues the line and flushes on
+    // connect — the same accept-at-spawn guarantee the kernel-buffered stdin
+    // pipe gave. A host that never comes up exits and rotates the generation,
+    // exactly like a child that died after a buffered write.
     this.writeLine(p, encoded);
     // Ground truth recorded at the accept point, deterministic (spec point 3).
     this.consumed.set(messageId, generation);
@@ -351,7 +485,8 @@ export class HsrDriver implements RuntimeDriver {
     if (typeof p.adapter.encodeInterrupt !== "function") return { interrupted: false, reason: "unsupported" };
     const encoded = p.adapter.encodeInterrupt({ sessionId: p.sessionId, turnId: p.turnId });
     if (encoded == null) return { interrupted: false, reason: "not_ready" };
-    if (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable) {
+    if (p.hostStyle && p.socketBroken) return { interrupted: false, reason: "not_ready" };
+    if (!p.hostStyle && (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable)) {
       return { interrupted: false, reason: "no_process" };
     }
     this.writeLine(p, encoded);
@@ -359,12 +494,118 @@ export class HsrDriver implements RuntimeDriver {
   }
 
   observe(): DriverObservation[] {
-    // Adopted (degraded) processes have no exit callback — their death is a
-    // fact recovered by polling the exact pid (cheap signal-0 probe).
-    this.pollDegraded();
+    this.pumpAll();
     const out = this.events;
     this.events = [];
     return out;
+  }
+
+  /**
+   * Parse everything new before any drain: host-style runtimes are observed
+   * by files (status facts + session-log tail), so observations, flag
+   * evidence, and session evidence all materialize HERE — every observe*()
+   * surface pumps first, keeping the pipe-era semantics where evidence
+   * accumulated without an observe() call.
+   */
+  private pumpAll(): void {
+    for (const p of [...this.procs.values()]) {
+      if (!p.hostStyle || p.exited) continue;
+      this.pumpHost(p);
+    }
+    // Adopted (degraded) processes have no exit callback — their death is a
+    // fact recovered by polling the exact pid (cheap signal-0 probe).
+    this.pollDegraded();
+  }
+
+  /** One observation pass over a host-style runtime: status facts, log tail,
+   * and (for adopted hosts with no exit callback) pid-liveness. */
+  private pumpHost(p: ManagedProcess): void {
+    if (p.statusPath && (p.agentPid == null || p.spawnError == null)) {
+      const status = readRunnerStatus(p.statusPath);
+      if (status) {
+        if (status.socketError && !p.socketBroken) {
+          p.socketBroken = true;
+          this.appendSidecar(p.beeId, `runner host socket failed: ${status.socketError}\n`);
+        }
+        if (p.agentPid == null && typeof status.agentPid === "number") {
+          p.agentPid = status.agentPid;
+          if (p.adapter?.readyAtSpawn) {
+            // The OS confirmed the AGENT spawn (v9: synthetic, never boot
+            // evidence) — the same edge the direct child's `spawn` event was.
+            this.events.push({
+              beeId: p.beeId,
+              generation: p.generation,
+              kind: "booted",
+              pid: p.pid,
+              pidStartedAt: p.pidStartedAt,
+              synthetic: true,
+            });
+          }
+        }
+        if (status.exited) {
+          this.finishHost(p);
+          return;
+        }
+      }
+    }
+    this.pumpHostTail(p);
+    // An adopted host has no ChildProcess exit callback; recover its death by
+    // polling the exact identity, then fold the recorded exit facts.
+    if (p.child == null && !pidAlive(p.pid)) this.finishHost(p);
+  }
+
+  /** Read new session-log bytes; parse agent lines, skipping outbound echoes. */
+  private pumpHostTail(p: ManagedProcess): void {
+    if (!p.adapter) return;
+    const path = this.sessionLogPath(p.beeId);
+    let size: number;
+    try {
+      size = statSync(path).size;
+    } catch {
+      return; // no log yet
+    }
+    if (size < p.logOffset) {
+      // Truncated/rotated underneath us (never normal): restart from zero
+      // rather than reading torn bytes at a stale offset.
+      p.logOffset = 0;
+      p.stdoutRest = "";
+    }
+    if (size === p.logOffset) return;
+    let fd: number;
+    try {
+      fd = openSync(path, "r");
+    } catch {
+      return;
+    }
+    let chunk: string;
+    try {
+      const length = size - p.logOffset;
+      const buffer = Buffer.alloc(Math.min(length, 4 * 1024 * 1024));
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, p.logOffset);
+      p.logOffset += bytesRead;
+      chunk = buffer.toString("utf8", 0, bytesRead);
+    } finally {
+      closeSync(fd);
+    }
+    const data = p.stdoutRest + chunk;
+    const lines = data.split("\n");
+    p.stdoutRest = lines.pop() ?? "";
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (line.trim().length === 0) continue;
+      // Outbound lines (deliver/interrupt/respond/boot) come back through the
+      // host's single-writer log in send order — skip, never parse.
+      if (p.outboundPending.length > 0 && p.outboundPending[0] === line) {
+        p.outboundPending.shift();
+        continue;
+      }
+      const signals = p.adapter.parseLine(line);
+      const lateBoot = p.phase !== "booting" && signals.some((sig) => sig.kind === "booted");
+      for (const signal of signals) {
+        if (lateBoot && signal.kind === "turn_ended") continue;
+        this.onSignal(p, signal);
+      }
+    }
   }
 
   hasProcess(beeId: string, generation: number): boolean {
@@ -399,6 +640,59 @@ export class HsrDriver implements RuntimeDriver {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
     if (!verifyProcessIdentity(pid, pidStartedAt, this.adoptTolMs)) return false;
+    // WP5: a runtime with runner-host artifacts for this exact (pid ==
+    // host pid) re-adopts at FULL capability — reconnect the write socket,
+    // resume the log tail, keep delivering. The degraded stop-on-mail
+    // rotation below remains only for runtimes spawned by a pre-host daemon.
+    const paths = this.runnerPaths(beeId, generation);
+    const status = readRunnerStatus(paths.status);
+    if (status && status.hostPid === pid && !status.exited) {
+      let adapter: HarnessAdapter | null = null;
+      try {
+        adapter = this.cfg.resolve(beeId).adapter;
+      } catch {
+        adapter = null; // unresolvable harness: fall through to degraded
+      }
+      if (adapter) {
+        const proc: ManagedProcess = {
+          beeId,
+          generation,
+          pid,
+          pidStartedAt,
+          child: null,
+          adapter,
+          degraded: false,
+          // Unknown phase — edges during the daemon gap were not observed.
+          // "running" is the safe claim: hang policy bounds it, and the next
+          // tailed turn_ended corrects it. acceptsMidTurn harnesses deliver
+          // immediately; the rest refuse until that edge, exactly like a
+          // genuinely mid-turn runtime.
+          phase: "running",
+          sessionId: null,
+          turnId: null,
+          stopCause: null,
+          killTimer: null,
+          stdoutRest: "",
+          exited: false,
+          spawnError: null,
+          realEvidence: false,
+          hostStyle: true,
+          agentPid: typeof status.agentPid === "number" ? status.agentPid : null,
+          socket: null,
+          socketRetry: null,
+          socketPath: paths.socket,
+          statusPath: paths.status,
+          // History edges were the previous daemon's; observe only new bytes.
+          logOffset: this.sessionLogSize(beeId),
+          outboundPending: [],
+          pendingWrites: [],
+          socketBroken: false,
+        };
+        this.procs.set(beeId, proc);
+        this.connectSocket(proc);
+        return true;
+      }
+    }
     this.procs.set(beeId, {
       beeId,
       generation,
@@ -422,6 +716,16 @@ export class HsrDriver implements RuntimeDriver {
       // store's persisted boot_evidence for the row (from before the daemon
       // restart) governs its exit accounting; this field is driver-local.
       realEvidence: false,
+      hostStyle: false,
+      agentPid: null,
+      socket: null,
+      socketRetry: null,
+      socketPath: null,
+      statusPath: null,
+      logOffset: 0,
+      outboundPending: [],
+      pendingWrites: [],
+      socketBroken: false,
     });
     return true;
   }
@@ -451,6 +755,7 @@ export class HsrDriver implements RuntimeDriver {
 
   /** Drain condition-flag evidence (adapters report; the daemon acts). */
   observeEvidence(): FlagEvidence[] {
+    this.pumpAll();
     const out = this.evidence;
     this.evidence = [];
     return out;
@@ -462,6 +767,7 @@ export class HsrDriver implements RuntimeDriver {
    * records them on the bee row (spec 07 §F continuity).
    */
   observeSessions(): SessionEvidence[] {
+    this.pumpAll();
     const out = this.sessions;
     this.sessions = [];
     return out;
@@ -499,6 +805,14 @@ export class HsrDriver implements RuntimeDriver {
         clearTimeout(p.killTimer);
         p.killTimer = null;
       }
+      if (p.socketRetry) {
+        clearTimeout(p.socketRetry);
+        p.socketRetry = null;
+      }
+      // The write lane belongs to THIS daemon process; the next daemon
+      // reconnects its own. Destroying it never touches the agent.
+      p.socket?.destroy();
+      p.socket = null;
       p.child?.unref();
       // stdio pipes are net.Socket instances (unref exists at runtime).
       for (const stream of [p.child?.stdin, p.child?.stdout, p.child?.stderr]) {
@@ -533,6 +847,23 @@ export class HsrDriver implements RuntimeDriver {
     // Bidirectional JSON-RPC (codex/grok ACP) and claude stream-json user
     // lines live on stdin; the session log is the verbatim native stream in
     // BOTH directions so panes can render the operator's prompt.
+    if (p.hostStyle) {
+      // The HOST is the session log's single writer: it appends the outbound
+      // line (before stdin) exactly as it appends agent stdout, keeping one
+      // append order the tail can skip against via `outboundPending`.
+      try {
+        p.outboundPending.push(line);
+        if (p.socket && !p.socket.destroyed) {
+          p.socket.write(`${JSON.stringify({ op: "write", line })}\n`);
+        } else {
+          p.pendingWrites.push(line);
+          this.connectSocket(p);
+        }
+      } catch {
+        // A write race against a dying host; its exit observation follows.
+      }
+      return;
+    }
     this.appendSessionLog(p.beeId, line);
     try {
       p.child?.stdin?.write(`${line}\n`);
@@ -572,31 +903,6 @@ export class HsrDriver implements RuntimeDriver {
     }
   }
 
-  private onStdout(p: ManagedProcess, chunk: string): void {
-    const adapter = p.adapter;
-    if (!adapter) return; // degraded processes have no stream (and no stdout wiring)
-    const data = p.stdoutRest + chunk;
-    const lines = data.split("\n");
-    p.stdoutRest = lines.pop() ?? "";
-    for (const rawLine of lines) {
-      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-      if (line.trim().length === 0) continue;
-      // Q1: append the raw native line verbatim, before any interpretation.
-      this.appendSessionLog(p.beeId, line);
-      const signals = adapter.parseLine(line);
-      // A late `booted` (readyAtSpawn harnesses emit init only after the first
-      // message) is informational — the process is already live and mid-turn.
-      // Its companion bootedToIdle `turn_ended` must NOT close the in-flight
-      // turn (live 2026-08-17: the cell smoke saw a phantom turn_ended ~100ms
-      // after delivery and tore claude down mid-turn). Drop the trailing idle
-      // marker whenever the booted itself is a no-op duplicate.
-      const lateBoot = p.phase !== "booting" && signals.some((sig) => sig.kind === "booted");
-      for (const signal of signals) {
-        if (lateBoot && signal.kind === "turn_ended") continue;
-        this.onSignal(p, signal);
-      }
-    }
-  }
 
   private onSignal(p: ManagedProcess, signal: ReturnType<HarnessAdapter["parseLine"]>[number]): void {
     if (!p.realEvidence) {
@@ -682,6 +988,12 @@ export class HsrDriver implements RuntimeDriver {
       clearTimeout(p.killTimer);
       p.killTimer = null;
     }
+    if (p.socketRetry) {
+      clearTimeout(p.socketRetry);
+      p.socketRetry = null;
+    }
+    p.socket?.destroy();
+    p.socket = null;
     this.procs.delete(p.beeId);
     // Cause: a requested stop fixes its cause; otherwise exit code 0 is clean
     // and anything else (non-zero, signal, spawn error) is a crash — death is
