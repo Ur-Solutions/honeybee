@@ -512,7 +512,7 @@ export class HiveDaemon {
     if (!spec) throw new Error(`resolve: no agent spec for '${bee.agent}'`);
     const adapterName = spec.adapter ?? bee.agent;
     const grokMcpServers: GrokMcpServerStdio[] = adapterName === "grok"
-      ? liveGateways(this.cfg.dataDir).map((gateway) => ({
+      ? liveGateways().map((gateway) => ({
         name: gateway.name,
         command: gateway.shim.command,
         args: [...gateway.shim.args],
