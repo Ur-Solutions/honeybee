@@ -17,8 +17,8 @@
  *  - daemon SIGKILL → restart re-adopts a cell bee (cellOf re-hydrated from
  *    cell.json; the next runtime provisions by replay, cwd = the same space)
  *  - the RPC result shapes vs the Apiary-expected fixture (type + runtime keys)
- *  - spawn param validation; a cell whose provisioning fails lands on the B5
- *    table as spawn_failed (never a wedged command)
+ *  - spawn param validation; async provisioning failure lands on the B5
+ *    budget/flag surface after admission (never a wedged command)
  *
  * SAFETY: temp dirs only (daemon data dir, cells root, fixture origins). No
  * ~/.hive, no live daemon, no user repos, stub agents only.
@@ -587,16 +587,18 @@ test("cells.4: spawn param validation (typed invalid_request), explicit sha/warm
       const cmds = await client.request<CommandsResult>("commands", { beeId: doomed.beeId });
       const spawnCmd = cmds.commands.find((c) => c.verb === "spawn");
       const view = await client.request<ViewResult>("view", { beeId: doomed.beeId });
-      if (spawnCmd?.status === "failed") return { spawnCmd, view };
+      if (view.view.flags.includes("spawn_failed") && view.view.runtimeState === "stopped") {
+        return { spawnCmd, view, provisioningFailed: true as const };
+      }
       // The race the other way: provisioning won before the rm — then the
       // bee is simply idle in a cell whose origin is gone (a valid state).
-      if (view.view.runtimeState === "idle") return { spawnCmd, view };
+      if (view.view.runtimeState === "idle") return { spawnCmd, view, provisioningFailed: false as const };
       return null;
     }, "doomed spawn settles one way or the other", 20_000);
-    if (outcome.spawnCmd?.status === "failed") {
-      assert.equal(outcome.spawnCmd.failureCause, "spawn_failed");
-      assert.equal(outcome.spawnCmd.attempts, 2, "bounded by the retry budget");
+    assert.equal(outcome.spawnCmd?.status, "done", "admission command is not the async provisioning verdict");
+    if (outcome.provisioningFailed) {
       assert.ok(outcome.view.view.flags.includes("spawn_failed"), "spawn_failed flag visible");
+      assert.equal(outcome.view.bee?.spawnFailures, 2, "bounded by the retry budget");
     }
     const health = await client.request<HealthResult>("health");
     assert.equal(health.tickErrors, 0, "a driver start failure is never a tick error");

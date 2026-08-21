@@ -23,7 +23,14 @@ const AGENT_PATH = join(here, "..", "..", "driver-hsr", "test-agent", "agent.mjs
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function makeDriver(rig: CellTestRig, opts: { sandbox?: boolean | null } = {}): CellDriver {
+function makeDriver(
+  rig: CellTestRig,
+  opts: {
+    sandbox?: boolean | null;
+    backgroundProvisioning?: boolean;
+    provisionWorkerUrl?: URL;
+  } = {},
+): CellDriver {
   return new CellDriver({
     cellsRoot: rig.cellsRoot,
     nodeKind: "workstation",
@@ -50,6 +57,8 @@ function makeDriver(rig: CellTestRig, opts: { sandbox?: boolean | null } = {}): 
     // dir via the driver, outside the sandboxed child.
     sandboxWritablePaths: defaultScratchPaths(),
     disableCow: true,
+    backgroundProvisioning: opts.backgroundProvisioning,
+    provisionWorkerUrl: opts.provisionWorkerUrl,
   });
 }
 
@@ -90,6 +99,51 @@ test("cell-driver.roundtrip: start provisions the cell, runtime runs in the spac
 
     driver.stop("bee-1", 1, "stopped_by_user");
     await drainUntil(driver, (e) => e.some((x) => x.kind === "exited"));
+    assert.equal(driver.hasProcess("bee-1", 1), false);
+  } finally {
+    driver.disposeAll();
+    await sleep(10);
+    rig.cleanup();
+  }
+});
+
+test("cell-driver.background: start returns before provisioning and later boots from the durable ledger", async () => {
+  const rig = makeRig();
+  const driver = makeDriver(rig, { backgroundProvisioning: true });
+  try {
+    const startedAt = performance.now();
+    driver.start("bee-1", 1);
+    assert.ok(performance.now() - startedAt < 500, "start must not run Git provisioning on the daemon lane");
+    assert.equal(driver.hasProcess("bee-1", 1), true, "pending provisioning owns the generation");
+
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"));
+    const cell = driver.cellOf("bee-1");
+    assert.ok(cell);
+    assert.ok(existsSync(join(cell.paths.spaceDir, ".git")));
+    driver.stop("bee-1", 1, "stopped_by_user");
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "exited"));
+  } finally {
+    driver.disposeAll();
+    await sleep(10);
+    rig.cleanup();
+  }
+});
+
+test("cell-driver.background: worker exit without a result becomes a boot failure", async () => {
+  const rig = makeRig();
+  const driver = makeDriver(rig, {
+    backgroundProvisioning: true,
+    provisionWorkerUrl: new URL("./fixtures/silent-worker.mjs", import.meta.url),
+  });
+  try {
+    driver.start("bee-1", 1);
+    const observations = await drainUntil(
+      driver,
+      (events) => events.some((event) => event.kind === "exited"),
+    );
+    const exited = observations.find((event) => event.kind === "exited");
+    assert.equal(exited?.exitCause, "crashed");
+    assert.match(exited?.detail ?? "", /without a result/);
     assert.equal(driver.hasProcess("bee-1", 1), false);
   } finally {
     driver.disposeAll();

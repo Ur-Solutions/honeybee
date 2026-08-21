@@ -25,4 +25,16 @@ await build({
   preserveSymlinks: true,
   logLevel: "silent",
 });
-process.stdout.write("v2 cli artifact staged at dist/v2/cli.js\n");
+await build({
+  absWorkingDir: root,
+  entryPoints: [join(root, "v2", "driver-cell", "src", "provisionWorker.ts")],
+  outfile: join(outDir, "provision-worker.js"),
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  minify: false,
+  preserveSymlinks: true,
+  logLevel: "silent",
+});
+process.stdout.write("v2 cli artifacts staged at dist/v2/cli.js and dist/v2/provision-worker.js\n");

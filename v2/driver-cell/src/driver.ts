@@ -18,6 +18,7 @@
  *    exposed for the daemon/UI (WP6) — they never touch runtime driving.
  */
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { Worker } from "node:worker_threads";
 import type {
   DeliverOutcome,
   DriverObservation,
@@ -67,6 +68,22 @@ export interface CellDriverConfig {
   sandboxWritablePaths?: string[];
   /** Tests: force the clone fallback / cold cells. */
   disableCow?: boolean;
+  /** Daemon mode: provision Cells off the RPC/event-loop hot lane. */
+  backgroundProvisioning?: boolean;
+  /** Tests: substitute the provisioning worker entrypoint. */
+  provisionWorkerUrl?: URL;
+}
+
+interface PendingProvision {
+  beeId: string;
+  generation: number;
+  worker: Worker;
+  settled: boolean;
+}
+
+interface ProvisionWorkerResult {
+  ok: boolean;
+  error?: string;
 }
 
 /** `removeCell` refusal: the bee still has a live runtime — stop it first. */
@@ -82,6 +99,8 @@ export class CellDriver implements RuntimeDriver {
   private readonly inner: HsrDriver;
   /** Provisioned cells by beeId — the driver-side allocation cache. */
   private readonly cells = new Map<string, ProvisionedCell>();
+  private readonly pending = new Map<string, PendingProvision>();
+  private readonly pendingObservations: DriverObservation[] = [];
 
   constructor(cfg: CellDriverConfig) {
     this.cfg = cfg;
@@ -98,8 +117,46 @@ export class CellDriver implements RuntimeDriver {
   start(beeId: string, generation: number): void {
     // Provisioning is idempotent and ledger-keyed: a replayed spawn command
     // (crash mid-provision, executor replay) resumes instead of redoing.
-    this.ensureCell(beeId, `start-${beeId}-g${generation}`);
-    this.inner.start(beeId, generation);
+    const opId = `start-${beeId}-g${generation}`;
+    if (this.cfg.backgroundProvisioning !== true) {
+      this.ensureCell(beeId, opId);
+      this.inner.start(beeId, generation);
+      return;
+    }
+    if (this.pending.has(beeId)) {
+      throw new Error(`cell driver: bee ${beeId} already has provisioning in flight`);
+    }
+    const spec = this.cfg.resolveCell(beeId);
+    const workerUrl = this.cfg.provisionWorkerUrl ?? (import.meta.url.endsWith(".ts")
+      ? new URL("./provisionWorker.ts", import.meta.url)
+      : new URL("./provision-worker.js", import.meta.url));
+    const worker = new Worker(workerUrl, {
+      execArgv: [],
+      workerData: {
+        cellsRoot: this.cfg.cellsRoot,
+        request: spec.provision,
+        opId,
+        disableCow: this.cfg.disableCow ?? false,
+      },
+    });
+    const pending: PendingProvision = { beeId, generation, worker, settled: false };
+    this.pending.set(beeId, pending);
+    worker.once("message", (message: ProvisionWorkerResult) => {
+      if (message.ok) this.finishProvision(pending);
+      else this.failProvision(pending, message.error ?? "cell provisioning failed");
+    });
+    worker.once("error", (error) => this.failProvision(
+      pending,
+      error instanceof Error ? error.message : String(error),
+    ));
+    worker.once("exit", (code) => {
+      if (!pending.settled) {
+        this.failProvision(
+          pending,
+          `cell provisioning worker exited with code ${code} without a result`,
+        );
+      }
+    });
   }
 
   deliver(beeId: string, generation: number, messageId: number, body: string): DeliverOutcome {
@@ -107,6 +164,14 @@ export class CellDriver implements RuntimeDriver {
   }
 
   stop(beeId: string, generation: number, cause: StopCause): { hadProcess: boolean } {
+    const pending = this.pending.get(beeId);
+    if (pending?.generation === generation) {
+      pending.settled = true;
+      this.pending.delete(beeId);
+      void pending.worker.terminate();
+      this.pendingObservations.push({ beeId, generation, kind: "exited", exitCause: cause });
+      return { hadProcess: true };
+    }
     return this.inner.stop(beeId, generation, cause);
   }
 
@@ -115,11 +180,12 @@ export class CellDriver implements RuntimeDriver {
   }
 
   observe(): DriverObservation[] {
-    return this.inner.observe();
+    const pending = this.pendingObservations.splice(0);
+    return [...pending, ...this.inner.observe()];
   }
 
   hasProcess(beeId: string, generation: number): boolean {
-    return this.inner.hasProcess(beeId, generation);
+    return this.pending.get(beeId)?.generation === generation || this.inner.hasProcess(beeId, generation);
   }
 
   snapshotLive(): LiveProcess[] {
@@ -167,10 +233,12 @@ export class CellDriver implements RuntimeDriver {
   }
 
   detachAll(): void {
+    this.cancelPending();
     this.inner.detachAll();
   }
 
   disposeAll(): void {
+    this.cancelPending();
     this.inner.disposeAll();
   }
 
@@ -249,7 +317,7 @@ export class CellDriver implements RuntimeDriver {
    * any other. Throws CellRuntimeLiveError while a runtime is live.
    */
   removeCell(beeId: string, opts: { force?: boolean } = {}): DeleteResult {
-    if (this.snapshotLive().some((p) => p.beeId === beeId)) {
+    if (this.pending.has(beeId) || this.snapshotLive().some((p) => p.beeId === beeId)) {
       throw new CellRuntimeLiveError(beeId);
     }
     const cell = this.cellOf(beeId);
@@ -296,6 +364,47 @@ export class CellDriver implements RuntimeDriver {
   // -------------------------------------------------------------------------
   // internals
   // -------------------------------------------------------------------------
+
+  private finishProvision(pending: PendingProvision): void {
+    if (pending.settled || this.pending.get(pending.beeId) !== pending) return;
+    pending.settled = true;
+    this.pending.delete(pending.beeId);
+    try {
+      // The worker completed the ledger-keyed operation. This replay only
+      // hydrates the parent driver's cache before the HSR process starts.
+      this.ensureCell(pending.beeId, `start-${pending.beeId}-g${pending.generation}`);
+      this.inner.start(pending.beeId, pending.generation);
+    } catch (error) {
+      this.pendingObservations.push({
+        beeId: pending.beeId,
+        generation: pending.generation,
+        kind: "exited",
+        exitCause: "crashed",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private failProvision(pending: PendingProvision, detail: string): void {
+    if (pending.settled || this.pending.get(pending.beeId) !== pending) return;
+    pending.settled = true;
+    this.pending.delete(pending.beeId);
+    this.pendingObservations.push({
+      beeId: pending.beeId,
+      generation: pending.generation,
+      kind: "exited",
+      exitCause: "crashed",
+      detail: `cell provisioning failed: ${detail}`,
+    });
+  }
+
+  private cancelPending(): void {
+    for (const pending of this.pending.values()) {
+      pending.settled = true;
+      void pending.worker.terminate();
+    }
+    this.pending.clear();
+  }
 
   private resolveCellSpawn(beeId: string): SpawnSpec {
     const cell = this.cells.get(beeId);

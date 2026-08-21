@@ -384,6 +384,7 @@ export class HiveDaemon {
       resolveHarness: (beeId: string) => this.resolveSpawnSpec(beeId),
       resolveCell: (beeId: string) => this.resolveCellSpec(beeId),
       hsr: hsrConfig,
+      backgroundProvisioning: true,
     });
     mkdirSync(join(this.cfg.dataDir, "tmux-events"), { recursive: true });
     const tmux = new TmuxDriver({
