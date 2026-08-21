@@ -504,7 +504,13 @@ export class TmuxDriver implements RuntimeDriver {
    * functional: send-keys delivery still works and the observer stack
    * re-attaches at EOF (no history replay) — deliverable after restart.
    */
-  adopt(beeId: string, generation: number, pid: number, pidStartedAt: number): boolean {
+  adopt(
+    beeId: string,
+    generation: number,
+    pid: number,
+    pidStartedAt: number,
+    _lastKnownState?: "booting" | "running" | "idle",
+  ): boolean {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
     if (!verifyProcessIdentity(pid, pidStartedAt, this.adoptTolMs)) return false;

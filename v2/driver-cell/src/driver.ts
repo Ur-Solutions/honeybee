@@ -196,8 +196,14 @@ export class CellDriver implements RuntimeDriver {
   // Extended driver surface (duck-typed by DaemonCore) — delegation
   // -------------------------------------------------------------------------
 
-  adopt(beeId: string, generation: number, pid: number, pidStartedAt: number): boolean {
-    return this.inner.adopt(beeId, generation, pid, pidStartedAt);
+  adopt(
+    beeId: string,
+    generation: number,
+    pid: number,
+    pidStartedAt: number,
+    lastKnownState?: "booting" | "running" | "idle",
+  ): boolean {
+    return this.inner.adopt(beeId, generation, pid, pidStartedAt, lastKnownState);
   }
 
   isDegraded(beeId: string, generation: number): boolean {

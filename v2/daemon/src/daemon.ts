@@ -605,7 +605,9 @@ export class HiveDaemon {
     for (const bee of store.listBees()) {
       const rt = store.currentRuntime(bee.id);
       if (!rt || rt.state === "stopped" || rt.pid == null || rt.pidStartedAt == null) continue;
-      const adopted = driver.adopt(bee.id, rt.generation, rt.pid, rt.pidStartedAt);
+      const lastKnownState =
+        rt.state === "booting" || rt.state === "running" || rt.state === "idle" ? rt.state : undefined;
+      const adopted = driver.adopt(bee.id, rt.generation, rt.pid, rt.pidStartedAt, lastKnownState);
       this.log(`boot.adopt bee=${bee.id} gen=${rt.generation} pid=${rt.pid} ok=${adopted}`);
     }
   }
