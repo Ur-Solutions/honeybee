@@ -373,6 +373,19 @@ export class HiveDaemon {
       sessionLogDir: this.cfg.sessionLogDir,
       stopKillGraceMs: this.cfg.stopKillGraceMs,
       adoptToleranceMs: this.cfg.adoptToleranceMs,
+      // WP5 runner host: in production v2 ships as a single bundle, so the
+      // driver's source-path default cannot exist — the host is our own CLI
+      // entry re-invoked with the hidden runner-host verb. Under tests the
+      // daemon is constructed in-process (argv[1] is the test runner), so
+      // only claim the entry when it is recognizably the hive CLI.
+      ...(process.argv[1] && /(?:^|\/)(?:hive|cli\.[cm]?js)$/.test(process.argv[1])
+        ? {
+            hostCommand: (configPath: string) => ({
+              command: process.execPath,
+              args: [process.argv[1] as string, "v2", "runner-host", configPath],
+            }),
+          }
+        : {}),
     };
     const hsr = new HsrDriver({ ...hsrConfig, resolve: (beeId: string) => this.resolveSpawnSpec(beeId) });
     // Cell substrate (spec 05): a CellDriver composed over its own inner
