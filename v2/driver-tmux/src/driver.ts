@@ -510,6 +510,7 @@ export class TmuxDriver implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     _lastKnownState?: "booting" | "running" | "idle",
+    _providerSessionId?: string | null,
   ): boolean {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;

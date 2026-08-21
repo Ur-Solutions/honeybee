@@ -13,8 +13,17 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HsrDriver, type SpawnSpec } from "../src/index.ts";
-import { stubAdapter } from "../../adapters/src/index.ts";
+import { stubAdapter, type HarnessAdapter } from "../../adapters/src/index.ts";
 import { AGENT_PATH, drainUntil, ofKind, pidAlive, sleep } from "./helpers.ts";
+
+const sessionRequiredStubAdapter: HarnessAdapter = {
+  ...stubAdapter,
+  harness: "session-required-stub",
+  encodeMessage(body, ctx) {
+    if (!ctx.sessionId) return null;
+    return stubAdapter.encodeMessage(body, ctx);
+  },
+};
 
 function makeDriver(dir: string): HsrDriver {
   return new HsrDriver({
@@ -22,11 +31,11 @@ function makeDriver(dir: string): HsrDriver {
     stopKillGraceMs: 400,
     resolve(): SpawnSpec {
       return {
-        adapter: stubAdapter,
+        adapter: sessionRequiredStubAdapter,
         command: process.execPath,
         args: [AGENT_PATH],
         cwd: dir,
-        env: { ...process.env, STUB_TURN_MS: "5" },
+        env: { ...process.env, STUB_TURN_MS: "5", STUB_SESSION_ID: "session-r" },
       };
     },
   });
@@ -54,7 +63,7 @@ test("daemon restart: the runtime survives and the successor daemon delivers at 
     // The store knew the runtime was idle at shutdown; the hint opens the
     // accept point immediately AND keeps the adopted bee out of the
     // turn-hang policy (the 2026-08-21 deploy-soak hang_stop lesson).
-    assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt, "idle"), true);
+    assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt, "idle", "session-r"), true);
     assert.equal(second.isDegraded("bee-r", 1), false, "host adoption is never degraded");
     assert.ok(second.hasProcess("bee-r", 1));
 

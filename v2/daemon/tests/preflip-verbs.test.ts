@@ -334,6 +334,63 @@ test("v6.rpc.4: bee.fork (codex) — the fork's handshake sends thread/fork {thr
   }
 });
 
+test("daemon restart: an adopted codex runtime keeps its persisted thread id and accepts the next message", async () => {
+  const rpcLog = join(process.env.TMPDIR ?? "/tmp", `hb-v6-codex-adopt-${process.pid}-${Date.now()}.jsonl`);
+  const { dir, cleanup } = makeDaemonDir({
+    agents: {
+      codex: { command: process.execPath, args: [FAKE_CODEX, "app-server"], adapter: "codex", env: { FAKE_CODEX_RPC_LOG: rpcLog } },
+    },
+  });
+  let daemon: DaemonHandle | null = null;
+  let client: RpcClient | null = null;
+  let hostPid: number | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+    const spawned = await client.request<SpawnResult>("spawn", { name: "codex-adopt", agent: "codex", cwd: dir });
+    const threadId = await waitFor(
+      async () => (await client!.request<ViewResult>("view", { beeId: spawned.beeId })).bee?.providerSessionId,
+      "codex thread id",
+    );
+    const before = await waitState(client, spawned.beeId, "idle", "codex idle before daemon restart");
+    hostPid = before.runtime?.pid ?? null;
+    assert.ok(hostPid != null && hostPid > 0);
+
+    client.close();
+    client = null;
+    await daemon.kill();
+
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+    const adopted = await client.request<ViewResult>("view", { beeId: spawned.beeId });
+    assert.equal(adopted.view.generation, 1, "the surviving runtime is adopted, not replaced");
+    assert.equal(adopted.bee?.providerSessionId, threadId, "the durable provider thread is unchanged");
+
+    const sent = await client.request<SendRpcResult>("send", { beeId: spawned.beeId, body: "after restart" });
+    assert.equal(
+      await waitDelivered(client, spawned.beeId, sent.messageId, "post-restart codex delivery"),
+      1,
+      "mail reaches the adopted generation",
+    );
+    await waitState(client, spawned.beeId, "idle", "codex idle after daemon restart");
+
+    const turns = jsonl<{ method: string; params: Record<string, unknown> | null }>(rpcLog)
+      .filter((call) => call.method === "turn/start");
+    assert.equal(turns.at(-1)?.params?.threadId, threadId, "delivery targets the restored thread id");
+
+    await client.request("stop", { beeId: spawned.beeId });
+    await waitState(client, spawned.beeId, "stopped", "codex stopped after adoption test");
+  } finally {
+    client?.close();
+    await daemon?.stop().catch(() => {});
+    if (hostPid != null) {
+      try { process.kill(-hostPid, "SIGKILL"); } catch { /* already stopped */ }
+      try { process.kill(hostPid, "SIGKILL"); } catch { /* already stopped */ }
+    }
+    cleanup();
+  }
+});
+
 test("v6.rpc.5: parenting policy over RPC — archive parent leaves children; delete parent orphans (bee.orphaned in the watch stream, children alive, parentId null); fork of a cell bee refused", async () => {
   const root = mkdtempSync(join(tmpdir(), "hb-v6-cells-"));
   const origin = makeOrigin(root);

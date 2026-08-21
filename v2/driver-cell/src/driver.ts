@@ -202,8 +202,16 @@ export class CellDriver implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
+    providerSessionId?: string | null,
   ): boolean {
-    return this.inner.adopt(beeId, generation, pid, pidStartedAt, lastKnownState);
+    return this.inner.adopt(
+      beeId,
+      generation,
+      pid,
+      pidStartedAt,
+      lastKnownState,
+      providerSessionId,
+    );
   }
 
   isDegraded(beeId: string, generation: number): boolean {

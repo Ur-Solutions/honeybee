@@ -105,8 +105,16 @@ export class SubstrateRouter implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
+    providerSessionId?: string | null,
   ): boolean {
-    return this.driverFor(beeId).adopt(beeId, generation, pid, pidStartedAt, lastKnownState);
+    return this.driverFor(beeId).adopt(
+      beeId,
+      generation,
+      pid,
+      pidStartedAt,
+      lastKnownState,
+      providerSessionId,
+    );
   }
 
   isDegraded(beeId: string, generation: number): boolean {

@@ -643,7 +643,14 @@ export class HiveDaemon {
       if (!rt || rt.state === "stopped" || rt.pid == null || rt.pidStartedAt == null) continue;
       const lastKnownState =
         rt.state === "booting" || rt.state === "running" || rt.state === "idle" ? rt.state : undefined;
-      const adopted = driver.adopt(bee.id, rt.generation, rt.pid, rt.pidStartedAt, lastKnownState);
+      const adopted = driver.adopt(
+        bee.id,
+        rt.generation,
+        rt.pid,
+        rt.pidStartedAt,
+        lastKnownState,
+        bee.providerSessionId,
+      );
       this.log(`boot.adopt bee=${bee.id} gen=${rt.generation} pid=${rt.pid} ok=${adopted}`);
     }
   }

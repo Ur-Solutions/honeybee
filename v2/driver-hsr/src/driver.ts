@@ -37,7 +37,8 @@
  *
  * WP4 addition — cross-restart re-adoption (contract §3.2): when the daemon
  * PROCESS restarts, the ChildProcess handles and pipes are gone but detached
- * children may survive. `adopt(beeId, generation, pid, pidStartedAt)` verifies
+ * children may survive. `adopt(beeId, generation, pid, pidStartedAt, state,
+ * providerSessionId)` verifies
  * exact identity (pid alive + OS start time within tolerance of the recorded
  * spawn stamp) and registers the process as *degraded*: it counts as live
  * (snapshotLive/hasProcess — so reconcileAtBoot keeps its runtime row, B7),
@@ -657,6 +658,7 @@ export class HsrDriver implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
+    providerSessionId?: string | null,
   ): boolean {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
@@ -692,7 +694,11 @@ export class HsrDriver implements RuntimeDriver {
           // Without a hint, "running" stays the safe claim (hang policy
           // bounds it; the next tailed edge corrects it).
           phase: lastKnownState === "idle" ? "idle" : "running",
-          sessionId: null,
+          // The adapter learned this id before the old daemon persisted it on
+          // the bee. Adoption tails from EOF, so it will not see the original
+          // boot signal again; restore the durable fact or session-addressed
+          // protocols (Codex/Grok) can never encode another delivery.
+          sessionId: providerSessionId ?? null,
           turnId: null,
           stopCause: null,
           killTimer: null,
