@@ -54,6 +54,7 @@ import {
 } from "./activation.ts";
 import type { ResolvedNodeConfig } from "./config.ts";
 import { credentialDigest, readClaudeKeychain, writeClaudeKeychainEntry, type KeychainReader, type KeychainWriter } from "./keychain.ts";
+import { atomicWriteFileSync } from "./homeDefaults.ts";
 
 // ---------------------------------------------------------------------------
 // injected transports
@@ -62,8 +63,17 @@ import { credentialDigest, readClaudeKeychain, writeClaudeKeychainEntry, type Ke
 export interface LimitsFetchers {
   /** GET api.anthropic.com/api/oauth/usage with a bearer token (default: real fetch). */
   claudeUsage?: (accessToken: string) => Promise<ClaudeUsageResponse>;
+  /** Rotate an expired Claude OAuth refresh token (default: real OAuth endpoint). */
+  claudeRefresh?: (refreshToken: string) => Promise<RefreshedClaudeToken | null>;
   /** `codex app-server` account/rateLimits/read against a home (default: real child process). Null = unavailable. */
   codexRateLimits?: (homePath: string) => Promise<CodexLiveRateLimits | null>;
+}
+
+export interface RefreshedClaudeToken {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  scopes?: string[];
 }
 
 export interface AccountsServiceOptions {
@@ -75,6 +85,21 @@ export interface AccountsServiceOptions {
   keychainWriter?: KeychainWriter;
   fetchers?: LimitsFetchers;
 }
+
+type ClaudeCredential = {
+  accessToken: string;
+  expiresAt: number;
+  subscriptionType?: string;
+  refreshToken?: string;
+  document: Record<string, unknown>;
+  oauth: Record<string, unknown>;
+};
+
+type ClaudeRefreshOutcome =
+  | { kind: "ok"; credential: ClaudeCredential }
+  | { kind: "live_runtime" }
+  | { kind: "no_refresh_token" }
+  | { kind: "refresh_failed" };
 
 // ---------------------------------------------------------------------------
 // selection results
@@ -139,6 +164,29 @@ async function claudeOauthGet(accessToken: string, url: string, timeoutMs: numbe
 
 function defaultClaudeUsage(timeoutMs: number): NonNullable<LimitsFetchers["claudeUsage"]> {
   return (accessToken) => claudeOauthGet(accessToken, "https://api.anthropic.com/api/oauth/usage", timeoutMs) as Promise<ClaudeUsageResponse>;
+}
+
+// Claude Code's public OAuth client id (the same one the CLI itself uses).
+const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+function defaultClaudeRefresh(timeoutMs: number): NonNullable<LimitsFetchers["claudeRefresh"]> {
+  return async (refreshToken) => {
+    const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return null;
+    const fresh = (await response.json()) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; scope?: unknown };
+    if (typeof fresh.access_token !== "string") return null;
+    return {
+      accessToken: fresh.access_token,
+      refreshToken: typeof fresh.refresh_token === "string" ? fresh.refresh_token : refreshToken,
+      expiresAt: Date.now() + (typeof fresh.expires_in === "number" ? fresh.expires_in : 3600) * 1000,
+      ...(typeof fresh.scope === "string" ? { scopes: fresh.scope.split(" ") } : {}),
+    };
+  };
 }
 
 /**
@@ -221,6 +269,8 @@ export class AccountsService {
   private pollingSeats = false;
   private lastPeriodicRefreshAt = 0;
   private refreshing: Promise<void> | null = null;
+  /** Refresh tokens rotate on use: at most one refresh may run per account. */
+  private readonly claudeRefreshes = new Map<string, Promise<ClaudeRefreshOutcome>>();
 
   constructor(opts: AccountsServiceOptions) {
     this.store = opts.store;
@@ -231,6 +281,7 @@ export class AccountsService {
     this.keychainWriter = opts.keychainWriter ?? writeClaudeKeychainEntry;
     this.fetchers = {
       claudeUsage: opts.fetchers?.claudeUsage ?? defaultClaudeUsage(this.cfg.accounts.limitsFetchTimeoutMs),
+      claudeRefresh: opts.fetchers?.claudeRefresh ?? defaultClaudeRefresh(this.cfg.accounts.limitsFetchTimeoutMs),
       codexRateLimits: opts.fetchers?.codexRateLimits ?? defaultCodexRateLimits(this.cfg.accounts.limitsFetchTimeoutMs, this.cfg.agents.codex?.command ?? "codex"),
     };
   }
@@ -409,7 +460,7 @@ export class AccountsService {
       const row = this.store.putAccountLimits(id, fetched);
       // The probe is the authentication check account health keys on: a REAL
       // auth failure sets auth_needed; a readable answer is contrary evidence.
-      if (!fetched.readable && fetched.error && isAuthFailureLimitsError(fetched.error)) {
+      if (!fetched.readable && fetched.error && fetched.unreadableReason === "auth_failed") {
         if (this.store.setAccountStatus(id, account.status === "paused" ? "paused" : "auth_needed", `limits probe: ${fetched.error.slice(0, 200)}`).applied) {
           this.log(`account.auth_needed account=${id} by=limits_probe`);
         }
@@ -431,28 +482,47 @@ export class AccountsService {
       const bounded = new Promise<PutAccountLimitsInput>((_, reject) => setTimeout(() => reject(new Error(`limits fetch timed out after ${timeout}ms`)), timeout).unref());
       return await Promise.race([attempt, bounded]);
     } catch (err) {
-      return { readable: false, error: (err instanceof Error ? err.message : String(err)).slice(0, 500) };
+      const error = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+      return {
+        readable: false,
+        unreadableReason: /timed out|timeout/i.test(error)
+          ? "timeout"
+          : isAuthFailureLimitsError(error)
+            ? "auth_failed"
+            : "provider_error",
+        error,
+      };
     }
   }
 
   private async fetchByHarness(account: AccountRow): Promise<PutAccountLimitsInput> {
     switch (account.harness) {
       case "claude": {
-        const credential = await this.freshestClaudeCredential(account);
-        if (!credential) return { readable: false, error: "no OAuth token found in home, keychain, or vault" };
+        let credential = await this.freshestClaudeCredential(account);
+        if (!credential) {
+          return { readable: false, unreadableReason: "auth_expired", error: "no OAuth token found in home, keychain, or vault" };
+        }
         if (credential.expiresAt <= this.now()) {
-          return { readable: false, error: "OAuth token expired; a running claude refreshes it, or log in: hive v2 account login " + account.id };
+          const refreshed = await this.refreshClaudeCredential(account);
+          if (refreshed.kind === "ok") credential = refreshed.credential;
+          else if (refreshed.kind === "live_runtime") {
+            return { readable: false, unreadableReason: "auth_expired", error: "OAuth token expired; the running Claude owns refresh for this account" };
+          } else if (refreshed.kind === "no_refresh_token") {
+            return { readable: false, unreadableReason: "auth_expired", error: "OAuth token expired and has no refresh token; log in: hive v2 account login " + account.id };
+          } else {
+            return { readable: false, unreadableReason: "auth_failed", error: "OAuth refresh failed; log in: hive v2 account login " + account.id };
+          }
         }
         const usage = await this.fetchers.claudeUsage(credential.accessToken);
         return parseClaudeUsage(usage, credential.subscriptionType ?? null);
       }
       case "codex": {
         const limits = await this.fetchers.codexRateLimits(account.homePath);
-        if (!limits) return { readable: false, error: "codex app-server did not answer account/rateLimits/read" };
+        if (!limits) return { readable: false, unreadableReason: "provider_error", error: "codex app-server did not answer account/rateLimits/read" };
         return parseCodexRateLimits(limits);
       }
       default:
-        return { readable: false, error: `${account.harness} has no limits source` };
+        return { readable: false, unreadableReason: "unsupported", error: `${account.harness} has no limits source` };
     }
   }
 
@@ -463,17 +533,86 @@ export class AccountsService {
    * — no cross-home candidate pool, no identity arbitration (one account =
    * one home in v2).
    */
-  private async freshestClaudeCredential(account: AccountRow): Promise<{ accessToken: string; expiresAt: number; subscriptionType?: string } | null> {
-    const candidates: Array<{ accessToken: string; expiresAt: number; subscriptionType?: string }> = [];
+  private async freshestClaudeCredential(account: AccountRow): Promise<ClaudeCredential | null> {
+    const candidates: ClaudeCredential[] = [];
     const push = (raw: string | null) => {
       const parsed = parseClaudeCredentials(raw);
-      if (parsed) candidates.push(parsed);
+      if (!parsed || !raw) return;
+      try {
+        const document = JSON.parse(raw) as Record<string, unknown>;
+        const oauth = document.claudeAiOauth;
+        if (!oauth || typeof oauth !== "object" || Array.isArray(oauth)) return;
+        candidates.push({ ...parsed, document, oauth: oauth as Record<string, unknown> });
+      } catch {
+        // parseClaudeCredentials already rejects malformed documents; defensive only.
+      }
     };
     push(readIfFile(join(account.homePath, ".credentials.json")));
     push(await this.keychainReader(account.homePath).catch(() => null));
     push(readIfFile(join(this.vaultDirOf(account), ".credentials.json")));
     candidates.sort((a, b) => b.expiresAt - a.expiresAt);
     return candidates[0] ?? null;
+  }
+
+  private hasLiveRuntime(accountId: string): boolean {
+    return this.store.listBees().some((bee) => {
+      if (bee.account !== accountId) return false;
+      const runtime = this.store.currentRuntime(bee.id);
+      return runtime !== null && runtime.state !== "stopped";
+    });
+  }
+
+  /**
+   * Rotate one expired Claude chain exactly once and persist the new chain to
+   * the account's only home, Keychain item, and vault backup. A live runtime
+   * owns its own refresh and is never raced by the daemon.
+   */
+  private async refreshClaudeCredential(account: AccountRow): Promise<ClaudeRefreshOutcome> {
+    const joined = this.claudeRefreshes.get(account.id);
+    if (joined) return joined;
+    const pending = (async (): Promise<ClaudeRefreshOutcome> => {
+      if (this.hasLiveRuntime(account.id)) return { kind: "live_runtime" };
+      // Re-read inside the single-flight boundary: another limits caller or
+      // harness may have advanced the chain after the first read.
+      const credential = await this.freshestClaudeCredential(account);
+      if (credential && credential.expiresAt > this.now()) return { kind: "ok", credential };
+      if (!credential?.refreshToken) return { kind: "no_refresh_token" };
+      const refreshed = await this.fetchers.claudeRefresh(credential.refreshToken);
+      if (!refreshed) return { kind: "refresh_failed" };
+      const oauth: Record<string, unknown> = {
+        ...credential.oauth,
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken,
+        expiresAt: refreshed.expiresAt,
+        ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
+      };
+      const document = { ...credential.document, claudeAiOauth: oauth };
+      const raw = JSON.stringify(document);
+      mkdirSync(account.homePath, { recursive: true, mode: 0o700 });
+      mkdirSync(this.vaultDirOf(account), { recursive: true, mode: 0o700 });
+      atomicWriteFileSync(join(account.homePath, ".credentials.json"), raw);
+      atomicWriteFileSync(join(this.vaultDirOf(account), ".credentials.json"), raw);
+      const keychainWritten = await this.keychainWriter(account.homePath, raw).catch(() => false);
+      if (!keychainWritten) this.log(`account.refresh.keychain_degraded account=${account.id}`);
+      this.log(`account.refresh account=${account.id} persisted=home,vault keychain=${keychainWritten}`);
+      return {
+        kind: "ok",
+        credential: {
+          accessToken: refreshed.accessToken,
+          refreshToken: refreshed.refreshToken,
+          expiresAt: refreshed.expiresAt,
+          ...(credential.subscriptionType ? { subscriptionType: credential.subscriptionType } : {}),
+          document,
+          oauth,
+        },
+      };
+    })();
+    this.claudeRefreshes.set(account.id, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.claudeRefreshes.get(account.id) === pending) this.claudeRefreshes.delete(account.id);
+    }
   }
 
   /** Tick hook: the periodic refresh (every limitsRefreshMs while the daemon runs; 0 = off). Never overlaps itself. */

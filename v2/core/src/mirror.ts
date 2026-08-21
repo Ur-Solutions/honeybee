@@ -249,6 +249,7 @@ export const MIRROR_ACCOUNT_LIMITS_KEYS = [
   "account",
   "fetchedAt",
   "readable",
+  "unreadableReason",
   "error",
   "plan",
   "fiveHourPct",

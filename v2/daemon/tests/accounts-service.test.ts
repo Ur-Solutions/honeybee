@@ -340,6 +340,92 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
     await svc.refreshLimits([claude.id]);
     assert.equal(usageCalls.length, before);
     assert.match(r.store.getAccountLimits(claude.id)?.error ?? "", /expired/);
+    assert.equal(r.store.getAccountLimits(claude.id)?.unreadableReason, "auth_expired");
+    assert.equal(r.store.getAccount(claude.id)?.status, "ok", "expiry alone is not proof that the refresh chain is invalid");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("limits.1b: expired Claude chains refresh once, persist home + keychain + vault, and a rejected refresh is typed auth_failed", async () => {
+  const r = rig();
+  try {
+    let refreshCalls = 0;
+    const usageCalls: string[] = [];
+    const keychainWrites: string[] = [];
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    const svc = service(r, {
+      fetchers: {
+        claudeRefresh: async (token) => {
+          refreshCalls += 1;
+          assert.equal(token, "old-refresh");
+          await refreshGate;
+          return { accessToken: "new-access", refreshToken: "new-refresh", expiresAt: r.now() + HOUR, scopes: ["user:profile"] };
+        },
+        claudeUsage: async (token) => {
+          usageCalls.push(token);
+          return { five_hour: { utilization: 7 }, seven_day: { utilization: 19 } };
+        },
+      },
+      keychainReader: async () => null,
+      keychainWriter: async (_home, raw) => { keychainWrites.push(raw); return true; },
+    });
+    const account = addAccount(r, "claude", "refresh", {
+      vault: { ".credentials.json": JSON.stringify({ sibling: { keep: true }, claudeAiOauth: { accessToken: "old-access", refreshToken: "old-refresh", expiresAt: r.now() - 1, subscriptionType: "max" } }) },
+    });
+    mkdirSync(account.homePath, { recursive: true });
+    writeFileSync(join(account.homePath, ".credentials.json"), readFileSync(join(r.vault, "claude", account.id, ".credentials.json"), "utf8"));
+
+    const first = svc.refreshLimits([account.id]);
+    const second = svc.refreshLimits([account.id]);
+    await waitFor(() => (refreshCalls === 1 ? true : null), "single refresh started");
+    releaseRefresh();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(refreshCalls, 1, "rotating refresh token is single-flight per account");
+    assert.deepEqual(usageCalls, ["new-access", "new-access"]);
+    assert.equal(a[0]?.readable, true);
+    assert.equal(b[0]?.unreadableReason, null);
+    for (const path of [
+      join(account.homePath, ".credentials.json"),
+      join(r.vault, "claude", account.id, ".credentials.json"),
+    ]) {
+      const doc = JSON.parse(readFileSync(path, "utf8")) as { sibling?: { keep?: boolean }; claudeAiOauth?: { accessToken?: string; refreshToken?: string } };
+      assert.equal(doc.sibling?.keep, true, "non-OAuth credential siblings survive rotation");
+      assert.equal(doc.claudeAiOauth?.accessToken, "new-access");
+      assert.equal(doc.claudeAiOauth?.refreshToken, "new-refresh");
+    }
+    assert.equal(keychainWrites.length, 1);
+    assert.match(keychainWrites[0] ?? "", /new-refresh/);
+
+    const live = addAccount(r, "claude", "live", {
+      vault: { ".credentials.json": JSON.stringify({ claudeAiOauth: { accessToken: "live-old", refreshToken: "live-refresh", expiresAt: r.now() - 1 } }) },
+    });
+    const { bee } = r.store.createBee({ name: "live-owner", agent: "claude", substrate: "hsr", cwd: "/tmp", account: live.id });
+    r.store.updateRuntimeState(bee.id, 1, "running", { pid: 99, pidStartedAt: 1 });
+    let racedRefreshes = 0;
+    const liveSvc = service(r, {
+      fetchers: { claudeRefresh: async () => { racedRefreshes += 1; return null; } },
+      keychainReader: async () => null,
+    });
+    const liveRow = (await liveSvc.refreshLimits([live.id]))[0]!;
+    assert.equal(racedRefreshes, 0, "the daemon never races a live Claude runtime's rotating refresh token");
+    assert.equal(liveRow.unreadableReason, "auth_expired");
+    assert.match(liveRow.error ?? "", /running Claude owns refresh/);
+    assert.equal(r.store.getAccount(live.id)?.status, "ok");
+
+    const rejected = addAccount(r, "claude", "rejected", {
+      vault: { ".credentials.json": JSON.stringify({ claudeAiOauth: { accessToken: "bad-access", refreshToken: "bad-refresh", expiresAt: r.now() - 1 } }) },
+    });
+    const rejectedSvc = service(r, {
+      fetchers: { claudeRefresh: async () => null },
+      keychainReader: async () => null,
+    });
+    const failed = (await rejectedSvc.refreshLimits([rejected.id]))[0]!;
+    assert.equal(failed.readable, false);
+    assert.equal(failed.unreadableReason, "auth_failed");
+    assert.match(failed.error ?? "", /refresh failed/);
+    assert.equal(r.store.getAccount(rejected.id)?.status, "auth_needed");
   } finally {
     r.cleanup();
   }

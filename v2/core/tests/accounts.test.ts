@@ -228,7 +228,7 @@ test("v7.migration: a v6 store opens as v7 — bees.account added, accounts/acco
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 11);
+      assert.equal(SCHEMA_VERSION, 12);
       const cols = (check.prepare("SELECT name FROM pragma_table_info('bees')").all() as Array<{ name: string }>).map((c) => c.name);
       assert.ok(cols.includes("account"));
       const tables = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name);
@@ -251,6 +251,51 @@ test("v7.dump: StateDump carries accounts + limits + cursors; a fresh store's re
     assert.deepEqual(dump.selectionCursors, []);
     assert.deepEqual(replayAudit(store.auditRows()), dump);
     store.close();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("v12.migration: account_limits gains the closed unreadable reason without inventing a class for old rows", () => {
+  const h = harness();
+  try {
+    const db = new DatabaseSync(h.path);
+    db.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+      INSERT INTO meta(key, value) VALUES('schema_version', '11');
+      CREATE TABLE accounts (
+        id TEXT PRIMARY KEY, harness TEXT NOT NULL, home_path TEXT NOT NULL, label TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ok','auth_needed','paused')), penalty INTEGER NOT NULL DEFAULT 0,
+        last_login_at INTEGER, exhausted_at INTEGER, added_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO accounts VALUES('claude-old','claude','/tmp/claude-old','old','ok',0,NULL,NULL,1,1);
+      CREATE TABLE account_limits (
+        account TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+        fetched_at INTEGER NOT NULL, readable INTEGER NOT NULL CHECK (readable IN (0,1)), error TEXT, plan TEXT,
+        five_hour_pct REAL, five_hour_resets_at INTEGER, five_hour_minutes INTEGER,
+        weekly_pct REAL, weekly_resets_at INTEGER, weekly_minutes INTEGER,
+        fable_weekly_pct REAL, fable_resets_at INTEGER, fable_minutes INTEGER
+      ) STRICT;
+      INSERT INTO account_limits VALUES('claude-old',2,0,'old failure',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+    `);
+    db.close();
+    const store = h.open();
+    assert.equal(store.getAccountLimits("claude-old")?.unreadableReason, null);
+    const refreshed = store.putAccountLimits("claude-old", {
+      readable: false,
+      unreadableReason: "auth_expired",
+      error: "expired",
+    });
+    assert.equal(refreshed.unreadableReason, "auth_expired");
+    store.close();
+    const check = new DatabaseSync(h.path, { readOnly: true });
+    try {
+      const columns = (check.prepare("SELECT name FROM pragma_table_info('account_limits')").all() as Array<{ name: string }>).map((row) => row.name);
+      assert.ok(columns.includes("unreadable_reason"));
+      assert.equal((check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value, "12");
+    } finally {
+      check.close();
+    }
   } finally {
     h.cleanup();
   }

@@ -87,6 +87,7 @@ function mapAccountLimitsRow(r: Row): AccountLimitsRow {
     account: r.account as string,
     fetchedAt: Number(r.fetched_at),
     readable: Number(r.readable) === 1,
+    unreadableReason: (r.unreadable_reason as AccountLimitsRow["unreadableReason"]) ?? null,
     error: (r.error as string | null) ?? null,
     plan: (r.plan as string | null) ?? null,
     fiveHourPct: numOrNull(r.five_hour_pct),

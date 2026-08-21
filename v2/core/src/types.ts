@@ -244,6 +244,16 @@ export interface AuditRow {
 export const ACCOUNT_STATUSES = ["ok", "auth_needed", "paused"] as const;
 export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 
+/** Why a limits snapshot is unreadable. Keep this closed so clients never infer from prose. */
+export const ACCOUNT_LIMITS_UNREADABLE_REASONS = [
+  "unsupported",
+  "auth_expired",
+  "auth_failed",
+  "provider_error",
+  "timeout",
+] as const;
+export type AccountLimitsUnreadableReason = (typeof ACCOUNT_LIMITS_UNREADABLE_REASONS)[number];
+
 /** A provider login identity: the WHO. One account = one run-home. */
 export interface AccountRow {
   /** `<harness>-<label>` (safe-named, lower-cased). */
@@ -271,6 +281,8 @@ export interface AccountLimitsRow {
   account: string;
   fetchedAt: number;
   readable: boolean;
+  /** Null for readable rows; otherwise the typed class clients render. */
+  unreadableReason: AccountLimitsUnreadableReason | null;
   error: string | null;
   plan: string | null;
   fiveHourPct: number | null;

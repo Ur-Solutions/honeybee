@@ -27,6 +27,7 @@ import {
   UnknownVerbError,
   VERBS,
   type AccountLimitsRow,
+  type AccountLimitsUnreadableReason,
   type AccountRow,
   type AccountStatus,
   type AuditRow,
@@ -200,6 +201,7 @@ export interface CreateAccountInput {
 /** v7 — `putAccountLimits` input (the fetcher's parsed snapshot). */
 export interface PutAccountLimitsInput {
   readable: boolean;
+  unreadableReason?: AccountLimitsUnreadableReason | null;
   error?: string | null;
   plan?: string | null;
   fiveHour?: { usedPercent: number; resetsAt?: number | null; windowMinutes?: number | null } | null;
@@ -405,6 +407,7 @@ function mapAccountLimits(r: Row): AccountLimitsRow {
     account: r.account as string,
     fetchedAt: Number(r.fetched_at),
     readable: Number(r.readable) === 1,
+    unreadableReason: (r.unreadable_reason as AccountLimitsUnreadableReason | null) ?? null,
     error: (r.error as string | null) ?? null,
     plan: (r.plan as string | null) ?? null,
     fiveHourPct: numOrNull(r.five_hour_pct),
@@ -807,6 +810,16 @@ export class CoreStore {
       );
       for (const [name, ddl] of RUNTIMES_ADDITIVE_COLUMNS) {
         if (!runtimeCols.has(name)) this.db.exec(`ALTER TABLE runtimes ADD COLUMN ${ddl}`);
+      }
+      // v11 → v12: typed account-limit failure class. Existing unreadable
+      // rows stay null until the next bounded limits sweep refreshes them.
+      const accountLimitCols = new Set(
+        (this.stmt("SELECT name FROM pragma_table_info('account_limits')").all() as Row[]).map((c) => String(c.name)),
+      );
+      if (!accountLimitCols.has("unreadable_reason")) {
+        this.db.exec(
+          "ALTER TABLE account_limits ADD COLUMN unreadable_reason TEXT CHECK (unreadable_reason IS NULL OR unreadable_reason IN ('unsupported','auth_expired','auth_failed','provider_error','timeout'))",
+        );
       }
       // v9 → v10: mint display handles for existing bees. An imported bee
       // whose old id already IS a pretty handle (CL.7920-style) keeps it —
@@ -2589,13 +2602,13 @@ export class CoreStore {
         x ? [x.usedPercent, x.resetsAt ?? null, x.windowMinutes ?? null] : [null, null, null];
       this.db
         .prepare(
-          `INSERT INTO account_limits(account, fetched_at, readable, error, plan,
+          `INSERT INTO account_limits(account, fetched_at, readable, unreadable_reason, error, plan,
              five_hour_pct, five_hour_resets_at, five_hour_minutes,
              weekly_pct, weekly_resets_at, weekly_minutes,
              fable_weekly_pct, fable_resets_at, fable_minutes)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(account) DO UPDATE SET
-             fetched_at = excluded.fetched_at, readable = excluded.readable, error = excluded.error, plan = excluded.plan,
+             fetched_at = excluded.fetched_at, readable = excluded.readable, unreadable_reason = excluded.unreadable_reason, error = excluded.error, plan = excluded.plan,
              five_hour_pct = excluded.five_hour_pct, five_hour_resets_at = excluded.five_hour_resets_at, five_hour_minutes = excluded.five_hour_minutes,
              weekly_pct = excluded.weekly_pct, weekly_resets_at = excluded.weekly_resets_at, weekly_minutes = excluded.weekly_minutes,
              fable_weekly_pct = excluded.fable_weekly_pct, fable_resets_at = excluded.fable_resets_at, fable_minutes = excluded.fable_minutes`,
@@ -2604,6 +2617,7 @@ export class CoreStore {
           accountId,
           at,
           input.readable ? 1 : 0,
+          input.readable ? null : (input.unreadableReason ?? "provider_error"),
           input.error ?? null,
           input.plan ?? null,
           ...w(input.fiveHour),

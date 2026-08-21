@@ -300,6 +300,7 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       "account": "codex-work",
       "fetchedAt": 1019000,
       "readable": true,
+      "unreadableReason": null,
       "error": null,
       "plan": "pro",
       "fiveHourPct": 12,

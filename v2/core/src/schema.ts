@@ -78,8 +78,13 @@
  *        have bee_id NULL) and `task_supply` (per-bee auto-supply config +
  *        breaker). Delivery stays the mailbox — feeding a task is one idle
  *        send. Additive; migration = CREATE TABLE IF NOT EXISTS ×2.
+ *  v12 — typed account-limit failures: adds
+ *        `account_limits.unreadable_reason`, a closed classification that
+ *        lets clients distinguish unsupported providers, expired/failed
+ *        authentication, provider errors, and timeouts without parsing prose.
+ *        Additive; migration = ALTER TABLE ADD COLUMN ×1.
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -291,6 +296,7 @@ CREATE TABLE IF NOT EXISTS account_limits (
   account              TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   fetched_at           INTEGER NOT NULL,
   readable             INTEGER NOT NULL CHECK (readable IN (0,1)),
+  unreadable_reason    TEXT CHECK (unreadable_reason IS NULL OR unreadable_reason IN ('unsupported','auth_expired','auth_failed','provider_error','timeout')),
   error                TEXT,
   plan                 TEXT,
   five_hour_pct        REAL,
