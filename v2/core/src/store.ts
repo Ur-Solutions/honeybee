@@ -56,9 +56,32 @@ import {
   QuestionNotOpenError,
   SchemaVersionError,
   SealNotFoundError,
+  TaskNotFoundError,
   TemplateNotFoundError,
   TrackNotFoundError,
+  type TaskRow,
+  type TaskStatus,
+  type TaskSupplyRow,
+  type TaskTransitionAction,
 } from "./types.ts";
+import {
+  beeTaskList,
+  buildTaskFeedBody,
+  CLOSING_TASK_ACTIONS,
+  DEFAULT_TASK_SUPPLY_LIMIT,
+  defaultTaskSupply,
+  evaluateSupplyGate,
+  formatTaskList,
+  MAX_TASK_TITLE_LENGTH,
+  normalizeSupplyLimit,
+  ORDER_STEP,
+  parseTaskContext,
+  parseTaskListRef,
+  resolveTaskAuto,
+  TASK_ID_PREFIX,
+  TASK_SUPPLY_SENDER_NAME,
+  TASK_TRANSITIONS,
+} from "./tasks.ts";
 import { BEES_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import { deriveBeeView } from "./view.ts";
 import {
@@ -192,6 +215,35 @@ export interface CreateSealInput {
   title: string;
   body: string;
   refs?: string[];
+}
+
+/** `addTask` input. */
+export interface AddTaskInput {
+  /** `bee:<beeId>` or `shared:<name>`. */
+  list: string;
+  title: string;
+  body?: string | null;
+  context?: Record<string, unknown> | null;
+  originKind: TaskRow["originKind"];
+  originSender: string;
+  autoRequested?: boolean;
+  questId?: string | null;
+  id?: string;
+}
+
+export interface TransitionTaskInput {
+  reason?: string;
+}
+
+export interface EditTaskInput {
+  title?: string;
+  body?: string | null;
+  auto?: boolean;
+}
+
+export interface SetTaskSupplyInput {
+  on?: boolean;
+  limit?: number;
 }
 
 export interface SendResult {
@@ -396,6 +448,41 @@ function mapSeal(r: Row): SealRow {
     body: r.body as string,
     refs: JSON.parse(r.refs as string) as string[],
     createdAt: Number(r.created_at),
+  };
+}
+
+function mapTask(r: Row): TaskRow {
+  return {
+    id: r.id as string,
+    list: r.list as string,
+    beeId: (r.bee_id as string | null) ?? null,
+    title: r.title as string,
+    body: (r.body as string | null) ?? null,
+    context: r.context == null ? null : (JSON.parse(r.context as string) as Record<string, unknown>),
+    originKind: r.origin_kind as TaskRow["originKind"],
+    originSender: r.origin_sender as string,
+    auto: Number(r.auto) === 1,
+    status: r.status as TaskStatus,
+    claimedBy: (r.claimed_by as string | null) ?? null,
+    order: Number(r.sort_order),
+    questId: (r.quest_id as string | null) ?? null,
+    mailboxMessageId: r.mailbox_message_id == null ? null : Number(r.mailbox_message_id),
+    fedAt: r.fed_at == null ? null : Number(r.fed_at),
+    stalledAt: r.stalled_at == null ? null : Number(r.stalled_at),
+    blockedReason: (r.blocked_reason as string | null) ?? null,
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    closedAt: r.closed_at == null ? null : Number(r.closed_at),
+  };
+}
+
+function mapTaskSupply(r: Row): TaskSupplyRow {
+  return {
+    beeId: r.bee_id as string,
+    on: Number(r.enabled) === 1,
+    limit: Number(r.feed_limit ?? DEFAULT_TASK_SUPPLY_LIMIT),
+    feeds: Number(r.feeds ?? 0),
+    paused: Number(r.paused) === 1,
   };
 }
 
@@ -997,7 +1084,8 @@ export class CoreStore {
         this.stmt("UPDATE bees SET parent_id = NULL WHERE id = ?").run(childId);
         this.audit("bee.orphaned", childId, { beeId: childId, parentId: beeId, reason: "parent_deleted" });
       }
-      // ON DELETE CASCADE removes runtimes, flags, mailbox, questions, seals.
+      // ON DELETE CASCADE removes runtimes, flags, mailbox, questions, seals,
+      // tasks, and task_supply.
       this.stmt("DELETE FROM bees WHERE id = ?").run(beeId);
       this.audit("bee.deleted", beeId, {
         beeId,
@@ -1539,6 +1627,11 @@ export class CoreStore {
         deliveredGeneration: null,
       };
       this.audit("mail.enqueued", beeId, { message });
+      // Human (and bee) interaction resets the consecutive-feed counter; the
+      // supply loop's own sends are excluded by sender name.
+      if ((opts.sender ?? "operator") !== TASK_SUPPLY_SENDER_NAME) {
+        this.applyResetTaskSupplyFeeds(beeId);
+      }
       const wakeCommand = this.applyWakeIfNeeded(beeId).command;
       return { message, wakeCommand, unarchived };
     });
@@ -2550,6 +2643,302 @@ export class CoreStore {
   }
 
   // -------------------------------------------------------------------------
+  // v11 — agent task lists
+  // -------------------------------------------------------------------------
+
+  addTask(input: AddTaskInput): { task: TaskRow; warning?: string } {
+    const title = requireNonEmpty(input.title, "addTask: title");
+    if (title.includes("\n")) throw new CoreError("addTask: title must be a single line (use body for detail)");
+    if (title.length > MAX_TASK_TITLE_LENGTH) {
+      throw new CoreError(`addTask: title exceeds ${MAX_TASK_TITLE_LENGTH} characters (use body for detail)`);
+    }
+    const parsed = parseTaskListRef(input.list);
+    const context = input.context === undefined || input.context === null ? null : parseTaskContext(input.context);
+    const { auto, warning } = resolveTaskAuto(input.originKind, input.autoRequested);
+    return this.tx(() => {
+      let list: string;
+      let beeId: string | null;
+      if (parsed.kind === "bee") {
+        this.mustGetBee(parsed.name);
+        beeId = parsed.name;
+        list = beeTaskList(parsed.name);
+      } else {
+        beeId = null;
+        list = formatTaskList("shared", parsed.name);
+      }
+      const id = input.id ?? `${TASK_ID_PREFIX}${randomUUID()}`;
+      if (this.getTask(id)) throw new CoreError(`task already exists: ${id}`);
+      const existing = this.listTasks({ list });
+      const maxOrder = existing.reduce((max, t) => Math.max(max, t.order), 0);
+      const at = this.now();
+      this.db
+        .prepare(
+          `INSERT INTO tasks(id, list, bee_id, title, body, context, origin_kind, origin_sender, auto, status, claimed_by, sort_order, quest_id, mailbox_message_id, fed_at, stalled_at, blocked_reason, created_at, updated_at, closed_at)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)`,
+        )
+        .run(
+          id,
+          list,
+          beeId,
+          title,
+          input.body ?? null,
+          context === null ? null : JSON.stringify(context),
+          input.originKind,
+          input.originSender,
+          auto ? 1 : 0,
+          maxOrder + ORDER_STEP,
+          input.questId ?? null,
+          at,
+          at,
+        );
+      const task = this.getTask(id) as TaskRow;
+      this.audit("task.put", beeId, { task, outcome: "created" });
+      return { task, ...(warning ? { warning } : {}) };
+    });
+  }
+
+  getTask(id: string): TaskRow | null {
+    const row = this.stmt("SELECT * FROM tasks WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapTask(row) : null;
+  }
+
+  mustGetTask(id: string): TaskRow {
+    const task = this.getTask(id);
+    if (!task) throw new TaskNotFoundError(id);
+    return task;
+  }
+
+  listTasks(filter: { list?: string; beeId?: string; statuses?: TaskStatus[] } = {}): TaskRow[] {
+    const where: string[] = [];
+    const params: Array<string> = [];
+    if (filter.list !== undefined) {
+      where.push("list = ?");
+      params.push(filter.list);
+    }
+    if (filter.beeId !== undefined) {
+      where.push("bee_id = ?");
+      params.push(filter.beeId);
+    }
+    if (filter.statuses && filter.statuses.length > 0) {
+      where.push(`status IN (${filter.statuses.map(() => "?").join(",")})`);
+      params.push(...filter.statuses);
+    }
+    const sql = `SELECT * FROM tasks${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY sort_order, id`;
+    return (this.stmt(sql).all(...params) as Row[]).map(mapTask);
+  }
+
+  listTaskLists(): Array<{ id: string; total: number }> {
+    const rows = this.stmt("SELECT list AS id, COUNT(*) AS total FROM tasks GROUP BY list ORDER BY list").all() as Row[];
+    return rows.map((r) => ({ id: String(r.id), total: Number(r.total) }));
+  }
+
+  transitionTask(id: string, action: TaskTransitionAction, opts: TransitionTaskInput = {}): TaskRow {
+    const rule = TASK_TRANSITIONS[action];
+    return this.tx(() => {
+      const current = this.mustGetTask(id);
+      if (!rule.from.includes(current.status)) {
+        throw new CoreError(`task ${id} is ${current.status}; ${action} requires one of: ${rule.from.join(", ")}`);
+      }
+      const at = this.now();
+      let mailboxMessageId = current.mailboxMessageId;
+      if (current.status === "queued" && CLOSING_TASK_ACTIONS.includes(action) && current.mailboxMessageId != null) {
+        const canceled = this.cancelMessage(current.mailboxMessageId);
+        if (canceled.canceled) mailboxMessageId = null;
+        else mailboxMessageId = null;
+      }
+      const closedAt = CLOSING_TASK_ACTIONS.includes(action) ? at : action === "start" ? null : current.closedAt;
+      const blockedReason = action === "block" ? (opts.reason ?? current.blockedReason) : action === "start" ? null : current.blockedReason;
+      this.stmt(
+        "UPDATE tasks SET status = ?, updated_at = ?, closed_at = ?, blocked_reason = ?, mailbox_message_id = ? WHERE id = ?",
+      ).run(rule.to, at, closedAt, blockedReason, mailboxMessageId, id);
+      const task = this.getTask(id) as TaskRow;
+      this.audit("task.put", task.beeId, { task, outcome: "updated" });
+      return task;
+    });
+  }
+
+  claimTask(list: string, claimant: string): TaskRow | null {
+    const who = requireNonEmpty(claimant, "claimTask: claimant");
+    return this.tx(() => {
+      const tasks = this.listTasks({ list, statuses: ["pending"] });
+      const top = tasks.find((task) => task.claimedBy === null);
+      if (!top) return null;
+      const at = this.now();
+      this.stmt("UPDATE tasks SET status = 'in-progress', claimed_by = ?, updated_at = ? WHERE id = ?").run(who, at, top.id);
+      const task = this.getTask(top.id) as TaskRow;
+      this.audit("task.put", task.beeId, { task, outcome: "updated" });
+      return task;
+    });
+  }
+
+  moveTask(id: string, anchor: { before?: string; after?: string }): TaskRow {
+    const hasBefore = typeof anchor.before === "string";
+    const hasAfter = typeof anchor.after === "string";
+    if (hasBefore === hasAfter) throw new CoreError("moveTask: pass exactly one of before or after");
+    const anchorId = (anchor.before ?? anchor.after)!;
+    if (anchorId === id) throw new CoreError("moveTask: a task cannot anchor on itself");
+    return this.tx(() => {
+      const current = this.mustGetTask(id);
+      const tasks = this.listTasks({ list: current.list }).filter((task) => task.id !== id);
+      const anchorIdx = tasks.findIndex((task) => task.id === anchorId);
+      if (anchorIdx === -1) throw new CoreError(`moveTask: anchor task ${anchorId} not found in ${current.list}`);
+      const anchorOrder = tasks[anchorIdx]!.order;
+      let nextOrder: number;
+      if (hasBefore) {
+        const prev = tasks[anchorIdx - 1];
+        nextOrder = prev ? (prev.order + anchorOrder) / 2 : anchorOrder - ORDER_STEP;
+      } else {
+        const after = tasks[anchorIdx + 1];
+        nextOrder = after ? (anchorOrder + after.order) / 2 : anchorOrder + ORDER_STEP;
+      }
+      const at = this.now();
+      this.stmt("UPDATE tasks SET sort_order = ?, updated_at = ? WHERE id = ?").run(nextOrder, at, id);
+      const task = this.getTask(id) as TaskRow;
+      this.audit("task.put", task.beeId, { task, outcome: "updated" });
+      return task;
+    });
+  }
+
+  editTask(id: string, patch: EditTaskInput): TaskRow {
+    return this.tx(() => {
+      const current = this.mustGetTask(id);
+      let title = current.title;
+      if (patch.title !== undefined) {
+        title = requireNonEmpty(patch.title, "editTask: title");
+        if (title.includes("\n")) throw new CoreError("editTask: title must be a single line");
+        if (title.length > MAX_TASK_TITLE_LENGTH) throw new CoreError(`editTask: title exceeds ${MAX_TASK_TITLE_LENGTH} characters`);
+      }
+      const body = patch.body === undefined ? current.body : patch.body;
+      let auto = current.auto;
+      if (patch.auto !== undefined) {
+        if (current.originKind === "self" && patch.auto) {
+          auto = false;
+        } else {
+          auto = patch.auto;
+        }
+      }
+      const at = this.now();
+      this.stmt("UPDATE tasks SET title = ?, body = ?, auto = ?, updated_at = ? WHERE id = ?").run(
+        title,
+        body,
+        auto ? 1 : 0,
+        at,
+        id,
+      );
+      const task = this.getTask(id) as TaskRow;
+      this.audit("task.put", task.beeId, { task, outcome: "updated" });
+      return task;
+    });
+  }
+
+  getTaskSupply(beeId: string): TaskSupplyRow {
+    const row = this.stmt("SELECT * FROM task_supply WHERE bee_id = ?").get(beeId) as Row | undefined;
+    return row ? mapTaskSupply(row) : defaultTaskSupply(beeId);
+  }
+
+  listTaskSupply(filter: { on?: boolean } = {}): TaskSupplyRow[] {
+    const rows = (this.stmt("SELECT * FROM task_supply ORDER BY bee_id").all() as Row[]).map(mapTaskSupply);
+    return filter.on === true ? rows.filter((r) => r.on) : rows;
+  }
+
+  setTaskSupply(beeId: string, patch: SetTaskSupplyInput): TaskSupplyRow {
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const current = this.getTaskSupply(beeId);
+      const on = patch.on === undefined ? current.on : patch.on;
+      const limit = patch.limit === undefined ? current.limit : normalizeSupplyLimit(patch.limit);
+      // --on clears the tripped breaker AND the consecutive-feed counter.
+      const feeds = patch.on === true ? 0 : current.feeds;
+      const paused = patch.on === true ? false : current.paused;
+      this.db
+        .prepare(
+          `INSERT INTO task_supply(bee_id, enabled, feed_limit, feeds, paused) VALUES(?, ?, ?, ?, ?)
+           ON CONFLICT(bee_id) DO UPDATE SET enabled = excluded.enabled, feed_limit = excluded.feed_limit, feeds = excluded.feeds, paused = excluded.paused`,
+        )
+        .run(beeId, on ? 1 : 0, limit, feeds, paused ? 1 : 0);
+      const supply = this.getTaskSupply(beeId);
+      this.audit("task_supply.put", beeId, { supply });
+      return supply;
+    });
+  }
+
+  /**
+   * If the six-condition gate fires, mark the top eligible task queued, send
+   * one idle mailbox message carrying the feed body, record its id, and bump
+   * the consecutive-feed counter (tripping the breaker at the limit).
+   */
+  tryFeedTaskSupply(beeId: string): { fed: TaskRow; supply: TaskSupplyRow } | null {
+    return this.tx(() => {
+      const bee = this.getBee(beeId);
+      if (!bee) return null;
+      const supply = this.getTaskSupply(beeId);
+      const tasks = this.listTasks({ list: beeTaskList(beeId) });
+      const needsInput = this.listQuestions({ beeId, open: true }).length > 0;
+      const mailboxEmpty = this.undeliveredMessages(beeId).length === 0;
+      const decision = evaluateSupplyGate({ supply, needsInput, mailboxEmpty, tasks });
+      if (!decision.feed) return null;
+      const task = decision.feed;
+      const at = this.now();
+      this.stmt("UPDATE tasks SET status = 'queued', fed_at = ?, stalled_at = NULL, updated_at = ? WHERE id = ?").run(
+        at,
+        at,
+        task.id,
+      );
+      const remaining = tasks.filter((t) => t.status === "pending" && t.id !== task.id).length;
+      const queued = this.getTask(task.id) as TaskRow;
+      const body = buildTaskFeedBody(queued, remaining);
+      const sent = this.send(beeId, body, { sender: TASK_SUPPLY_SENDER_NAME, urgency: "idle" });
+      this.stmt("UPDATE tasks SET mailbox_message_id = ?, updated_at = ? WHERE id = ?").run(sent.message.id, at, task.id);
+      const feeds = supply.feeds + 1;
+      const paused = supply.paused || feeds >= supply.limit;
+      this.db
+        .prepare(
+          `INSERT INTO task_supply(bee_id, enabled, feed_limit, feeds, paused) VALUES(?, 1, ?, ?, ?)
+           ON CONFLICT(bee_id) DO UPDATE SET feeds = excluded.feeds, paused = excluded.paused`,
+        )
+        .run(beeId, supply.limit, feeds, paused ? 1 : 0);
+      const fed = this.getTask(task.id) as TaskRow;
+      this.audit("task.put", beeId, { task: fed, outcome: "updated" });
+      const nextSupply = this.getTaskSupply(beeId);
+      this.audit("task_supply.put", beeId, { supply: nextSupply });
+      return { fed, supply: nextSupply };
+    });
+  }
+
+  /**
+   * One idle tick with empty mail and an auto-fed in-flight task: stamp
+   * stalledAt (idempotent). The inbox surfaces stalled tasks.
+   */
+  maybeStallFedTask(beeId: string): TaskRow | null {
+    return this.tx(() => {
+      const rt = this.currentRuntime(beeId);
+      if (rt && (rt.state === "booting" || rt.state === "running")) return null;
+      if (this.undeliveredMessages(beeId).length > 0) return null;
+      const inflight = this.listTasks({ list: beeTaskList(beeId) }).find(
+        (task) => (task.status === "queued" || (task.status === "in-progress" && task.fedAt !== null)) && task.stalledAt === null && task.fedAt !== null,
+      );
+      if (!inflight) return null;
+      const at = this.now();
+      this.stmt("UPDATE tasks SET stalled_at = ?, updated_at = ? WHERE id = ?").run(at, at, inflight.id);
+      const task = this.getTask(inflight.id) as TaskRow;
+      this.audit("task.put", beeId, { task, outcome: "updated" });
+      return task;
+    });
+  }
+
+  private applyResetTaskSupplyFeeds(beeId: string): void {
+    const current = this.getTaskSupply(beeId);
+    if (current.feeds <= 0) return;
+    this.db
+      .prepare(
+        `INSERT INTO task_supply(bee_id, enabled, feed_limit, feeds, paused) VALUES(?, ?, ?, 0, ?)
+         ON CONFLICT(bee_id) DO UPDATE SET feeds = 0`,
+      )
+      .run(beeId, current.on ? 1 : 0, current.limit, current.paused ? 1 : 0);
+    this.audit("task_supply.put", beeId, { supply: this.getTaskSupply(beeId) });
+  }
+
+  // -------------------------------------------------------------------------
   // Audit access & snapshots
   // -------------------------------------------------------------------------
 
@@ -2583,6 +2972,8 @@ export class CoreStore {
       accounts: this.listAccounts(),
       accountLimits: this.listAccountLimits(),
       selectionCursors: this.listSelectionCursors(),
+      tasks: (this.stmt("SELECT * FROM tasks ORDER BY id").all() as Row[]).map(mapTask),
+      taskSupply: (this.stmt("SELECT * FROM task_supply ORDER BY bee_id").all() as Row[]).map(mapTaskSupply),
     };
   }
 }

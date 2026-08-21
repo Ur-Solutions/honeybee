@@ -23,6 +23,10 @@ import {
   type RuntimeRow,
   type RuntimeState,
   type SealRow,
+  type TaskRow,
+  type TaskStatus,
+  type TaskSupplyRow,
+  defaultTaskSupply,
 } from "../../core/src/index.ts";
 
 type Row = Record<string, unknown>;
@@ -122,6 +126,41 @@ function mapSealRow(r: Row): SealRow {
     body: r.body as string,
     refs: JSON.parse(r.refs as string) as string[],
     createdAt: Number(r.created_at),
+  };
+}
+
+function mapTaskRow(r: Row): TaskRow {
+  return {
+    id: r.id as string,
+    list: r.list as string,
+    beeId: (r.bee_id as string | null) ?? null,
+    title: r.title as string,
+    body: (r.body as string | null) ?? null,
+    context: r.context == null ? null : (JSON.parse(r.context as string) as Record<string, unknown>),
+    originKind: r.origin_kind as TaskRow["originKind"],
+    originSender: r.origin_sender as string,
+    auto: Number(r.auto) === 1,
+    status: r.status as TaskStatus,
+    claimedBy: (r.claimed_by as string | null) ?? null,
+    order: Number(r.sort_order),
+    questId: (r.quest_id as string | null) ?? null,
+    mailboxMessageId: r.mailbox_message_id == null ? null : Number(r.mailbox_message_id),
+    fedAt: r.fed_at == null ? null : Number(r.fed_at),
+    stalledAt: r.stalled_at == null ? null : Number(r.stalled_at),
+    blockedReason: (r.blocked_reason as string | null) ?? null,
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    closedAt: r.closed_at == null ? null : Number(r.closed_at),
+  };
+}
+
+function mapTaskSupplyRow(r: Row): TaskSupplyRow {
+  return {
+    beeId: r.bee_id as string,
+    on: Number(r.enabled) === 1,
+    limit: Number(r.feed_limit ?? 5),
+    feeds: Number(r.feeds ?? 0),
+    paused: Number(r.paused) === 1,
   };
 }
 
@@ -336,6 +375,37 @@ export class ReadOnlyStore {
   accountLimits(): AccountLimitsRow[] {
     if (!this.tableExists("account_limits")) return [];
     return (this.db.prepare("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimitsRow);
+  }
+
+  /** v11 — tolerate a pre-v11 store file (no table): empty. */
+  tasks(filter: { list?: string; statuses?: TaskStatus[] } = {}): TaskRow[] {
+    if (!this.tableExists("tasks")) return [];
+    return (this.db.prepare("SELECT * FROM tasks ORDER BY sort_order, id").all() as Row[])
+      .map(mapTaskRow)
+      .filter(
+        (t) =>
+          (filter.list === undefined || t.list === filter.list) &&
+          (filter.statuses === undefined || filter.statuses.includes(t.status)),
+      );
+  }
+
+  task(id: string): TaskRow | null {
+    if (!this.tableExists("tasks")) return null;
+    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapTaskRow(row) : null;
+  }
+
+  taskSupply(beeId: string): TaskSupplyRow {
+    if (!this.tableExists("task_supply")) return defaultTaskSupply(beeId);
+    const row = this.db.prepare("SELECT * FROM task_supply WHERE bee_id = ?").get(beeId) as Row | undefined;
+    return row ? mapTaskSupplyRow(row) : defaultTaskSupply(beeId);
+  }
+
+  taskLists(): Array<{ id: string; total: number }> {
+    if (!this.tableExists("tasks")) return [];
+    return (this.db.prepare("SELECT list AS id, COUNT(*) AS total FROM tasks GROUP BY list ORDER BY list").all() as Row[]).map(
+      (r) => ({ id: String(r.id), total: Number(r.total) }),
+    );
   }
 
   /** Audit-log tail (`hive v2 events` stale fallback): rows with seq > afterSeq, oldest first. */

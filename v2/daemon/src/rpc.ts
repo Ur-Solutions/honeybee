@@ -19,6 +19,7 @@ import {
   PackageError,
   QuestionNotFoundError,
   SealNotFoundError,
+  TaskNotFoundError,
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "../../core/src/index.ts";
@@ -67,6 +68,7 @@ export function toRpcError(err: unknown): { code: RpcErrorCode; message: string 
   if (err instanceof TrackNotFoundError) return { code: "track_not_found", message: err.message };
   if (err instanceof QuestionNotFoundError) return { code: "question_not_found", message: err.message };
   if (err instanceof SealNotFoundError) return { code: "seal_not_found", message: err.message };
+  if (err instanceof TaskNotFoundError) return { code: "task_not_found", message: err.message };
   if (err instanceof AccountNotFoundError) return { code: "account_not_found", message: err.message };
   if (err instanceof AccountReferencedError) return { code: "account_referenced", message: err.message };
   if (err instanceof NameConflictError) return { code: "name_conflict", message: err.message };

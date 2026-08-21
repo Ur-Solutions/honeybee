@@ -17,6 +17,8 @@ import type {
   SealRow,
   SelectionCursorRow,
   StateDump,
+  TaskRow,
+  TaskSupplyRow,
   TemplateRow,
   TrackRow,
 } from "./types.ts";
@@ -34,6 +36,8 @@ export function replayAudit(rows: AuditRow[]): StateDump {
   const accounts = new Map<string, AccountRow>();
   const accountLimits = new Map<string, AccountLimitsRow>();
   const selectionCursors = new Map<string, SelectionCursorRow>();
+  const tasks = new Map<string, TaskRow>();
+  const taskSupply = new Map<string, TaskSupplyRow>();
 
   const rtKey = (beeId: string, generation: number) => `${beeId}#${generation}`;
   const mustBee = (id: string): BeeRow => {
@@ -143,6 +147,8 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         for (const [k, m] of mailbox) if (m.beeId === beeId) mailbox.delete(k);
         for (const [k, q] of questions) if (q.beeId === beeId) questions.delete(k);
         for (const [k, sl] of seals) if (sl.beeId === beeId) seals.delete(k);
+        for (const [k, t] of tasks) if (t.beeId === beeId) tasks.delete(k);
+        taskSupply.delete(beeId);
         for (const id of p.settledCommandIds as number[]) {
           const command = mustCommand(id);
           command.status = "done";
@@ -181,6 +187,17 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         if (!message) throw new Error(`audit replay: unknown message ${String(p.messageId)}`);
         message.deliveredAt = p.deliveredAt as number;
         message.deliveredGeneration = p.deliveredGeneration as number;
+        break;
+      }
+      case "mail.canceled": {
+        const messageId = p.messageId as number;
+        if (!mailbox.delete(messageId)) throw new Error(`audit replay: unknown message ${String(messageId)}`);
+        break;
+      }
+      case "mail.expedited": {
+        const message = mailbox.get(p.messageId as number);
+        if (!message) throw new Error(`audit replay: unknown message ${String(p.messageId)}`);
+        message.urgency = p.to as MessageRow["urgency"];
         break;
       }
       case "command.enqueued": {
@@ -264,6 +281,19 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         seals.set(seal.id, { ...seal, refs: [...seal.refs] });
         break;
       }
+      case "task.put": {
+        const task = p.task as TaskRow;
+        tasks.set(task.id, {
+          ...task,
+          context: task.context === null ? null : { ...task.context },
+        });
+        break;
+      }
+      case "task_supply.put": {
+        const supply = p.supply as TaskSupplyRow;
+        taskSupply.set(supply.beeId, { ...supply });
+        break;
+      }
       // Recorded no-ops and informational rows: state unchanged by definition.
       case "bee.imported":
       case "bee.interrupted":
@@ -296,5 +326,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
     accounts: [...accounts.values()].sort((a, b) => a.addedAt - b.addedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     accountLimits: [...accountLimits.values()].sort((a, b) => (a.account < b.account ? -1 : a.account > b.account ? 1 : 0)),
     selectionCursors: [...selectionCursors.values()].sort((a, b) => (a.harness < b.harness ? -1 : a.harness > b.harness ? 1 : 0)),
+    tasks: [...tasks.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    taskSupply: [...taskSupply.values()].sort((a, b) => (a.beeId < b.beeId ? -1 : a.beeId > b.beeId ? 1 : 0)),
   };
 }

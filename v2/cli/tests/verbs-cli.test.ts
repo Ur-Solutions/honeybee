@@ -11,13 +11,14 @@ import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
-import { makeDaemonDir, sleep, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
+import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
 import { runV2Cli, withModelArg, type CliIo } from "../src/main.ts";
+import { stripAnsi } from "../src/style.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
   const out: string[] = [];
   const err: string[] = [];
-  return { io: { out: (l) => out.push(l), err: (l) => err.push(l) }, out, err };
+  return { io: { out: (l) => out.push(stripAnsi(l)), err: (l) => err.push(stripAnsi(l)) }, out, err };
 }
 
 async function idleBee(dir: string, needle: string): Promise<void> {
@@ -54,7 +55,7 @@ test("verbs.x: spawn + first send in one shot (fire-and-forget); prompt lands in
     // usage error: no prompt
     const bad = capture();
     assert.equal(await runV2Cli(["x", "nope", "--agent", "stub", "--data-dir", dir], bad.io), 1);
-    assert.ok(bad.err[0]?.includes("usage: hive v2 x"), bad.err[0]);
+    assert.ok(bad.err[0]?.includes("usage: hive x"), bad.err[0]);
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();
@@ -83,7 +84,7 @@ test("verbs.run: spawn + send + wait + print the reply + archive; --keep leaves 
     const h = capture();
     assert.equal(await runV2Cli(["run", "job2", "-p", "ping", "--agent", "stub", "--cwd", "/tmp", "--keep", "--data-dir", dir], h.io), 0);
     assert.equal(h.out[0], "echo:ping");
-    assert.ok(h.err.some((l) => l.startsWith("kept ")), h.err.join("\n"));
+    assert.ok(h.err.some((l) => l.includes("kept ")), h.err.join("\n"));
     const l2 = capture();
     await runV2Cli(["list", "--data-dir", dir, "--json"], l2.io);
     const active = JSON.parse(l2.out[0] ?? "{}") as { views: Array<{ bee: { name: string } }> };
@@ -191,16 +192,16 @@ test("verbs.transcript+last: stub session log rendered as turns; --raw verbatim;
 
     // tail renders like transcript (v1 tail showed the readable pane; a
     // pane-less bee must not get raw jsonl instead — contract §6). --raw is
-    // the verbatim stream. --no-follow so the test does not block.
+    // the verbatim stream. Default is dump-and-exit; -f/--follow streams.
     const tail = capture();
-    assert.equal(await runV2Cli(["tail", "talker", "--no-follow", "--data-dir", dir], tail.io), 0);
+    assert.equal(await runV2Cli(["tail", "talker", "--data-dir", dir], tail.io), 0);
     assert.deepEqual(tail.out, ["[assistant] echo:first", "[assistant] echo:second"]);
     const tailRaw = capture();
-    assert.equal(await runV2Cli(["tail", "talker", "--raw", "--no-follow", "--data-dir", dir], tailRaw.io), 0);
+    assert.equal(await runV2Cli(["tail", "talker", "--raw", "--data-dir", dir], tailRaw.io), 0);
     assert.ok(tailRaw.out.every((l) => l.startsWith("{")), tailRaw.out[0]);
     // -n bounds the rendered lines.
     const tailN = capture();
-    assert.equal(await runV2Cli(["tail", "talker", "-n", "1", "--no-follow", "--data-dir", dir], tailN.io), 0);
+    assert.equal(await runV2Cli(["tail", "talker", "-n", "1", "--data-dir", dir], tailN.io), 0);
     assert.deepEqual(tailN.out, ["[assistant] echo:second"]);
   } finally {
     await daemon?.stop().catch(() => {});
@@ -261,7 +262,29 @@ test("verbs.transcript: claude-format fixture — text turns kept, tool traffic 
   }
 });
 
-test("verbs.tail: rendered backlog with -n (--raw for verbatim), then follows appends until SIGINT; --no-follow exits after the backlog", async () => {
+async function runFollowUntil(
+  argv: string[],
+  cap: { io: CliIo; out: string[] },
+  afterStart: () => void,
+  predicate: () => boolean,
+  label: string,
+): Promise<number> {
+  const before = new Set(process.listeners("SIGINT"));
+  const done = runV2Cli(argv, cap.io);
+  await waitFor(
+    () => process.listeners("SIGINT").some((l) => !before.has(l)),
+    `${label}: follow started`,
+    5000,
+  );
+  afterStart();
+  await waitFor(predicate, label, 5000);
+  const added = process.listeners("SIGINT").filter((l) => !before.has(l));
+  assert.ok(added.length > 0, `${label}: follow registered its SIGINT stop`);
+  for (const listener of added) (listener as () => void)();
+  return done;
+}
+
+test("verbs.tail: rendered backlog with -n (--raw for verbatim); -f/--follow streams appends until SIGINT", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
   try {
     const logPath = join(dir, "log.jsonl");
@@ -270,29 +293,80 @@ test("verbs.tail: rendered backlog with -n (--raw for verbatim), then follows ap
     store.createBee({ id: "tail-1", name: "tailee", agent: "stub", substrate: "hsr", cwd: "/tmp", sessionLogPath: logPath });
     store.close();
 
-    // Default: rendered turns (v1 tail showed readable pane output).
+    // Default: dump-and-exit, rendered turns (v1 tail showed readable pane output).
     const a = capture();
-    assert.equal(await runV2Cli(["tail", "tailee", "-n", "2", "--no-follow", "--data-dir", dir], a.io), 0);
+    assert.equal(await runV2Cli(["tail", "tailee", "-n", "2", "--data-dir", dir], a.io), 0);
     assert.deepEqual(a.out, ["[assistant] b", "[assistant] c"]);
 
     // --raw is the verbatim session log.
     const rawTail = capture();
-    assert.equal(await runV2Cli(["tail", "tailee", "-n", "2", "--raw", "--no-follow", "--data-dir", dir], rawTail.io), 0);
+    assert.equal(await runV2Cli(["tail", "tailee", "-n", "2", "--raw", "--data-dir", dir], rawTail.io), 0);
     assert.deepEqual(rawTail.out, [JSON.stringify({ event: "text", text: "b" }), JSON.stringify({ event: "text", text: "c" })]);
 
-    // follow: appended lines stream out; SIGINT ends the follow. Invoke the
+    // --no-follow still dumps even if --follow is also passed.
+    const nof = capture();
+    assert.equal(await runV2Cli(["tail", "tailee", "-n", "1", "--follow", "--no-follow", "--raw", "--data-dir", dir], nof.io), 0);
+    assert.deepEqual(nof.out, [JSON.stringify({ event: "text", text: "c" })]);
+
+    // --follow: appended lines stream out; SIGINT ends the follow. Invoke the
     // follow's own SIGINT listener directly (a synthetic process.emit would
     // also hit the test runner's handlers).
-    const before = new Set(process.listeners("SIGINT"));
     const f = capture();
-    const done = runV2Cli(["tail", "tailee", "-n", "1", "--raw", "--data-dir", dir], f.io);
-    await sleep(100);
-    appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "d" })}\n`);
-    await waitFor(() => f.out.some((l) => l.includes('"text":"d"')), "appended line followed", 5000);
-    const added = process.listeners("SIGINT").filter((l) => !before.has(l));
-    assert.ok(added.length > 0, "the follow registered its SIGINT stop");
-    for (const listener of added) (listener as () => void)();
-    assert.equal(await done, 0);
+    assert.equal(
+      await runFollowUntil(
+        ["tail", "tailee", "-n", "1", "--raw", "--follow", "--data-dir", dir],
+        f,
+        () => appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "d" })}\n`),
+        () => f.out.some((l) => l.includes('"text":"d"')),
+        "tail --follow appended line",
+      ),
+      0,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verbs.transcript: -f/--follow streams appended lines until SIGINT", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
+  try {
+    const logPath = join(dir, "tx.jsonl");
+    writeFileSync(logPath, `${JSON.stringify({ event: "text", text: "hello" })}\n`);
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({ id: "tx-1", name: "txbee", agent: "stub", substrate: "hsr", cwd: "/tmp", sessionLogPath: logPath });
+    store.close();
+
+    const dump = capture();
+    assert.equal(await runV2Cli(["transcript", "txbee", "--data-dir", dir], dump.io), 0);
+    assert.deepEqual(dump.out, ["[assistant] hello"]);
+
+    const f = capture();
+    assert.equal(
+      await runFollowUntil(
+        ["transcript", "txbee", "-n", "1", "-f", "--data-dir", dir],
+        f,
+        () => appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "world" })}\n`),
+        () => f.out.includes("[assistant] world"),
+        "transcript -f appended turn",
+      ),
+      0,
+    );
+    assert.deepEqual(
+      f.out.filter((l) => l.startsWith("[assistant]")),
+      ["[assistant] hello", "[assistant] world"],
+    );
+
+    const raw = capture();
+    assert.equal(
+      await runFollowUntil(
+        ["tx", "txbee", "--raw", "--follow", "--data-dir", dir],
+        raw,
+        () => appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "again" })}\n`),
+        () => raw.out.some((l) => l.includes('"text":"again"')),
+        "tx --follow --raw appended line",
+      ),
+      0,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -444,13 +518,13 @@ test("verbs.aliases: ls and ps are list; usage is limits-shaped over account_lim
     // top-level login/swap-account delegate to the account/bee verbs (typed errors prove the route).
     const l = capture();
     assert.equal(await runV2Cli(["login", "--data-dir", dir], l.io), 1);
-    assert.ok(l.err[0]?.includes("usage: hive v2 login"), l.err[0]);
+    assert.ok(l.err[0]?.includes("usage: hive login"), l.err[0]);
     const l2 = capture();
     assert.equal(await runV2Cli(["login", "nope", "--data-dir", dir], l2.io), 1);
     assert.ok(l2.err[0]?.includes("account_not_found"), l2.err[0]);
     const sa = capture();
     assert.equal(await runV2Cli(["swap-account", "ally", "--data-dir", dir], sa.io), 1);
-    assert.ok(sa.err[0]?.includes("usage: hive v2 swap-account"), sa.err[0]);
+    assert.ok(sa.err[0]?.includes("usage: hive swap-account"), sa.err[0]);
     const sa2 = capture();
     assert.equal(await runV2Cli(["swap-account", "ally", "nope", "--data-dir", dir], sa2.io), 1);
     assert.ok(sa2.err[0]?.includes("account_not_found"), sa2.err[0]);
@@ -506,7 +580,7 @@ test("verbs.xa: v1 shape is <agent> (not a bee name); refuses pane-less substrat
     daemon = await startDaemon(dir);
     const usage = capture();
     assert.equal(await runV2Cli(["xa", "--data-dir", dir], usage.io), 1);
-    assert.ok(usage.err[0]?.includes("usage: hive v2 xa"), usage.err[0]);
+    assert.ok(usage.err[0]?.includes("usage: hive xa"), usage.err[0]);
 
     const clash = capture();
     assert.equal(await runV2Cli(["xa", "stub", "--agent", "claude", "--data-dir", dir], clash.io), 1);
@@ -516,7 +590,7 @@ test("verbs.xa: v1 shape is <agent> (not a bee name); refuses pane-less substrat
     assert.equal(await runV2Cli(["xa", "stub", "--substrate", "hsr", "--data-dir", dir], hsr.io), 1);
     const hsrMsg = hsr.err.join("\n");
     assert.ok(hsrMsg.includes("hsr bees don't have"), hsrMsg);
-    assert.ok(hsrMsg.includes("hive v2 x"), hsrMsg);
+    assert.ok(hsrMsg.includes("hive x"), hsrMsg);
 
     const cell = capture();
     assert.equal(await runV2Cli(["xa", "stub", "--substrate", "cell", "--data-dir", dir], cell.io), 1);
@@ -561,7 +635,7 @@ test("verbs.attach: refuses hsr/cell bees with the v2 guidance; tmux bees get th
     assert.equal(await runV2Cli(["attach", "paneless", "--data-dir", dir], a.io), 1);
     const message = a.err.join("\n");
     assert.ok(message.includes("pane-less"), message);
-    assert.ok(message.includes("hive v2 tail paneless"), message);
+    assert.ok(message.includes("hive tail paneless --follow"), message);
     assert.ok(message.includes("transcript paneless --follow"), message);
     await daemon.stop();
     daemon = null;
@@ -641,7 +715,7 @@ test("handles.live: spawn returns the minted handle; ls leads with it and keeps 
     const ls = capture();
     assert.equal(await runV2Cli(["ls", "--data-dir", dir, "--socket", daemon.socketPath], ls.io), 0);
     const row = ls.out.find((l) => l.includes("prettybee")) ?? "";
-    assert.ok(row.startsWith(handle), `ls leads with handle: ${row}`);
+    assert.ok(row.includes(handle), `ls shows handle: ${row}`);
     assert.ok(row.includes(`id=${uuid}`), `ls keeps the uuid tail: ${row}`);
     // the handle resolves in a mutation verb round-trip
     const v = capture();

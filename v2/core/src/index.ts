@@ -25,6 +25,10 @@ export {
   type AskQuestionInput,
   type AnswerResult,
   type CreateSealInput,
+  type AddTaskInput,
+  type TransitionTaskInput,
+  type EditTaskInput,
+  type SetTaskSupplyInput,
   type CreateAccountInput,
   type PutAccountLimitsInput,
 } from "./store.ts";
@@ -44,6 +48,7 @@ export {
 export * from "./packages.ts";
 export * from "./import-frozen.ts";
 export * from "./mirror.ts";
+export * from "./tasks.ts";
 export { replayAudit } from "./audit.ts";
 export { deriveBeeView } from "./view.ts";
 export { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";

@@ -31,8 +31,12 @@ import {
   importLocalConfig,
   importTemplate,
   importTrack,
+  beeTaskList,
+  isTaskStatus,
+  isTaskTransitionAction,
   MESSAGE_URGENCIES,
   openCoreStore,
+  TASK_TRANSITION_ACTIONS,
   serializePackage,
   type AccountRow,
   type BeeRow,
@@ -128,6 +132,16 @@ import {
   type SealCreateResult,
   type SealGetResult,
   type SealListResult,
+  type TaskAddResult,
+  type TaskClaimResult,
+  type TaskEditResult,
+  type TaskGetResult,
+  type TaskListResult,
+  type TaskListsResult,
+  type TaskMoveResult,
+  type TaskSupplyGetResult,
+  type TaskSupplySetResult,
+  type TaskTransitionResult,
   type SetArgsResult,
   type TagResult,
   type ImportFromFrozenResult,
@@ -697,6 +711,26 @@ export class HiveDaemon {
         return this.rpcSealList(params);
       case "seal.get":
         return { seal: this.mustStore().mustGetSeal(this.param(params, "sealId")) } satisfies SealGetResult;
+      case "task.add":
+        return this.withIdempotency(verb, params, () => this.rpcTaskAdd(params));
+      case "task.list":
+        return this.rpcTaskList(params);
+      case "task.get":
+        return this.rpcTaskGet(params);
+      case "task.transition":
+        return this.withIdempotency(verb, params, () => this.rpcTaskTransition(params));
+      case "task.claim":
+        return this.withIdempotency(verb, params, () => this.rpcTaskClaim(params));
+      case "task.move":
+        return this.withIdempotency(verb, params, () => this.rpcTaskMove(params));
+      case "task.edit":
+        return this.withIdempotency(verb, params, () => this.rpcTaskEdit(params));
+      case "task.lists":
+        return { lists: this.mustStore().listTaskLists() } satisfies TaskListsResult;
+      case "task.supply.get":
+        return this.rpcTaskSupplyGet(params);
+      case "task.supply.set":
+        return this.withIdempotency(verb, params, () => this.rpcTaskSupplySet(params));
       case "archive":
         return this.withIdempotency(verb, params, () =>
           this.rpcEnqueue("archive", this.param(params, "beeId"), {}, params),
@@ -1397,6 +1431,150 @@ export class HiveDaemon {
     return { seals: store.listSeals(beeId ? { beeId } : {}) };
   }
 
+  private rpcTaskAdd(params: Record<string, unknown>): TaskAddResult {
+    const store = this.mustStore();
+    const title = this.param(params, "title");
+    let list: string;
+    if (typeof params.list === "string" && params.list.length > 0) {
+      list = params.list;
+    } else {
+      const beeId = this.requireBee(params);
+      list = beeTaskList(beeId);
+    }
+    const originKind =
+      params.originKind === "user" || params.originKind === "self" || params.originKind === "bee"
+        ? params.originKind
+        : "user";
+    const originSender =
+      typeof params.originSender === "string" && params.originSender.length > 0 ? params.originSender : "operator";
+    const body = params.body === undefined || params.body === null ? undefined : params.body;
+    if (body !== undefined && typeof body !== "string") throw new RpcError("invalid_request", "task.add: body must be a string");
+    const autoRequested = typeof params.auto === "boolean" ? params.auto : undefined;
+    const questId = typeof params.questId === "string" && params.questId.length > 0 ? params.questId : undefined;
+    let context: Record<string, unknown> | undefined;
+    if (params.context !== undefined && params.context !== null) {
+      if (typeof params.context !== "object" || Array.isArray(params.context)) {
+        throw new RpcError("invalid_request", "task.add: context must be a JSON object");
+      }
+      context = params.context as Record<string, unknown>;
+    }
+    try {
+      const res = store.addTask({
+        list,
+        title,
+        originKind,
+        originSender,
+        ...(body !== undefined ? { body } : {}),
+        ...(autoRequested !== undefined ? { autoRequested } : {}),
+        ...(questId !== undefined ? { questId } : {}),
+        ...(context !== undefined ? { context } : {}),
+      });
+      this.log(`task.add list=${res.task.list} task=${res.task.id}`);
+      return { task: res.task, ...(res.warning ? { warning: res.warning } : {}) };
+    } catch (err) {
+      if (err instanceof RpcError) throw err;
+      throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private rpcTaskList(params: Record<string, unknown>): TaskListResult {
+    const store = this.mustStore();
+    let list: string | undefined;
+    let beeId: string | undefined;
+    if (typeof params.list === "string" && params.list.length > 0) list = params.list;
+    else if (params.beeId !== undefined && params.beeId !== null) {
+      beeId = this.requireBee(params);
+      list = beeTaskList(beeId);
+    }
+    let statuses: Array<"pending" | "queued" | "in-progress" | "done" | "blocked" | "cancelled"> | undefined;
+    if (params.statuses !== undefined && params.statuses !== null) {
+      if (!Array.isArray(params.statuses) || params.statuses.some((s) => !isTaskStatus(s))) {
+        throw new RpcError("invalid_request", "task.list: statuses must be an array of known statuses");
+      }
+      statuses = params.statuses as NonNullable<typeof statuses>;
+    }
+    const tasks = store.listTasks({
+      ...(list ? { list } : {}),
+      ...(beeId && !list ? { beeId } : {}),
+      ...(statuses ? { statuses } : {}),
+    });
+    return { list: list ?? null, tasks };
+  }
+
+  private rpcTaskGet(params: Record<string, unknown>): TaskGetResult {
+    const taskId = this.param(params, "taskId");
+    const task = this.mustStore().getTask(taskId);
+    if (!task) throw new RpcError("task_not_found", `task not found: ${taskId}`);
+    return { task };
+  }
+
+  private rpcTaskTransition(params: Record<string, unknown>): TaskTransitionResult {
+    const taskId = this.param(params, "taskId");
+    const action = this.param(params, "action");
+    if (!isTaskTransitionAction(action)) {
+      throw new RpcError("invalid_request", `task.transition: action must be one of ${TASK_TRANSITION_ACTIONS.join("|")}`);
+    }
+    if (!this.mustStore().getTask(taskId)) throw new RpcError("task_not_found", `task not found: ${taskId}`);
+    const reason = typeof params.reason === "string" && params.reason.length > 0 ? params.reason : undefined;
+    const task = this.mustStore().transitionTask(taskId, action, reason !== undefined ? { reason } : {});
+    this.log(`task.${action} task=${taskId} status=${task.status}`);
+    return { task };
+  }
+
+  private rpcTaskClaim(params: Record<string, unknown>): TaskClaimResult {
+    const list = this.param(params, "list");
+    const claimant = this.param(params, "claimant");
+    const task = this.mustStore().claimTask(list, claimant);
+    return { task };
+  }
+
+  private rpcTaskMove(params: Record<string, unknown>): TaskMoveResult {
+    const taskId = this.param(params, "taskId");
+    if (!this.mustStore().getTask(taskId)) throw new RpcError("task_not_found", `task not found: ${taskId}`);
+    const before = typeof params.before === "string" && params.before.length > 0 ? params.before : undefined;
+    const after = typeof params.after === "string" && params.after.length > 0 ? params.after : undefined;
+    const task = this.mustStore().moveTask(taskId, { ...(before ? { before } : {}), ...(after ? { after } : {}) });
+    return { task };
+  }
+
+  private rpcTaskEdit(params: Record<string, unknown>): TaskEditResult {
+    const taskId = this.param(params, "taskId");
+    if (!this.mustStore().getTask(taskId)) throw new RpcError("task_not_found", `task not found: ${taskId}`);
+    const title = typeof params.title === "string" ? params.title : undefined;
+    const body = params.body === undefined ? undefined : params.body === null ? null : params.body;
+    if (body !== undefined && body !== null && typeof body !== "string") {
+      throw new RpcError("invalid_request", "task.edit: body must be a string or null");
+    }
+    const auto = typeof params.auto === "boolean" ? params.auto : undefined;
+    const task = this.mustStore().editTask(taskId, {
+      ...(title !== undefined ? { title } : {}),
+      ...(body !== undefined ? { body } : {}),
+      ...(auto !== undefined ? { auto } : {}),
+    });
+    return { task };
+  }
+
+  private rpcTaskSupplyGet(params: Record<string, unknown>): TaskSupplyGetResult {
+    const beeId = this.requireBee(params);
+    return { supply: this.mustStore().getTaskSupply(beeId) };
+  }
+
+  private rpcTaskSupplySet(params: Record<string, unknown>): TaskSupplySetResult {
+    const beeId = this.requireBee(params);
+    if (params.on !== undefined && params.on !== null && typeof params.on !== "boolean") {
+      throw new RpcError("invalid_request", "task.supply.set: on must be a boolean");
+    }
+    if (params.limit !== undefined && params.limit !== null && typeof params.limit !== "number") {
+      throw new RpcError("invalid_request", "task.supply.set: limit must be a number");
+    }
+    const supply = this.mustStore().setTaskSupply(beeId, {
+      ...(typeof params.on === "boolean" ? { on: params.on } : {}),
+      ...(typeof params.limit === "number" ? { limit: params.limit } : {}),
+    });
+    this.log(`task.supply bee=${beeId} on=${supply.on} limit=${supply.limit} paused=${supply.paused}`);
+    return { supply };
+  }
+
   private rpcSend(params: Record<string, unknown>): SendRpcResult {
     const store = this.mustStore();
     const beeId = this.param(params, "beeId");
@@ -1513,6 +1691,8 @@ export class HiveDaemon {
       seals: store.listSeals(),
       accounts: store.listAccounts(),
       accountLimits: store.listAccountLimits(),
+      tasks: store.listTasks(),
+      taskSupply: store.listTaskSupply(),
     };
   }
 

@@ -12,7 +12,7 @@
  * Changing anything here is a protocol change (bump PROTOCOL in the daemon).
  * The shape snapshot test (tests/mirror.test.ts) fails on any drift.
  */
-import type { AccountLimitsRow, AccountRow, AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TemplateRow, TrackRow } from "./types.ts";
+import type { AccountLimitsRow, AccountRow, AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TaskRow, TaskSupplyRow, TemplateRow, TrackRow } from "./types.ts";
 
 /** One bee as apiaryd stores it: B8 view verbatim + record + current runtime. */
 export interface MirrorBeeRow {
@@ -40,6 +40,12 @@ export type MirrorAccountRow = AccountRow;
 /** v7: the latest limits snapshot per account, verbatim (`hive_account_limits` — the account-menu usage hint). */
 export type MirrorAccountLimitsRow = AccountLimitsRow;
 
+/** v11: tasks mirror as their store rows, verbatim. */
+export type MirrorTaskRow = TaskRow;
+
+/** v11: per-bee auto-supply config, verbatim (`hive_task_supply`). */
+export type MirrorTaskSupplyRow = TaskSupplyRow;
+
 /**
  * The versioned snapshot: replace all mirror tables in one transaction
  * stamped `seq`, then apply deltas with `baseSeq === seq`. `questions` and
@@ -56,6 +62,9 @@ export interface MirrorSnapshot {
   /** v7 (additive): accounts + their latest limits, store rows verbatim. */
   accounts: MirrorAccountRow[];
   accountLimits: MirrorAccountLimitsRow[];
+  /** v11 (additive): agent task lists + per-bee auto-supply config. */
+  tasks: MirrorTaskRow[];
+  taskSupply: MirrorTaskSupplyRow[];
 }
 
 /** A watch delta is a contiguous run of audit rows (see daemon protocol.ts WatchFrame). */
@@ -103,6 +112,11 @@ export type MirrorDelta = AuditRow;
  * pre-v8 deltas simply lack the key and mean `next`. The daemon's `mailbox`
  * read returns the same shape. No new kinds; a materializer that ignores
  * unknown keys stays correct.
+ * v11 (agent task lists) adds, all additive:
+ *   task.put         → { task: TaskRow, outcome: "created"|"updated" }  (tasks table: upsert)
+ *   task_supply.put  → { supply: TaskSupplyRow }                       (task_supply table: upsert)
+ * bee.deleted cascades tasks + task_supply for that beeId (shared-list
+ * tasks are untouched).
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
@@ -110,12 +124,16 @@ export const MIRROR_QUESTION_AUDIT_KINDS = ["question.asked", "question.answered
 export const MIRROR_SEAL_AUDIT_KINDS = ["seal.created"] as const;
 export const MIRROR_ACCOUNT_AUDIT_KINDS = ["account.put", "account.removed"] as const;
 export const MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS = ["account_limits.put", "account.removed"] as const;
+export const MIRROR_TASK_AUDIT_KINDS = ["task.put"] as const;
+export const MIRROR_TASK_SUPPLY_AUDIT_KINDS = ["task_supply.put"] as const;
 export type MirrorAccountAuditKind = (typeof MIRROR_ACCOUNT_AUDIT_KINDS)[number];
 export type MirrorAccountLimitsAuditKind = (typeof MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS)[number];
 export type MirrorTemplateAuditKind = (typeof MIRROR_TEMPLATE_AUDIT_KINDS)[number];
 export type MirrorTrackAuditKind = (typeof MIRROR_TRACK_AUDIT_KINDS)[number];
 export type MirrorQuestionAuditKind = (typeof MIRROR_QUESTION_AUDIT_KINDS)[number];
 export type MirrorSealAuditKind = (typeof MIRROR_SEAL_AUDIT_KINDS)[number];
+export type MirrorTaskAuditKind = (typeof MIRROR_TASK_AUDIT_KINDS)[number];
+export type MirrorTaskSupplyAuditKind = (typeof MIRROR_TASK_SUPPLY_AUDIT_KINDS)[number];
 
 /** Key lists — the shape snapshot; a materializer's column map must cover exactly these. */
 export const MIRROR_BEE_ROW_KEYS = ["view", "bee", "runtime"] as const;
@@ -243,3 +261,26 @@ export const MIRROR_ACCOUNT_LIMITS_KEYS = [
   "fableResetsAt",
   "fableMinutes",
 ] as const;
+export const MIRROR_TASK_KEYS = [
+  "id",
+  "list",
+  "beeId",
+  "title",
+  "body",
+  "context",
+  "originKind",
+  "originSender",
+  "auto",
+  "status",
+  "claimedBy",
+  "order",
+  "questId",
+  "mailboxMessageId",
+  "fedAt",
+  "stalledAt",
+  "blockedReason",
+  "createdAt",
+  "updatedAt",
+  "closedAt",
+] as const;
+export const MIRROR_TASK_SUPPLY_KEYS = ["beeId", "on", "limit", "feeds", "paused"] as const;

@@ -11,22 +11,23 @@ import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
 import { runV2Cli, serviceEnv, serviceExecArgs, serviceLabel, type CliIo } from "../src/main.ts";
+import { stripAnsi } from "../src/style.ts";
 import { claudeHsrRecord, makeFrozenFixture } from "../../core/tests/frozen-fixture.ts";
 import { commitInCell, g, makeOrigin } from "../../driver-cell/tests/helpers.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
   const out: string[] = [];
   const err: string[] = [];
-  return { io: { out: (l) => out.push(l), err: (l) => err.push(l) }, out, err };
+  return { io: { out: (l) => out.push(stripAnsi(l)), err: (l) => err.push(stripAnsi(l)) }, out, err };
 }
 
 test("cli.1: help prints and exits 0; unknown command exits 1", async () => {
   const a = capture();
   assert.equal(await runV2Cli(["help"], a.io), 0);
-  assert.ok(a.out.join("\n").includes("hive v2"));
+  assert.ok(a.out.join("\n").includes("hive <command>"));
   const b = capture();
   assert.equal(await runV2Cli(["frobnicate"], b.io), 1);
-  assert.ok(b.err[0]?.includes("unknown v2 command"));
+  assert.ok(b.err[0]?.includes("unknown command"));
 });
 
 test("cli.2: reads fall back to the read-only store when the daemon is down — labeled stale", async () => {
@@ -124,8 +125,11 @@ test("cli.3b: a misspelled flag is a LOUD error (never a silent no-op), and spaw
 
     // Short aliases still resolve (they expand before the known-flag check).
     const e = capture();
-    assert.equal(await runV2Cli(["tail", "nope", "-n", "5", "--data-dir", dir], e.io), 1);
+    assert.equal(await runV2Cli(["tail", "nope", "-n", "5", "-f", "--data-dir", dir], e.io), 1);
     assert.doesNotMatch([...e.err, ...e.out].join("\n"), /unknown flag/);
+    const tf = capture();
+    assert.equal(await runV2Cli(["transcript", "nope", "-f", "--data-dir", dir], tf.io), 1);
+    assert.doesNotMatch([...tf.err, ...tf.out].join("\n"), /unknown flag/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -264,11 +268,11 @@ test("cli.4c: per-bee args — `spawn --arg` (repeatable), `bee set-args <bee> -
     // human, unchanged
     const same = capture();
     assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir, "--", "--model", "opus", "--effort", "high", "--dangerously-skip-permissions"], same.io), 0);
-    assert.ok(same.out[0]?.startsWith("unchanged args for"), same.out[0]);
+    assert.ok(same.out[0]?.includes("unchanged args for"), same.out[0]);
     // usage errors: no args and no --clear
     const bad = capture();
     assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir], bad.io), 1);
-    assert.ok(bad.err[0]?.includes("usage: hive v2 bee set-args"));
+    assert.ok(bad.err[0]?.includes("usage: hive bee set-args"));
     const bad2 = capture();
     assert.equal(await runV2Cli(["bee", "frob", "--data-dir", dir], bad2.io), 1);
     // --clear
@@ -432,10 +436,10 @@ test("cli.4e: v6 verbs — rename, tag, interrupt, fork, children, spawn --paren
     // rename by name, then by id; unchanged
     const r = capture();
     assert.equal(await runV2Cli(["rename", "boss", "chief", "--data-dir", dir], r.io), 0);
-    assert.ok(r.out[0]?.startsWith(`renamed ${boss} → "chief"`), r.out[0]);
+    assert.ok(r.out[0]?.includes(`renamed ${boss} → "chief"`), r.out[0]);
     const r2 = capture();
     assert.equal(await runV2Cli(["rename", boss, "chief", "--data-dir", dir], r2.io), 0);
-    assert.ok(r2.out[0]?.startsWith("unchanged"), r2.out[0]);
+    assert.ok(r2.out[0]?.includes("unchanged"), r2.out[0]);
 
     // tag: --add / --remove (repeatable)
     const t = capture();
@@ -635,7 +639,7 @@ test("cli.7: cutover verbs — `freeze` writes/refuses locally; `import --from-f
     // usage guard
     const bad = capture();
     assert.equal(await runV2Cli(["import", "--data-dir", dir], bad.io), 1);
-    assert.ok(bad.err[0]?.includes("usage: hive v2 import --from-frozen"));
+    assert.ok(bad.err[0]?.includes("usage: hive import --from-frozen"));
 
     // freeze: lock pid alive → refused; impossible pid → written; again → already frozen
     fx.writeDaemonLock({ pid: process.pid, startedAt: new Date().toISOString() });
@@ -677,7 +681,7 @@ test("cli.7: cutover verbs — `freeze` writes/refuses locally; `import --from-f
     const i2 = capture();
     assert.equal(await runV2Cli(["import", "--from-frozen", "--root", fx.root, "--data-dir", dir], i2.io), 0);
     assert.ok(i2.out.some((l) => l.includes("already_imported=1")), i2.out.join("\n"));
-    assert.ok(i2.out.some((l) => l === "imported 0 bee(s)"));
+    assert.ok(i2.out.some((l) => l.includes("imported 0 bee(s)")));
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();
@@ -734,5 +738,56 @@ test("cli.version: --version answers (Apiary's Doctor gates local runs on it)", 
     const c = capture();
     assert.equal(await runV2Cli(argv, c.io), 0);
     assert.match(c.out[0] ?? "", /^honeybee \S+$/);
+  }
+});
+
+test("cli.task: add/ls/done/supply round-trip through the daemon; unknown command is gone", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const spawn = capture();
+    assert.equal(
+      await runV2Cli(["spawn", "worker", "--agent", "stub", "--cwd", "/tmp", "--data-dir", dir, "--json"], spawn.io),
+      0,
+    );
+    const spawned = JSON.parse(spawn.out[0] ?? "{}") as { beeId: string };
+
+    const add = capture();
+    assert.equal(
+      await runV2Cli(
+        ["task", "add", "worker", "-p", "paint the button", "--sender-human", "operator", "--data-dir", dir, "--json"],
+        add.io,
+      ),
+      0,
+    );
+    const added = JSON.parse(add.out[0] ?? "{}") as { task: { id: string; status: string; auto: boolean; title: string } };
+    assert.equal(added.task.status, "pending");
+    assert.equal(added.task.auto, true);
+    assert.equal(added.task.title, "paint the button");
+
+    const ls = capture();
+    assert.equal(await runV2Cli(["task", "ls", "worker", "--data-dir", dir, "--json"], ls.io), 0);
+    const listed = JSON.parse(ls.out[0] ?? "{}") as { tasks: Array<{ id: string }> };
+    assert.equal(listed.tasks.length, 1);
+    assert.equal(listed.tasks[0]?.id, added.task.id);
+
+    const done = capture();
+    assert.equal(await runV2Cli(["task", "done", added.task.id, "--data-dir", dir, "--json"], done.io), 0);
+    const closed = JSON.parse(done.out[0] ?? "{}") as { task: { status: string } };
+    assert.equal(closed.task.status, "done");
+
+    const supply = capture();
+    assert.equal(await runV2Cli(["task", "supply", spawned.beeId, "--on", "--data-dir", dir, "--json"], supply.io), 0);
+    const set = JSON.parse(supply.out[0] ?? "{}") as { supply: { on: boolean; paused: boolean } };
+    assert.equal(set.supply.on, true);
+    assert.equal(set.supply.paused, false);
+
+    const help = capture();
+    assert.equal(await runV2Cli(["help"], help.io), 0);
+    assert.ok(help.out.join("\n").includes("task"));
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
   }
 });

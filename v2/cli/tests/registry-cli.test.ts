@@ -11,11 +11,12 @@ import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, type DaemonHandle } from "../../daemon/tests/helpers.ts";
 import { runV2Cli, type CliIo } from "../src/main.ts";
+import { stripAnsi } from "../src/style.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
   const out: string[] = [];
   const err: string[] = [];
-  return { io: { out: (l) => out.push(l), err: (l) => err.push(l) }, out, err };
+  return { io: { out: (l) => out.push(stripAnsi(l)), err: (l) => err.push(stripAnsi(l)) }, out, err };
 }
 
 test("regcli.1: template/track/packages against a live daemon — put, list, export → import, import-local", async () => {
@@ -31,7 +32,7 @@ test("regcli.1: template/track/packages against a live daemon — put, list, exp
     writeFileSync(fieldsPath, JSON.stringify({ name: "commit", agent: "codex", prompt: "Commit the tree." }));
     const p = capture();
     assert.equal(await runV2Cli(["template", "put", "--file", fieldsPath, ...base], p.io), 0);
-    assert.ok(p.out[0]?.startsWith("created template "), p.out[0]);
+    assert.ok(p.out[0]?.includes("created") && p.out[0]?.includes("template "), p.out[0]);
 
     // list (json) — not stale
     const l = capture();
@@ -82,7 +83,7 @@ test("regcli.1: template/track/packages against a live daemon — put, list, exp
     // delete
     const d = capture();
     assert.equal(await runV2Cli(["template", "delete", "local", ...base], d.io), 0);
-    assert.ok(d.out[0]?.startsWith("deleted template "));
+    assert.ok(d.out[0]?.includes("deleted") && d.out[0]?.includes("template "));
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();

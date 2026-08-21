@@ -29,8 +29,11 @@ import type {
   MessageRow,
   MirrorQuestionRow,
   MirrorSealRow,
+  MirrorTaskRow,
+  MirrorTaskSupplyRow,
   MirrorTemplateRow,
   MirrorTrackRow,
+  TaskTransitionAction,
   RuntimeRow,
   TemplatePackage,
   TrackPackage,
@@ -61,6 +64,8 @@ export const RPC_ERROR_CODES = [
   "seal_not_found",
   /** v7 (spec 08, additive): account verbs. */
   "account_not_found",
+  /** v11: agent task lists. */
+  "task_not_found",
   /** The account is paused (explicit spawn / swap onto it refused). */
   "account_paused",
   /** The account's harness differs from the bee's agent (spawn / swap). */
@@ -148,6 +153,17 @@ export const RPC_VERBS = [
   // writes `naming` in the node's config.json.
   "config.get",
   "config.patch",
+  // v11: agent task lists (mailbox is the delivery path).
+  "task.add",
+  "task.list",
+  "task.get",
+  "task.transition",
+  "task.claim",
+  "task.move",
+  "task.edit",
+  "task.lists",
+  "task.supply.get",
+  "task.supply.set",
 ] as const;
 export type RpcVerb = (typeof RPC_VERBS)[number];
 
@@ -460,6 +476,64 @@ export interface SealGetResult {
   seal: MirrorSealRow;
 }
 
+// ---------------------------------------------------------------------------
+// v11 — agent task lists. Mutations take the optional idempotencyKey.
+// ---------------------------------------------------------------------------
+
+/** `task.add {list|beeId, title, body?, context?, originKind?, originSender?, auto?, questId?}` */
+export interface TaskAddResult extends DedupMarkers {
+  task: MirrorTaskRow;
+  warning?: string;
+}
+
+/** `task.list {list?, beeId?, statuses?}` */
+export interface TaskListResult {
+  list: string | null;
+  tasks: MirrorTaskRow[];
+}
+
+/** `task.get {taskId}` — `task_not_found` when absent. */
+export interface TaskGetResult {
+  task: MirrorTaskRow;
+}
+
+/** `task.transition {taskId, action, reason?}` */
+export interface TaskTransitionResult extends DedupMarkers {
+  task: MirrorTaskRow;
+}
+
+/** `task.claim {list, claimant}` — `task` is null when the list has nothing pending. */
+export interface TaskClaimResult extends DedupMarkers {
+  task: MirrorTaskRow | null;
+}
+
+/** `task.move {taskId, before?, after?}` */
+export interface TaskMoveResult extends DedupMarkers {
+  task: MirrorTaskRow;
+}
+
+/** `task.edit {taskId, title?, body?, auto?}` */
+export interface TaskEditResult extends DedupMarkers {
+  task: MirrorTaskRow;
+}
+
+/** `task.lists` */
+export interface TaskListsResult {
+  lists: Array<{ id: string; total: number }>;
+}
+
+/** `task.supply.get {beeId}` */
+export interface TaskSupplyGetResult {
+  supply: MirrorTaskSupplyRow;
+}
+
+/** `task.supply.set {beeId, on?, limit?}` */
+export interface TaskSupplySetResult extends DedupMarkers {
+  supply: MirrorTaskSupplyRow;
+}
+
+export type { TaskTransitionAction };
+
 /**
  * The substrates the daemon can spawn onto (contract §1: tmux | hsr | cell).
  * `spawn` takes `substrate?` (default `hsr`) and, for `cell`, a `cell`
@@ -592,6 +666,9 @@ export interface SnapshotResult {
   /** v7 (additive): accounts + latest limits, store rows verbatim. */
   accounts: MirrorAccountRow[];
   accountLimits: MirrorAccountLimitsRow[];
+  /** v11 (additive): agent task lists + per-bee auto-supply, store rows verbatim. */
+  tasks: MirrorTaskRow[];
+  taskSupply: MirrorTaskSupplyRow[];
 }
 
 // ---------------------------------------------------------------------------

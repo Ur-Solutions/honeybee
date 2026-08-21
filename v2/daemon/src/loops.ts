@@ -243,7 +243,25 @@ export class DaemonCore {
     this.degradedMailPolicy();
     this.executeCommands();
     this.deliveryLoop();
+    this.taskSupplyLoop();
     this.i1Telemetry();
+  }
+
+  /**
+   * After mailbox drain: if a bee's supply is on, the queue is empty, and the
+   * six-condition gate fires, feed one pending auto task as an idle mailbox
+   * message. A fed task that sits through an idle tick without being closed
+   * is stamped stalled.
+   */
+  private taskSupplyLoop(): void {
+    for (const row of this.store.listTaskSupply({ on: true })) {
+      try {
+        this.store.tryFeedTaskSupply(row.beeId);
+        this.store.maybeStallFedTask(row.beeId);
+      } catch (err) {
+        this.log(`task.supply.err bee=${row.beeId} ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------

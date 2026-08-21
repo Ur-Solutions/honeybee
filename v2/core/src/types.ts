@@ -328,6 +328,57 @@ export interface SealRow {
   createdAt: number;
 }
 
+// ---------------------------------------------------------------------------
+// v11 — agent task lists (shared micro-task backlog; mailbox is the delivery path)
+// ---------------------------------------------------------------------------
+
+export const TASK_STATUSES = ["pending", "queued", "in-progress", "done", "blocked", "cancelled"] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+export const TASK_ORIGIN_KINDS = ["user", "self", "bee"] as const;
+export type TaskOriginKind = (typeof TASK_ORIGIN_KINDS)[number];
+
+export const TASK_TRANSITION_ACTIONS = ["start", "done", "block", "cancel"] as const;
+export type TaskTransitionAction = (typeof TASK_TRANSITION_ACTIONS)[number];
+
+/**
+ * One micro-task. Bee lists are `bee:<beeId>` (cascade with the bee); shared
+ * lists are `shared:<name>` with `beeId` null. Feeding a task sends one
+ * mailbox message (urgency idle) and records it on `mailboxMessageId`.
+ */
+export interface TaskRow {
+  id: string;
+  list: string;
+  beeId: string | null;
+  title: string;
+  body: string | null;
+  /** Opaque structured payload (`{kind, ...}`); stored verbatim. */
+  context: Record<string, unknown> | null;
+  originKind: TaskOriginKind;
+  originSender: string;
+  auto: boolean;
+  status: TaskStatus;
+  claimedBy: string | null;
+  order: number;
+  questId: string | null;
+  mailboxMessageId: number | null;
+  fedAt: number | null;
+  stalledAt: number | null;
+  blockedReason: string | null;
+  createdAt: number;
+  updatedAt: number;
+  closedAt: number | null;
+}
+
+/** Per-bee auto-supply config. Missing row = off / limit 5 / feeds 0 / not paused. */
+export interface TaskSupplyRow {
+  beeId: string;
+  on: boolean;
+  limit: number;
+  feeds: number;
+  paused: boolean;
+}
+
 /** B8 — the derived read model. Computed, never stored. */
 export interface BeeView {
   beeId: string;
@@ -445,6 +496,9 @@ export interface StateDump {
   accounts: AccountRow[];
   accountLimits: AccountLimitsRow[];
   selectionCursors: SelectionCursorRow[];
+  /** v11 */
+  tasks: TaskRow[];
+  taskSupply: TaskSupplyRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +599,12 @@ export class QuestionNotOpenError extends CoreError {}
 export class SealNotFoundError extends CoreError {
   constructor(id: string) {
     super(`seal not found: ${id}`);
+  }
+}
+
+export class TaskNotFoundError extends CoreError {
+  constructor(id: string) {
+    super(`task not found: ${id}`);
   }
 }
 

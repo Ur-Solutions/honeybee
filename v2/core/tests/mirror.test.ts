@@ -19,6 +19,10 @@ import {
   MIRROR_RUNTIME_KEYS,
   MIRROR_SEAL_AUDIT_KINDS,
   MIRROR_SEAL_KEYS,
+  MIRROR_TASK_AUDIT_KINDS,
+  MIRROR_TASK_KEYS,
+  MIRROR_TASK_SUPPLY_AUDIT_KINDS,
+  MIRROR_TASK_SUPPLY_KEYS,
   MIRROR_TEMPLATE_AUDIT_KINDS,
   MIRROR_TEMPLATE_KEYS,
   MIRROR_TRACK_AUDIT_KINDS,
@@ -75,6 +79,16 @@ test("mirror.1: live rows carry exactly the declared keys — bees (view/bee/run
     assert.deepEqual(keysOf(account), [...MIRROR_ACCOUNT_KEYS].sort());
     const limits = store.putAccountLimits("claude-a", { readable: true, weekly: { usedPercent: 10 } });
     assert.deepEqual(keysOf(limits), [...MIRROR_ACCOUNT_LIMITS_KEYS].sort());
+    // v11: tasks + supply mirror as store rows, verbatim.
+    const added = store.addTask({
+      list: `bee:${bee.id}`,
+      title: "paint it",
+      originKind: "user",
+      originSender: "operator",
+    });
+    assert.deepEqual(keysOf(added.task), [...MIRROR_TASK_KEYS].sort());
+    const supply = store.setTaskSupply(bee.id, { on: true });
+    assert.deepEqual(keysOf(supply), [...MIRROR_TASK_SUPPLY_KEYS].sort());
     store.close();
   } finally {
     h.cleanup();
@@ -120,6 +134,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       seals: [seal],
       accounts: [account],
       accountLimits: [limits],
+      tasks: [],
+      taskSupply: [],
     };
     // Neutralize the nondeterministic values (bee uuid, minted handle) then freeze.
     const text = JSON.stringify(snapshot, null, 2)
@@ -296,7 +312,9 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       "fableResetsAt": null,
       "fableMinutes": null
     }
-  ]
+  ],
+  "tasks": [],
+  "taskSupply": []
 }`,
     );
     store.close();
@@ -353,6 +371,22 @@ test("mirror.3: template/track audit kinds are exactly the declared mirror kinds
     assert.deepEqual(keysOf(v7[1]!.payload), ["account", "changed", "outcome", "previous", "reason"]);
     assert.deepEqual(keysOf(v7[2]!.payload), ["limits"]);
     assert.deepEqual(keysOf(v7[3]!.payload), ["accountId", "cursorCleared", "harness", "removedAt"]);
+    // v11: task / supply audit kinds + payload shapes.
+    const added = store.addTask({
+      list: `bee:${bee.id}`,
+      title: "one",
+      originKind: "user",
+      originSender: "operator",
+    });
+    store.setTaskSupply(bee.id, { on: true });
+    const v11 = store.auditRows().filter((r) => r.kind === "task.put" || r.kind === "task_supply.put");
+    assert.equal(v11[0]?.kind, "task.put");
+    assert.equal(v11[1]?.kind, "task_supply.put");
+    for (const r of v11) assert.ok(([...MIRROR_TASK_AUDIT_KINDS, ...MIRROR_TASK_SUPPLY_AUDIT_KINDS] as string[]).includes(r.kind));
+    assert.deepEqual(keysOf(v11[0]!.payload), ["outcome", "task"]);
+    assert.equal(v11[0]?.payload.outcome, "created");
+    assert.equal((v11[0]?.payload.task as { id: string }).id, added.task.id);
+    assert.deepEqual(keysOf(v11[1]!.payload), ["supply"]);
     store.close();
   } finally {
     h.cleanup();

@@ -73,8 +73,13 @@
  *        migration = ALTER TABLE ADD COLUMN ×1 + backfill mint for existing
  *        rows (an imported bee whose old id already looks like a handle
  *        keeps it as its handle).
+ *  v11 — agent task lists (brought back from v1 `hive task`): `tasks` (one
+ *        row per micro-task; bee lists cascade with the bee; shared lists
+ *        have bee_id NULL) and `task_supply` (per-bee auto-supply config +
+ *        breaker). Delivery stays the mailbox — feeding a task is one idle
+ *        send. Additive; migration = CREATE TABLE IF NOT EXISTS ×2.
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -305,6 +310,46 @@ CREATE TABLE IF NOT EXISTS selection_cursors (
   harness         TEXT PRIMARY KEY,
   last_account_id TEXT NOT NULL,
   updated_at      INTEGER NOT NULL
+) STRICT;
+
+-- v11: agent task lists. Bee lists (bee:id) cascade with the bee;
+-- shared lists (shared:name) have bee_id NULL. sort_order is the FIFO
+-- rank (bisect-on-move). Mailbox delivery of a fed task is recorded on
+-- mailbox_message_id (the carrying undelivered row, cancelled if the task
+-- closes while still queued).
+CREATE TABLE IF NOT EXISTS tasks (
+  id                  TEXT PRIMARY KEY,
+  list                TEXT NOT NULL,
+  bee_id              TEXT REFERENCES bees(id) ON DELETE CASCADE,
+  title               TEXT NOT NULL,
+  body                TEXT,
+  context             TEXT,
+  origin_kind         TEXT NOT NULL CHECK (origin_kind IN ('user','self','bee')),
+  origin_sender       TEXT NOT NULL,
+  auto                INTEGER NOT NULL CHECK (auto IN (0,1)),
+  status              TEXT NOT NULL CHECK (status IN ('pending','queued','in-progress','done','blocked','cancelled')),
+  claimed_by          TEXT,
+  sort_order          REAL NOT NULL,
+  quest_id            TEXT,
+  mailbox_message_id  INTEGER,
+  fed_at              INTEGER,
+  stalled_at          INTEGER,
+  blocked_reason      TEXT,
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  closed_at           INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS tasks_list ON tasks(list, sort_order, id);
+CREATE INDEX IF NOT EXISTS tasks_bee ON tasks(bee_id, sort_order, id) WHERE bee_id IS NOT NULL;
+
+-- v11: per-bee auto-supply config. Missing row = off / limit 5 / feeds 0.
+-- on is the human gate; paused is the breaker (cleared only by --on).
+CREATE TABLE IF NOT EXISTS task_supply (
+  bee_id     TEXT PRIMARY KEY REFERENCES bees(id) ON DELETE CASCADE,
+  enabled    INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  feed_limit INTEGER NOT NULL DEFAULT 5,
+  feeds      INTEGER NOT NULL DEFAULT 0,
+  paused     INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0,1))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS audit (

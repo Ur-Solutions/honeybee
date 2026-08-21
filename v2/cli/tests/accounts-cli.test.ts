@@ -12,11 +12,12 @@ import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, type DaemonHandle } from "../../daemon/tests/helpers.ts";
 import { runV2Cli, type CliIo } from "../src/main.ts";
+import { stripAnsi } from "../src/style.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
   const out: string[] = [];
   const err: string[] = [];
-  return { io: { out: (l) => out.push(l), err: (l) => err.push(l) }, out, err };
+  return { io: { out: (l) => out.push(stripAnsi(l)), err: (l) => err.push(stripAnsi(l)) }, out, err };
 }
 
 test("cli.accounts.1: account verbs over RPC + spawn --account + bee swap-account (stub) + import --dry-run against a fixture root", async () => {
@@ -36,12 +37,12 @@ test("cli.accounts.1: account verbs over RPC + spawn --account + bee swap-accoun
     // list (human)
     const list = capture();
     assert.equal(await runV2Cli(["account", "list", ...base], list.io), 0);
-    assert.ok(list.out.some((l) => l.startsWith("stub-one  stub  ok") && l.includes("penalty=5")), list.out.join("\n"));
-    assert.ok(list.out.some((l) => l.startsWith("stub-two  stub  ok")));
+    assert.ok(list.out.some((l) => l.includes("stub-one") && l.includes("stub") && l.includes("ok") && l.includes("penalty=5")), list.out.join("\n"));
+    assert.ok(list.out.some((l) => l.includes("stub-two") && l.includes("stub") && l.includes("ok")));
     // pause / unpause / penalty
     const pause = capture();
     assert.equal(await runV2Cli(["account", "pause", "stub-two", ...base], pause.io), 0);
-    assert.match(pause.out[0] ?? "", /paused stub-two \(status paused\)/);
+    assert.match(pause.out[0] ?? "", /paused\s+stub-two \(status paused\)/);
     const pen = capture();
     assert.equal(await runV2Cli(["account", "penalty", "stub-one", "0", ...base], pen.io), 0);
     assert.match(pen.out[0] ?? "", /set penalty for stub-one: 0/);
@@ -99,7 +100,7 @@ test("cli.accounts.1: account verbs over RPC + spawn --account + bee swap-accoun
     // usage errors
     const usage = capture();
     assert.equal(await runV2Cli(["account", "frob", ...base], usage.io), 1);
-    assert.match(usage.err[0] ?? "", /usage: hive v2 account/);
+    assert.match(usage.err[0] ?? "", /usage: hive account/);
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();
@@ -122,7 +123,7 @@ test("cli.accounts.2: `account list` falls back to the read-only store when the 
     const h = capture();
     assert.equal(await runV2Cli(["account", "list", "--data-dir", dir], h.io), 0);
     assert.ok(h.err[0]?.startsWith("STALE"));
-    assert.match(h.out[0] ?? "", /^stale: claude-a  claude  ok  \/tmp\/h  penalty=3  weekly=40% 5h=5% plan=max$/);
+    assert.match(h.out[0] ?? "", /^stale: claude-a\s+claude\s+ok\s+\/tmp\/h\s+penalty=3\s+weekly=40%\s+5h=5%\s+plan=max$/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
