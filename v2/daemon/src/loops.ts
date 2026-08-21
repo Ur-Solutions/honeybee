@@ -326,6 +326,7 @@ export class DaemonCore {
       // dies on its own — same budget as an exit during `booting`.
       const countable = rt.state === "booting" || rt.bootEvidence === "synthetic";
       const failuresBefore = countable ? (this.store.getBee(obs.beeId)?.spawnFailures ?? 0) : null;
+      let bootRetryNeeded = false;
       this.store.updateRuntimeState(obs.beeId, obs.generation, "stopped", {
         exitCause: obs.exitCause ?? "crashed",
         exitDetail: obs.detail,
@@ -340,12 +341,14 @@ export class DaemonCore {
         if (failures > failuresBefore) {
           const flagged = this.store.activeFlags(obs.beeId).some((f) => f.flag === "spawn_failed");
           this.log(`spawn.failure bee=${obs.beeId} gen=${obs.generation} failures=${failures} flagged=${flagged}`);
+          bootRetryNeeded = !flagged;
         }
       }
       // A dead runtime with pending mail must be revived — no user intervention
       // (I1) — on the boot-failure backoff table, and never while spawn_failed
       // is set (visibly blocked; the operator's revive is the way back).
       this.ensureWake(obs.beeId);
+      if (bootRetryNeeded) this.ensureBootRetry(obs.beeId);
       this.reviveAfterStopIfRequested(obs.beeId, obs.generation);
     } else if (obs.kind === "booted") {
       this.store.updateRuntimeState(obs.beeId, obs.generation, "running", {
@@ -378,6 +381,18 @@ export class DaemonCore {
     if (outcome !== "enqueued" || !command) return false;
     this.log(
       `wake.enqueued bee=${beeId} gen=${command.targetGeneration ?? 0}` +
+        (command.nextAttemptAt > command.enqueuedAt ? ` notBefore=${command.nextAttemptAt}` : ""),
+    );
+    return true;
+  }
+
+  /** A failed boot is retried on B5's budget even for a prompt-less spawn. */
+  private ensureBootRetry(beeId: string): boolean {
+    const { command, outcome } = this.store.enqueueBootRetry(beeId);
+    if (outcome === "suppressed") return false;
+    if (outcome !== "enqueued" || !command) return false;
+    this.log(
+      `boot_retry.enqueued bee=${beeId} gen=${command.targetGeneration ?? 0}` +
         (command.nextAttemptAt > command.enqueuedAt ? ` notBefore=${command.nextAttemptAt}` : ""),
     );
     return true;

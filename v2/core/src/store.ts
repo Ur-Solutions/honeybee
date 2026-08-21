@@ -1379,6 +1379,18 @@ export class CoreStore {
   }
 
   /**
+   * Retry a failed boot even when the bee has no mailbox work. This shares
+   * the exact bounded budget, backoff, generation fence, and spawn_failed
+   * suppression used by mailbox wakes.
+   */
+  enqueueBootRetry(beeId: string): WakeResult {
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      return this.applyWakeIfNeeded(beeId);
+    });
+  }
+
+  /**
    * WP2 pid-at-spawn amendment (WP4 wiring): record the process identity the
    * driver captured at spawn on the current, live runtime row — no state
    * transition. A daemon restart at any point (even mid-boot) can then

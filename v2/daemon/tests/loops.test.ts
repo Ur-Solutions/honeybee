@@ -357,6 +357,27 @@ test("budget.5: immediate-exit runtime → bounded revives with backoff, spawn_f
   }
 });
 
+test("budget.5a: prompt-less spawn boot failures still retry to the visible bounded terminal", () => {
+  const rig = makeRig({ i1DeadlineSteps: 200 });
+  try {
+    rig.driver.bootCrash = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "stub", substrate: "cell", cwd: "/cells/w/repo-space-1" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    stepUntilQuiet(rig, 40);
+
+    assert.equal(rig.store.undeliveredMessages("bee-1").length, 0);
+    assert.equal(rig.driver.starts.length, 3, "boot retry is not conditional on mailbox work");
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 3);
+    assert.deepEqual(rig.store.activeFlags("bee-1").map((flag) => flag.flag), ["spawn_failed"]);
+    assert.equal(
+      rig.store.listCommands({ beeId: "bee-1" }).filter((command) => command.verb === "send_wake").length,
+      2,
+    );
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("budget.5b: a driver that THROWS from start (cell provisioning failed) is a spawn failure on the B5 table — retried with backoff, spawn_failed at the budget, never a wedged command or a loop error", () => {
   const rig = makeRig();
   try {
@@ -640,22 +661,15 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
     store.enqueueCommand("spawn", "bee-x");
     store.send("bee-x", "hello?");
     // The doomed phase is BOUNDED whichever way the spawn/delivery race falls
-    // (deliver-at-spawn is legal for readyAtSpawn; the race stalled the deploy
-    // gate 4× on 2026-08-19):
-    //   - delivery loses (the soak cadence): undelivered mail wake-revives
-    //     each generation until spawn_failed flags at maxAttempts;
-    //   - delivery wins: the mail is consumed by a dying generation and
-    //     NOTHING drives revives — the bee parks stopped below the budget.
-    // Pre-fix the synthetic booted reset the budget every generation and the
-    // churn was UNBOUNDED — the regression pinned here (+ audit check below).
+    // (deliver-at-spawn is legal for readyAtSpawn). Boot retry is independent
+    // of mailbox state, so both arms reach the same visible spawn_failed
+    // terminal at maxAttempts instead of sometimes parking silently below it.
     const deadline = Date.now() + 10_000;
-    let flagged = false;
     for (;;) {
       core.step();
-      flagged = store.activeFlags("bee-x").some((f) => f.flag === "spawn_failed");
+      const flagged = store.activeFlags("bee-x").some((f) => f.flag === "spawn_failed");
       const stopped = store.currentRuntime("bee-x")?.state === "stopped";
-      const parked = stopped && store.undeliveredMessages("bee-x").length === 0;
-      if ((flagged && stopped) || parked) break;
+      if (flagged && stopped) break;
       assert.ok(Date.now() < deadline, `never bounded; ops tail: ${ops.slice(-25).join(" | ")}`);
       await sleep(40);
     }
@@ -675,29 +689,21 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
       assert.equal(r.bootEvidence, "synthetic", `generation ${r.generation} never produced real output`);
     }
     assert.equal(store.getBee("bee-x")?.spawnFailures, runtimes.length, "every generation counted against the budget");
-    if (flagged) {
-      assert.equal(store.getBee("bee-x")?.spawnFailures, 3);
-      // The delivery race can consume the mail on ANY doomed generation while
-      // wake-driven revives still flag the budget: pending mail must answer
-      // `suppressed` (the flag gates wakes); consumed mail answers `no_mail`.
-      // Both are bounded — the flag is what stops the churn either way.
-      const pending = store.undeliveredMessages("bee-x").length;
-      assert.equal(
-        store.enqueueWake("bee-x").outcome,
-        pending > 0 ? "suppressed" : "no_mail",
-        "wakes gated while spawn_failed is set",
-      );
-    } else {
-      assert.equal(store.undeliveredMessages("bee-x").length, 0, "parked-quiet path: the mail was consumed by a dying generation");
-    }
+    assert.equal(store.getBee("bee-x")?.spawnFailures, 3);
+    const pending = store.undeliveredMessages("bee-x").length;
+    assert.equal(
+      store.enqueueWake("bee-x").outcome,
+      pending > 0 ? "suppressed" : "no_mail",
+      "mailbox wakes are gated while spawn_failed is set",
+    );
     assert.equal(
       store.auditRows().filter((r) => r.kind === "bee.spawn_failures" && r.payload.spawnFailures === 0).length,
       0,
       "REGRESSION: no synthetic-booted budget reset, ever",
     );
     // Operator revive with the harness fixed: real output → evidence → flag
-    // clears, counter resets, the mail finally flows. (Parked-quiet path: the
-    // original mail was consumed, so prove the flow with a fresh message.)
+    // clears, counter resets, the mail finally flows. If the original mail was
+    // consumed by a doomed generation, prove the flow with a fresh message.
     fixed = true;
     if (store.undeliveredMessages("bee-x").length === 0) store.send("bee-x", "hello again?");
     store.enqueueCommand("revive", "bee-x");

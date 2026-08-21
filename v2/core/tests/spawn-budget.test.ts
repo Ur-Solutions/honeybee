@@ -82,6 +82,36 @@ test("budget.1: exits during booting count on ONE per-bee budget; the next wake 
   store.close();
 });
 
+test("budget.1b: a prompt-less boot failure retries on the same bounded policy", (t) => {
+  const h = harness();
+  t.after(() => h.cleanup());
+  const clock = { now: 1_000_000 };
+  const store = openCoreStore(h.path, {
+    now: () => clock.now,
+    maxAttempts: 2,
+    backoffBaseMs: 100,
+    ephemeral: true,
+  });
+  const { bee } = makeBee(store);
+
+  bootCrash(store, bee.id);
+  assert.equal(store.enqueueWake(bee.id).outcome, "no_mail");
+  const retry = store.enqueueBootRetry(bee.id);
+  assert.equal(retry.outcome, "enqueued");
+  assert.equal(retry.command?.nextAttemptAt, clock.now + 100);
+  assert.equal(store.enqueueBootRetry(bee.id).outcome, "pending");
+
+  clock.now = retry.command!.nextAttemptAt;
+  const claimed = store.claimNextCommand();
+  assert.equal(claimed?.id, retry.command?.id);
+  store.completeCommand(claimed!.id);
+  store.reviveBee(bee.id);
+  bootCrash(store, bee.id);
+  assert.deepEqual(store.activeFlags(bee.id).map((flag) => flag.flag), ["spawn_failed"]);
+  assert.equal(store.enqueueBootRetry(bee.id).outcome, "suppressed");
+  store.close();
+});
+
 test("budget.2: a crash after running/idle is NOT a spawn failure; system/user stops and machine restarts during boot do not count", (t) => {
   const h = harness();
   t.after(() => h.cleanup());
