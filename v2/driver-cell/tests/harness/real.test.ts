@@ -55,7 +55,6 @@ interface RunConfig {
   };
   policy: {
     bootHangTimeoutMs: number;
-    turnHangTimeoutMs: number;
     commandsPerStep: number;
     maxAttempts: number;
     backoffBaseMs: number;
@@ -117,7 +116,6 @@ async function runCellSim(seed: number, cfg: RunConfig): Promise<{ violations: V
   );
   const policy = {
     bootHangTimeoutSteps: cfg.policy.bootHangTimeoutMs,
-    turnHangTimeoutSteps: cfg.policy.turnHangTimeoutMs,
     commandsPerStep: cfg.policy.commandsPerStep,
   };
   const storeOpts = { maxAttempts: cfg.policy.maxAttempts, backoffBaseMs: cfg.policy.backoffBaseMs };
@@ -132,7 +130,6 @@ async function runCellSim(seed: number, cfg: RunConfig): Promise<{ violations: V
       i1BoundSteps: cfg.i1BoundMs,
       queueBoundSteps: cfg.queueBoundMs,
       maxAttempts: cfg.policy.maxAttempts,
-      turnHangTimeoutSteps: cfg.policy.turnHangTimeoutMs,
     },
     () => opLog.slice(-40),
   );
@@ -281,7 +278,7 @@ async function runCellSim(seed: number, cfg: RunConfig): Promise<{ violations: V
       if (stepDaemon(s, step)) checker.checkStep(step, Date.now(), s, driver);
       if (store == null) s = reopen(step);
     }
-    checker.checkSettle(step, Date.now(), s);
+    checker.checkSettle(step, s);
     checker.checkReplay(step, s);
     stats.delivered = driver.consumedCount();
     s.close();
@@ -321,7 +318,6 @@ function baseConfig(overrides: Partial<RunConfig> = {}): RunConfig {
     },
     policy: {
       bootHangTimeoutMs: 3_000,
-      turnHangTimeoutMs: 2_000,
       commandsPerStep: 6,
       maxAttempts: 5,
       backoffBaseMs: 50,
@@ -356,7 +352,7 @@ test("cell-real.2: reboot-equivalent storm + agent faults — invariants hold, c
       stopProbability: 0.03,
       archiveProbability: 0.02,
       deleteProbability: 0.012,
-      hangProbability: 0.05,
+      hangProbability: 0,
       crashProbability: 0.05,
       exitProbability: 0.04,
     },

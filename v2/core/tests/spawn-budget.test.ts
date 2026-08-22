@@ -131,7 +131,7 @@ test("budget.2: a crash after running/idle is NOT a spawn failure; system/user s
   assert.equal(store.getBee(bee.id)?.spawnFailures, 0);
   // Stops during boot that are not the process dying on its own do not count.
   store.reviveBee(bee.id);
-  store.updateRuntimeState(bee.id, 3, "stopped", { exitCause: "stopped_by_system" }); // hang policy
+  store.updateRuntimeState(bee.id, 3, "stopped", { exitCause: "stopped_by_system" }); // boot-hang policy
   store.reviveBee(bee.id);
   store.updateRuntimeState(bee.id, 4, "stopped", { exitCause: "stopped_by_user" });
   store.reviveBee(bee.id);

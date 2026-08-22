@@ -245,7 +245,6 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
     // The agent outlives the daemon (detached + survive-stdin-close) and works
     // a long turn so the kill happens mid-turn.
     stubEnv: { STUB_SURVIVE_STDIN_CLOSE: "1", STUB_TURN_MS: "60000" },
-    turnHangTimeoutMs: 120_000, // hang policy must not race the assertions
     bootHangTimeoutMs: 8000,
   });
   let daemon: DaemonHandle | null = null;
@@ -346,7 +345,6 @@ test("int.6: induced I1 breach — a boot-hanging agent leaves mail undelivered 
   const { dir, cleanup } = makeDaemonDir({
     stubEnv: { STUB_HANG_ON_BOOT: "1" },
     bootHangTimeoutMs: 250,
-    turnHangTimeoutMs: 250,
     bootAllowanceMs: 100,
     turnAllowanceMs: 100,
     tickMs: 40,

@@ -8,10 +8,9 @@
  * as everything else.
  *
  * The workload deliberately omits @hang directives: the transcript-only
- * observer derives turn ends from quiescence, so "hung" and "idle without
- * further output" are indistinguishable BY DESIGN for such harnesses; hang
- * containment for them is the daemon's hang policy over recency, covered in
- * the driver/eq tiers.
+ * observer derives turn ends from quiescence, so "hung" and "legitimately
+ * long-running" are indistinguishable BY DESIGN. Silence never authorizes an
+ * automatic stop.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -54,7 +53,6 @@ interface RunConfig {
   };
   policy: {
     bootHangTimeoutMs: number;
-    turnHangTimeoutMs: number;
     commandsPerStep: number;
     maxAttempts: number;
     backoffBaseMs: number;
@@ -111,7 +109,6 @@ async function runTmuxSim(seed: number, cfg: RunConfig): Promise<{ violations: V
   );
   const policy = {
     bootHangTimeoutSteps: cfg.policy.bootHangTimeoutMs,
-    turnHangTimeoutSteps: cfg.policy.turnHangTimeoutMs,
     commandsPerStep: cfg.policy.commandsPerStep,
   };
   const storeOpts = { maxAttempts: cfg.policy.maxAttempts, backoffBaseMs: cfg.policy.backoffBaseMs };
@@ -126,7 +123,6 @@ async function runTmuxSim(seed: number, cfg: RunConfig): Promise<{ violations: V
       i1BoundSteps: cfg.i1BoundMs,
       queueBoundSteps: cfg.queueBoundMs,
       maxAttempts: cfg.policy.maxAttempts,
-      turnHangTimeoutSteps: cfg.policy.turnHangTimeoutMs,
     },
     () => opLog.slice(-40),
   );
@@ -274,7 +270,7 @@ async function runTmuxSim(seed: number, cfg: RunConfig): Promise<{ violations: V
       if (stepDaemon(s, step)) checker.checkStep(step, Date.now(), s, driver);
       if (store == null) s = reopen(step);
     }
-    checker.checkSettle(step, Date.now(), s);
+    checker.checkSettle(step, s);
     checker.checkReplay(step, s);
     stats.delivered = driver.consumedCount();
     s.close();
@@ -317,10 +313,9 @@ function baseConfig(overrides: Partial<RunConfig> = {}): RunConfig {
       exitProbability: 0,
     },
     policy: {
-      // Quiescence-derived turn ends take turn+quiesce (~300ms); hang
-      // policy must sit far above that.
+      // Quiescence-derived turn ends take turn+quiesce (~300ms); recovery is
+      // based on explicit observation, never elapsed turn time.
       bootHangTimeoutMs: 5_000,
-      turnHangTimeoutMs: 4_000,
       commandsPerStep: 4,
       maxAttempts: 5,
       backoffBaseMs: 50,

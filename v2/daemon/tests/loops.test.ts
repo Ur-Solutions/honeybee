@@ -2,7 +2,7 @@
  * WP4 unit tier: the DaemonCore loop cores under a controllable fake driver
  * and a virtual clock (spec 04 test plan: "loops against SimDriver — fast,
  * deterministic"). The full six-invariant proof of the shared executor/
- * delivery/hang logic lives in `v2:harness` / `v2:harness:real`, which drive
+ * delivery/boot-recovery logic lives in `v2:harness` / `v2:harness:real`, which drive
  * this same DaemonCore through the SimDaemon wrapper; here we pin the WP4
  * additions: scale-to-zero, flag policy, degraded-runtime policy, pid-at-
  * spawn recording, and I1 telemetry.
@@ -43,7 +43,6 @@ function makeRig(policy: Partial<DaemonPolicy> = {}): Rig {
     driver,
     policy: {
       bootHangTimeoutSteps: 50,
-      turnHangTimeoutSteps: 50,
       commandsPerStep: 8,
       ...policy,
     },
@@ -344,7 +343,7 @@ test("budget.5: immediate-exit runtime → bounded revives with backoff, spawn_f
     const core2 = new DaemonCore({
       store: rig.store,
       driver: rig.driver,
-      policy: { bootHangTimeoutSteps: 50, turnHangTimeoutSteps: 50, commandsPerStep: 8 },
+      policy: { bootHangTimeoutSteps: 50, commandsPerStep: 8 },
       now: () => rig.clock.now,
       log: (op) => rig.ops.push(op),
     });
@@ -651,7 +650,7 @@ test("budget.11 (end-to-end repro): a REAL readyAtSpawn process that spawns fine
   const core = new DaemonCore({
     store,
     driver,
-    policy: { bootHangTimeoutSteps: 5000, turnHangTimeoutSteps: 5000, commandsPerStep: 8 },
+    policy: { bootHangTimeoutSteps: 5000, commandsPerStep: 8 },
     now: Date.now,
     log: (op) => ops.push(op),
   });
@@ -780,7 +779,7 @@ test("unit.10 (spec 08): the onFlagEvidence hook fires after each applied eviden
   const core = new DaemonCore({
     store,
     driver,
-    policy: { bootHangTimeoutSteps: 50, turnHangTimeoutSteps: 50, commandsPerStep: 8 },
+    policy: { bootHangTimeoutSteps: 50, commandsPerStep: 8 },
     now,
     log: (op) => ops.push(op),
     onFlagEvidence: (ev) => {
@@ -821,8 +820,36 @@ function startTurn(rig: Rig, id = "bee-1"): void {
   assert.equal(rig.store.currentRuntime(id)?.state, "running");
 }
 
+test("runtime policy: a running turn is never stopped because time elapsed", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    const generation = rig.store.currentRuntime("bee-1")?.generation;
+
+    rig.clock.now += 24 * 60 * 60 * 1000;
+    rig.core.step();
+    rig.core.step();
+
+    const rt = rig.store.currentRuntime("bee-1");
+    assert.equal(rt?.generation, generation);
+    assert.equal(rt?.state, "running");
+    assert.equal(
+      rig.store.listCommands({ beeId: "bee-1" }).some((c) => c.verb === "stop"),
+      false,
+      "elapsed time must not manufacture stop intent",
+    );
+    assert.equal(
+      rig.ops.some((op) => op.includes("policy.hang_stop") && op.includes("state=running")),
+      false,
+    );
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("urgency.d1: `idle` is not delivered while the runtime is running — it lands at turn end", () => {
-  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  const rig = makeRig();
   try {
     spawnIdleBee(rig);
     startTurn(rig);
@@ -844,7 +871,7 @@ test("urgency.d1: `idle` is not delivered while the runtime is running — it la
 });
 
 test("urgency.d2: `now` mid-turn interrupts exactly once, then delivers at the resulting accept point", () => {
-  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  const rig = makeRig();
   try {
     spawnIdleBee(rig);
     startTurn(rig);
@@ -884,7 +911,7 @@ test("urgency.d3: `now` to an idle runtime is a plain delivery — no interrupt"
 });
 
 test("urgency.d4: ordering — urgency governs WHEN a message is eligible; among eligible, enqueue order wins", () => {
-  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  const rig = makeRig();
   try {
     spawnIdleBee(rig);
     startTurn(rig);
@@ -928,7 +955,7 @@ test("urgency.d5: `idle` to a stopped bee still revives (revive-on-message uncha
 });
 
 test("urgency.d6: I1 telemetry — an `idle` message's deadline clock starts at eligibility (turn end), not enqueue", () => {
-  const rig = makeRig({ i1DeadlineSteps: 200, turnHangTimeoutSteps: 1_000_000 });
+  const rig = makeRig({ i1DeadlineSteps: 200 });
   try {
     spawnIdleBee(rig);
     startTurn(rig);
@@ -979,7 +1006,7 @@ test("envelope.d1: bee-sent mail is delivered ENVELOPED; operator mail is delive
 });
 
 test("urgency.d6: idle mail DELIVERS to a synthetic-running fresh revive — no generation churn (2026-08-19 budget.11 discovery)", () => {
-  const rig = makeRig({ turnHangTimeoutSteps: 1_000_000 });
+  const rig = makeRig();
   try {
     spawnIdleBee(rig);
     rig.core.step();

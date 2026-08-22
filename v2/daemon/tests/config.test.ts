@@ -57,21 +57,22 @@ test("config.2: file values override defaults; unknown keys are ignored", () => 
   });
 });
 
-test("config.3: I1 deadline is clamped UP to the policy-aware floor (hang + boot + turn allowances)", () => {
+test("config.3: I1 deadline covers bounded boot recovery; the legacy turn timeout is ignored", () => {
   withDir((dir) => {
     writeFileSync(
       join(dir, "config.json"),
       JSON.stringify({
         bootHangTimeoutMs: 500,
-        turnHangTimeoutMs: 800,
+        turnHangTimeoutMs: 800, // legacy compatibility key: must not affect policy
         bootAllowanceMs: 100,
         turnAllowanceMs: 200,
         i1DeadlineMs: 1, // below floor: measuring nothing — clamp
       }),
     );
     const cfg = loadNodeConfig(dir);
-    assert.equal(cfg.i1FloorMs, 800 + 100 + 200);
+    assert.equal(cfg.i1FloorMs, 500 + 100 + 200);
     assert.equal(cfg.i1DeadlineMs, cfg.i1FloorMs);
+    assert.equal("turnHangTimeoutMs" in cfg, false);
   });
 });
 
@@ -79,7 +80,7 @@ test("config.4: an above-floor deadline override is honored", () => {
   withDir((dir) => {
     writeFileSync(
       join(dir, "config.json"),
-      JSON.stringify({ bootHangTimeoutMs: 100, turnHangTimeoutMs: 100, bootAllowanceMs: 10, turnAllowanceMs: 10, i1DeadlineMs: 99_999 }),
+      JSON.stringify({ bootHangTimeoutMs: 100, bootAllowanceMs: 10, turnAllowanceMs: 10, i1DeadlineMs: 99_999 }),
     );
     const cfg = loadNodeConfig(dir);
     assert.equal(cfg.i1DeadlineMs, 99_999);

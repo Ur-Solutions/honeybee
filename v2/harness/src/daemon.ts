@@ -1,7 +1,7 @@
 /**
  * SimDaemon — the harness face of the daemon loop cores.
  *
- * WP2 prototyped the executor/delivery/hang loops here; WP4 extracted them to
+ * WP2 prototyped the executor/delivery/boot-recovery loops here; WP4 extracted them to
  * v2/daemon/src/loops.ts (DaemonCore) so the REAL daemon runs the exact code
  * this harness proves. SimDaemon remains the harness's construction: it wires
  * the WP2 FaultInjector into DaemonCore's injected fault hooks and keeps the

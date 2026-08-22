@@ -115,7 +115,11 @@ export interface NodeConfigFile {
   idleWindowMs?: number;
   /** Hang policy: stop a runtime stuck in `booting` past this. */
   bootHangTimeoutMs?: number;
-  /** Hang policy: stop a runtime stuck in `running` past this. */
+  /**
+   * @deprecated Ignored. Running turns are unbounded; silence and elapsed
+   * time are not failure evidence. Retained only so old config files remain
+   * readable during the compatibility window.
+   */
   turnHangTimeoutMs?: number;
   /** I1 deadline allowance for a replacement runtime to boot. */
   bootAllowanceMs?: number;
@@ -123,8 +127,8 @@ export interface NodeConfigFile {
   turnAllowanceMs?: number;
   /**
    * I1 delivery deadline per pending mailbox position (behavior 5). Clamped
-   * UP to the policy-aware floor: max(hang timeouts) + boot + turn allowances
-   * — the WP2 finding that a bound below policy reach measures nothing.
+   * UP to the policy-aware floor: boot timeout + boot + ordinary-turn
+   * allowances. A breach records telemetry; it never stops a running turn.
    */
   i1DeadlineMs?: number;
   /** Daemon tick interval. */
@@ -162,7 +166,6 @@ export interface ResolvedNodeConfig {
   cellWarm: Record<string, string[]>;
   idleWindowMs: number;
   bootHangTimeoutMs: number;
-  turnHangTimeoutMs: number;
   bootAllowanceMs: number;
   turnAllowanceMs: number;
   /** The effective (floor-clamped) I1 deadline. */
@@ -216,7 +219,6 @@ export const BUILTIN_AGENTS: Record<string, AgentSpecConfig> = {
 export const DEFAULTS = {
   idleWindowMs: 60 * 60 * 1000, // Q4 ruling: default 60 min
   bootHangTimeoutMs: 3 * 60 * 1000,
-  turnHangTimeoutMs: 45 * 60 * 1000,
   bootAllowanceMs: 60 * 1000,
   turnAllowanceMs: 5 * 60 * 1000,
   tickMs: 200,
@@ -494,13 +496,12 @@ export function loadNodeConfig(dataDir: string, configPath?: string): ResolvedNo
         })();
 
   const bootHangTimeoutMs = num(raw, "bootHangTimeoutMs", DEFAULTS.bootHangTimeoutMs);
-  const turnHangTimeoutMs = num(raw, "turnHangTimeoutMs", DEFAULTS.turnHangTimeoutMs);
   const bootAllowanceMs = num(raw, "bootAllowanceMs", DEFAULTS.bootAllowanceMs);
   const turnAllowanceMs = num(raw, "turnAllowanceMs", DEFAULTS.turnAllowanceMs);
-  // Behavior 5: the deadline is policy-aware — at least hang-timeout + boot +
-  // turn allowances, so "late" is only ever counted past the system's own
-  // legitimate recovery reach.
-  const i1FloorMs = Math.max(bootHangTimeoutMs, turnHangTimeoutMs) + bootAllowanceMs + turnAllowanceMs;
+  // Behavior 5: the deadline covers bounded system recovery plus ordinary
+  // boot/turn allowances. It is observability, never a destructive watchdog:
+  // a legitimate long-running turn may exceed it without being stopped.
+  const i1FloorMs = bootHangTimeoutMs + bootAllowanceMs + turnAllowanceMs;
   const i1DeadlineMs = Math.max(num(raw, "i1DeadlineMs", i1FloorMs), i1FloorMs);
 
   const cells = cellsOf(raw);
@@ -513,7 +514,6 @@ export function loadNodeConfig(dataDir: string, configPath?: string): ResolvedNo
     cellWarm: cells.warm,
     idleWindowMs: num(raw, "idleWindowMs", DEFAULTS.idleWindowMs),
     bootHangTimeoutMs,
-    turnHangTimeoutMs,
     bootAllowanceMs,
     turnAllowanceMs,
     i1DeadlineMs,

@@ -685,12 +685,11 @@ export class HsrDriver implements RuntimeDriver {
           degraded: false,
           // The store's persisted runtime state is the phase truth at the
           // moment the old daemon stopped (rows-are-truth): an idle runtime
-          // adopts with its accept point OPEN and, crucially, outside the
-          // turn-hang policy — the 2026-08-21 deploy soak saw every idle
-          // adopted bee hang-stopped minutes later because the blanket
-          // "running" claim promised a turn_ended that could never come.
-          // Without a hint, "running" stays the safe claim (hang policy
-          // bounds it; the next tailed edge corrects it).
+          // adopts with its accept point OPEN. The 2026-08-21 deploy soak
+          // showed why the blanket "running" claim was wrong for known-idle
+          // bees: it promised a turn_ended that could never come. Without a
+          // hint, "running" remains the conservative claim; the next tailed
+          // edge corrects it, and elapsed time alone never changes it.
           phase: lastKnownState === "idle" ? "idle" : "running",
           sessionId: null,
           turnId: null,
@@ -726,8 +725,8 @@ export class HsrDriver implements RuntimeDriver {
       adapter: null,
       degraded: true,
       // Unknown phase — the event stream died with the old daemon. "running"
-      // is the safe claim: hang policy bounds it, and turn_ended can never be
-      // observed for it anyway.
+      // is the conservative claim. Mail-driven degraded-runtime rotation
+      // replaces it when work arrives; silence alone never authorizes a stop.
       phase: "running",
       sessionId: null,
       turnId: null,

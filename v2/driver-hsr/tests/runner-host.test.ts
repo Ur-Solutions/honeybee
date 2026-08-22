@@ -52,8 +52,8 @@ test("daemon restart: the runtime survives and the successor daemon delivers at 
 
     second = makeDriver(dir);
     // The store knew the runtime was idle at shutdown; the hint opens the
-    // accept point immediately AND keeps the adopted bee out of the
-    // turn-hang policy (the 2026-08-21 deploy-soak hang_stop lesson).
+    // accept point immediately and avoids fabricating a running turn (the
+    // 2026-08-21 deploy-soak hang_stop lesson).
     assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt, "idle"), true);
     assert.equal(second.isDegraded("bee-r", 1), false, "host adoption is never degraded");
     assert.ok(second.hasProcess("bee-r", 1));

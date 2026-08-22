@@ -424,7 +424,6 @@ export class HiveDaemon {
       driver,
       policy: {
         bootHangTimeoutSteps: this.cfg.bootHangTimeoutMs,
-        turnHangTimeoutSteps: this.cfg.turnHangTimeoutMs,
         commandsPerStep: this.cfg.commandsPerTick,
         idleWindowSteps: this.cfg.idleWindowMs > 0 ? this.cfg.idleWindowMs : null,
         i1DeadlineSteps: this.cfg.i1DeadlineMs,

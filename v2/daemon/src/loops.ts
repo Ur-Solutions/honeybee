@@ -13,7 +13,9 @@
  *  2. flag policy: apply adapter condition-flag evidence (contrary-evidence
  *     clearing per spec 03 — every setter has a clearer); and record the
  *     harness session id a runtime reported (spec 07 §F: revive resumes it)
- *  3. hang policy: stop runtimes stuck in booting/running past their timeout
+ *  3. boot-hang policy: stop runtimes that never produce the bounded boot
+ *     readiness handshake. Running turns are unbounded: silence and elapsed
+ *     time are not failure evidence.
  *  4. scale-to-zero: stop(stopped_by_system) idle runtimes past the idle
  *     window (Q4 ruling; revive-on-message undoes it)
  *  5. degraded-runtime policy: a re-adopted runtime has no event stream or
@@ -57,8 +59,6 @@ export type ExecutorCrashPoint = "none" | "before_effect" | "after_effect";
 export interface DaemonPolicy {
   /** Stop a runtime stuck in `booting` longer than this many steps (ms for the real daemon). */
   bootHangTimeoutSteps: number;
-  /** Stop a runtime stuck in `running` longer than this many steps (ms for the real daemon). */
-  turnHangTimeoutSteps: number;
   /** Max commands executed per step (executor loop budget). */
   commandsPerStep: number;
   /**
@@ -70,8 +70,9 @@ export interface DaemonPolicy {
   /**
    * I1 telemetry (spec 04 behavior 5): per pending mailbox position, the
    * delivery deadline in steps/ms. Omitted/null = telemetry off. The real
-   * daemon computes this policy-aware (≥ hang timeout + boot + turn
-   * allowances — the WP2 finding).
+   * daemon computes this policy-aware (≥ boot timeout + boot + ordinary-turn
+   * allowances). A breach is telemetry, never permission to stop a running
+   * turn.
    */
   i1DeadlineSteps?: number | null;
 }
@@ -238,7 +239,7 @@ export class DaemonCore {
     this.drainObservations();
     this.applyEvidence();
     this.applySessionIds();
-    this.hangPolicy();
+    this.bootHangPolicy();
     this.scaleToZeroPolicy();
     this.degradedMailPolicy();
     this.executeCommands();
@@ -483,7 +484,7 @@ export class DaemonCore {
   }
 
   // -------------------------------------------------------------------------
-  // hang policy — the hook that turns hung runtimes into stopped ones
+  // boot-hang policy — bounded recovery for a missing readiness handshake
   // -------------------------------------------------------------------------
 
   private pendingStopExists(beeId: string, generation: number): boolean {
@@ -497,15 +498,12 @@ export class DaemonCore {
       );
   }
 
-  private hangPolicy(): void {
+  private bootHangPolicy(): void {
     const now = this.now();
     for (const bee of this.store.listBees()) {
       const rt = this.store.currentRuntime(bee.id);
-      if (!rt) continue;
-      const overdue =
-        (rt.state === "booting" && now - rt.startedAt > this.policy.bootHangTimeoutSteps) ||
-        (rt.state === "running" && now - rt.updatedAt > this.policy.turnHangTimeoutSteps);
-      if (!overdue) continue;
+      if (!rt || rt.state !== "booting") continue;
+      if (now - rt.startedAt <= this.policy.bootHangTimeoutSteps) continue;
       if (this.pendingStopExists(bee.id, rt.generation)) continue;
       this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "hang_policy" });
       this.log(`policy.hang_stop bee=${bee.id} gen=${rt.generation} state=${rt.state}`);

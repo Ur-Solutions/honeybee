@@ -84,7 +84,6 @@ export function defaultConfig(): SimConfig {
     },
     policy: {
       bootHangTimeoutSteps: 20,
-      turnHangTimeoutSteps: 30,
       commandsPerStep: 4,
       maxAttempts: 4,
       backoffBaseSteps: 2,
@@ -179,7 +178,6 @@ export function runSim(
       i1BoundSteps: config.i1BoundSteps ?? i1DefaultBoundSteps(config),
       queueBoundSteps: config.queueBoundSteps,
       maxAttempts: config.policy.maxAttempts,
-      turnHangTimeoutSteps: config.policy.turnHangTimeoutSteps,
     },
     opsTail,
     config.maxViolations,
@@ -350,7 +348,7 @@ export function runSim(
     currentStep = totalSteps;
     s = reopen(totalSteps);
   }
-  checker.checkSettle(totalSteps, clock.now(), s);
+  checker.checkSettle(totalSteps, s);
   checker.checkReplay(totalSteps, s);
   stats.delivered = driver.consumedCount();
   const finalDump = s.dumpState();

@@ -242,7 +242,6 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
   const config: NodeConfigFile = {
     tickMs: 20,
     bootHangTimeoutMs: 4000,
-    turnHangTimeoutMs: 4000,
     bootAllowanceMs: 1000,
     turnAllowanceMs: 1000,
     idleWindowMs: 0, // scale-to-zero off unless a test opts in

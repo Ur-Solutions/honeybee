@@ -9,8 +9,8 @@
  *    `snapshotLive()` (reconcileAtBoot, B7) — checked by I4 at every boot.
  *  - executor crash mid-command: ExecutorCrashError from the fault injector;
  *    boot replay (B5) requeues and re-executes idempotently.
- *  - runtime faults come from the agents themselves (@hang/@crash/@exit
- *    message directives), recovered by the daemon's hang policy + send_wake.
+ *  - runtime faults come from the agents themselves (@crash/@exit message
+ *    directives); long-running turns are never inferred failed from silence.
  *
  * Same six invariants as WP2, over real time (one "step" ≈ stepMs of wall
  * clock; all bounds are in ms because the store clock is Date.now).
@@ -54,14 +54,13 @@ interface RealRunConfig {
     stopProbability: number;
     archiveProbability: number;
     deleteProbability: number;
-    /** Probability a sent message is a fault directive (@hang/@crash/@exit). */
+    /** Probability a sent message is a fault directive. Hang remains available for focused tests only. */
     hangProbability: number;
     crashProbability: number;
     exitProbability: number;
   };
   policy: {
     bootHangTimeoutMs: number;
-    turnHangTimeoutMs: number;
     commandsPerStep: number;
     maxAttempts: number;
     backoffBaseMs: number;
@@ -126,7 +125,6 @@ async function runRealSim(seed: number, cfg: RealRunConfig): Promise<RealRunResu
   );
   const policy = {
     bootHangTimeoutSteps: cfg.policy.bootHangTimeoutMs, // "steps" ARE ms here (now = Date.now)
-    turnHangTimeoutSteps: cfg.policy.turnHangTimeoutMs,
     commandsPerStep: cfg.policy.commandsPerStep,
   };
   const storeOpts = {
@@ -144,7 +142,6 @@ async function runRealSim(seed: number, cfg: RealRunConfig): Promise<RealRunResu
       i1BoundSteps: cfg.i1BoundMs,
       queueBoundSteps: cfg.queueBoundMs,
       maxAttempts: cfg.policy.maxAttempts,
-      turnHangTimeoutSteps: cfg.policy.turnHangTimeoutMs,
     },
     () => opLog.slice(-40),
   );
@@ -313,7 +310,7 @@ async function runRealSim(seed: number, cfg: RealRunConfig): Promise<RealRunResu
       if (stepDaemon(s, step)) checker.checkStep(step, Date.now(), s, driver);
       if (store == null) s = reopen(step);
     }
-    checker.checkSettle(step, Date.now(), s);
+    checker.checkSettle(step, s);
     checker.checkReplay(step, s);
     stats.delivered = driver.consumedCount();
     s.close();
@@ -361,7 +358,6 @@ function baseConfig(overrides: Partial<RealRunConfig> = {}): RealRunConfig {
     },
     policy: {
       bootHangTimeoutMs: 2_000,
-      turnHangTimeoutMs: 1_500,
       commandsPerStep: 6,
       maxAttempts: 5,
       backoffBaseMs: 50,
@@ -402,7 +398,7 @@ test("real.2: reboot-equivalent storm — store-connection kills, snapshotLive r
   console.log(`real.2 stats: ${JSON.stringify(result.stats)}`);
 });
 
-test("real.3: adversarial mix — executor crashes + agent hangs/crashes/clean exits; invariants hold", async () => {
+test("real.3: adversarial mix — executor crashes + agent crashes/clean exits; invariants hold", async () => {
   const result = await runRealSim(31337, baseConfig({
     steps: 220,
     storeKillEverySteps: 60,
@@ -414,7 +410,7 @@ test("real.3: adversarial mix — executor crashes + agent hangs/crashes/clean e
       stopProbability: 0.03,
       archiveProbability: 0.02,
       deleteProbability: 0.015,
-      hangProbability: 0.06,
+      hangProbability: 0,
       crashProbability: 0.06,
       exitProbability: 0.05,
     },

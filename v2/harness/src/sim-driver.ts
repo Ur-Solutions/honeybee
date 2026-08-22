@@ -199,7 +199,8 @@ export class SimDriver implements RuntimeDriver {
 
   /**
    * Settle mode: no NEW spontaneous faults (crash/hang/clean-exit). Already-hung
-   * processes stay hung — the daemon's policy hooks must clean those up.
+   * processes remain running: without positive failure evidence they are
+   * intentionally indistinguishable from legitimate long-running turns.
    */
   quiesce(): void {
     this.quiescent = true;

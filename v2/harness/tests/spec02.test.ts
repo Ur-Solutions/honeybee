@@ -115,39 +115,48 @@ test("spec02.4: executor crash mid-command — replay settles idempotently, no d
   );
 });
 
-test("spec02.5: hang workload — hung runtimes get stopped by policy and messages re-deliver", () => {
+test("spec02.5: long-running turns remain live and are not mistaken for zombies", () => {
   runSeeds(
-    "hang",
+    "long-running",
     {
-      steps: scaleSteps(400),
-      settleSteps: 200,
-      driver: { hangProbability: 0.25 },
-      // Hang recovery costs hang-timeout + stop + reboot + turn per incident, and
-      // incidents can chain; the bound is configurable per Q1.
-      i1BoundSteps: 250,
-      queueBoundSteps: 300,
+      steps: scaleSteps(80),
+      settleSteps: 80,
+      driver: {
+        turnDuration: [100_000, 100_000],
+        crashProbability: 0,
+        hangProbability: 0,
+        exitProbability: 0,
+      },
+      workload: {
+        maxBees: 1,
+        createProbability: 1,
+        sendProbability: 0,
+        stopProbability: 0,
+        archiveProbability: 0,
+        deleteProbability: 0,
+      },
     },
     (result) => {
       assertClean(result);
-      const systemStopped = result.finalDump.runtimes.filter(
-        (r) => r.exitCause === "stopped_by_system",
+      assert.equal(result.finalDump.runtimes.length, 1);
+      assert.equal(result.finalDump.runtimes[0]?.state, "running");
+      assert.equal(result.finalDump.runtimes[0]?.exitCause, null);
+      assert.equal(
+        result.finalDump.commands.some((c) => c.verb === "stop"),
+        false,
+        `seed ${result.seed}: elapsed time manufactured a stop command`,
       );
-      assert.ok(
-        systemStopped.length > 0,
-        `seed ${result.seed}: hang policy never stopped a hung runtime`,
-      );
-      assert.ok(result.stats.delivered > 10, `seed ${result.seed}: messages did not re-deliver past hangs`);
     },
   );
 });
 
-test("spec02.6: adversarial mix — all faults at high rates; invariants hold; replayable from seed", () => {
+test("spec02.6: adversarial mix — observable faults at high rates; invariants hold; replayable from seed", () => {
   const overrides: SimConfigOverrides = {
     steps: scaleSteps(500),
     settleSteps: 250,
     driver: {
       crashProbability: 0.015,
-      hangProbability: 0.1,
+      hangProbability: 0,
       exitProbability: 0.05,
     },
     faults: {

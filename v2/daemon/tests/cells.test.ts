@@ -471,7 +471,6 @@ test("cells.3: daemon SIGKILL → restart re-adopts a cell bee; the next generat
   // kill lands mid-turn — run as a CELL bee (any harness can live in a cell).
   const rig = makeCellRig({
     stubEnv: { STUB_SURVIVE_STDIN_CLOSE: "1", STUB_TURN_MS: "60000" },
-    turnHangTimeoutMs: 120_000,
     bootHangTimeoutMs: 8000,
   });
   let daemon: DaemonHandle | null = null;

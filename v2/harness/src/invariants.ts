@@ -66,8 +66,6 @@ export interface InvariantBounds {
   queueBoundSteps: number;
   /** I2: commands never exceed the configured retry budget. */
   maxAttempts: number;
-  /** I3: a settled `running` runtime must be younger than this. */
-  turnHangTimeoutSteps: number;
 }
 
 export interface PreBootSnapshot {
@@ -346,7 +344,7 @@ export class InvariantChecker {
   // I3 — no permanent zombie once storms settle
   // ---------------------------------------------------------------------------
 
-  checkSettle(step: number, now: number, store: CoreStore): void {
+  checkSettle(step: number, store: CoreStore): void {
     const dump = store.dumpState();
     const activeFlagBees = new Set(
       dump.flags.filter((f) => f.clearedAt == null).map((f) => f.beeId),
@@ -368,9 +366,6 @@ export class InvariantChecker {
       if (!current) continue;
       if (current.state === "booting") {
         this.report(step, bee.id, "I3", `I3:booting:${bee.id}`, `runtime ${current.generation} stuck booting after settle`);
-      }
-      if (current.state === "running" && now - current.updatedAt > this.bounds.turnHangTimeoutSteps) {
-        this.report(step, bee.id, "I3", `I3:running:${bee.id}`, `runtime ${current.generation} running ${now - current.updatedAt} steps after settle (hang policy missed it)`);
       }
     }
     for (const cmd of dump.commands) {
