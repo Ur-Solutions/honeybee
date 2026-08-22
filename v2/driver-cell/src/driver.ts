@@ -104,6 +104,8 @@ export class CellDriver implements RuntimeDriver {
   private readonly pending = new Map<string, PendingProvision>();
   /** Workers may keep refreshing a cache image after reporting Cell-ready. */
   private readonly maintenanceWorkers = new Set<Worker>();
+  /** Image maintenance waits until the first turn boundary (or worker fallback). */
+  private readonly maintenanceByRuntime = new Map<string, Worker>();
   private readonly pendingObservations: DriverObservation[] = [];
 
   constructor(cfg: CellDriverConfig) {
@@ -153,6 +155,7 @@ export class CellDriver implements RuntimeDriver {
         // Keep it cancellable on driver disposal but do not keep the daemon
         // process alive solely for an acceleration cache refresh.
         this.maintenanceWorkers.add(worker);
+        this.maintenanceByRuntime.set(`${pending.beeId}:g${pending.generation}`, worker);
         worker.unref();
         this.finishProvision(pending);
       }
@@ -164,6 +167,9 @@ export class CellDriver implements RuntimeDriver {
     ));
     worker.once("exit", (code) => {
       this.maintenanceWorkers.delete(worker);
+      for (const [key, candidate] of this.maintenanceByRuntime) {
+        if (candidate === worker) this.maintenanceByRuntime.delete(key);
+      }
       if (!pending.settled) {
         this.failProvision(
           pending,
@@ -195,7 +201,20 @@ export class CellDriver implements RuntimeDriver {
 
   observe(): DriverObservation[] {
     const pending = this.pendingObservations.splice(0);
-    return [...pending, ...this.inner.observe()];
+    const inner = this.inner.observe();
+    for (const event of inner) {
+      // Let the first prompt reach a real accept/idle boundary before the
+      // cache worker begins CPU/disk-heavy packing. An early runtime exit is
+      // also a safe point. The worker has its own bounded fallback if neither
+      // observation arrives.
+      if (event.kind !== "turn_ended" && event.kind !== "exited") continue;
+      const key = `${event.beeId}:g${event.generation}`;
+      const worker = this.maintenanceByRuntime.get(key);
+      if (worker == null) continue;
+      this.maintenanceByRuntime.delete(key);
+      worker.postMessage({ kind: "refresh_git_image" });
+    }
+    return [...pending, ...inner];
   }
 
   hasProcess(beeId: string, generation: number): boolean {
@@ -428,6 +447,7 @@ export class CellDriver implements RuntimeDriver {
     this.pending.clear();
     for (const worker of this.maintenanceWorkers) void worker.terminate();
     this.maintenanceWorkers.clear();
+    this.maintenanceByRuntime.clear();
   }
 
   private resolveCellSpawn(beeId: string): SpawnSpec {

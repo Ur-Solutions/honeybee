@@ -150,6 +150,10 @@ test("cell-driver.background: reports ready before image maintenance and the nex
     driver.start("bee-1", 1);
     await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"), 15_000);
 
+    const delivered = driver.deliver("bee-1", 1, 1, "prime image after first turn");
+    assert.equal(delivered.accepted, true);
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "turn_ended"), 15_000);
+
     const deadline = Date.now() + 15_000;
     while (readCurrentGitImage(imagesRoot, rig.origin.repo) == null) {
       if (Date.now() > deadline) throw new Error("background Git image refresh timed out");

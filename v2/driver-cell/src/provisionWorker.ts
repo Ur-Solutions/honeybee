@@ -16,6 +16,32 @@ interface ProvisionWorkerResult {
   error?: string;
 }
 
+interface MaintenanceStart {
+  kind: "refresh_git_image";
+}
+
+const MAINTENANCE_FALLBACK_MS = 30_000;
+
+async function waitForMaintenanceStart(): Promise<void> {
+  const port = parentPort;
+  if (port == null) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      port.off("message", onMessage);
+      resolve();
+    };
+    const onMessage = (message: MaintenanceStart): void => {
+      if (message?.kind === "refresh_git_image") done();
+    };
+    const timer = setTimeout(done, MAINTENANCE_FALLBACK_MS);
+    port.on("message", onMessage);
+  });
+}
+
 const data = workerData as ProvisionWorkerData;
 
 try {
@@ -36,6 +62,7 @@ try {
 // Cache maintenance is explicitly after the Cell-ready result. A cache
 // failure must never turn a correct, provisioned Cell into a failed start.
 if (process.exitCode == null && data.useGitImages && !data.disableCow) {
+  await waitForMaintenanceStart();
   try {
     refreshGitImage(
       data.gitImagesRoot ?? gitImagesRootForCells(data.cellsRoot),
