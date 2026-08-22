@@ -14,8 +14,10 @@ import { fileURLToPath } from "node:url";
 import { stubAdapter } from "../../adapters/src/index.ts";
 import type { DriverObservation } from "../../harness/src/driver.ts";
 import { CellDriver, CellRuntimeLiveError } from "../src/driver.ts";
+import { gitImagesRootForCells, readCurrentGitImage } from "../src/gitImage.ts";
 import { reserveCell } from "../src/provision.ts";
-import { defaultScratchPaths } from "../src/sandbox.ts";
+import { probeCow } from "../src/cow.ts";
+import { defaultScratchPaths, type NodeKind } from "../src/sandbox.ts";
 import { commitInCell, makeRig, type CellTestRig } from "./helpers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -29,11 +31,14 @@ function makeDriver(
     sandbox?: boolean | null;
     backgroundProvisioning?: boolean;
     provisionWorkerUrl?: URL;
+    disableCow?: boolean;
+    gitImagesRoot?: string;
+    nodeKind?: NodeKind;
   } = {},
 ): CellDriver {
   return new CellDriver({
     cellsRoot: rig.cellsRoot,
-    nodeKind: "workstation",
+    nodeKind: opts.nodeKind ?? "workstation",
     resolveHarness: () => ({
       adapter: stubAdapter,
       command: process.execPath,
@@ -56,9 +61,10 @@ function makeDriver(
     // default scratch list covers it. Harness "home" writes go to the logs
     // dir via the driver, outside the sandboxed child.
     sandboxWritablePaths: defaultScratchPaths(),
-    disableCow: true,
+    disableCow: opts.disableCow ?? true,
     backgroundProvisioning: opts.backgroundProvisioning,
     provisionWorkerUrl: opts.provisionWorkerUrl,
+    gitImagesRoot: opts.gitImagesRoot,
   });
 }
 
@@ -120,6 +126,64 @@ test("cell-driver.background: start returns before provisioning and later boots 
     const cell = driver.cellOf("bee-1");
     assert.ok(cell);
     assert.ok(existsSync(join(cell.paths.spaceDir, ".git")));
+    driver.stop("bee-1", 1, "stopped_by_user");
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "exited"));
+  } finally {
+    driver.disposeAll();
+    await sleep(10);
+    rig.cleanup();
+  }
+});
+
+test("cell-driver.background: reports ready before image maintenance and the next Cell uses the image", {
+  skip: platform() !== "darwin" && platform() !== "linux",
+}, async (t) => {
+  const rig = makeRig();
+  if (!probeCow(join(rig.origin.repo, ".git"), rig.cellsRoot)) {
+    rig.cleanup();
+    t.skip("filesystem has no local CoW support");
+    return;
+  }
+  const imagesRoot = gitImagesRootForCells(rig.cellsRoot);
+  const driver = makeDriver(rig, { backgroundProvisioning: true, disableCow: false, gitImagesRoot: imagesRoot });
+  try {
+    driver.start("bee-1", 1);
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"));
+
+    const deadline = Date.now() + 5_000;
+    while (readCurrentGitImage(imagesRoot, rig.origin.repo) == null) {
+      if (Date.now() > deadline) throw new Error("background Git image refresh timed out");
+      await sleep(10);
+    }
+
+    driver.start("bee-2", 1);
+    await drainUntil(driver, (events) => events.some((event) => event.beeId === "bee-2" && event.kind === "booted"));
+    assert.equal(driver.cellOf("bee-2")?.copyMode, "image-cow");
+    driver.stop("bee-1", 1, "stopped_by_user");
+    driver.stop("bee-2", 1, "stopped_by_user");
+    await drainUntil(driver, (events) => events.filter((event) => event.kind === "exited").length >= 2);
+  } finally {
+    driver.disposeAll();
+    await sleep(10);
+    rig.cleanup();
+  }
+});
+
+test("cell-driver.background: satellites do not build the workstation-local Git image", async () => {
+  const rig = makeRig();
+  const imagesRoot = gitImagesRootForCells(rig.cellsRoot);
+  const driver = makeDriver(rig, {
+    backgroundProvisioning: true,
+    disableCow: false,
+    gitImagesRoot: imagesRoot,
+    nodeKind: "satellite",
+    sandbox: false,
+  });
+  try {
+    driver.start("bee-1", 1);
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"));
+    await sleep(50);
+    assert.equal(readCurrentGitImage(imagesRoot, rig.origin.repo), null);
     driver.stop("bee-1", 1, "stopped_by_user");
     await drainUntil(driver, (events) => events.some((event) => event.kind === "exited"));
   } finally {
