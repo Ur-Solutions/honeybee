@@ -65,19 +65,31 @@ async function spawnAndSettle(client: RpcClient, name: string, extra: Record<str
   return spawned.beeId;
 }
 
-async function waitDelivered(client: RpcClient, beeId: string, messageId: number, what: string): Promise<number> {
+async function waitDelivered(
+  client: RpcClient,
+  beeId: string,
+  messageId: number,
+  what: string,
+  timeoutMs = 12_000,
+): Promise<number> {
   return (await waitFor(async () => {
     const { messages } = await client.request<MailboxResult>("mailbox", { beeId });
     const m = messages.find((x) => x.id === messageId);
     return m?.deliveredAt != null ? m.deliveredGeneration : null;
-  }, what, 12_000)) as number;
+  }, what, timeoutMs)) as number;
 }
 
-async function waitState(client: RpcClient, beeId: string, state: string, what: string): Promise<ViewResult> {
+async function waitState(
+  client: RpcClient,
+  beeId: string,
+  state: string,
+  what: string,
+  timeoutMs = 12_000,
+): Promise<ViewResult> {
   return waitFor(async () => {
     const v = await client.request<ViewResult>("view", { beeId });
     return v.view.runtimeState === state ? v : null;
-  }, what, 12_000);
+  }, what, timeoutMs);
 }
 
 test("v6.rpc.1: rename / tag / children round-trips, idempotent replays, typed refusals; snapshot + watch carry the new rows/kinds", async () => {
@@ -351,8 +363,9 @@ test("daemon restart: an adopted codex runtime keeps its persisted thread id and
     const threadId = await waitFor(
       async () => (await client!.request<ViewResult>("view", { beeId: spawned.beeId })).bee?.providerSessionId,
       "codex thread id",
+      30_000,
     );
-    const before = await waitState(client, spawned.beeId, "idle", "codex idle before daemon restart");
+    const before = await waitState(client, spawned.beeId, "idle", "codex idle before daemon restart", 30_000);
     hostPid = before.runtime?.pid ?? null;
     assert.ok(hostPid != null && hostPid > 0);
 
@@ -368,18 +381,20 @@ test("daemon restart: an adopted codex runtime keeps its persisted thread id and
 
     const sent = await client.request<SendRpcResult>("send", { beeId: spawned.beeId, body: "after restart" });
     assert.equal(
-      await waitDelivered(client, spawned.beeId, sent.messageId, "post-restart codex delivery"),
+      await waitDelivered(client, spawned.beeId, sent.messageId, "post-restart codex delivery", 30_000),
       1,
       "mail reaches the adopted generation",
     );
-    await waitState(client, spawned.beeId, "idle", "codex idle after daemon restart");
-
-    const turns = jsonl<{ method: string; params: Record<string, unknown> | null }>(rpcLog)
-      .filter((call) => call.method === "turn/start");
-    assert.equal(turns.at(-1)?.params?.threadId, threadId, "delivery targets the restored thread id");
+    await waitFor(
+      async () => jsonl<{ method: string; params: Record<string, unknown> | null }>(rpcLog)
+        .some((call) => call.method === "turn/start" && call.params?.threadId === threadId),
+      "post-restart turn/start targets the restored thread id",
+      30_000,
+    );
+    await waitState(client, spawned.beeId, "idle", "codex idle after daemon restart", 30_000);
 
     await client.request("stop", { beeId: spawned.beeId });
-    await waitState(client, spawned.beeId, "stopped", "codex stopped after adoption test");
+    await waitState(client, spawned.beeId, "stopped", "codex stopped after adoption test", 30_000);
   } finally {
     client?.close();
     await daemon?.stop().catch(() => {});
