@@ -43,6 +43,26 @@ export {
   sanitizeComponent,
   type CellPaths,
 } from "./layout.ts";
-export { readLedger, writeLedger, isProvisioned, type CellLedger, type CopyMode, type WarmRecord } from "./ledger.ts";
+export {
+  readLedger,
+  writeLedger,
+  isProvisioned,
+  type CellLedger,
+  type CopyMode,
+  type GitImageRecord,
+  type WarmRecord,
+} from "./ledger.ts";
 export { cowCopy, cowPlatform, probeCow, probeCowWritable, type CowPlatform } from "./cow.ts";
 export { git, tryGit, gitEnv, revParse, refSet, porcelainStatus, currentBranch, hasCommit, GitError } from "./git.ts";
+export {
+  CELL_GIT_IMAGE_VERSION,
+  gitImageRepoKey,
+  gitImagesRootForCells,
+  readCurrentGitImage,
+  refreshGitImage,
+  tryMaterializeGitImage,
+  type GitImageOptions,
+  type GitImagePlacement,
+  type GitImagePointer,
+  type GitImageRefreshResult,
+} from "./gitImage.ts";

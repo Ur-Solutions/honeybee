@@ -2,11 +2,15 @@
  * Two-step cell provisioning (WP5, spec 05 point 1) + warm cells (A5).
  *
  * Step 1 — place a `.git` in the space:
- *   preferred: CoW copy of the origin's `.git` (`cp -c` / `cp --reflink=always`)
- *   — instant on APFS/btrfs/XFS same-volume; fails honestly elsewhere.
+ *   preferred: initialize a fresh `.git`, then CoW-copy the small pack set
+ *   from Honeybee's immutable per-repository Git image. The image is local
+ *   acceleration state, built/refreshed after a Cell is ready by the
+ *   provisioning worker; a miss never changes correctness.
+ *   Cold fallback: CoW copy of the origin's `.git` (`cp -c` /
+ *   `cp --reflink=always`).
  *   Fallback: `git clone --local --no-checkout` — hardlinked objects on any
  *   same-volume POSIX fs, and a factory-fresh `.git` needing no scrubbing.
- *   Only the CoW path runs hygiene (it copied the user's live `.git`
+ *   Only the live-origin CoW path runs hygiene (it copied the user's live `.git`
  *   verbatim): hooksPath → empty dir, fsmonitor off, scrub lock files and
  *   merge/rebase/sequencer state. `copy_mode` is recorded honestly.
  *
@@ -26,6 +30,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { cowCopy, cowPlatform, probeCow, type CowPlatform } from "./cow.ts";
 import { git } from "./git.ts";
+import { gitImagesRootForCells, tryMaterializeGitImage } from "./gitImage.ts";
 import { cellPaths, parseSpaceName, type CellPaths } from "./layout.ts";
 import {
   isProvisioned,
@@ -67,7 +72,11 @@ export interface ProvisionedCell {
 export interface ProvisionOptions {
   /** Force-skip the CoW path (tests; ext4 simulation). */
   disableCow?: boolean;
+  /** Driver policy gate; production enables local images on workstations only. */
+  useGitImages?: boolean;
   platform?: CowPlatform | null;
+  /** Override the Honeybee-owned image root (tests); defaults beside cells/. */
+  gitImagesRoot?: string;
   now?: () => number;
 }
 
@@ -206,7 +215,13 @@ export function provisionCell(
         `refusing to provision bee=${req.beeId} sha=${req.sha} into it`,
     );
   }
-  return runProvisionOperation(paths, ledger, opId, req, { platform, disableCow: opts.disableCow ?? false, now });
+  return runProvisionOperation(paths, ledger, opId, req, {
+    platform,
+    disableCow: opts.disableCow ?? false,
+    useGitImages: opts.useGitImages ?? true,
+    gitImagesRoot: opts.gitImagesRoot ?? gitImagesRootForCells(cellsRoot),
+    now,
+  });
 }
 
 function runProvisionOperation(
@@ -214,7 +229,13 @@ function runProvisionOperation(
   ledger: CellLedger,
   opId: string,
   req: ProvisionRequest,
-  cfg: { platform: CowPlatform | null; disableCow: boolean; now: () => number },
+  cfg: {
+    platform: CowPlatform | null;
+    disableCow: boolean;
+    useGitImages: boolean;
+    gitImagesRoot: string;
+    now: () => number;
+  },
 ): ProvisionedCell {
   // A completed provisioning — this operation's or an earlier one's — makes
   // this call a recorded no-op (idempotent replay).
@@ -245,7 +266,20 @@ function runProvisionOperation(
     // wipe and redo (the step records only after it fully completed).
     rmSync(paths.spaceDir, { recursive: true, force: true });
     let mode: CopyMode = "clone";
-    if (!cfg.disableCow && cfg.platform != null && probeCow(originGitDir, paths.boxDir, cfg.platform)) {
+    let image: { repoKey: string; generation: string } | undefined;
+    if (cfg.useGitImages && !cfg.disableCow && cfg.platform != null) {
+      image = tryMaterializeGitImage(
+        cfg.gitImagesRoot,
+        req.originRepo,
+        req.sha,
+        paths.spaceDir,
+        paths.boxDir,
+        paths.emptyHooksDir,
+        { platform: cfg.platform },
+      ) ?? undefined;
+      if (image != null) mode = "image-cow";
+    }
+    if (mode === "clone" && !cfg.disableCow && cfg.platform != null && probeCow(originGitDir, paths.boxDir, cfg.platform)) {
       mkdirSync(paths.spaceDir, { recursive: true });
       if (cowCopy(cfg.platform, originGitDir, join(paths.spaceDir, ".git"), { recursive: true })) {
         mode = "cow";
@@ -258,7 +292,7 @@ function runProvisionOperation(
     if (mode === "clone") {
       git(paths.boxDir, ["clone", "--local", "--no-checkout", req.originRepo, paths.spaceDir]);
     }
-    op.steps.git_placed = { mode, at: cfg.now() };
+    op.steps.git_placed = { mode, at: cfg.now(), ...(image == null ? {} : { image }) };
     ledger.copy_mode = mode;
     save();
   }
@@ -272,7 +306,7 @@ function runProvisionOperation(
       git(paths.spaceDir, ["config", "core.hooksPath", paths.emptyHooksDir]);
       git(paths.spaceDir, ["config", "core.fsmonitor", "false"]);
     }
-    // The clone path yields a factory-fresh .git: nothing to scrub.
+    // The clone and image paths yield factory-fresh .git dirs: nothing to scrub.
     op.steps.hygiene = { at: cfg.now() };
     save();
   }

@@ -10,7 +10,12 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-export type CopyMode = "cow" | "clone";
+export type CopyMode = "image-cow" | "cow" | "clone";
+
+export interface GitImageRecord {
+  repoKey: string;
+  generation: string;
+}
 
 export interface WarmRecord {
   mode: "cow" | "cold";
@@ -20,7 +25,7 @@ export interface WarmRecord {
 }
 
 export interface ProvisionSteps {
-  git_placed?: { mode: CopyMode; at: number };
+  git_placed?: { mode: CopyMode; at: number; image?: GitImageRecord };
   hygiene?: { at: number };
   checkout?: { sha: string; at: number };
   warm?: WarmRecord & { at: number };

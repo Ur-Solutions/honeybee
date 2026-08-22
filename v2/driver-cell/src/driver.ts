@@ -72,6 +72,8 @@ export interface CellDriverConfig {
   backgroundProvisioning?: boolean;
   /** Tests: substitute the provisioning worker entrypoint. */
   provisionWorkerUrl?: URL;
+  /** Override the Honeybee-owned Git-image root (tests). */
+  gitImagesRoot?: string;
 }
 
 interface PendingProvision {
@@ -100,6 +102,8 @@ export class CellDriver implements RuntimeDriver {
   /** Provisioned cells by beeId — the driver-side allocation cache. */
   private readonly cells = new Map<string, ProvisionedCell>();
   private readonly pending = new Map<string, PendingProvision>();
+  /** Workers may keep refreshing a cache image after reporting Cell-ready. */
+  private readonly maintenanceWorkers = new Set<Worker>();
   private readonly pendingObservations: DriverObservation[] = [];
 
   constructor(cfg: CellDriverConfig) {
@@ -137,12 +141,21 @@ export class CellDriver implements RuntimeDriver {
         request: spec.provision,
         opId,
         disableCow: this.cfg.disableCow ?? false,
+        useGitImages: this.cfg.nodeKind === "workstation",
+        gitImagesRoot: this.cfg.gitImagesRoot,
       },
     });
     const pending: PendingProvision = { beeId, generation, worker, settled: false };
     this.pending.set(beeId, pending);
     worker.once("message", (message: ProvisionWorkerResult) => {
-      if (message.ok) this.finishProvision(pending);
+      if (message.ok) {
+        // provisionWorker reports Cell-ready before doing image maintenance.
+        // Keep it cancellable on driver disposal but do not keep the daemon
+        // process alive solely for an acceleration cache refresh.
+        this.maintenanceWorkers.add(worker);
+        worker.unref();
+        this.finishProvision(pending);
+      }
       else this.failProvision(pending, message.error ?? "cell provisioning failed");
     });
     worker.once("error", (error) => this.failProvision(
@@ -150,6 +163,7 @@ export class CellDriver implements RuntimeDriver {
       error instanceof Error ? error.message : String(error),
     ));
     worker.once("exit", (code) => {
+      this.maintenanceWorkers.delete(worker);
       if (!pending.settled) {
         this.failProvision(
           pending,
@@ -259,6 +273,8 @@ export class CellDriver implements RuntimeDriver {
     const spec = this.cfg.resolveCell(beeId);
     const cell = provisionCell(this.cfg.cellsRoot, spec.provision, opId, {
       disableCow: this.cfg.disableCow ?? false,
+      useGitImages: this.cfg.nodeKind === "workstation",
+      gitImagesRoot: this.cfg.gitImagesRoot,
     });
     this.cells.set(beeId, cell);
     return cell;
@@ -410,6 +426,8 @@ export class CellDriver implements RuntimeDriver {
       void pending.worker.terminate();
     }
     this.pending.clear();
+    for (const worker of this.maintenanceWorkers) void worker.terminate();
+    this.maintenanceWorkers.clear();
   }
 
   private resolveCellSpawn(beeId: string): SpawnSpec {
