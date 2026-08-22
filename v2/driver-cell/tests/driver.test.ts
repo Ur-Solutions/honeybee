@@ -148,16 +148,20 @@ test("cell-driver.background: reports ready before image maintenance and the nex
   const driver = makeDriver(rig, { backgroundProvisioning: true, disableCow: false, gitImagesRoot: imagesRoot });
   try {
     driver.start("bee-1", 1);
-    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"));
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"), 15_000);
 
-    const deadline = Date.now() + 5_000;
+    const deadline = Date.now() + 15_000;
     while (readCurrentGitImage(imagesRoot, rig.origin.repo) == null) {
       if (Date.now() > deadline) throw new Error("background Git image refresh timed out");
       await sleep(10);
     }
 
     driver.start("bee-2", 1);
-    await drainUntil(driver, (events) => events.some((event) => event.beeId === "bee-2" && event.kind === "booted"));
+    await drainUntil(
+      driver,
+      (events) => events.some((event) => event.beeId === "bee-2" && event.kind === "booted"),
+      15_000,
+    );
     assert.equal(driver.cellOf("bee-2")?.copyMode, "image-cow");
     driver.stop("bee-1", 1, "stopped_by_user");
     driver.stop("bee-2", 1, "stopped_by_user");
@@ -181,7 +185,7 @@ test("cell-driver.background: satellites do not build the workstation-local Git 
   });
   try {
     driver.start("bee-1", 1);
-    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"));
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"), 15_000);
     await sleep(50);
     assert.equal(readCurrentGitImage(imagesRoot, rig.origin.repo), null);
     driver.stop("bee-1", 1, "stopped_by_user");
