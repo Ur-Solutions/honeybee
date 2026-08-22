@@ -495,6 +495,12 @@ export function refreshGitImage(
       if (reusedPacks) {
         try {
           packRevision(originRepo, stageGit, sha, { incremental: true });
+          if (packCount(stageGit) > MAX_IMAGE_PACKS) {
+            rmSync(stageDir, { recursive: true, force: true });
+            mkdirSync(stageDir, { recursive: true });
+            initBare(repoRoot, stageGit, objectFormat);
+            reusedPacks = false;
+          }
         } catch {
           rmSync(stageDir, { recursive: true, force: true });
           mkdirSync(stageDir, { recursive: true });
