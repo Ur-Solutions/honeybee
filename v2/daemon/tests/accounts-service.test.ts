@@ -505,7 +505,7 @@ test("limits.1c: Grok, Kimi, Cursor, MiniMax, and z.ai use their real provider w
     assert.equal(rows.get(cursor.id)?.weeklyPct, 44, "routing uses the tighter explicit pool");
     assert.equal(rows.get(cursor.id)?.weeklyMinutes, 43_200);
     assert.deepEqual(rows.get(cursor.id)?.displayWindows, [
-      { key: "cursor-models", label: "grok + composer", usedPercent: 9, resetsAt: r.now() + 30 * DAY, windowMinutes: 43_200 },
+      { key: "cursor-models", label: "cursor models", usedPercent: 9, resetsAt: r.now() + 30 * DAY, windowMinutes: 43_200 },
       { key: "other-models", label: "third-party", usedPercent: 44, resetsAt: r.now() + 30 * DAY, windowMinutes: 43_200 },
     ]);
     assert.equal(rows.get(minimax.id)?.fiveHourPct, 8);
