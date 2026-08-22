@@ -27,10 +27,16 @@
  * unrecorded step.
  */
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import { join } from "node:path";
 import { cowCopy, cowPlatform, probeCow, type CowPlatform } from "./cow.ts";
 import { git } from "./git.ts";
-import { gitImagesRootForCells, tryMaterializeGitImage } from "./gitImage.ts";
+import {
+  gitImagesRootForCells,
+  refreshGitImage,
+  tryMaterializeGitImage,
+  type GitImagePlacement,
+} from "./gitImage.ts";
 import { cellPaths, parseSpaceName, type CellPaths } from "./layout.ts";
 import {
   isProvisioned,
@@ -77,7 +83,76 @@ export interface ProvisionOptions {
   platform?: CowPlatform | null;
   /** Override the Honeybee-owned image root (tests); defaults beside cells/. */
   gitImagesRoot?: string;
+  /** Bound for waiting on another worker's image publication (tests/ops). */
+  gitImageBusyWaitMs?: number;
   now?: () => number;
+}
+
+const DEFAULT_GIT_IMAGE_BUSY_WAIT_MS = 15_000;
+const GIT_IMAGE_BUSY_POLL_MS = 50;
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  const cell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  Atomics.wait(cell, 0, 0, ms);
+}
+
+/**
+ * Resolve a workstation image miss in the Cell worker before falling back to
+ * the origin's metadata-heavy `.git`. Active repositories advance on nearly
+ * every Cell launch; treating each new commit as a cold fallback defeats the
+ * image. A concurrent builder remains single-flight: wait a bounded interval
+ * for its atomic publication, then retry/acquire the lock ourselves.
+ *
+ * Every image error is still only a cache miss. The caller retains the live
+ * origin CoW and local-clone correctness paths.
+ */
+function materializeProvisionGitImage(
+  paths: CellPaths,
+  req: ProvisionRequest,
+  cfg: {
+    platform: CowPlatform;
+    gitImagesRoot: string;
+    gitImageBusyWaitMs: number;
+    now: () => number;
+  },
+): GitImagePlacement | null {
+  const materialize = (): GitImagePlacement | null => tryMaterializeGitImage(
+    cfg.gitImagesRoot,
+    req.originRepo,
+    req.sha,
+    paths.spaceDir,
+    paths.boxDir,
+    paths.emptyHooksDir,
+    { platform: cfg.platform },
+  );
+
+  const current = materialize();
+  if (current != null) return current;
+
+  const deadline = performance.now() + cfg.gitImageBusyWaitMs;
+  for (;;) {
+    let refresh: ReturnType<typeof refreshGitImage>;
+    try {
+      refresh = refreshGitImage(cfg.gitImagesRoot, req.originRepo, req.sha, {
+        platform: cfg.platform,
+        now: cfg.now,
+      });
+    } catch {
+      return null;
+    }
+
+    if (refresh.status !== "busy") return materialize();
+
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return null;
+    sleepSync(Math.min(GIT_IMAGE_BUSY_POLL_MS, remaining));
+
+    // Avoid acquiring the lock when the concurrent worker just published the
+    // exact requested graph; otherwise loop and extend whatever it published.
+    const published = materialize();
+    if (published != null) return published;
+  }
 }
 
 /** Lock/merge/rebase/sequencer state scrubbed from a CoW-copied `.git`. */
@@ -220,6 +295,9 @@ export function provisionCell(
     disableCow: opts.disableCow ?? false,
     useGitImages: opts.useGitImages ?? true,
     gitImagesRoot: opts.gitImagesRoot ?? gitImagesRootForCells(cellsRoot),
+    gitImageBusyWaitMs: Number.isFinite(opts.gitImageBusyWaitMs)
+      ? Math.max(0, opts.gitImageBusyWaitMs as number)
+      : DEFAULT_GIT_IMAGE_BUSY_WAIT_MS,
     now,
   });
 }
@@ -234,6 +312,7 @@ function runProvisionOperation(
     disableCow: boolean;
     useGitImages: boolean;
     gitImagesRoot: string;
+    gitImageBusyWaitMs: number;
     now: () => number;
   },
 ): ProvisionedCell {
@@ -268,15 +347,12 @@ function runProvisionOperation(
     let mode: CopyMode = "clone";
     let image: { repoKey: string; generation: string } | undefined;
     if (cfg.useGitImages && !cfg.disableCow && cfg.platform != null) {
-      image = tryMaterializeGitImage(
-        cfg.gitImagesRoot,
-        req.originRepo,
-        req.sha,
-        paths.spaceDir,
-        paths.boxDir,
-        paths.emptyHooksDir,
-        { platform: cfg.platform },
-      ) ?? undefined;
+      image = materializeProvisionGitImage(paths, req, {
+        platform: cfg.platform,
+        gitImagesRoot: cfg.gitImagesRoot,
+        gitImageBusyWaitMs: cfg.gitImageBusyWaitMs,
+        now: cfg.now,
+      }) ?? undefined;
       if (image != null) mode = "image-cow";
     }
     if (mode === "clone" && !cfg.disableCow && cfg.platform != null && probeCow(originGitDir, paths.boxDir, cfg.platform)) {

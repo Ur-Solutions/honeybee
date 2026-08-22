@@ -59,8 +59,9 @@ try {
   process.exitCode = 1;
 }
 
-// Cache maintenance is explicitly after the Cell-ready result. A cache
-// failure must never turn a correct, provisioned Cell into a failed start.
+// Post-turn maintenance retries any foreground image miss/failure and is a
+// cheap ready check when provisioning already ensured the requested graph. A
+// cache failure must never turn a correct, provisioned Cell into a failed start.
 if (process.exitCode == null && data.useGitImages && !data.disableCow) {
   await waitForMaintenanceStart();
   try {

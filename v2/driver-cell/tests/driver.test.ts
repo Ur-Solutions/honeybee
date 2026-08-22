@@ -135,7 +135,7 @@ test("cell-driver.background: start returns before provisioning and later boots 
   }
 });
 
-test("cell-driver.background: reports ready before image maintenance and the next Cell uses the image", {
+test("cell-driver.background: first Cell ensures the image before boot and the next Cell stays hot", {
   skip: platform() !== "darwin" && platform() !== "linux",
 }, async (t) => {
   const rig = makeRig();
@@ -149,7 +149,9 @@ test("cell-driver.background: reports ready before image maintenance and the nex
   try {
     driver.start("bee-1", 1);
     await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"), 15_000);
+    assert.equal(driver.cellOf("bee-1")?.copyMode, "image-cow");
 
+    // The post-turn maintenance lane remains a cheap ready/retry check.
     const delivered = driver.deliver("bee-1", 1, 1, "prime image after first turn");
     assert.equal(delivered.accepted, true);
     await drainUntil(driver, (events) => events.some((event) => event.kind === "turn_ended"), 15_000);

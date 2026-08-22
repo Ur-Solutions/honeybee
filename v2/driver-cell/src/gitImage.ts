@@ -8,9 +8,10 @@
  * atomic `current.json` pointer and are never changed in place.
  *
  * Image refresh is deliberately synchronous because its caller is the Cell
- * provisioning worker (never the daemon/RPC lane).  A missing, stale, busy, or
- * corrupt image is only a cache miss; normal provisioning remains the source
- * of correctness.
+ * provisioning worker (never the daemon/RPC lane). The provision worker may
+ * extend a stale image before checkout; post-turn maintenance retries failures.
+ * A missing, stale, busy, or corrupt image is only a cache miss; normal
+ * provisioning remains the source of correctness.
  */
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -428,7 +429,8 @@ function cleanupOldGenerations(repoRoot: string, current: GitImagePointer, now: 
 
 /**
  * Build or extend the immutable image for `sha`, publishing it atomically.
- * Call only from a background/maintenance worker.
+ * Call only from the dedicated Cell worker, either while resolving a
+ * provisioning miss or during post-turn maintenance.
  */
 export function refreshGitImage(
   imagesRoot: string,

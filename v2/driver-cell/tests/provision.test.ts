@@ -50,7 +50,7 @@ test("provision.cow: CoW path places .git, records copy_mode=cow, hygiene applie
     g(rig.origin.repo, ["config", "core.fsmonitor", "true"]);
     const before = fingerprintOrigin(rig.origin.repo);
 
-    const cell = provisionCell(rig.cellsRoot, req(rig), "cmd-1");
+    const cell = provisionCell(rig.cellsRoot, req(rig), "cmd-1", { useGitImages: false });
     assert.equal(cell.copyMode, "cow");
     assert.equal(cell.replayed, false);
 
