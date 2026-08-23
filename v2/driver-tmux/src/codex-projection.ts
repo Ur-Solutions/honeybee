@@ -63,6 +63,15 @@ function firstIso(...values: unknown[]): TranscriptIsoTs {
   return null;
 }
 
+/** Thread snapshots use epoch seconds while live notifications use `*AtMs`. */
+function snapshotIso(value: unknown): TranscriptIsoTs {
+  const numeric = finiteNumber(value);
+  if (numeric !== undefined && Math.abs(numeric) < 100_000_000_000) {
+    return isoFrom(numeric * 1_000);
+  }
+  return isoFrom(value);
+}
+
 function textFromContent(content: unknown): string | undefined {
   if (typeof content === "string") return nonEmptyString(content);
   if (!Array.isArray(content)) return undefined;
@@ -304,6 +313,51 @@ function completedItemEvent(
 }
 
 /**
+ * A successful `thread/fork` response is the forked bee's only authoritative
+ * copy of the turns inherited before its fresh session log began. Project the
+ * response snapshot once; later live notifications append the child's turns.
+ */
+function forkSnapshotEvents(result: JsonObject): TranscriptProjectedEvent[] {
+  const thread = asObject(result.thread);
+  if (!thread || !Array.isArray(thread.turns)) return [];
+  const threadId = idString(thread.id) ?? idString(thread.threadId);
+  const events: TranscriptProjectedEvent[] = [];
+  for (const value of thread.turns) {
+    const turn = asObject(value);
+    if (!turn) continue;
+    const turnId = idString(turn.id);
+    const startedAt = snapshotIso(turn.startedAt ?? turn.startedAtMs);
+    const completedAt = snapshotIso(turn.completedAt ?? turn.completedAtMs);
+    events.push({
+      kind: "turn_start",
+      ts: startedAt,
+      ...(turnId ? { turnId } : {}),
+      ...(threadId ? { threadId } : {}),
+    });
+    if (Array.isArray(turn.items)) {
+      for (const itemValue of turn.items) {
+        const item = asObject(itemValue);
+        if (!item) continue;
+        const itemTs = firstIso(item.completedAtMs, item.startedAtMs) ?? completedAt ?? startedAt;
+        events.push(...withThreadId(completedItemEvent(item, itemTs, false), threadId));
+      }
+    }
+    const durationMs = finiteNumber(turn.durationMs);
+    const finishReason = nonEmptyString(turn.status);
+    events.push({
+      kind: "turn_end",
+      ts: completedAt,
+      ...(turnId ? { turnId } : {}),
+      ...(threadId ? { threadId } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(finishReason ? { finishReason } : {}),
+      ...(finishReason === "interrupted" ? { interrupted: true } : {}),
+    });
+  }
+  return events;
+}
+
+/**
  * Stateful projection of Codex app-server session logs plus native rollout
  * rows. App-server request/notification envelopes are authoritative for HSR;
  * nested turn items are intentionally never replayed from turn/completed.
@@ -311,6 +365,7 @@ function completedItemEvent(
 export function createCodexProjector(): TranscriptProjector {
   const startedItems = new Map<string, JsonObject>();
   const rolloutMessages = new Set<string>();
+  const forkRequestIds = new Set<string>();
   let rolloutTurnOpen = false;
 
   const emitRolloutMessage = (
@@ -402,7 +457,15 @@ export function createCodexProjector(): TranscriptProjector {
       const row = parseLine(line);
       if (!row) return [];
       const method = nonEmptyString(row.method);
-      if (!method) return pushRollout(row);
+      const requestId = idString(row.id);
+      if (!method) {
+        if (requestId && forkRequestIds.delete(requestId)) {
+          const result = asObject(row.result);
+          return result ? forkSnapshotEvents(result) : [];
+        }
+        return pushRollout(row);
+      }
+      if (method === "thread/fork" && requestId) forkRequestIds.add(requestId);
       const params = asObject(row.params) ?? {};
       switch (method) {
         // Client request: no native turn id exists yet. Only turn/started is
@@ -520,6 +583,7 @@ export function createCodexProjector(): TranscriptProjector {
     },
     flush(): TranscriptProjectedEvent[] {
       startedItems.clear();
+      forkRequestIds.clear();
       return [];
     },
   };

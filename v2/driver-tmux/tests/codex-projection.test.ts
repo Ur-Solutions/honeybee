@@ -214,6 +214,64 @@ test("codex projector: empty commentary and app-server protocol noise emit nothi
   for (const row of noise) assert.deepEqual(projector.pushLine(j(row)), []);
 });
 
+test("codex projector: thread/fork response replays inherited turns once", () => {
+  const projector = createCodexProjector();
+  assert.deepEqual(projector.pushLine(j({
+    jsonrpc: "2.0",
+    id: 9,
+    method: "thread/fork",
+    params: { threadId: "thread-parent" },
+  })), []);
+
+  const events = projector.pushLine(j({
+    id: 9,
+    result: {
+      thread: {
+        id: "thread-child",
+        turns: [{
+          id: "turn-parent-1",
+          startedAt: 1_787_227_578,
+          completedAt: 1_787_227_580,
+          durationMs: 2_000,
+          status: "completed",
+          items: [
+            { type: "userMessage", id: "user-1", content: [{ type: "text", text: "before the fork" }] },
+            { type: "agentMessage", id: "assistant-1", text: "inherited answer" },
+            { type: "mcpToolCall", id: "tool-1", tool: "self", arguments: {}, result: "ok", status: "completed" },
+          ],
+        }],
+      },
+    },
+  }));
+
+  assert.deepEqual(events.map((event) => event.kind), [
+    "turn_start",
+    "message",
+    "message",
+    "tool_call",
+    "tool_result",
+    "turn_end",
+  ]);
+  assert.equal(events.every((event) => event.threadId === "thread-child"), true);
+  assert.equal(events[0]?.ts, new Date(1_787_227_578_000).toISOString());
+  const end = events.at(-1);
+  assert.equal(end?.ts, new Date(1_787_227_580_000).toISOString());
+  assert.equal(end?.kind === "turn_end" && end.durationMs, 2_000);
+  const inherited = events.filter((event) => event.kind === "message");
+  assert.deepEqual(inherited.map((event) => [event.role, event.text, event.providerEventId]), [
+    ["user", "before the fork", "user-1"],
+    ["assistant", "inherited answer", "assistant-1"],
+  ]);
+
+  // The request correlation is consumed: a duplicate/unrelated response
+  // cannot replay the inherited prefix a second time.
+  assert.deepEqual(projector.pushLine(j({ id: 9, result: { thread: { turns: [] } } })), []);
+  assert.deepEqual(projector.pushLine(j({
+    id: 10,
+    result: { thread: { id: "resumed", turns: [{ id: "old", items: [] }] } },
+  })), []);
+});
+
 test("codex projector: interrupted turn completion is an end only and never re-renders nested items", () => {
   const projector = createCodexProjector();
   assert.deepEqual(projector.pushLine(j({
