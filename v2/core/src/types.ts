@@ -315,6 +315,79 @@ export interface SelectionCursorRow {
 }
 
 // ---------------------------------------------------------------------------
+// v14 — automatic-naming usage (operational telemetry, not replay state)
+// ---------------------------------------------------------------------------
+
+export const NAMING_USAGE_STATUSES = ["succeeded", "failed"] as const;
+export type NamingUsageStatus = (typeof NAMING_USAGE_STATUSES)[number];
+
+/** One immutable title-generator attempt. Monetary values are integer nano-USD. */
+export interface NamingUsageRow {
+  id: number;
+  /** Soft reference retained after a bee is deleted; null for unscoped/manual calls. */
+  beeId: string | null;
+  backend: string;
+  provider: string;
+  model: string;
+  status: NamingUsageStatus;
+  latencyMs: number;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+  inputRateNanoUsd: number | null;
+  cachedInputRateNanoUsd: number | null;
+  cacheWriteRateNanoUsd: number | null;
+  outputRateNanoUsd: number | null;
+  /** Null when the configured model has no known price. */
+  estimatedCostNanoUsd: number | null;
+  responseId: string | null;
+  requestId: string | null;
+  error: string | null;
+  recordedAt: number;
+}
+
+export interface NamingUsageModelSummary {
+  backend: string;
+  provider: string;
+  model: string;
+  requests: number;
+  succeeded: number;
+  failed: number;
+  pricedRequests: number;
+  unpricedRequests: number;
+  estimatedCostNanoUsd: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  averageLatencyMs: number | null;
+  lastRecordedAt: number | null;
+}
+
+/** All-time aggregate returned by `naming.usage`; rows remain in SQLite. */
+export interface NamingUsageSummary {
+  requests: number;
+  succeeded: number;
+  failed: number;
+  pricedRequests: number;
+  unpricedRequests: number;
+  estimatedCostNanoUsd: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  averageLatencyMs: number | null;
+  firstRecordedAt: number | null;
+  lastRecordedAt: number | null;
+  byModel: NamingUsageModelSummary[];
+}
+
+// ---------------------------------------------------------------------------
 // v6 — questions (a bee asks the operator) and seals (a bee's structured record)
 // ---------------------------------------------------------------------------
 

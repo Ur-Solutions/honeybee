@@ -12,6 +12,8 @@ import { join } from "node:path";
 import type { ResolvedNamingConfig } from "./config.ts";
 
 export type TitleContext = {
+  /** Owning bee for durable usage attribution; ignored by prompt construction. */
+  beeId?: string;
   userMessages: string[];
   lastAssistant?: string;
 };

@@ -157,7 +157,7 @@ test("urgency.5: v8 migration — a v7 store opens as v8: mailbox.urgency added,
   try {
     const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
     assert.equal(Number(version.value), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 13);
+    assert.equal(SCHEMA_VERSION, 14);
     const cols = (check.prepare("SELECT name FROM pragma_table_info('mailbox')").all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes("urgency"));
     assert.ok(cols.includes("priority"));

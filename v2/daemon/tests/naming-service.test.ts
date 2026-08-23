@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import type { ResolvedNamingConfig } from "../src/config.ts";
+import type { RecordNamingUsageInput } from "../../core/src/index.ts";
 import { TitleGeneratorService } from "../src/namingService.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -56,18 +57,30 @@ test("naming service keeps one Codex app-server warm and isolates titles in ephe
 
 test("naming service calls Responses API without exposing the configured key in output", async () => {
   const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const usageRows: RecordNamingUsageInput[] = [];
+  const times = [1_000, 1_123];
   const service = new TitleGeneratorService({
     fetchImpl: async (url, init) => {
       requests.push({ url: String(url), init });
       return new Response(JSON.stringify({
+        id: "resp_naming_1",
         output: [{ type: "message", content: [{ type: "output_text", text: "Direct Luna Naming" }] }],
-      }), { status: 200, headers: { "content-type": "application/json" } });
+        usage: {
+          input_tokens: 120,
+          input_tokens_details: { cached_tokens: 20, cache_write_tokens: 10 },
+          output_tokens: 6,
+          output_tokens_details: { reasoning_tokens: 0 },
+          total_tokens: 126,
+        },
+      }), { status: 200, headers: { "content-type": "application/json", "x-request-id": "req_naming_1" } });
     },
+    now: () => times.shift() ?? 1_123,
+    recordUsage: (usage) => usageRows.push(usage),
   });
   const apiKey = "sk-test-write-only";
   try {
     const title = await service.generate(
-      { userMessages: ["Name this through the API"] },
+      { beeId: "bee-1", userMessages: ["Name this through the API"] },
       config({ backend: "openai-api", apiKey }),
     );
     assert.equal(title, "Direct Luna Naming");
@@ -79,6 +92,63 @@ test("naming service calls Responses API without exposing the configured key in 
     assert.equal(body.reasoning.effort, "none");
     assert.equal(body.store, false);
     assert.doesNotMatch(JSON.stringify({ title }), /sk-test-write-only/);
+    assert.deepEqual(usageRows, [{
+      beeId: "bee-1",
+      backend: "openai-api",
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      status: "succeeded",
+      latencyMs: 123,
+      inputTokens: 120,
+      cachedInputTokens: 20,
+      cacheWriteInputTokens: 10,
+      outputTokens: 6,
+      reasoningTokens: 0,
+      totalTokens: 126,
+      inputRateNanoUsd: 200,
+      cachedInputRateNanoUsd: 20,
+      cacheWriteRateNanoUsd: 250,
+      outputRateNanoUsd: 1_200,
+      estimatedCostNanoUsd: 28_100,
+      responseId: "resp_naming_1",
+      requestId: "req_naming_1",
+      error: null,
+      recordedAt: 1_123,
+    }]);
+  } finally {
+    service.close();
+  }
+});
+
+test("naming service records failed direct API attempts without hiding their latency", async () => {
+  const usageRows: RecordNamingUsageInput[] = [];
+  const times = [2_000, 2_250];
+  const service = new TitleGeneratorService({
+    fetchImpl: async () => new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+      status: 429,
+      headers: { "x-request-id": "req_failed" },
+    }),
+    now: () => times.shift() ?? 2_250,
+    recordUsage: (usage) => usageRows.push(usage),
+  });
+  try {
+    await assert.rejects(
+      service.generate({ beeId: "bee-2", userMessages: ["Name it"] }, config({ backend: "openai-api", apiKey: "sk-test" })),
+      /rate limited/,
+    );
+    assert.equal(usageRows.length, 1);
+    assert.deepEqual(usageRows[0], {
+      beeId: "bee-2",
+      backend: "openai-api",
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      status: "failed",
+      latencyMs: 250,
+      responseId: null,
+      requestId: "req_failed",
+      error: "OpenAI API naming failed (429): rate limited",
+      recordedAt: 2_250,
+    });
   } finally {
     service.close();
   }

@@ -7,6 +7,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdirSync } from "node:fs";
+import type { RecordNamingUsageInput } from "../../core/src/index.ts";
 import type { ResolvedNamingConfig } from "./config.ts";
 import {
   buildTitleContentPrompt,
@@ -28,6 +29,80 @@ export interface TitleGeneratorServiceOptions {
   codexArgs?: string[];
   fetchImpl?: typeof globalThis.fetch;
   log?: (op: string) => void;
+  now?: () => number;
+  recordUsage?: (usage: RecordNamingUsageInput) => void;
+}
+
+interface OpenAiUsage {
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+}
+
+interface OpenAiRunResult {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  body: JsonObject;
+  text: string;
+  responseId: string | null;
+  requestId: string | null;
+  usage: OpenAiUsage | null;
+}
+
+export interface OpenAiNamingRates {
+  inputNanoUsd: number;
+  cachedInputNanoUsd: number;
+  cacheWriteNanoUsd: number;
+  outputNanoUsd: number;
+}
+
+/** Published standard-tier prices, converted to integer nano-USD per token. */
+const OPENAI_NAMING_RATES: Readonly<Record<string, OpenAiNamingRates>> = {
+  "gpt-5.6-sol": { inputNanoUsd: 4_000, cachedInputNanoUsd: 400, cacheWriteNanoUsd: 5_000, outputNanoUsd: 20_000 },
+  "gpt-5.6-terra": { inputNanoUsd: 2_000, cachedInputNanoUsd: 200, cacheWriteNanoUsd: 2_500, outputNanoUsd: 12_000 },
+  "gpt-5.6-luna": { inputNanoUsd: 200, cachedInputNanoUsd: 20, cacheWriteNanoUsd: 250, outputNanoUsd: 1_200 },
+};
+
+export function openAiNamingRates(model: string): OpenAiNamingRates | null {
+  return OPENAI_NAMING_RATES[model] ?? null;
+}
+
+function integerField(object: JsonObject | null, key: string): number | null {
+  const value = object?.[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function openAiUsage(body: JsonObject): OpenAiUsage | null {
+  const usage = asObject(body.usage);
+  if (!usage) return null;
+  const inputDetails = asObject(usage.input_tokens_details);
+  const outputDetails = asObject(usage.output_tokens_details);
+  return {
+    inputTokens: integerField(usage, "input_tokens"),
+    cachedInputTokens: integerField(inputDetails, "cached_tokens"),
+    cacheWriteInputTokens: integerField(inputDetails, "cache_write_tokens"),
+    outputTokens: integerField(usage, "output_tokens"),
+    reasoningTokens: integerField(outputDetails, "reasoning_tokens"),
+    totalTokens: integerField(usage, "total_tokens"),
+  };
+}
+
+export function estimateOpenAiNamingCostNanoUsd(
+  usage: OpenAiUsage | null,
+  rates: OpenAiNamingRates | null,
+): number | null {
+  if (!usage || !rates || usage.inputTokens == null || usage.outputTokens == null) return null;
+  const cached = Math.min(usage.cachedInputTokens ?? 0, usage.inputTokens);
+  const cacheWrite = Math.min(usage.cacheWriteInputTokens ?? 0, Math.max(0, usage.inputTokens - cached));
+  const uncached = Math.max(0, usage.inputTokens - cached - cacheWrite);
+  return uncached * rates.inputNanoUsd
+    + cached * rates.cachedInputNanoUsd
+    + cacheWrite * rates.cacheWriteNanoUsd
+    + usage.outputTokens * rates.outputNanoUsd;
 }
 
 type PendingRequest = {
@@ -319,11 +394,15 @@ export class TitleGeneratorService {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
   private readonly log: (op: string) => void;
+  private readonly now: () => number;
+  private readonly recordUsage: ((usage: RecordNamingUsageInput) => void) | null;
 
   constructor(options: TitleGeneratorServiceOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_GENERATOR_TIMEOUT_MS;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.log = options.log ?? (() => undefined);
+    this.now = options.now ?? Date.now;
+    this.recordUsage = options.recordUsage ?? null;
     this.codex = new CodexNamingAppServer(options);
   }
 
@@ -340,23 +419,86 @@ export class TitleGeneratorService {
   }
 
   async generate(context: TitleContext, config: ResolvedNamingConfig): Promise<string> {
-    if (config.command || config.backend === "claude-cli") {
-      return generateTitle(context, { config });
+    const startedAt = this.now();
+    let api: OpenAiRunResult | null = null;
+    let status: RecordNamingUsageInput["status"] = "failed";
+    let failure: Error | null = null;
+    try {
+      let raw: string;
+      if (config.command || config.backend === "claude-cli") {
+        raw = await generateTitle(context, { config });
+      } else {
+        const prompt = buildTitleContentPrompt(context);
+        if (config.backend === "openai-api") {
+          api = await this.runOpenAi(prompt, config);
+          if (!api.ok) {
+            throw new Error(
+              `OpenAI API naming failed (${api.status}): ${errorMessage(api.body.error, api.statusText)}`,
+            );
+          }
+          raw = api.text;
+        } else {
+          raw = await this.codex.generate(prompt, config);
+        }
+      }
+      const title = normalizeGeneratedTitle(raw);
+      if (!title) throw new Error(`title generator produced no usable title (${config.backend})`);
+      status = "succeeded";
+      return title;
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+      throw failure;
+    } finally {
+      const completedAt = this.now();
+      this.emitUsage({
+        beeId: context.beeId ?? null,
+        backend: config.command ? "custom-command" : config.backend,
+        provider: config.tool === "claude" ? "anthropic" : "openai",
+        model: config.model,
+        status,
+        latencyMs: Math.max(0, Math.round(completedAt - startedAt)),
+        ...this.apiUsageFields(api, config.model),
+        responseId: api?.responseId ?? null,
+        requestId: api?.requestId ?? null,
+        error: failure?.message ?? null,
+        recordedAt: completedAt,
+      });
     }
-    const prompt = buildTitleContentPrompt(context);
-    const raw = config.backend === "openai-api"
-      ? await this.runOpenAi(prompt, config)
-      : await this.codex.generate(prompt, config);
-    const title = normalizeGeneratedTitle(raw);
-    if (!title) throw new Error(`title generator produced no usable title (${config.backend})`);
-    return title;
   }
 
   close(): void {
     this.codex.close();
   }
 
-  private async runOpenAi(prompt: string, config: ResolvedNamingConfig): Promise<string> {
+  private emitUsage(usage: RecordNamingUsageInput): void {
+    const cost = usage.estimatedCostNanoUsd == null ? "unknown" : String(usage.estimatedCostNanoUsd);
+    this.log(
+      `autoTitle.usage backend=${usage.backend} model=${JSON.stringify(usage.model)} status=${usage.status} ` +
+      `latencyMs=${usage.latencyMs} inputTokens=${usage.inputTokens ?? "unknown"} ` +
+      `outputTokens=${usage.outputTokens ?? "unknown"} costNanoUsd=${cost}`,
+    );
+    if (!this.recordUsage) return;
+    try {
+      this.recordUsage(usage);
+    } catch (error) {
+      this.log(`autoTitle.usage.error ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+    }
+  }
+
+  private apiUsageFields(api: OpenAiRunResult | null, model: string): Partial<RecordNamingUsageInput> {
+    if (!api?.usage) return {};
+    const rates = openAiNamingRates(model);
+    return {
+      ...api.usage,
+      inputRateNanoUsd: rates?.inputNanoUsd ?? null,
+      cachedInputRateNanoUsd: rates?.cachedInputNanoUsd ?? null,
+      cacheWriteRateNanoUsd: rates?.cacheWriteNanoUsd ?? null,
+      outputRateNanoUsd: rates?.outputNanoUsd ?? null,
+      estimatedCostNanoUsd: estimateOpenAiNamingCostNanoUsd(api.usage, rates),
+    };
+  }
+
+  private async runOpenAi(prompt: string, config: ResolvedNamingConfig): Promise<OpenAiRunResult> {
     if (!config.apiKey) throw new Error("OpenAI API naming requires a configured API key");
     const response = await this.fetchImpl("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -381,9 +523,6 @@ export class TitleGeneratorService {
     } catch {
       body = {};
     }
-    if (!response.ok) {
-      throw new Error(`OpenAI API naming failed (${response.status}): ${errorMessage(body.error, response.statusText)}`);
-    }
     const output = Array.isArray(body.output) ? body.output : [];
     const parts: string[] = [];
     for (const entry of output) {
@@ -394,8 +533,15 @@ export class TitleGeneratorService {
         if (item?.type === "output_text" && typeof item.text === "string") parts.push(item.text);
       }
     }
-    const title = parts.join("").trim();
-    if (!title) throw new Error("OpenAI API naming produced no output text");
-    return title;
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      body,
+      text: parts.join("").trim(),
+      responseId: typeof body.id === "string" ? body.id : null,
+      requestId: response.headers.get("x-request-id"),
+      usage: openAiUsage(body),
+    };
   }
 }

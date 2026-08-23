@@ -27,6 +27,7 @@ import type {
   FrozenImportReport,
   LocalConfigImportReport,
   MessageRow,
+  NamingUsageSummary,
   MirrorQuestionRow,
   MirrorSealRow,
   MirrorTaskRow,
@@ -153,6 +154,8 @@ export const RPC_VERBS = [
   // writes `naming` in the node's config.json.
   "config.get",
   "config.patch",
+  // v14 operational telemetry (read-only): all-time automatic-naming spend.
+  "naming.usage",
   // v11: agent task lists (mailbox is the delivery path).
   "task.add",
   "task.list",
@@ -375,6 +378,11 @@ export interface ConfigGetResult {
 export interface ConfigPatchResult extends DedupMarkers {
   naming: NamingConfigView;
   configPath: string;
+}
+
+/** `naming.usage` — all-time automatic-naming attempts, latency, tokens, and estimated API cost. */
+export interface NamingUsageResult {
+  usage: NamingUsageSummary;
 }
 
 /**

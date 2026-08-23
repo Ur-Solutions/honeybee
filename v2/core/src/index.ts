@@ -31,6 +31,7 @@ export {
   type SetTaskSupplyInput,
   type CreateAccountInput,
   type PutAccountLimitsInput,
+  type RecordNamingUsageInput,
 } from "./store.ts";
 export * from "./accountSelect.ts";
 export * from "./accountRecipes.ts";

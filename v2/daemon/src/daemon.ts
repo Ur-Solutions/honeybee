@@ -365,6 +365,7 @@ export class HiveDaemon {
     const codexSpec = this.cfg.agents.codex;
     this.titleGenerator = new TitleGeneratorService({
       log: (op) => this.log(op),
+      recordUsage: (usage) => store.recordNamingUsage(usage),
       ...(codexSpec?.command ? { codexCommand: codexSpec.command } : {}),
       ...(codexSpec?.args ? { codexArgs: codexSpec.args } : {}),
     });
@@ -714,6 +715,8 @@ export class HiveDaemon {
         return this.rpcConfigGet();
       case "config.patch":
         return this.withIdempotency(verb, params, () => this.rpcConfigPatch(params));
+      case "naming.usage":
+        return { usage: this.mustStore().namingUsageSummary() };
       case "account.list":
         return this.rpcAccountList(params);
       case "account.get":

@@ -172,7 +172,7 @@ export function createAutoTitleDispatcher(deps: AutoTitleDeps): (bees?: BeeRow[]
       inFlightBee = bee.id;
       const generationToken = ++nextInFlightToken;
       inFlightToken = generationToken;
-      const context: TitleContext = { userMessages: userMessages.slice(-3) };
+      const context: TitleContext = { beeId: bee.id, userMessages: userMessages.slice(-3) };
       void Promise.resolve()
         .then(() => deps.generate(context))
         .then((title) => {

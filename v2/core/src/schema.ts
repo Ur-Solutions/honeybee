@@ -88,8 +88,13 @@
  *        fields remain the routing contract; display windows preserve named
  *        multi-pool plans such as Cursor Models vs Other Models.
  *        Additive; migration = ALTER TABLE ADD COLUMN ×1.
+ *  v14 — durable automatic-naming usage: adds the append-only `naming_usage`
+ *        telemetry table. It records one row per generator attempt, including
+ *        direct-API token counts, the price rates used at request time,
+ *        estimated cost, latency, and provider request ids. It is operational
+ *        telemetry (like rpc_idempotency), not replayable Hive state.
  */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -363,6 +368,37 @@ CREATE TABLE IF NOT EXISTS task_supply (
   feeds      INTEGER NOT NULL DEFAULT 0,
   paused     INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0,1))
 ) STRICT;
+
+-- v14: append-only automatic-naming telemetry. bee_id is deliberately a soft
+-- reference: deleting a bee must not erase spend history. Prices are stored as
+-- integer nano-USD per token alongside the derived total, so historical cost
+-- never changes when a model's published rates change later.
+CREATE TABLE IF NOT EXISTS naming_usage (
+  id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+  bee_id                       TEXT,
+  backend                      TEXT NOT NULL,
+  provider                     TEXT NOT NULL,
+  model                        TEXT NOT NULL,
+  status                       TEXT NOT NULL CHECK (status IN ('succeeded','failed')),
+  latency_ms                   INTEGER NOT NULL CHECK (latency_ms >= 0),
+  input_tokens                 INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+  cached_input_tokens          INTEGER CHECK (cached_input_tokens IS NULL OR cached_input_tokens >= 0),
+  cache_write_input_tokens     INTEGER CHECK (cache_write_input_tokens IS NULL OR cache_write_input_tokens >= 0),
+  output_tokens                INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+  reasoning_tokens             INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0),
+  total_tokens                 INTEGER CHECK (total_tokens IS NULL OR total_tokens >= 0),
+  input_rate_nano_usd          INTEGER CHECK (input_rate_nano_usd IS NULL OR input_rate_nano_usd >= 0),
+  cached_input_rate_nano_usd   INTEGER CHECK (cached_input_rate_nano_usd IS NULL OR cached_input_rate_nano_usd >= 0),
+  cache_write_rate_nano_usd    INTEGER CHECK (cache_write_rate_nano_usd IS NULL OR cache_write_rate_nano_usd >= 0),
+  output_rate_nano_usd         INTEGER CHECK (output_rate_nano_usd IS NULL OR output_rate_nano_usd >= 0),
+  estimated_cost_nano_usd      INTEGER CHECK (estimated_cost_nano_usd IS NULL OR estimated_cost_nano_usd >= 0),
+  response_id                  TEXT,
+  request_id                   TEXT,
+  error                        TEXT,
+  recorded_at                  INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS naming_usage_recorded ON naming_usage(recorded_at, id);
+CREATE INDEX IF NOT EXISTS naming_usage_bee ON naming_usage(bee_id, recorded_at) WHERE bee_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS audit (
   seq     INTEGER PRIMARY KEY AUTOINCREMENT,

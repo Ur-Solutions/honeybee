@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { NAMING_DEFAULTS } from "../src/config.ts";
-import type { ConfigGetResult, ConfigPatchResult } from "../src/protocol.ts";
+import type { ConfigGetResult, ConfigPatchResult, NamingUsageResult } from "../src/protocol.ts";
 import { makeDaemonDir, startDaemon, type DaemonHandle } from "./helpers.ts";
 
 test("config.get returns naming defaults; config.patch merges onto disk", async () => {
@@ -19,6 +19,24 @@ test("config.get returns naming defaults; config.patch merges onto disk", async 
     assert.equal(got.naming.model, NAMING_DEFAULTS.model);
     assert.equal(got.naming.effort, NAMING_DEFAULTS.effort);
     assert.equal(got.configPath, join(dir, "config.json"));
+    const usage = (await client.request("naming.usage", {})) as NamingUsageResult;
+    assert.deepEqual(usage.usage, {
+      requests: 0,
+      succeeded: 0,
+      failed: 0,
+      pricedRequests: 0,
+      unpricedRequests: 0,
+      estimatedCostNanoUsd: 0,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      averageLatencyMs: null,
+      firstRecordedAt: null,
+      lastRecordedAt: null,
+      byModel: [],
+    });
 
     const patched = (await client.request("config.patch", {
       naming: { auto: false, model: "gpt-5.6-terra", effort: "low" },

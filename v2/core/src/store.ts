@@ -40,6 +40,10 @@ import {
   type Flag,
   type FlagRow,
   type MessageRow,
+  NAMING_USAGE_STATUSES,
+  type NamingUsageRow,
+  type NamingUsageStatus,
+  type NamingUsageSummary,
   type QuestionRow,
   type RuntimeRow,
   type RuntimeState,
@@ -225,6 +229,31 @@ export interface PutAccountLimitsInput {
   }>;
   /** Snapshot time override; defaults to the store clock. */
   fetchedAt?: number;
+}
+
+/** v14 — one immutable title-generator attempt written to naming_usage. */
+export interface RecordNamingUsageInput {
+  beeId?: string | null;
+  backend: string;
+  provider: string;
+  model: string;
+  status: NamingUsageStatus;
+  latencyMs: number;
+  inputTokens?: number | null;
+  cachedInputTokens?: number | null;
+  cacheWriteInputTokens?: number | null;
+  outputTokens?: number | null;
+  reasoningTokens?: number | null;
+  totalTokens?: number | null;
+  inputRateNanoUsd?: number | null;
+  cachedInputRateNanoUsd?: number | null;
+  cacheWriteRateNanoUsd?: number | null;
+  outputRateNanoUsd?: number | null;
+  estimatedCostNanoUsd?: number | null;
+  responseId?: string | null;
+  requestId?: string | null;
+  error?: string | null;
+  recordedAt?: number;
 }
 
 /** `createSeal` input. */
@@ -418,6 +447,14 @@ function numOrNull(v: unknown): number | null {
   return v == null ? null : Number(v);
 }
 
+function nonNegativeInteger(value: number | null | undefined, field: string): number | null {
+  if (value == null) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new CoreError(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
 function displayWindowsOrEmpty(value: unknown): AccountLimitsDisplayWindow[] {
   if (typeof value !== "string") return [];
   try {
@@ -467,6 +504,33 @@ function mapAccountLimits(r: Row): AccountLimitsRow {
 
 function mapSelectionCursor(r: Row): SelectionCursorRow {
   return { harness: r.harness as string, lastAccountId: r.last_account_id as string, updatedAt: Number(r.updated_at) };
+}
+
+function mapNamingUsage(r: Row): NamingUsageRow {
+  return {
+    id: Number(r.id),
+    beeId: (r.bee_id as string | null) ?? null,
+    backend: String(r.backend),
+    provider: String(r.provider),
+    model: String(r.model),
+    status: r.status as NamingUsageStatus,
+    latencyMs: Number(r.latency_ms),
+    inputTokens: numOrNull(r.input_tokens),
+    cachedInputTokens: numOrNull(r.cached_input_tokens),
+    cacheWriteInputTokens: numOrNull(r.cache_write_input_tokens),
+    outputTokens: numOrNull(r.output_tokens),
+    reasoningTokens: numOrNull(r.reasoning_tokens),
+    totalTokens: numOrNull(r.total_tokens),
+    inputRateNanoUsd: numOrNull(r.input_rate_nano_usd),
+    cachedInputRateNanoUsd: numOrNull(r.cached_input_rate_nano_usd),
+    cacheWriteRateNanoUsd: numOrNull(r.cache_write_rate_nano_usd),
+    outputRateNanoUsd: numOrNull(r.output_rate_nano_usd),
+    estimatedCostNanoUsd: numOrNull(r.estimated_cost_nano_usd),
+    responseId: (r.response_id as string | null) ?? null,
+    requestId: (r.request_id as string | null) ?? null,
+    error: (r.error as string | null) ?? null,
+    recordedAt: Number(r.recorded_at),
+  };
 }
 
 function mapQuestion(r: Row): QuestionRow {
@@ -2699,6 +2763,127 @@ export class CoreStore {
 
   listAccountLimits(): AccountLimitsRow[] {
     return (this.stmt("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimits);
+  }
+
+  /** v14 — append one immutable generator attempt. Telemetry is not audit-replayed state. */
+  recordNamingUsage(input: RecordNamingUsageInput): NamingUsageRow {
+    if (!input.backend.trim() || !input.provider.trim() || !input.model.trim()) {
+      throw new CoreError("naming usage backend, provider, and model must be non-empty");
+    }
+    if (!(NAMING_USAGE_STATUSES as readonly string[]).includes(input.status)) {
+      throw new CoreError(`unknown naming usage status: ${String(input.status)}`);
+    }
+    const latencyMs = nonNegativeInteger(input.latencyMs, "latencyMs");
+    const recordedAt = nonNegativeInteger(input.recordedAt ?? this.now(), "recordedAt");
+    const values = {
+      inputTokens: nonNegativeInteger(input.inputTokens, "inputTokens"),
+      cachedInputTokens: nonNegativeInteger(input.cachedInputTokens, "cachedInputTokens"),
+      cacheWriteInputTokens: nonNegativeInteger(input.cacheWriteInputTokens, "cacheWriteInputTokens"),
+      outputTokens: nonNegativeInteger(input.outputTokens, "outputTokens"),
+      reasoningTokens: nonNegativeInteger(input.reasoningTokens, "reasoningTokens"),
+      totalTokens: nonNegativeInteger(input.totalTokens, "totalTokens"),
+      inputRateNanoUsd: nonNegativeInteger(input.inputRateNanoUsd, "inputRateNanoUsd"),
+      cachedInputRateNanoUsd: nonNegativeInteger(input.cachedInputRateNanoUsd, "cachedInputRateNanoUsd"),
+      cacheWriteRateNanoUsd: nonNegativeInteger(input.cacheWriteRateNanoUsd, "cacheWriteRateNanoUsd"),
+      outputRateNanoUsd: nonNegativeInteger(input.outputRateNanoUsd, "outputRateNanoUsd"),
+      estimatedCostNanoUsd: nonNegativeInteger(input.estimatedCostNanoUsd, "estimatedCostNanoUsd"),
+    };
+    return this.tx(() => {
+      const inserted = this.stmt(
+        `INSERT INTO naming_usage(
+           bee_id, backend, provider, model, status, latency_ms,
+           input_tokens, cached_input_tokens, cache_write_input_tokens,
+           output_tokens, reasoning_tokens, total_tokens,
+           input_rate_nano_usd, cached_input_rate_nano_usd,
+           cache_write_rate_nano_usd, output_rate_nano_usd,
+           estimated_cost_nano_usd, response_id, request_id, error, recorded_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        input.beeId ?? null,
+        input.backend.trim(),
+        input.provider.trim(),
+        input.model.trim(),
+        input.status,
+        latencyMs,
+        values.inputTokens,
+        values.cachedInputTokens,
+        values.cacheWriteInputTokens,
+        values.outputTokens,
+        values.reasoningTokens,
+        values.totalTokens,
+        values.inputRateNanoUsd,
+        values.cachedInputRateNanoUsd,
+        values.cacheWriteRateNanoUsd,
+        values.outputRateNanoUsd,
+        values.estimatedCostNanoUsd,
+        input.responseId ?? null,
+        input.requestId ?? null,
+        input.error?.slice(0, 500) ?? null,
+        recordedAt,
+      );
+      const row = this.stmt("SELECT * FROM naming_usage WHERE id = ?").get(inserted.lastInsertRowid) as Row;
+      return mapNamingUsage(row);
+    });
+  }
+
+  /** Newest immutable attempts, primarily for diagnostics and tests. */
+  listNamingUsage(limit = 100): NamingUsageRow[] {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
+      throw new CoreError("naming usage limit must be an integer from 1 to 10000");
+    }
+    return (this.stmt("SELECT * FROM naming_usage ORDER BY recorded_at DESC, id DESC LIMIT ?").all(limit) as Row[])
+      .map(mapNamingUsage);
+  }
+
+  /** All-time naming usage aggregate; monetary sums include only priced rows. */
+  namingUsageSummary(): NamingUsageSummary {
+    const select = `
+      COUNT(*) AS requests,
+      COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+      COALESCE(SUM(CASE WHEN estimated_cost_nano_usd IS NOT NULL THEN 1 ELSE 0 END), 0) AS priced_requests,
+      COALESCE(SUM(CASE WHEN estimated_cost_nano_usd IS NULL THEN 1 ELSE 0 END), 0) AS unpriced_requests,
+      COALESCE(SUM(estimated_cost_nano_usd), 0) AS estimated_cost_nano_usd,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+      COALESCE(SUM(cache_write_input_tokens), 0) AS cache_write_input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+      AVG(latency_ms) AS average_latency_ms,
+      MIN(recorded_at) AS first_recorded_at,
+      MAX(recorded_at) AS last_recorded_at`;
+    const total = this.stmt(`SELECT ${select} FROM naming_usage`).get() as Row;
+    const byModel = this.stmt(
+      `SELECT backend, provider, model, ${select}
+       FROM naming_usage
+       GROUP BY backend, provider, model
+       ORDER BY estimated_cost_nano_usd DESC, requests DESC, backend, model`,
+    ).all() as Row[];
+    const common = (row: Row) => ({
+      requests: Number(row.requests ?? 0),
+      succeeded: Number(row.succeeded ?? 0),
+      failed: Number(row.failed ?? 0),
+      pricedRequests: Number(row.priced_requests ?? 0),
+      unpricedRequests: Number(row.unpriced_requests ?? 0),
+      estimatedCostNanoUsd: Number(row.estimated_cost_nano_usd ?? 0),
+      inputTokens: Number(row.input_tokens ?? 0),
+      cachedInputTokens: Number(row.cached_input_tokens ?? 0),
+      cacheWriteInputTokens: Number(row.cache_write_input_tokens ?? 0),
+      outputTokens: Number(row.output_tokens ?? 0),
+      reasoningTokens: Number(row.reasoning_tokens ?? 0),
+      averageLatencyMs: row.average_latency_ms == null ? null : Number(row.average_latency_ms),
+      lastRecordedAt: numOrNull(row.last_recorded_at),
+    });
+    return {
+      ...common(total),
+      firstRecordedAt: numOrNull(total.first_recorded_at),
+      byModel: byModel.map((row) => ({
+        backend: String(row.backend),
+        provider: String(row.provider),
+        model: String(row.model),
+        ...common(row),
+      })),
+    };
   }
 
   /** v7 — replace the account's limits snapshot (one row per account). Audited `account_limits.put {limits}`. */
