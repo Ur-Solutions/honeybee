@@ -37,6 +37,12 @@ export type TranscriptFileChange = {
   removedLines?: number;
 };
 
+/** Bounded inline image bytes emitted by a harness tool result. */
+export type TranscriptProjectedImage = {
+  data: string;
+  mimeType: string;
+};
+
 type Base = { ts: TranscriptIsoTs; threadId?: string };
 
 export type TranscriptProjectedEvent =
@@ -51,7 +57,14 @@ export type TranscriptProjectedEvent =
     })
   | (Base & { kind: "thinking"; redacted: boolean; text?: string })
   | (Base & { kind: "tool_call"; callId: string; name: string; input?: unknown })
-  | (Base & { kind: "tool_result"; callId: string; isError: boolean; output?: string; name?: string })
+  | (Base & {
+      kind: "tool_result";
+      callId: string;
+      isError: boolean;
+      output?: string;
+      name?: string;
+      images?: TranscriptProjectedImage[];
+    })
   | (Base & {
       kind: "shell";
       callId: string;

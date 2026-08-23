@@ -1,5 +1,6 @@
 import type {
   TranscriptIsoTs,
+  TranscriptProjectedImage,
   TranscriptProjectedEvent,
   TranscriptProjector,
   TranscriptTokenUsage,
@@ -46,6 +47,19 @@ function nonEmptyString(value: unknown): string | undefined {
 const NO_TS: TranscriptIsoTs = null;
 
 const NOISE_TYPES = new Set(["rate_limit_event", "tool_progress", "stream_event"]);
+const IMAGE_META_RE = /^\[Image:\s*original\s+\d+x\d+(?:,[^\]]*)?\]\s*$/i;
+const IMAGE_MIME_TYPES = new Set([
+  "image/avif",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const MAX_PROJECTED_IMAGES = 8;
+/** Keeps one canonical event comfortably below Apiary's 32 MiB peer frame. */
+const MAX_PROJECTED_IMAGE_DATA_CHARS = 24 * 1024 * 1024;
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 function textFromContent(content: unknown): string {
   if (typeof content === "string") return content;
@@ -61,6 +75,34 @@ function textFromContent(content: unknown): string {
     if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
   }
   return parts.join("\n");
+}
+
+function imagesFromContent(content: unknown): TranscriptProjectedImage[] {
+  if (!Array.isArray(content)) return [];
+  const images: TranscriptProjectedImage[] = [];
+  let retainedChars = 0;
+  for (const value of content) {
+    if (images.length >= MAX_PROJECTED_IMAGES) break;
+    const block = asObject(value);
+    if (block?.type !== "image") continue;
+    const source = asObject(block.source);
+    const mimeType = nonEmptyString(source?.media_type);
+    const data = nonEmptyString(source?.data);
+    if (
+      source?.type !== "base64" ||
+      !mimeType ||
+      !IMAGE_MIME_TYPES.has(mimeType) ||
+      !data ||
+      data.length % 4 !== 0 ||
+      !BASE64_RE.test(data) ||
+      retainedChars + data.length > MAX_PROJECTED_IMAGE_DATA_CHARS
+    ) {
+      continue;
+    }
+    images.push({ data, mimeType });
+    retainedChars += data.length;
+  }
+  return images;
 }
 
 function usageFrom(raw: unknown): TranscriptTokenUsage | null {
@@ -110,20 +152,26 @@ export function createClaudeProjector(): TranscriptProjector {
             // as the codex projector's itemCallId.
             const callId = nonEmptyString(block.tool_use_id) ?? "claude:tool_result:unknown";
             const output = textFromContent(block.content);
+            const images = imagesFromContent(block.content);
             events.push({
               kind: "tool_result",
               ts: NO_TS,
               callId,
               isError: block.is_error === true,
               ...(output.trim().length > 0 ? { output } : {}),
+              ...(images.length > 0 ? { images } : {}),
             });
           }
         }
         if (events.length > 0) return events;
-        // A synthetic/meta user line (tool echoes, injected context) is not
-        // an operator prompt and must not open a turn.
-        if (row.isMeta === true) return [];
         const text = textFromContent(content);
+        // A meta row is never an operator prompt. Current Claude versions mark
+        // the dimensions echo after an image result as `isSynthetic` instead
+        // of `isMeta`; suppress that exact provider-owned shape as well.
+        if (
+          row.isMeta === true ||
+          (row.isSynthetic === true && IMAGE_META_RE.test(text.trim()))
+        ) return [];
         if (text.trim().length === 0) return [];
         return [
           { kind: "turn_start", ts: NO_TS },

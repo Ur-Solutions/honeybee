@@ -81,6 +81,44 @@ test("claude projector: redacted thinking, meta users, and protocol noise", () =
   ]);
 });
 
+test("claude projector: image results stay typed and their synthetic dimensions echo stays hidden", () => {
+  const p = createClaudeProjector();
+  const imageData = "iVBORw0KGgo=";
+  const result = p.pushLine(line({
+    type: "user",
+    message: {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "toolu_image",
+        content: [{
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: imageData },
+        }],
+      }],
+    },
+  }));
+  assert.deepEqual(result, [{
+    kind: "tool_result",
+    ts: null,
+    callId: "toolu_image",
+    isError: false,
+    images: [{ data: imageData, mimeType: "image/png" }],
+  }]);
+
+  assert.deepEqual(p.pushLine(line({
+    type: "user",
+    isSynthetic: true,
+    message: {
+      role: "user",
+      content: [{
+        type: "text",
+        text: "[Image: original 2240x1880, displayed at 2000x1679. Multiply coordinates by 1.12 to map to original image.]",
+      }],
+    },
+  })), []);
+});
+
 test("claude projector: registered in the factory (no renderer fallback)", () => {
   const p = createTranscriptProjector("claude");
   const events = p.pushLine(line({
