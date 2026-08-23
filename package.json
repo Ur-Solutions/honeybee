@@ -30,7 +30,7 @@
     "ap": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/build-runner-host-artifact.mjs && node scripts/build-v2-artifact.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/build-runner-host-artifact.mjs && node scripts/build-v2-artifact.mjs && node scripts/build-cli-entry.mjs",
     "build:test": "node scripts/build-tests.mjs",
     "postbuild": "chmod +x dist/cli.js dist/cli-x.js",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",

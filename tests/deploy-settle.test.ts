@@ -207,6 +207,7 @@ test("the deploy archive allowlist excludes workstation state and retains runtim
   for (const required of [
     "package.json",
     "dist/cli.js",
+    "dist/cli-legacy.js",
     "dist/hsr/runner-entry.js",
     "dist/hsr/artifacts/runner-host.mjs",
     "dist/hsr/artifacts/runner-host.manifest.json",

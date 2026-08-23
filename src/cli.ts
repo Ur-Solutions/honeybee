@@ -2,10 +2,7 @@
 // hive CLI entrypoint: argv parsing + top-level command dispatch. Every command
 // handler lives in src/commands/*, shared helpers in src/cli/shared.ts, and the
 // HSR runner host in src/hsr/runnerHost.ts (HIVE-15 decomposition of cli.ts).
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { getCompletions } from "./completion.js";
-import { storeRoot } from "./fsx.js";
 import { dispatchCellBrokerVerb } from "./cellBroker.js";
 import { bold, cyan, dim, errorPrefix, gray, isPretty, yellow } from "./format.js";
 import { flag, parse, truthy } from "./parse.js";
@@ -50,6 +47,7 @@ import { cmdTrack } from "./commands/track.js";
 import { sealHelpText } from "./seal.js";
 import { closeAllSubstrates } from "./substrates/index.js";
 import { waitHelpText } from "./wait.js";
+import { v2IsDefault } from "./cliRoute.js";
 
 // Re-exports consumed by the unit tests (tests/*.test.ts import these from
 // "../src/cli.js"). The HIVE-15 decomposition moved the handlers into
@@ -60,6 +58,7 @@ export { resolveDefineArgs } from "./commands/frame.js";
 export { assertResumable, tmuxSessionSurvives } from "./commands/migrate.js";
 export { assertSingleBeeInvocation } from "./commands/run.js";
 export { resolvePromptArg } from "./commands/loop.js";
+export { v2IsDefault } from "./cliRoute.js";
 
 /** Load the v2 CLI: the compiled dist/v2/cli.js bundle, or the TS entry from source. */
 async function loadV2Cli(): Promise<{ runV2Cli(args: string[]): Promise<number> }> {
@@ -86,13 +85,6 @@ async function loadV2Cli(): Promise<{ runV2Cli(args: string[]): Promise<number> 
  * (removing the marker, reset-07 §C) un-flips automatically — no config, no
  * second switch to forget.
  */
-const V1_VERBS_KEPT_WHEN_FROZEN = new Set(["deploy", "__complete"]);
-
-export function v2IsDefault(argv0: string | undefined): boolean {
-  if (argv0 !== undefined && V1_VERBS_KEPT_WHEN_FROZEN.has(argv0)) return false;
-  return existsSync(join(storeRoot(), "FROZEN"));
-}
-
 async function main(argv: string[]) {
   if (argv[0] === "v2") {
     // Reset WP4: route `hive v2 …` into the v2 stack (v2/cli). Additive
@@ -558,7 +550,7 @@ ${envs}
 `);
 }
 
-main(process.argv.slice(2)).catch((error) => {
+export const legacyCliCompletion = main(process.argv.slice(2)).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   const [first, ...rest] = message.split("\n");
   console.error(`${errorPrefix()} ${first}`);

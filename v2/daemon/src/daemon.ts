@@ -1734,10 +1734,7 @@ export class HiveDaemon {
   private rpcList(params: Record<string, unknown>): ListResult {
     const store = this.mustStore();
     const lifecycle = typeof params.lifecycle === "string" ? params.lifecycle : null;
-    const views = store
-      .listBees()
-      .filter((b) => lifecycle == null || b.lifecycle === lifecycle)
-      .map((b) => this.viewOf(store, b.id));
+    const views = store.listBeeViewRows(lifecycle);
     return { views };
   }
 
@@ -1797,7 +1794,7 @@ export class HiveDaemon {
     this.publishedSeq = seq;
     return {
       seq,
-      views: store.listBees().map((b) => this.viewOf(store, b.id)),
+      views: store.listBeeViewRows(),
       templates: store.listTemplates(),
       tracks: store.listTracks(),
       questions: store.listQuestions(),

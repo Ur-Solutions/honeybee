@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { v2IsDefault } from "../src/cli.js";
+import { v2IsDefault } from "../src/cliRoute.js";
 
 // WP7 B5 — the flip switch is the freeze marker itself (reset-07 §B3/§B5):
 // FROZEN present → plain `hive` verbs are the v2 surface; `deploy` and

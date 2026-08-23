@@ -165,6 +165,13 @@ export interface CreateBeeInput {
   createdAt?: number;
 }
 
+/** One authoritative, internally consistent bee/read-model row for list RPCs. */
+export interface BeeViewRow {
+  bee: BeeRow;
+  runtime: RuntimeRow | null;
+  view: BeeView;
+}
+
 /** `tagBee` outcome: the row after the edit plus what actually changed. */
 export interface TagResult {
   bee: BeeRow;
@@ -2146,8 +2153,56 @@ export class CoreStore {
     );
   }
 
+  /**
+   * Batch the authoritative list projection into three SQLite reads: bees,
+   * latest runtimes, and active flags. The old `listBees().map(view)` path
+   * repeated getBee/currentRuntime/activeFlags for every row (and the daemon
+   * then repeated getBee/currentRuntime once more while shaping the RPC),
+   * making `hive ls` scale as hundreds of queries on an ordinary hive.
+   */
+  listBeeViewRows(lifecycle: string | null = null): BeeViewRow[] {
+    const bees = this.listBees().filter((bee) => lifecycle === null || bee.lifecycle === lifecycle);
+    if (bees.length === 0) return [];
+    const selected = new Set(bees.map((bee) => bee.id));
+
+    const runtimes = (
+      this.stmt(
+        `SELECT runtime.*
+         FROM runtimes AS runtime
+         LEFT JOIN runtimes AS newer
+           ON newer.bee_id = runtime.bee_id AND newer.generation > runtime.generation
+         WHERE newer.bee_id IS NULL
+         ORDER BY runtime.bee_id`,
+      ).all() as Row[]
+    ).map(mapRuntime);
+    const runtimeByBee = new Map(
+      runtimes
+        .filter((runtime) => selected.has(runtime.beeId))
+        .map((runtime) => [runtime.beeId, runtime] as const),
+    );
+
+    const flagsByBee = new Map<string, Flag[]>();
+    const activeFlagRows = this.stmt(
+      "SELECT * FROM flags WHERE cleared_at IS NULL ORDER BY bee_id, id",
+    ).all() as Row[];
+    for (const raw of activeFlagRows) {
+      const row = mapFlag(raw);
+      if (!selected.has(row.beeId)) continue;
+      flagsByBee.set(row.beeId, [...(flagsByBee.get(row.beeId) ?? []), row.flag]);
+    }
+
+    return bees.map((bee) => {
+      const runtime = runtimeByBee.get(bee.id) ?? null;
+      return {
+        bee,
+        runtime,
+        view: deriveBeeView(bee.id, bee, runtime, flagsByBee.get(bee.id) ?? []),
+      };
+    });
+  }
+
   views(): BeeView[] {
-    return this.listBees().map((b) => this.view(b.id));
+    return this.listBeeViewRows().map((row) => row.view);
   }
 
   // -------------------------------------------------------------------------
