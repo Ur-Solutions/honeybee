@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { HsrDriver } from "../src/index.ts";
 import { claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
+import type { AdapterSignal } from "../../adapters/src/types.ts";
 import {
   AGENT_PATH,
   drainEvidenceUntil,
@@ -705,4 +706,49 @@ test("self-woken turn: unprompted assistant output on an IDLE runtime opens a tu
     driver.stop("sw-1", 1, "stopped_by_system");
     driver.disposeAll();
   }
+});
+
+test("codex native subagent lifecycle cannot start or end the root bee turn", (t) => {
+  // One app-server emits notifications for the root thread and every native
+  // child agent. A child turn/completed used to idle the root bee and route it
+  // into Inbox while the root kept running (CO.b4b3, 2026-08-23).
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-codex-threads-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => { throw new Error("this state-machine regression does not spawn"); },
+  });
+  const processState = {
+    beeId: "codex-thread-scope",
+    generation: 1,
+    phase: "idle" as "booting" | "running" | "idle",
+    sessionId: "root-thread",
+    turnId: null as string | null,
+    realEvidence: true,
+  };
+  const onSignal = (signal: AdapterSignal) => {
+    (driver as unknown as { onSignal(p: typeof processState, signal: AdapterSignal): void })
+      .onSignal(processState, signal);
+  };
+
+  onSignal({ kind: "turn_started", threadId: "child-thread", turnId: "child-idle-turn" });
+  assert.equal(processState.phase, "idle");
+  assert.equal(processState.turnId, null);
+  assert.deepEqual(driver.observe(), [], "child start is invisible while the root is idle");
+
+  onSignal({ kind: "turn_started", threadId: "root-thread", turnId: "root-turn" });
+  assert.equal(processState.phase, "running");
+  assert.equal(processState.turnId, "root-turn");
+  assert.equal(ofKind(driver.observe(), "turn_started").length, 1);
+
+  onSignal({ kind: "turn_started", threadId: "child-thread", turnId: "child-running-turn" });
+  onSignal({ kind: "turn_ended", threadId: "child-thread" });
+  assert.equal(processState.phase, "running", "child completion cannot idle a running root");
+  assert.equal(processState.turnId, "root-turn", "child lifecycle cannot replace the root interrupt id");
+  assert.deepEqual(driver.observe(), []);
+
+  onSignal({ kind: "turn_ended", threadId: "root-thread" });
+  assert.equal(processState.phase, "idle");
+  assert.equal(processState.turnId, null);
+  assert.equal(ofKind(driver.observe(), "turn_ended").length, 1);
 });

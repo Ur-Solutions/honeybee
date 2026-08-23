@@ -35,9 +35,14 @@ export type AdapterSignal =
    * immediately followed by `turn_ended`, landing the store on `idle`.
    */
   | { kind: "booted"; sessionId?: string }
-  /** `turnId`: the harness-native turn id when the stream carries one (codex turn/started) — needed to interrupt it. */
-  | { kind: "turn_started"; turnId?: string }
-  | { kind: "turn_ended" }
+  /**
+   * `turnId`: the harness-native turn id when the stream carries one (codex
+   * turn/started) — needed to interrupt it. `threadId` scopes lifecycle from
+   * multiplexed harnesses: codex app-server also reports native subagent
+   * threads on the root bee's stream.
+   */
+  | { kind: "turn_started"; turnId?: string; threadId?: string }
+  | { kind: "turn_ended"; threadId?: string }
   /** Condition-flag evidence. The adapter reports; the daemon decides. */
   | { kind: "flag"; flag: AdapterFlag; action: "set" | "clear"; detail: string }
   /**

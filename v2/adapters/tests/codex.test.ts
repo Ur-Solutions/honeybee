@@ -59,14 +59,14 @@ test("codex: thread/start response → booted(threadId) + spawn_failed clear + t
 test("codex: turn/started → turn_started; turn/completed → clears + turn_ended", () => {
   assert.deepEqual(
     adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t", turn: { id: "turn-1" } } })),
-    [{ kind: "turn_started", turnId: "turn-1" }], // v6: the turn id rides along (turn/interrupt needs it)
+    [{ kind: "turn_started", turnId: "turn-1", threadId: "t" }], // v6: the turn id rides along (turn/interrupt needs it)
   );
   assert.deepEqual(
     adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: "t", turn: { id: "turn-1" } } })),
     [
       { kind: "flag", flag: "auth_needed", action: "clear", detail: "successful authenticated turn" },
       { kind: "flag", flag: "resource_blocked", action: "clear", detail: "successful turn served" },
-      { kind: "turn_ended" },
+      { kind: "turn_ended", threadId: "t" },
     ],
   );
 });
@@ -208,8 +208,8 @@ test("codex: resumeThreadId (spec 07 §F) — handshake sends thread/resume {thr
 
 test("codex v6: turn/started carries the turn id; encodeInterrupt = turn/interrupt {threadId, turnId} (null before a turn id is known); the ack parses to []", () => {
   const started = adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t-1", turn: { id: "turn-9" } } }));
-  assert.deepEqual(started, [{ kind: "turn_started", turnId: "turn-9" }]);
-  assert.deepEqual(adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t-1" } })), [{ kind: "turn_started" }]);
+  assert.deepEqual(started, [{ kind: "turn_started", turnId: "turn-9", threadId: "t-1" }]);
+  assert.deepEqual(adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", method: "turn/started", params: { threadId: "t-1" } })), [{ kind: "turn_started", threadId: "t-1" }]);
   assert.equal(adapter.encodeInterrupt!({ sessionId: "t-1", turnId: null }), null);
   assert.equal(adapter.encodeInterrupt!({ sessionId: null, turnId: "turn-9" }), null);
   const req = JSON.parse(adapter.encodeInterrupt!({ sessionId: "t-1", turnId: "turn-9" })!) as Record<string, unknown>;

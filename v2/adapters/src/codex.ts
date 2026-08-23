@@ -184,6 +184,9 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
 
   function methodSignals(msg: Record<string, unknown>): AdapterSignal[] {
     const params = asObject(msg.params) ?? {};
+    const threadId = typeof params.threadId === "string" && params.threadId.length > 0
+      ? params.threadId
+      : undefined;
 
     // A server REQUEST (has an id): refuse rather than leave the peer hanging.
     if (msg.id !== undefined && msg.id !== null) {
@@ -201,10 +204,14 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
       case "turn/started": {
         // `turn.id` is what turn/interrupt needs (v6 bee.interrupt).
         const turnId = asObject(params.turn)?.id;
-        return [typeof turnId === "string" && turnId.length > 0 ? { kind: "turn_started", turnId } : { kind: "turn_started" }];
+        return [{
+          kind: "turn_started",
+          ...(typeof turnId === "string" && turnId.length > 0 ? { turnId } : {}),
+          ...(threadId ? { threadId } : {}),
+        }];
       }
       case "turn/completed":
-        return [...successfulTurnClears(), { kind: "turn_ended" }];
+        return [...successfulTurnClears(), { kind: "turn_ended", ...(threadId ? { threadId } : {}) }];
       case "error": {
         const err = asObject(params.error);
         return errorSignals(String(err?.message ?? params.message ?? "codex error"));

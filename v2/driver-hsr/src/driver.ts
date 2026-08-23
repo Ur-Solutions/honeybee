@@ -928,6 +928,19 @@ export class HsrDriver implements RuntimeDriver {
 
 
   private onSignal(p: ManagedProcess, signal: ReturnType<HarnessAdapter["parseLine"]>[number]): void {
+    if (
+      (signal.kind === "turn_started" || signal.kind === "turn_ended")
+      && signal.threadId
+      && p.sessionId
+      && signal.threadId !== p.sessionId
+    ) {
+      // codex app-server multiplexes the root thread and native subagent
+      // threads onto one stdout stream. Only the provider session learned at
+      // boot owns this bee's lifecycle: a child completion must not idle the
+      // root, and a child start must not replace the root turn id used by
+      // interrupt. Unscoped signals remain valid for older/non-codex adapters.
+      return;
+    }
     if (!p.realEvidence) {
       p.realEvidence = true;
       // v9: the first ADAPTER-PARSED signal from a process whose phase left
