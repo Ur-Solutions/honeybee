@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  AUTO_TITLE_MAX_RETRY_BACKOFF_MS,
+  AUTO_TITLE_WATCHDOG_MS,
   autoTitleDecision,
+  autoTitleRetryBackoffMs,
   createAutoTitleDispatcher,
-  MAX_AUTO_TITLE_ATTEMPTS,
   type AutoTitleBookkeeping,
   type AutoTitleDeps,
 } from "../src/autoTitle.ts";
@@ -64,17 +66,22 @@ test("autoTitleDecision: substantial first message waits for output, then genera
   assert.equal(autoTitleDecision(bee({ lastOutputAt: 9 }), ["Enable auto-titling"], undefined, NOW).action, "generate");
 });
 
-test("autoTitleDecision: existing title / archived / attempt cap skip", () => {
+test("autoTitleDecision: existing title and archived skip; failures retry with bounded backoff", () => {
   assert.equal(autoTitleDecision(bee({ title: "Already" }), ["Enable auto-titling"], undefined, NOW).action, "skip");
   assert.equal(autoTitleDecision(bee({ lifecycle: "archived" }), ["Enable auto-titling"], undefined, NOW).action, "skip");
-  const capped: AutoTitleBookkeeping = {
-    attempts: MAX_AUTO_TITLE_ATTEMPTS,
+  const failed: AutoTitleBookkeeping = {
+    attempts: 20,
     lastAt: NOW,
     userTurns: 1,
     deferred: false,
     signature: "x",
   };
-  assert.equal(autoTitleDecision(bee(), ["Enable auto-titling"], capped, NOW).action, "skip");
+  assert.equal(autoTitleRetryBackoffMs(failed.attempts), AUTO_TITLE_MAX_RETRY_BACKOFF_MS);
+  assert.equal(autoTitleDecision(bee(), ["Enable auto-titling"], failed, NOW).action, "skip");
+  assert.equal(
+    autoTitleDecision(bee(), ["Enable auto-titling"], failed, NOW + AUTO_TITLE_MAX_RETRY_BACKOFF_MS).action,
+    "generate",
+  );
 });
 
 function settle(): Promise<void> {
@@ -91,6 +98,7 @@ test("dispatcher: thin opener does not burn an attempt; second message titles", 
     enabled: () => true,
     naming: () => ({
       auto: true,
+      backend: "codex-app-server",
       tool: "codex",
       model: "gpt-5.6-luna",
       effort: "medium",
@@ -129,11 +137,59 @@ test("dispatcher: thin opener does not burn an attempt; second message titles", 
   assert.equal(store.get(row.id)?.title, "Enable Auto Titler");
 });
 
+test("dispatcher: watchdog recovery ignores the stale generator completion", async () => {
+  let now = NOW;
+  let row = bee();
+  const bookkeeping = new Map<string, AutoTitleBookkeeping>();
+  const resolves: Array<(title: string) => void> = [];
+  const dispatch = createAutoTitleDispatcher({
+    enabled: () => true,
+    naming: () => ({
+      auto: true,
+      backend: "codex-app-server",
+      tool: "codex",
+      model: "gpt-5.6-luna",
+      effort: "none",
+      generatorCwd: "/tmp",
+    }),
+    listBees: () => [row],
+    listMessages: () => [mail("Repair automatic naming")],
+    getBee: () => row,
+    setTitle: (_id, title) => {
+      row = { ...row, title };
+      return { applied: true };
+    },
+    loadState: (id) => bookkeeping.get(id),
+    saveState: (id, state) => bookkeeping.set(id, state),
+    generate: () => new Promise((resolve) => resolves.push(resolve)),
+    now: () => now,
+    log: () => undefined,
+  });
+
+  await dispatch();
+  await settle();
+  assert.equal(resolves.length, 1);
+
+  now += AUTO_TITLE_WATCHDOG_MS + 1;
+  const watchdog = await dispatch();
+  await settle();
+  assert.equal(watchdog[0]?.error?.includes("watchdog"), true);
+  assert.equal(resolves.length, 2);
+
+  resolves[0]!("Stale Title");
+  await settle();
+  assert.equal(row.title, null);
+  resolves[1]!("Fresh Title");
+  await settle();
+  assert.equal(row.title, "Fresh Title");
+});
+
 test("dispatcher: disabled naming skips everything", async () => {
   const dispatch = createAutoTitleDispatcher({
     enabled: () => false,
     naming: () => ({
       auto: false,
+      backend: "codex-app-server",
       tool: "codex",
       model: "gpt-5.6-luna",
       effort: "medium",

@@ -1,8 +1,8 @@
 /**
  * Auto-titler: untitled active bees get a semantic title from their mailbox
  * once there is a real task signal. A thin first opener ("hi") defers until
- * a later message. Generation shells out, so at most one subprocess is in
- * flight; outcomes surface on a later tick.
+ * a later message. Generation is asynchronous and globally serialized;
+ * outcomes surface on a later tick without blocking the daemon loop.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -45,10 +45,17 @@ export type AutoTitleDeps = {
   log: (op: string) => void;
 };
 
-export const MAX_AUTO_TITLE_ATTEMPTS = 3;
-export const AUTO_TITLE_RETRY_BACKOFF_MS = 10 * 60_000;
-export const AUTO_TITLE_WATCHDOG_MS = 2 * 60_000;
-export const AUTO_TITLE_CONTEXT_PROBES_PER_TICK = 1;
+export const AUTO_TITLE_RETRY_BACKOFF_MS = 15_000;
+export const AUTO_TITLE_MAX_RETRY_BACKOFF_MS = 10 * 60_000;
+// The Codex transport may transparently restart once after its 20s request
+// deadline. Keep the outer slot alive long enough for both attempts to settle.
+export const AUTO_TITLE_WATCHDOG_MS = 45_000;
+export const AUTO_TITLE_CONTEXT_PROBES_PER_TICK = 8;
+
+export function autoTitleRetryBackoffMs(attempts: number): number {
+  const exponent = Math.max(0, Math.min(6, attempts - 1));
+  return Math.min(AUTO_TITLE_MAX_RETRY_BACKOFF_MS, AUTO_TITLE_RETRY_BACKOFF_MS * (2 ** exponent));
+}
 
 export function userTaskMessages(messages: readonly MessageRow[]): string[] {
   const out: string[] = [];
@@ -77,8 +84,11 @@ export function autoTitleDecision(
 ): { action: "skip"; reason: string } | { action: "defer"; reason: string } | { action: "generate" } {
   if (bee.lifecycle !== "active") return { action: "skip", reason: "not active" };
   if (bee.title) return { action: "skip", reason: "already titled" };
-  if ((bookkeeping?.attempts ?? 0) >= MAX_AUTO_TITLE_ATTEMPTS) return { action: "skip", reason: "attempt cap" };
-  if (bookkeeping?.lastAt && now - bookkeeping.lastAt < AUTO_TITLE_RETRY_BACKOFF_MS && !bookkeeping.deferred) {
+  if (
+    bookkeeping?.lastAt &&
+    now - bookkeeping.lastAt < autoTitleRetryBackoffMs(bookkeeping.attempts) &&
+    !bookkeeping.deferred
+  ) {
     return { action: "skip", reason: "backoff" };
   }
   if (userMessages.length === 0) return { action: "defer", reason: "no user message" };
@@ -130,13 +140,17 @@ export function createAutoTitleDispatcher(deps: AutoTitleDeps): (bees?: BeeRow[]
         // Same mailbox/output snapshot we already deferred on.
         continue;
       }
-      const decision = autoTitleDecision(bee, userMessages, bookkeeping, now);
+      // New mailbox/output evidence gets a fresh retry budget. An unchanged
+      // task retries forever with a bounded exponential delay, so a transient
+      // provider outage can never leave a bee permanently unnamed.
+      const currentBookkeeping = bookkeeping?.signature === signature ? bookkeeping : undefined;
+      const decision = autoTitleDecision(bee, userMessages, currentBookkeeping, now);
       if (decision.action === "skip") continue;
       probes += 1;
       if (decision.action === "defer") {
         deps.saveState(bee.id, {
-          attempts: bookkeeping?.attempts ?? 0,
-          lastAt: bookkeeping?.lastAt ?? 0,
+          attempts: currentBookkeeping?.attempts ?? 0,
+          lastAt: currentBookkeeping?.lastAt ?? 0,
           userTurns: userMessages.length,
           deferred: true,
           signature,
@@ -145,7 +159,7 @@ export function createAutoTitleDispatcher(deps: AutoTitleDeps): (bees?: BeeRow[]
       }
 
       const claimed: AutoTitleBookkeeping = {
-        attempts: (bookkeeping?.attempts ?? 0) + 1,
+        attempts: (currentBookkeeping?.attempts ?? 0) + 1,
         lastAt: now,
         userTurns: userMessages.length,
         deferred: false,
@@ -162,6 +176,7 @@ export function createAutoTitleDispatcher(deps: AutoTitleDeps): (bees?: BeeRow[]
       void Promise.resolve()
         .then(() => deps.generate(context))
         .then((title) => {
+          if (inFlightToken !== generationToken) return;
           const fresh = deps.getBee(bee.id);
           if (!fresh) {
             finished.push({ beeId: bee.id, ok: false, skipped: "record removed while generating" });
@@ -171,11 +186,16 @@ export function createAutoTitleDispatcher(deps: AutoTitleDeps): (bees?: BeeRow[]
             finished.push({ beeId: bee.id, ok: false, skipped: "title set while generating" });
             return;
           }
-          deps.setTitle(bee.id, title);
+          const applied = deps.setTitle(bee.id, title);
+          if (!applied.applied) {
+            finished.push({ beeId: bee.id, ok: false, skipped: "title write was a no-op" });
+            return;
+          }
           deps.log(`autoTitle bee=${bee.id} title=${JSON.stringify(title)}`);
           finished.push({ beeId: bee.id, ok: true, title });
         })
         .catch((error) => {
+          if (inFlightToken !== generationToken) return;
           finished.push({
             beeId: bee.id,
             ok: false,

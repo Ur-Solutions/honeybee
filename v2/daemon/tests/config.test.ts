@@ -4,10 +4,18 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, DEFAULTS, NAMING_DEFAULTS, defaultDataDir, loadNodeConfig, patchNamingConfig } from "../src/config.ts";
+import {
+  ConfigError,
+  DEFAULTS,
+  NAMING_DEFAULTS,
+  defaultDataDir,
+  loadNodeConfig,
+  patchNamingConfig,
+  publicNamingConfig,
+} from "../src/config.ts";
 
 function withDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-cfg-"));
@@ -186,11 +194,12 @@ test("config.6 (spec 08): accounts settings default (vault/homes under ~/.hive, 
   });
 });
 
-test("config.naming: absent file defaults to auto Codex GPT-5.6 Luna medium", () => {
+test("config.naming: absent file defaults to a warm Codex GPT-5.6 Luna app-server", () => {
   withDir((dir) => {
     const cfg = loadNodeConfig(dir);
     assert.deepEqual(cfg.naming, {
       auto: true,
+      backend: NAMING_DEFAULTS.backend,
       tool: NAMING_DEFAULTS.tool,
       model: NAMING_DEFAULTS.model,
       effort: NAMING_DEFAULTS.effort,
@@ -207,16 +216,42 @@ test("config.naming: file values override; patchNamingConfig merges and preserve
     );
     const cfg = loadNodeConfig(dir);
     assert.equal(cfg.naming.auto, false);
+    assert.equal(cfg.naming.backend, "claude-cli");
     assert.equal(cfg.naming.tool, "claude");
     assert.equal(cfg.naming.model, "haiku");
     assert.equal(cfg.naming.effort, NAMING_DEFAULTS.effort);
     const patched = patchNamingConfig(join(dir, "config.json"), dir, { auto: true, effort: "low" });
     assert.equal(patched.auto, true);
+    assert.equal(patched.backend, "claude-cli");
     assert.equal(patched.tool, "claude");
     assert.equal(patched.effort, "low");
     const round = JSON.parse(readFileSync(join(dir, "config.json"), "utf8")) as Record<string, unknown>;
     assert.equal(round.someFutureKey, true);
     assert.deepEqual(round.naming, { auto: true, tool: "claude", model: "haiku", effort: "low" });
+  });
+});
+
+test("config.naming: OpenAI key is required for API mode, persisted privately, and redacted publicly", () => {
+  withDir((dir) => {
+    const path = join(dir, "config.json");
+    assert.throws(
+      () => patchNamingConfig(path, dir, { backend: "openai-api" }),
+      /apiKey is required/,
+    );
+    const configured = patchNamingConfig(path, dir, {
+      backend: "openai-api",
+      apiKey: "sk-test-write-only",
+    });
+    assert.equal(configured.apiKey, "sk-test-write-only");
+    assert.equal(publicNamingConfig(configured).apiKeyConfigured, true);
+    assert.doesNotMatch(JSON.stringify(publicNamingConfig(configured)), /sk-test-write-only/);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    const cleared = patchNamingConfig(path, dir, {
+      backend: "codex-app-server",
+      apiKey: "",
+    });
+    assert.equal(cleared.apiKey, undefined);
+    assert.equal(publicNamingConfig(cleared).apiKeyConfigured, false);
   });
 });
 

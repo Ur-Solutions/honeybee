@@ -36,28 +36,37 @@ export interface AgentSpecConfig {
 export const NAMING_TOOLS = ["codex", "claude"] as const;
 export type NamingTool = (typeof NAMING_TOOLS)[number];
 
-export const NAMING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export const NAMING_BACKENDS = ["codex-app-server", "openai-api", "claude-cli"] as const;
+export type NamingBackend = (typeof NAMING_BACKENDS)[number];
+
+export const NAMING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type NamingEffort = (typeof NAMING_EFFORTS)[number];
 
 /** Daemon auto-titler (untitled bees → semantic `title` from the mailbox). */
 export interface NamingConfig {
   /** Default true. */
   auto?: boolean;
-  /** Builtin generator CLI. Default "codex". */
+  /** Generator transport. Default is one warm Codex app-server process. */
+  backend?: NamingBackend;
+  /** @deprecated Compatibility selector for configs written before `backend`. */
   tool?: NamingTool;
   /** Model passed to the generator. Default "gpt-5.6-luna". */
   model?: string;
-  /** Reasoning effort for the Codex generator. Default "medium". Ignored by Claude. */
+  /** Reasoning effort for Codex/OpenAI. Default "none". Ignored by Claude. */
   effort?: NamingEffort;
+  /** OpenAI Responses API credential. Write-only over RPC; never returned publicly. */
+  apiKey?: string;
   /** Custom generator command (prompt on stdin, title on stdout). Overrides tool/model. */
   command?: string;
 }
 
 export interface ResolvedNamingConfig {
   auto: boolean;
+  backend: NamingBackend;
   tool: NamingTool;
   model: string;
   effort: NamingEffort;
+  apiKey?: string;
   command?: string;
   /** Dedicated cwd so title-gen sessions never pollute a bee's transcript folder. */
   generatorCwd: string;
@@ -65,9 +74,10 @@ export interface ResolvedNamingConfig {
 
 export const NAMING_DEFAULTS = {
   auto: true,
+  backend: "codex-app-server" as NamingBackend,
   tool: "codex" as NamingTool,
   model: "gpt-5.6-luna",
-  effort: "medium" as NamingEffort,
+  effort: "none" as NamingEffort,
 };
 
 /** v7 (spec 08): accounts + vault settings. */
@@ -151,7 +161,7 @@ export interface NodeConfigFile {
   agents?: Record<string, AgentSpecConfig>;
   /** v7 (spec 08). */
   accounts?: AccountsConfig;
-  /** Auto-titler. Default on, Codex GPT-5.6 Luna medium. */
+  /** Auto-titler. Default on, warm Codex app-server with GPT-5.6 Luna at no reasoning. */
   naming?: NamingConfig;
 }
 
@@ -367,6 +377,9 @@ export function namingOf(raw: Record<string, unknown>, dataDir: string): Resolve
   if (n.auto !== undefined && typeof n.auto !== "boolean") {
     throw new ConfigError("config: naming.auto must be a boolean");
   }
+  if (n.backend !== undefined && !(NAMING_BACKENDS as readonly unknown[]).includes(n.backend)) {
+    throw new ConfigError(`config: naming.backend must be one of ${NAMING_BACKENDS.join("|")}`);
+  }
   if (n.tool !== undefined && (n.tool !== "codex" && n.tool !== "claude")) {
     throw new ConfigError('config: naming.tool must be "codex" or "claude"');
   }
@@ -376,14 +389,25 @@ export function namingOf(raw: Record<string, unknown>, dataDir: string): Resolve
   if (n.effort !== undefined && (typeof n.effort !== "string" || !(NAMING_EFFORTS as readonly string[]).includes(n.effort))) {
     throw new ConfigError(`config: naming.effort must be one of ${NAMING_EFFORTS.join("|")}`);
   }
+  if (n.apiKey !== undefined && (typeof n.apiKey !== "string" || n.apiKey.length === 0)) {
+    throw new ConfigError("config: naming.apiKey must be a non-empty string when given");
+  }
   if (n.command !== undefined && (typeof n.command !== "string" || n.command.length === 0)) {
     throw new ConfigError("config: naming.command must be a non-empty string when given");
   }
+  const backend = (n.backend as NamingBackend | undefined) ??
+    (n.tool === "claude" ? "claude-cli" : NAMING_DEFAULTS.backend);
+  if (backend === "openai-api" && typeof n.apiKey !== "string") {
+    throw new ConfigError("config: naming.apiKey is required when naming.backend is openai-api");
+  }
+  const tool: NamingTool = backend === "claude-cli" ? "claude" : "codex";
   return {
     auto: n.auto !== false,
-    tool: (n.tool as NamingTool | undefined) ?? NAMING_DEFAULTS.tool,
+    backend,
+    tool,
     model: (n.model as string | undefined) ?? NAMING_DEFAULTS.model,
     effort: (n.effort as NamingEffort | undefined) ?? NAMING_DEFAULTS.effort,
+    ...(typeof n.apiKey === "string" ? { apiKey: n.apiKey } : {}),
     ...(typeof n.command === "string" ? { command: n.command } : {}),
     generatorCwd: join(dataDir, "naming"),
   };
@@ -391,16 +415,20 @@ export function namingOf(raw: Record<string, unknown>, dataDir: string): Resolve
 
 export function publicNamingConfig(naming: ResolvedNamingConfig): {
   auto: boolean;
+  backend: NamingBackend;
   tool: NamingTool;
   model: string;
   effort: NamingEffort;
+  apiKeyConfigured: boolean;
   command?: string;
 } {
   return {
     auto: naming.auto,
+    backend: naming.backend,
     tool: naming.tool,
     model: naming.model,
     effort: naming.effort,
+    apiKeyConfigured: Boolean(naming.apiKey),
     ...(naming.command ? { command: naming.command } : {}),
   };
 }
@@ -428,9 +456,14 @@ export function patchNamingConfig(configPath: string, dataDir: string, patch: Na
     : {}) as NamingConfig;
   const next: NamingConfig = { ...current };
   if (patch.auto !== undefined) next.auto = patch.auto;
+  if (patch.backend !== undefined) next.backend = patch.backend;
   if (patch.tool !== undefined) next.tool = patch.tool;
   if (patch.model !== undefined) next.model = patch.model;
   if (patch.effort !== undefined) next.effort = patch.effort;
+  if (patch.apiKey !== undefined) {
+    if (patch.apiKey.length === 0) delete next.apiKey;
+    else next.apiKey = patch.apiKey;
+  }
   if (patch.command !== undefined) {
     if (patch.command.length === 0) delete next.command;
     else next.command = patch.command;
@@ -439,7 +472,7 @@ export function patchNamingConfig(configPath: string, dataDir: string, patch: Na
   const resolved = namingOf(raw, dataDir);
   const tmp = `${configPath}.${process.pid}.tmp`;
   mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`);
+  writeFileSync(tmp, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, configPath);
   return resolved;
 }

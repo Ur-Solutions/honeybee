@@ -96,6 +96,7 @@ import {
   type ResolvedNodeConfig,
 } from "./config.ts";
 import { createStoreAutoTitleDispatcher, type AutoTitleOutcome } from "./autoTitle.ts";
+import { TitleGeneratorService } from "./namingService.ts";
 import { TelemetryStore, formatI1Violation } from "./telemetry.ts";
 import { RpcServer, type RpcConn } from "./rpc.ts";
 import {
@@ -331,6 +332,7 @@ export class HiveDaemon {
   private readonly rotatedGenerations = new Map<string, number>();
   private naming: ResolvedNamingConfig;
   private autoTitle: ((bees?: BeeRow[]) => Promise<AutoTitleOutcome[]>) | null = null;
+  private titleGenerator: TitleGeneratorService | null = null;
 
   constructor(cfg: ResolvedNodeConfig, deps: HiveDaemonDeps = {}) {
     this.cfg = cfg;
@@ -360,11 +362,19 @@ export class HiveDaemon {
       backoffBaseMs: this.cfg.backoffBaseMs,
     });
     this.store = store;
+    const codexSpec = this.cfg.agents.codex;
+    this.titleGenerator = new TitleGeneratorService({
+      log: (op) => this.log(op),
+      ...(codexSpec?.command ? { codexCommand: codexSpec.command } : {}),
+      ...(codexSpec?.args ? { codexArgs: codexSpec.args } : {}),
+    });
     this.autoTitle = createStoreAutoTitleDispatcher(store, {
       naming: () => this.naming,
       statePath: join(this.cfg.dataDir, "auto-title.json"),
       log: (op) => this.log(op),
+      generate: (context) => this.titleGenerator!.generate(context, this.naming),
     });
+    this.titleGenerator.warm(this.naming);
     this.accounts = new AccountsService({
       store,
       cfg: this.cfg,
@@ -472,6 +482,8 @@ export class HiveDaemon {
     if (this.loopDelayTimer) clearInterval(this.loopDelayTimer);
     this.loopDelay?.disable();
     this.tickTimer = null;
+    this.titleGenerator?.close();
+    this.titleGenerator = null;
     await this.rpc?.close();
     this.store?.close();
     this.telemetry?.close();
@@ -1354,6 +1366,15 @@ export class HiveDaemon {
       if (typeof raw.auto !== "boolean") throw new RpcError("invalid_request", "config.patch: naming.auto must be a boolean");
       patch.auto = raw.auto;
     }
+    if (raw.backend !== undefined) {
+      if (raw.backend !== "codex-app-server" && raw.backend !== "openai-api" && raw.backend !== "claude-cli") {
+        throw new RpcError(
+          "invalid_request",
+          'config.patch: naming.backend must be "codex-app-server", "openai-api", or "claude-cli"',
+        );
+      }
+      patch.backend = raw.backend;
+    }
     if (raw.tool !== undefined) {
       if (raw.tool !== "codex" && raw.tool !== "claude") {
         throw new RpcError("invalid_request", 'config.patch: naming.tool must be "codex" or "claude"');
@@ -1372,6 +1393,12 @@ export class HiveDaemon {
       }
       patch.effort = raw.effort as NamingConfig["effort"];
     }
+    if (raw.apiKey !== undefined) {
+      if (typeof raw.apiKey !== "string") {
+        throw new RpcError("invalid_request", "config.patch: naming.apiKey must be a string");
+      }
+      patch.apiKey = raw.apiKey;
+    }
     if (raw.command !== undefined) {
       if (typeof raw.command !== "string") {
         throw new RpcError("invalid_request", "config.patch: naming.command must be a string");
@@ -1386,6 +1413,7 @@ export class HiveDaemon {
     } catch (err) {
       throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
     }
+    this.titleGenerator?.reconfigure(this.naming);
     this.log(`config.patch naming=${JSON.stringify(publicNamingConfig(this.naming))}`);
     return { naming: publicNamingConfig(this.naming), configPath: this.cfg.configPath };
   }

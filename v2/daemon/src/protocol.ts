@@ -357,9 +357,12 @@ export interface RenameResult extends DedupMarkers {
 /** `config.get` — resolved auto-titler settings (defaults applied). */
 export interface NamingConfigView {
   auto: boolean;
+  backend: "codex-app-server" | "openai-api" | "claude-cli";
   tool: "codex" | "claude";
   model: string;
   effort: string;
+  /** The API key itself is write-only and never crosses this read boundary. */
+  apiKeyConfigured: boolean;
   command?: string;
 }
 
