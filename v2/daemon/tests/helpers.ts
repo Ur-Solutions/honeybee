@@ -5,7 +5,7 @@
  * The only agent ever spawned is the stub (v2/driver-hsr/test-agent).
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -283,7 +283,14 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
   const proc = spawn(process.execPath, [DAEMON_BIN, "--data-dir", dir], {
     // HIVE_NO_KEYCHAIN: the daemon under test never touches the developer's
     // real macOS Keychain (spec 08 keychain bridge is off unless injected).
-    env: { ...process.env, HIVE_V2_DATA_DIR: dir, HIVE_NO_KEYCHAIN: "1" },
+    env: {
+      ...process.env,
+      HIVE_V2_DATA_DIR: dir,
+      HIVE_NO_KEYCHAIN: "1",
+      // Successful test shutdown owns and reaps its disposable runtimes.
+      // Production never sets this; restart-survival semantics stay intact.
+      HIVE_TEST_REAP_RUNTIMES_ON_SHUTDOWN: "1",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let out = "";
@@ -305,6 +312,11 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
     stop: async () => {
       proc.kill("SIGTERM");
       await waitFor(() => proc.exitCode != null || proc.signalCode != null, "daemon stopped", 6000);
+      await waitFor(
+        () => liveRunnerHostPids(dir).length === 0,
+        `test daemon runner hosts reaped (${liveRunnerHostPids(dir).join(", ")})`,
+        4000,
+      );
     },
   };
   // Ready when the socket accepts a hello.
@@ -324,4 +336,34 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
     20,
   );
   return handle;
+}
+
+/** Test postcondition: a successful graceful stop leaves no detached host. */
+function liveRunnerHostPids(dir: string): number[] {
+  const runnersDir = join(dir, "runners");
+  let names: string[];
+  try {
+    names = readdirSync(runnersDir).filter((name) => name.endsWith(".status.json"));
+  } catch {
+    return [];
+  }
+  const pids: number[] = [];
+  for (const name of names) {
+    try {
+      const status = JSON.parse(readFileSync(join(runnersDir, name), "utf8")) as { hostPid?: unknown };
+      if (typeof status.hostPid === "number" && status.hostPid > 0 && pidAlive(status.hostPid)) pids.push(status.hostPid);
+    } catch {
+      // A status write racing shutdown is retried by waitFor.
+    }
+  }
+  return pids;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }

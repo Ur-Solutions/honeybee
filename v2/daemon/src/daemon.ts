@@ -4,7 +4,7 @@
  * time; serves every client through the RPC surface (rpc.ts / protocol.ts).
  *
  * Spec mapping:
- *  - behavior 1 (loops)            → DaemonCore.step() on a tickMs interval
+ *  - behavior 1 (loops)            → DaemonCore.step() on a yielding tick loop
  *  - behavior 2 (boot sequence)    → start(): open store (boot replay) →
  *    adoptSurvivors() (pid + start-time re-adoption from the STORE's recorded
  *    identities) → DaemonCore.boot() (snapshotLive → reconcileAtBoot → orphan
@@ -283,6 +283,22 @@ export function beeIdentityEnv(bee: { id: string; name: string; parentId: string
 }
 
 const OP_LOG_TAIL = 40;
+const MIN_TICK_YIELD_MS = 1;
+
+/**
+ * Preserve the configured cadence while guaranteeing one timers/poll turn
+ * after an overrun. A repeating interval can remain perpetually overdue when
+ * synchronous tick work exceeds tickMs, starving the RPC accept loop behind
+ * back-to-back callbacks.
+ */
+export function nextTickDelayMs(tickMs: number, elapsedMs: number): number {
+  return Math.max(MIN_TICK_YIELD_MS, tickMs - elapsedMs);
+}
+
+export interface ShutdownOptions {
+  /** Production default: detached runtimes survive for the successor daemon. */
+  preserveRuntimes?: boolean;
+}
 
 /** v7: injectable transports for in-process tests (the daemon binary uses the defaults). */
 export interface HiveDaemonDeps {
@@ -457,7 +473,7 @@ export class HiveDaemon {
       dispatch: (verb, params, conn) => this.dispatch(verb, params, conn),
     });
     await this.rpc.listen();
-    this.tickTimer = setInterval(() => this.tick(), this.cfg.tickMs);
+    this.scheduleTick(this.cfg.tickMs);
     // Loop-delay watch (2026-08-21): tick.slow attributes stalls inside the
     // tick; this catches the rest (sync RPC-handler work, keychain/tmux
     // shell-outs) — at most one log line per minute, when the loop stalled.
@@ -475,11 +491,11 @@ export class HiveDaemon {
     this.log(`daemon.started pid=${process.pid} store=${this.cfg.storePath}`);
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(options: ShutdownOptions = {}): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
     this.log(`daemon.stopping pid=${process.pid}`);
-    if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.tickTimer) clearTimeout(this.tickTimer);
     if (this.loopDelayTimer) clearInterval(this.loopDelayTimer);
     this.loopDelay?.disable();
     this.tickTimer = null;
@@ -488,12 +504,30 @@ export class HiveDaemon {
     await this.rpc?.close();
     this.store?.close();
     this.telemetry?.close();
-    // Children are NOT killed: detached runtimes survive daemon restarts by
-    // design and the next boot re-adopts them (contract §3.2). Their pipe
-    // handles must not pin our event loop, though — detach them so the
-    // process can actually exit.
-    this.driver?.detachAll();
+    if (options.preserveRuntimes === false) {
+      // Test/ephemeral ownership only. Production never selects this path:
+      // deploys must preserve runtimes for successor-daemon re-adoption.
+      this.driver?.disposeAll();
+    } else {
+      // Children are NOT killed: detached runtimes survive daemon restarts by
+      // design and the next boot re-adopts them (contract §3.2). Their pipe
+      // handles must not pin our event loop, though — detach them so the
+      // process can actually exit.
+      this.driver?.detachAll();
+    }
     this.log("daemon.stopped");
+  }
+
+  private scheduleTick(delayMs: number): void {
+    this.tickTimer = setTimeout(() => {
+      this.tickTimer = null;
+      if (this.stopping) return;
+      const startedAt = Date.now();
+      this.tick();
+      if (!this.stopping) {
+        this.scheduleTick(nextTickDelayMs(this.cfg.tickMs, Date.now() - startedAt));
+      }
+    }, delayMs);
   }
 
   private tick(): void {

@@ -35,11 +35,14 @@ export function resolveDaemonConfig(args: DaemonRunArgs): ResolvedNodeConfig {
 export async function runDaemon(argv: string[]): Promise<number> {
   const cfg = resolveDaemonConfig(parseDaemonRunArgs(argv));
   const daemon = new HiveDaemon(cfg);
+  // Test daemons deliberately own disposable stub runtimes. Production omits
+  // this test-only flag so deploy/restart continues to preserve live bees.
+  const reapTestRuntimes = process.env.HIVE_TEST_REAP_RUNTIMES_ON_SHUTDOWN === "1";
   await daemon.start();
   process.stdout.write(`hived v2 listening on ${cfg.socketPath} (store ${cfg.storePath})\n`);
   await new Promise<void>((resolve) => {
     const onSignal = (): void => {
-      void daemon.shutdown().then(resolve);
+      void daemon.shutdown({ preserveRuntimes: !reapTestRuntimes }).then(resolve);
     };
     process.once("SIGTERM", onSignal);
     process.once("SIGINT", onSignal);
