@@ -153,6 +153,8 @@ export interface LaunchdDeps {
   /** LaunchAgents directory (injected; default ~/Library/LaunchAgents at the call site). */
   agentsDir: string;
   uid: number;
+  sleep?: (ms: number) => Promise<void>;
+  stopSettleTimeoutMs?: number;
 }
 
 export class LaunchdServiceManager implements ServiceManager {
@@ -198,7 +200,22 @@ export class LaunchdServiceManager implements ServiceManager {
   }
 
   async stop(): Promise<void> {
-    await must(this.deps.exec, "launchctl", ["bootout", `${this.domainTarget}/${this.spec.label}`]);
+    const target = `${this.domainTarget}/${this.spec.label}`;
+    await must(this.deps.exec, "launchctl", ["bootout", target]);
+    // bootout may return after requesting termination but before launchd has
+    // actually removed the job. A deploy that bootstraps immediately can then
+    // kick the dying job and report success, only for the pending bootout to
+    // remove it moments later. Do not return until launchd confirms absence.
+    const deadline = Date.now() + (this.deps.stopSettleTimeoutMs ?? 5000);
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    for (;;) {
+      const status = await this.deps.exec("launchctl", ["print", target]);
+      if (status.code !== 0) return;
+      if (Date.now() >= deadline) {
+        throw new ServiceError(`launchctl bootout ${target} did not unload within the timeout`);
+      }
+      await sleep(25);
+    }
   }
 
   async status(): Promise<ServiceStatus> {

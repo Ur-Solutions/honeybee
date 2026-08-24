@@ -286,13 +286,13 @@ const OP_LOG_TAIL = 40;
 const MIN_TICK_YIELD_MS = 1;
 
 /**
- * Preserve the configured cadence while guaranteeing one timers/poll turn
- * after an overrun. A repeating interval can remain perpetually overdue when
- * synchronous tick work exceeds tickMs, starving the RPC accept loop behind
- * back-to-back callbacks.
+ * Delay from tick completion, not tick start. A repeating interval can remain
+ * perpetually overdue when synchronous tick work exceeds tickMs, starving the
+ * RPC accept loop behind back-to-back callbacks. A full completion-relative
+ * delay gives pending socket work a real poll window under sustained overload.
  */
-export function nextTickDelayMs(tickMs: number, elapsedMs: number): number {
-  return Math.max(MIN_TICK_YIELD_MS, tickMs - elapsedMs);
+export function nextTickDelayMs(tickMs: number): number {
+  return Math.max(MIN_TICK_YIELD_MS, tickMs);
 }
 
 export interface ShutdownOptions {
@@ -522,10 +522,9 @@ export class HiveDaemon {
     this.tickTimer = setTimeout(() => {
       this.tickTimer = null;
       if (this.stopping) return;
-      const startedAt = Date.now();
       this.tick();
       if (!this.stopping) {
-        this.scheduleTick(nextTickDelayMs(this.cfg.tickMs, Date.now() - startedAt));
+        this.scheduleTick(nextTickDelayMs(this.cfg.tickMs));
       }
     }, delayMs);
   }

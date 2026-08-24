@@ -115,6 +115,7 @@ test("service.3: launchd manager — install writes the plist; start/stop/status
       { code: 0, stdout: "", stderr: "" }, // start → bootstrap ok
       { code: 0, stdout: "state = running\n", stderr: "" }, // status → print
       { code: 0, stdout: "", stderr: "" }, // stop → bootout
+      { code: 3, stdout: "", stderr: "Could not find service" }, // stop → unloaded
     ]);
     const mgr = new LaunchdServiceManager(SPEC, { exec: rec.exec, agentsDir: dir, uid: 501 });
     await mgr.install();
@@ -130,6 +131,7 @@ test("service.3: launchd manager — install writes the plist; start/stop/status
 
     await mgr.stop();
     assert.deepEqual(rec.calls[2], { cmd: "launchctl", args: ["bootout", "gui/501/dev.honeybee.hive.v2.test"] });
+    assert.deepEqual(rec.calls[3], { cmd: "launchctl", args: ["print", "gui/501/dev.honeybee.hive.v2.test"] });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -148,6 +150,30 @@ test("service.4: launchd start falls back to kickstart when already bootstrapped
       rec.calls.map((c) => c.args[0]),
       ["bootstrap", "kickstart"],
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("service.4b: launchd stop waits through the asynchronous bootout window", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-svc-"));
+  try {
+    const rec = recordingExec([
+      { code: 0, stdout: "", stderr: "" }, // bootout accepted
+      { code: 0, stdout: "state = running\n", stderr: "" }, // still unloading
+      { code: 0, stdout: "state = exited\n", stderr: "" }, // still registered
+      { code: 3, stdout: "", stderr: "Could not find service" }, // gone
+    ]);
+    const sleeps: number[] = [];
+    const mgr = new LaunchdServiceManager(SPEC, {
+      exec: rec.exec,
+      agentsDir: dir,
+      uid: 501,
+      sleep: async (ms) => { sleeps.push(ms); },
+    });
+    await mgr.stop();
+    assert.deepEqual(rec.calls.map((call) => call.args[0]), ["bootout", "print", "print", "print"]);
+    assert.deepEqual(sleeps, [25, 25]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

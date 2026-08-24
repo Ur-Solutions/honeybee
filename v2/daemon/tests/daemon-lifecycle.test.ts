@@ -13,10 +13,10 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-test("tick scheduling preserves cadence when fast and yields after an overrun", () => {
-  assert.equal(nextTickDelayMs(200, 40), 160);
-  assert.equal(nextTickDelayMs(200, 200), 1);
-  assert.equal(nextTickDelayMs(200, 5000), 1);
+test("tick scheduling always leaves a completion-relative poll window", () => {
+  assert.equal(nextTickDelayMs(200), 200);
+  assert.equal(nextTickDelayMs(20), 20);
+  assert.equal(nextTickDelayMs(0), 1);
 });
 
 test("test daemon graceful shutdown reaps its detached runner-host group", async () => {
