@@ -127,3 +127,46 @@ test("claude projector: registered in the factory (no renderer fallback)", () =>
   }));
   assert.deepEqual(events.map((e) => e.kind), ["tool_call"]); // was unknown('rendered_tool')
 });
+
+test("claude projector: assistant message.usage becomes turn-scoped token_usage with providerTurnId", () => {
+  const p = createClaudeProjector();
+  // Interactive sessions write one line per content block, repeating the SAME
+  // message id + usage — every line projects usage; the shared providerTurnId
+  // is the consumer's dedupe key.
+  const first = p.pushLine(line({
+    type: "assistant",
+    uuid: "a-10",
+    message: {
+      id: "msg_01",
+      role: "assistant",
+      content: [{ type: "tool_use", id: "toolu_5", name: "Bash", input: {} }],
+      usage: { input_tokens: 4, output_tokens: 120, cache_read_input_tokens: 8000, cache_creation_input_tokens: 30 },
+    },
+  }));
+  assert.deepEqual(first.map((e) => e.kind), ["tool_call", "token_usage"]);
+  const usage = first[1] as Extract<typeof first[number], { kind: "token_usage" }>;
+  assert.equal(usage.scope, "turn");
+  assert.equal(usage.providerTurnId, "msg_01");
+  assert.deepEqual(usage.usage, { input: 4, output: 120, cacheRead: 8000, cacheWrite: 30 });
+
+  const second = p.pushLine(line({
+    type: "assistant",
+    uuid: "a-11",
+    message: {
+      id: "msg_01",
+      role: "assistant",
+      content: [{ type: "text", text: "Done." }],
+      usage: { input_tokens: 4, output_tokens: 120, cache_read_input_tokens: 8000, cache_creation_input_tokens: 30 },
+    },
+  }));
+  assert.deepEqual(second.map((e) => e.kind), ["message", "token_usage"]);
+  assert.equal((second[1] as Extract<typeof second[number], { kind: "token_usage" }>).providerTurnId, "msg_01");
+
+  // Usage-only lines (no projectable blocks) still surface the usage.
+  const bare = p.pushLine(line({
+    type: "assistant",
+    uuid: "a-12",
+    message: { id: "msg_02", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 2 } },
+  }));
+  assert.deepEqual(bare.map((e) => e.kind), ["token_usage"]);
+});

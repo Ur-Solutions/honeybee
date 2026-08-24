@@ -21,9 +21,14 @@ type JsonObject = Record<string, unknown>;
  * Line shapes (HSR stream-json, both directions in one log):
  *  - user     {message.content: string | blocks} — plain text is the operator
  *    prompt (turn boundary); tool_result blocks are tool completions.
- *  - assistant {message.content: blocks} — text / thinking / tool_use.
+ *  - assistant {message.content: blocks} — text / thinking / tool_use. Each
+ *    line repeats the API response's `message.usage`; interactive sessions
+ *    never write a `result` row, so this is the only usage source there. One
+ *    API message spans several assistant lines (one per block) with the SAME
+ *    `message.id` and identical usage — the projection carries that id as
+ *    `providerTurnId` so consumers deduplicate instead of over-counting.
  *  - result   {subtype, usage, stop_reason, duration_ms} — the turn boundary
- *    close, with turn-scoped usage.
+ *    close, with turn-scoped usage (`claude -p` runs only).
  *  - system init carries the session id; every other system subtype plus
  *    rate_limit_event / tool_progress is protocol noise, projected to []
  *    exactly like codex deltas (noise is not "unknown" — unknown is reserved
@@ -188,6 +193,19 @@ export function createClaudeProjector(): TranscriptProjector {
       if (type === "assistant") {
         const message = asObject(row.message);
         const content = message?.content;
+        // Assistant lines repeat the API response usage; providerTurnId is
+        // the API message id shared by every line of that message (dedupe key).
+        const usage = usageFrom(message?.usage);
+        const messageId = nonEmptyString(message?.id);
+        const usageEvents: TranscriptProjectedEvent[] = usage
+          ? [{
+              kind: "token_usage",
+              ts: NO_TS,
+              usage,
+              scope: "turn",
+              ...(messageId ? { providerTurnId: messageId } : {}),
+            }]
+          : [];
         // String-content assistant messages are legitimate API shape.
         if (typeof content === "string") {
           const text = nonEmptyString(content);
@@ -198,10 +216,10 @@ export function createClaudeProjector(): TranscriptProjector {
                 role: "assistant",
                 text,
                 ...(providerEventId ? { providerEventId } : {}),
-              }]
-            : [];
+              }, ...usageEvents]
+            : usageEvents;
         }
-        if (!Array.isArray(content)) return [];
+        if (!Array.isArray(content)) return usageEvents;
         const events: TranscriptProjectedEvent[] = [];
         for (const value of content) {
           const block = asObject(value);
@@ -248,6 +266,7 @@ export function createClaudeProjector(): TranscriptProjector {
               break; // image/document blocks etc: no pane row yet
           }
         }
+        events.push(...usageEvents);
         return events;
       }
 
