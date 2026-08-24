@@ -46,8 +46,10 @@
 import {
   CoreError,
   RUNTIME_TRANSITIONS,
+  type BeeViewRow,
   type CommandRow,
   type CoreStore,
+  type MessageRow,
   type RuntimeState,
 } from "../../core/src/index.ts";
 import { deliveryText, isPeerSender } from "./envelope.ts";
@@ -169,6 +171,11 @@ export interface DaemonCoreOptions {
 
 const LIVE: readonly RuntimeState[] = ["booting", "running", "idle"];
 
+interface StepSnapshot {
+  rows: BeeViewRow[];
+  pendingByBee: Map<string, MessageRow[]>;
+}
+
 export class DaemonCore {
   protected readonly store: CoreStore;
   protected readonly driver: RuntimeDriver;
@@ -239,13 +246,33 @@ export class DaemonCore {
     this.drainObservations();
     this.applyEvidence();
     this.applySessionIds();
-    this.bootHangPolicy();
-    this.scaleToZeroPolicy();
-    this.degradedMailPolicy();
+    const policySnapshot = this.stepSnapshot();
+    this.bootHangPolicy(policySnapshot.rows);
+    this.scaleToZeroPolicy(policySnapshot.rows, policySnapshot.pendingByBee);
+    this.degradedMailPolicy(policySnapshot.rows, policySnapshot.pendingByBee);
     this.executeCommands();
-    this.deliveryLoop();
+    const deliverySnapshot = this.stepSnapshot();
+    this.deliveryLoop(deliverySnapshot.rows, deliverySnapshot.pendingByBee);
     this.taskSupplyLoop();
-    this.i1Telemetry();
+    if (this.policy.i1DeadlineSteps != null && this.onI1Violation != null) {
+      const telemetrySnapshot = this.stepSnapshot();
+      this.i1Telemetry(telemetrySnapshot.rows, telemetrySnapshot.pendingByBee);
+    }
+  }
+
+  /**
+   * One bounded read-model snapshot replaces the old per-policy N+1 store
+   * walks. Rows are refreshed across command/delivery boundaries where the
+   * step itself may have changed runtime or mailbox truth.
+   */
+  private stepSnapshot(): StepSnapshot {
+    const pendingByBee = new Map<string, MessageRow[]>();
+    for (const message of this.store.listUndeliveredMessages()) {
+      const pending = pendingByBee.get(message.beeId);
+      if (pending) pending.push(message);
+      else pendingByBee.set(message.beeId, [message]);
+    }
+    return { rows: this.store.listBeeViewRows(), pendingByBee };
   }
 
   /**
@@ -498,10 +525,9 @@ export class DaemonCore {
       );
   }
 
-  private bootHangPolicy(): void {
+  private bootHangPolicy(rows: BeeViewRow[]): void {
     const now = this.now();
-    for (const bee of this.store.listBees()) {
-      const rt = this.store.currentRuntime(bee.id);
+    for (const { bee, runtime: rt } of rows) {
       if (!rt || rt.state !== "booting") continue;
       if (now - rt.startedAt <= this.policy.bootHangTimeoutSteps) continue;
       if (this.pendingStopExists(bee.id, rt.generation)) continue;
@@ -514,17 +540,16 @@ export class DaemonCore {
   // scale-to-zero — idle → stop(stopped_by_system) after the idle window
   // -------------------------------------------------------------------------
 
-  private scaleToZeroPolicy(): void {
+  private scaleToZeroPolicy(rows: BeeViewRow[], pendingByBee: Map<string, MessageRow[]>): void {
     const window = this.policy.idleWindowSteps;
     if (window == null) return;
     const now = this.now();
-    for (const bee of this.store.listBees()) {
-      const rt = this.store.currentRuntime(bee.id);
+    for (const { bee, runtime: rt } of rows) {
       if (!rt || rt.state !== "idle") continue;
       if (now - rt.updatedAt <= window) continue;
       // Pending mail means the delivery loop is about to use this runtime —
       // stopping it now would only bounce through revive-on-message.
-      if (this.store.undeliveredMessages(bee.id).length > 0) continue;
+      if ((pendingByBee.get(bee.id)?.length ?? 0) > 0) continue;
       if (this.pendingStopExists(bee.id, rt.generation)) continue;
       this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "idle_window" });
       this.log(`policy.idle_stop bee=${bee.id} gen=${rt.generation} idleFor=${now - rt.updatedAt}`);
@@ -535,13 +560,12 @@ export class DaemonCore {
   // degraded-runtime policy — re-adopted processes cannot accept deliveries
   // -------------------------------------------------------------------------
 
-  private degradedMailPolicy(): void {
+  private degradedMailPolicy(rows: BeeViewRow[], pendingByBee: Map<string, MessageRow[]>): void {
     if (typeof this.ext.isDegraded !== "function") return;
-    for (const bee of this.store.listBees()) {
-      const rt = this.store.currentRuntime(bee.id);
+    for (const { bee, runtime: rt } of rows) {
       if (!rt || !LIVE.includes(rt.state)) continue;
       if (!this.ext.isDegraded(bee.id, rt.generation)) continue;
-      if (this.store.undeliveredMessages(bee.id).length === 0) continue;
+      if ((pendingByBee.get(bee.id)?.length ?? 0) === 0) continue;
       if (this.pendingStopExists(bee.id, rt.generation)) continue;
       this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "degraded_runtime" });
       this.log(`policy.degraded_stop bee=${bee.id} gen=${rt.generation}`);
@@ -729,11 +753,10 @@ export class DaemonCore {
    * message waiting out a turn does not block a later `next`/`now` message
    * from delivering at the next accept point.
    */
-  private deliveryLoop(): void {
-    for (const bee of this.store.listBees()) {
-      const rt = this.store.currentRuntime(bee.id);
+  private deliveryLoop(rows: BeeViewRow[], pendingByBee: Map<string, MessageRow[]>): void {
+    for (const { bee, runtime: rt } of rows) {
       if (!rt || rt.state === "stopped" || rt.state === "booting") continue;
-      const pending = this.store.undeliveredMessages(bee.id);
+      const pending = pendingByBee.get(bee.id) ?? [];
       if (pending.length === 0) continue;
       // `running` on nothing but a SYNTHETIC boot is provisional (v9): the
       // driver's accept point is open and no real turn exists to disturb, so
@@ -790,15 +813,13 @@ export class DaemonCore {
    * aware deadlines, and a suspended clock while a closed-list flag is active
    * (a visibly blocked bee is at an external boundary — I3/I6 territory).
    */
-  private i1Telemetry(): void {
-    const bound = this.policy.i1DeadlineSteps;
-    const record = this.onI1Violation;
-    if (bound == null || record == null) return;
+  private i1Telemetry(rows: BeeViewRow[], pendingByBee: Map<string, MessageRow[]>): void {
+    const bound = this.policy.i1DeadlineSteps as number;
+    const record = this.onI1Violation as (violation: I1ViolationEvent) => void;
     const now = this.now();
-    for (const bee of this.store.listBees()) {
-      if (this.store.activeFlags(bee.id).length > 0) continue;
-      const rt = this.store.currentRuntime(bee.id);
-      const pending = this.store.undeliveredMessages(bee.id);
+    for (const { bee, runtime: rt, view } of rows) {
+      if (view.flags.length > 0) continue;
+      const pending = pendingByBee.get(bee.id) ?? [];
       pending.forEach((m, pos) => {
         // v8 (Q2 amendment): an `idle` message's deadline clock starts when it
         // becomes ELIGIBLE (the runtime not `running`), not at enqueue — a

@@ -75,6 +75,35 @@ function spawnIdleBee(rig: Rig, id = "bee-1"): void {
   assert.equal(rig.store.currentRuntime(id)?.state, "idle");
 }
 
+test("unit.0: an idle tick uses bounded batch reads, independent of bee count", () => {
+  const rig = makeRig();
+  try {
+    for (let i = 0; i < 50; i++) {
+      const id = `batch-${i}`;
+      rig.store.createBee({ id, name: id, agent: "stub", substrate: "hsr", cwd: "/tmp" });
+    }
+
+    let viewReads = 0;
+    let mailboxReads = 0;
+    const listBeeViewRows = rig.store.listBeeViewRows.bind(rig.store);
+    const listUndeliveredMessages = rig.store.listUndeliveredMessages.bind(rig.store);
+    rig.store.listBeeViewRows = () => {
+      viewReads++;
+      return listBeeViewRows();
+    };
+    rig.store.listUndeliveredMessages = () => {
+      mailboxReads++;
+      return listUndeliveredMessages();
+    };
+
+    rig.core.step();
+    assert.equal(viewReads, 2, "policy and delivery each take one bee snapshot");
+    assert.equal(mailboxReads, 2, "policy and delivery each take one mailbox snapshot");
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("unit.1: scale-to-zero — idle past the window stops with stopped_by_system; send revives (Q4 + Q3)", () => {
   const rig = makeRig({ idleWindowSteps: 100 });
   try {

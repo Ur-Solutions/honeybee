@@ -129,6 +129,25 @@ test("mailbox is per-bee FIFO; priority column is reserved and unused in orderin
   store.close();
 });
 
+test("batch undelivered read preserves per-bee FIFO and excludes delivered rows", (t) => {
+  const h = harness();
+  t.after(() => h.cleanup());
+  const store = h.open();
+  const { bee: first } = makeBee(store, "first");
+  const { bee: second } = makeBee(store, "second");
+  bootToRunning(store, first.id, 11, 11);
+  bootToRunning(store, second.id, 12, 12);
+  const delivered = store.send(first.id, "first-delivered").message;
+  store.send(first.id, "first-pending");
+  store.send(second.id, "second-pending");
+  store.markDelivered(delivered.id, 1);
+  assert.deepEqual(
+    store.listUndeliveredMessages().map((message) => [message.beeId, message.body]),
+    [[first.id, "first-pending"], [second.id, "second-pending"]].sort(([a], [b]) => a.localeCompare(b)),
+  );
+  store.close();
+});
+
 test("delivery marks are fenced: stale generation and non-live generation are recorded no-ops", (t) => {
   const h = harness();
   t.after(() => h.cleanup());

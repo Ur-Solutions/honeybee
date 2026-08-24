@@ -1786,6 +1786,14 @@ export class CoreStore {
     return rows.map(mapMessage);
   }
 
+  /** All undelivered mail in per-bee FIFO order (daemon tick batch read). */
+  listUndeliveredMessages(): MessageRow[] {
+    const rows = this.stmt(
+      "SELECT * FROM mailbox WHERE delivered_at IS NULL ORDER BY bee_id, id",
+    ).all() as Row[];
+    return rows.map(mapMessage);
+  }
+
   /** All messages for a bee, delivered or not, per-bee FIFO order. */
   listMessages(beeId: string): MessageRow[] {
     const rows = this.db
