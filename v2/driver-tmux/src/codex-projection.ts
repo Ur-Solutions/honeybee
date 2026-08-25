@@ -176,31 +176,40 @@ function withThreadId(events: TranscriptProjectedEvent[], threadId: string | und
 
 function tokenUsageFrom(source: JsonObject | null | undefined): TranscriptTokenUsage | undefined {
   if (!source) return undefined;
-  const raw = asObject(source.usage)
+  const container = asObject(source.usage)
     ?? asObject(source.tokenUsage)
     ?? asObject(source.tokens)
     ?? asObject(source.total_token_usage)
     ?? asObject(source.last_token_usage)
     ?? source;
+  // The app-server `thread/tokenUsage/updated` shape nests the thread total
+  // under `total` (with `last` = the latest turn); the rollout shape is flat.
+  const raw = asObject(container.total) ?? container;
+  const inputInclusive = finiteNumber(raw.input ?? raw.input_tokens ?? raw.inputTokens);
+  const cacheRead = finiteNumber(
+    raw.cacheRead ?? raw.cached_input_tokens ?? raw.cachedInputTokens ?? raw.cache_read,
+  );
+  // OpenAI counts cached reads INSIDE input_tokens; the projection's `input`
+  // is uncached input everywhere, so subtract.
+  const input =
+    inputInclusive !== undefined && cacheRead !== undefined
+      ? Math.max(0, inputInclusive - cacheRead)
+      : inputInclusive;
+  const output = finiteNumber(raw.output ?? raw.output_tokens ?? raw.outputTokens);
+  const cacheWrite = finiteNumber(raw.cacheWrite ?? raw.cache_write ?? raw.cacheWriteInputTokens);
+  const reasoning = finiteNumber(
+    raw.reasoning ?? raw.reasoning_output_tokens ?? raw.reasoningOutputTokens,
+  );
+  const total = finiteNumber(
+    typeof raw.total === "number" ? raw.total : raw.total_tokens ?? raw.totalTokens,
+  );
   const usage: TranscriptTokenUsage = {
-    ...(finiteNumber(raw.input ?? raw.input_tokens) !== undefined
-      ? { input: finiteNumber(raw.input ?? raw.input_tokens) }
-      : {}),
-    ...(finiteNumber(raw.output ?? raw.output_tokens) !== undefined
-      ? { output: finiteNumber(raw.output ?? raw.output_tokens) }
-      : {}),
-    ...(finiteNumber(raw.cacheRead ?? raw.cached_input_tokens ?? raw.cache_read) !== undefined
-      ? { cacheRead: finiteNumber(raw.cacheRead ?? raw.cached_input_tokens ?? raw.cache_read) }
-      : {}),
-    ...(finiteNumber(raw.cacheWrite ?? raw.cache_write) !== undefined
-      ? { cacheWrite: finiteNumber(raw.cacheWrite ?? raw.cache_write) }
-      : {}),
-    ...(finiteNumber(raw.reasoning ?? raw.reasoning_output_tokens) !== undefined
-      ? { reasoning: finiteNumber(raw.reasoning ?? raw.reasoning_output_tokens) }
-      : {}),
-    ...(finiteNumber(raw.total ?? raw.total_tokens) !== undefined
-      ? { total: finiteNumber(raw.total ?? raw.total_tokens) }
-      : {}),
+    ...(input !== undefined ? { input } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(total !== undefined ? { total } : {}),
   };
   return Object.keys(usage).length > 0 ? usage : undefined;
 }
@@ -364,6 +373,8 @@ function forkSnapshotEvents(result: JsonObject): TranscriptProjectedEvent[] {
  */
 export function createCodexProjector(): TranscriptProjector {
   const startedItems = new Map<string, JsonObject>();
+  /** Model named on the client's thread/start or turn/start — usage attribution. */
+  let currentModel: string | undefined;
   const rolloutMessages = new Set<string>();
   const forkRequestIds = new Set<string>();
   let rolloutTurnOpen = false;
@@ -467,6 +478,9 @@ export function createCodexProjector(): TranscriptProjector {
       }
       if (method === "thread/fork" && requestId) forkRequestIds.add(requestId);
       const params = asObject(row.params) ?? {};
+      if ((method === "thread/start" || method === "turn/start") && nonEmptyString(params.model)) {
+        currentModel = nonEmptyString(params.model);
+      }
       switch (method) {
         // Client request: no native turn id exists yet. Only turn/started is
         // the app-server's explicit turn boundary.
@@ -509,6 +523,7 @@ export function createCodexProjector(): TranscriptProjector {
               scope: "turn",
               ...(turnId ? { providerTurnId: turnId } : {}),
               ...(threadId ? { threadId } : {}),
+              ...(currentModel ? { model: currentModel } : {}),
             });
           }
           return events;
@@ -573,6 +588,7 @@ export function createCodexProjector(): TranscriptProjector {
             usage,
             scope: nonEmptyString(params.scope) ?? "cumulative",
             ...(threadId ? { threadId } : {}),
+            ...(currentModel ? { model: currentModel } : {}),
           }];
         }
         default:

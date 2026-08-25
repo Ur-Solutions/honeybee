@@ -170,3 +170,25 @@ test("claude projector: assistant message.usage becomes turn-scoped token_usage 
   }));
   assert.deepEqual(bare.map((e) => e.kind), ["token_usage"]);
 });
+
+test("claude projector: usage carries the billed model; result rows carry the harness cost + dominant model", () => {
+  const p = createClaudeProjector();
+  const assistant = p.pushLine(line({
+    type: "assistant",
+    message: { id: "msg_7", model: "claude-fable-5", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 2 } },
+  }));
+  assert.equal((assistant[0] as Extract<typeof assistant[number], { kind: "token_usage" }>).model, "claude-fable-5");
+  const result = p.pushLine(line({
+    type: "result", subtype: "success", stop_reason: "end_turn", duration_ms: 10, total_cost_usd: 6.25,
+    usage: { input_tokens: 1256, output_tokens: 31152, cache_read_input_tokens: 2651307, cache_creation_input_tokens: 101819 },
+    modelUsage: {
+      "claude-haiku-4-5-20251001": { costUSD: 0.0014, canonicalModel: "claude-haiku-4-5" },
+      "claude-fable-5": { costUSD: 6.2486, canonicalModel: "claude-fable-5" },
+    },
+  }));
+  const usage = result[0] as Extract<typeof result[number], { kind: "token_usage" }>;
+  assert.equal(usage.kind, "token_usage");
+  assert.equal(usage.costUsd, 6.25);
+  assert.equal(usage.model, "claude-fable-5");
+  assert.equal(usage.providerTurnId, undefined);
+});

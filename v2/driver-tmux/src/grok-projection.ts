@@ -2,6 +2,7 @@ import type {
   TranscriptIsoTs,
   TranscriptProjectedEvent,
   TranscriptProjector,
+  TranscriptTokenUsage,
 } from "./transcript-projection.ts";
 
 type JsonObject = Record<string, unknown>;
@@ -198,6 +199,46 @@ export function isGrokCompactionSummary(text: string): boolean {
   return normalized.startsWith(`${GROK_COMPACTION_SUMMARY_PREFIX}\n\nSummary:`);
 }
 
+/**
+ * ACP turn_completed usage (camelCase). xAI counts cached reads inside
+ * inputTokens (totalTokens = inputTokens + outputTokens); the projection's
+ * `input` is uncached input, so subtract.
+ */
+function turnUsageFrom(usage: JsonObject | null): TranscriptTokenUsage | undefined {
+  if (!usage) return undefined;
+  const inputInclusive = finiteNumberField(usage, "inputTokens", "input_tokens");
+  const cacheRead = finiteNumberField(usage, "cachedReadTokens", "cache_read_input_tokens");
+  const input =
+    inputInclusive !== undefined && cacheRead !== undefined
+      ? Math.max(0, inputInclusive - cacheRead)
+      : inputInclusive;
+  const output = finiteNumberField(usage, "outputTokens", "output_tokens");
+  const cacheWrite = finiteNumberField(usage, "cacheCreationTokens", "cache_creation_input_tokens");
+  const reasoning = finiteNumberField(usage, "reasoningTokens", "reasoning_tokens");
+  const total = finiteNumberField(usage, "totalTokens", "total_tokens");
+  const out: TranscriptTokenUsage = {
+    ...(input !== undefined ? { input } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
+    ...(total !== undefined ? { total } : {}),
+  };
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** The `modelUsage` entry with the most tokens — the model the turn billed against. */
+function dominantModel(modelUsage: JsonObject | null): string | undefined {
+  if (!modelUsage) return undefined;
+  let best: { model: string; tokens: number } | undefined;
+  for (const [model, value] of Object.entries(modelUsage)) {
+    const entry = asObject(value);
+    const tokens = (entry ? finiteNumberField(entry, "totalTokens", "total_tokens") : undefined) ?? 0;
+    if (!best || tokens > best.tokens) best = { model, tokens };
+  }
+  return best?.model;
+}
+
 function finiteNumberField(value: JsonObject, ...keys: string[]): number | undefined {
   for (const key of keys) {
     const candidate = value[key];
@@ -366,6 +407,21 @@ export function createGrokProjector(): TranscriptProjector {
     if (kind && TURN_END_UPDATE_KINDS.has(kind)) {
       pendingPromptMirror = undefined;
       const events = flushOpenChunk();
+      // turn_completed carries the turn's billed usage (the per-call
+      // response_completed rows are its components and are not projected).
+      const usage = turnUsageFrom(asObject(update.usage));
+      if (usage) {
+        const promptId = stringField(update, "prompt_id", "promptId");
+        const model = dominantModel(asObject(asObject(update.usage)?.modelUsage));
+        events.push({
+          kind: "token_usage",
+          ts,
+          usage: usage,
+          scope: "turn",
+          ...(promptId ? { providerTurnId: promptId } : {}),
+          ...(model ? { model } : {}),
+        });
+      }
       events.push({ kind: "turn_end", ts });
       return events;
     }

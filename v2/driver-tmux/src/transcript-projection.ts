@@ -80,9 +80,15 @@ export type TranscriptProjectedEvent =
   | (Base & { kind: "web_search"; itemId?: string; providerEventId?: string; query?: string })
   | (Base & {
       kind: "token_usage";
+      /** `input` is UNCACHED input everywhere (OpenAI/xAI-shaped counts, which
+       * fold cached reads into input, are normalized by their projectors). */
       usage: TranscriptTokenUsage;
       scope?: string;
       providerTurnId?: string;
+      /** Provider model id the usage was billed against, when the log says. */
+      model?: string;
+      /** Provider-reported USD for this usage (claude `result` rows), when present. */
+      costUsd?: number;
     })
   | (Base & { kind: "compaction"; trigger?: string; tokensBefore?: number; tokensAfter?: number })
   | (Base & { kind: "unknown"; nativeType: string; detail?: string });

@@ -327,3 +327,30 @@ test("grok projector: project-then-flatten preserves the full last assistant tex
     "I'll start by loading the Apiary architecture contract and calling live",
   );
 });
+
+test("grok projector: turn_completed usage is projected turn-scoped with uncached input, prompt id, and model", () => {
+  const p = createGrokProjector();
+  const events = p.pushLine(JSON.stringify({
+    jsonrpc: "2.0",
+    method: "_x.ai/session_notification",
+    params: {
+      sessionId: "s-1",
+      update: {
+        sessionUpdate: "turn_completed",
+        prompt_id: "prompt-9",
+        stop_reason: "end_turn",
+        usage: {
+          inputTokens: 250645, outputTokens: 2196, totalTokens: 252841, cachedReadTokens: 227456,
+          cacheCreationTokens: 0, reasoningTokens: 1786, modelCalls: 9,
+          modelUsage: { "grok-4.6-build": { totalTokens: 252841 } },
+        },
+      },
+    },
+  }));
+  assert.deepEqual(events.map((e) => e.kind), ["token_usage", "turn_end"]);
+  const usage = events[0] as Extract<typeof events[number], { kind: "token_usage" }>;
+  assert.equal(usage.scope, "turn");
+  assert.equal(usage.providerTurnId, "prompt-9");
+  assert.equal(usage.model, "grok-4.6-build");
+  assert.deepEqual(usage.usage, { input: 23189, output: 2196, cacheRead: 227456, cacheWrite: 0, reasoning: 1786, total: 252841 });
+});

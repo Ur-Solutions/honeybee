@@ -315,3 +315,25 @@ test("codex projector: native rollout messages and tools remain projected withou
   assert.ok(events.some((event) => event.kind === "tool_result" && event.callId === "tool-1"));
   assert.equal(events.filter((event) => event.kind === "turn_end").length, 1);
 });
+
+test("codex projector: app-server tokenUsage.total becomes cumulative usage with uncached input and the thread model", () => {
+  const p = createCodexProjector();
+  assert.deepEqual(p.pushLine(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "thread/start", params: { model: "gpt-5.6-luna", cwd: "/w" } })), []);
+  const events = p.pushLine(JSON.stringify({
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: "t-1",
+      turnId: "turn-1",
+      tokenUsage: {
+        total: { totalTokens: 17894, inputTokens: 17699, cachedInputTokens: 1000, cacheWriteInputTokens: 0, outputTokens: 195, reasoningOutputTokens: 24 },
+        last: { totalTokens: 100, inputTokens: 90, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 10, reasoningOutputTokens: 0 },
+      },
+    },
+  }));
+  assert.equal(events.length, 1);
+  const usage = events[0] as Extract<typeof events[number], { kind: "token_usage" }>;
+  assert.equal(usage.scope, "cumulative");
+  assert.equal(usage.threadId, "t-1");
+  assert.equal(usage.model, "gpt-5.6-luna");
+  assert.deepEqual(usage.usage, { input: 16699, output: 195, cacheRead: 1000, cacheWrite: 0, reasoning: 24, total: 17894 });
+});

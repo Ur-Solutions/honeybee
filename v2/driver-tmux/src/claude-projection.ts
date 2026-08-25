@@ -128,6 +128,19 @@ function usageFrom(raw: unknown): TranscriptTokenUsage | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
+/** The `modelUsage` entry that cost the most (haiku side-calls ride along). */
+function dominantModel(modelUsage: JsonObject | null): string | undefined {
+  if (!modelUsage) return undefined;
+  let best: { model: string; cost: number } | undefined;
+  for (const [key, value] of Object.entries(modelUsage)) {
+    const entry = asObject(value);
+    const cost = typeof entry?.costUSD === "number" && Number.isFinite(entry.costUSD) ? entry.costUSD : 0;
+    const model = nonEmptyString(entry?.canonicalModel) ?? key;
+    if (!best || cost > best.cost) best = { model, cost };
+  }
+  return best?.model;
+}
+
 export function createClaudeProjector(): TranscriptProjector {
   return {
     harness: "claude",
@@ -197,6 +210,7 @@ export function createClaudeProjector(): TranscriptProjector {
         // the API message id shared by every line of that message (dedupe key).
         const usage = usageFrom(message?.usage);
         const messageId = nonEmptyString(message?.id);
+        const model = nonEmptyString(message?.model);
         const usageEvents: TranscriptProjectedEvent[] = usage
           ? [{
               kind: "token_usage",
@@ -204,6 +218,7 @@ export function createClaudeProjector(): TranscriptProjector {
               usage,
               scope: "turn",
               ...(messageId ? { providerTurnId: messageId } : {}),
+              ...(model ? { model } : {}),
             }]
           : [];
         // String-content assistant messages are legitimate API shape.
@@ -274,11 +289,21 @@ export function createClaudeProjector(): TranscriptProjector {
         const events: TranscriptProjectedEvent[] = [];
         const usage = usageFrom(row.usage);
         if (usage) {
+          // The turn total (sum of the assistant lines above it) plus the
+          // harness's own dollar figure and dominant billed model — a
+          // consumer holding the per-message rows treats this as superseding.
+          const costUsd =
+            typeof row.total_cost_usd === "number" && Number.isFinite(row.total_cost_usd)
+              ? row.total_cost_usd
+              : undefined;
+          const model = dominantModel(asObject(row.modelUsage));
           events.push({
             kind: "token_usage",
             ts: NO_TS,
             usage,
             scope: "turn",
+            ...(model ? { model } : {}),
+            ...(costUsd !== undefined ? { costUsd } : {}),
           });
         }
         const durationMs =
