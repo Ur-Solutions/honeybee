@@ -107,7 +107,7 @@ test("handles.4: v9-shaped store backfills on open — an old pretty id becomes 
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 14);
+      assert.equal(SCHEMA_VERSION, 15);
       const idx = check.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='bees_handle'").get();
       assert.ok(idx, "unique handle index exists");
     } finally {
