@@ -93,8 +93,14 @@
  *        direct-API token counts, the price rates used at request time,
  *        estimated cost, latency, and provider request ids. It is operational
  *        telemetry (like rpc_idempotency), not replayable Hive state.
+ *  v15 — crash-safe runner observation recovery: adds
+ *        `runtime_observation_cursors`, one generation-fenced applied byte
+ *        cursor into the runner host's output-only observation journal. The
+ *        daemon advances it only after every normalized effect through that
+ *        cursor has committed; restart replay is therefore deterministic and
+ *        at-least-once without crossing runtime generations.
  */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -176,6 +182,19 @@ CREATE TABLE IF NOT EXISTS runtimes (
   updated_at     INTEGER NOT NULL,
   PRIMARY KEY (bee_id, generation),
   CHECK ((state = 'stopped') = (exit_cause IS NOT NULL))
+) STRICT;
+
+-- v15: applied cursor into one runner-owned, output-only journal per runtime
+-- generation. This is recovery metadata, not a competing lifecycle state.
+-- Absence means recovery evidence is unavailable; callers fail closed rather
+-- than guessing from transcript history, silence, or elapsed time.
+CREATE TABLE IF NOT EXISTS runtime_observation_cursors (
+  bee_id     TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  cursor      INTEGER NOT NULL CHECK (cursor >= 0),
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY (bee_id, generation),
+  FOREIGN KEY (bee_id, generation) REFERENCES runtimes(bee_id, generation) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS flags (

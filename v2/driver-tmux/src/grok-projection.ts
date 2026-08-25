@@ -204,7 +204,7 @@ export function isGrokCompactionSummary(text: string): boolean {
  * inputTokens (totalTokens = inputTokens + outputTokens); the projection's
  * `input` is uncached input, so subtract.
  */
-function turnUsageFrom(usage: JsonObject | null): TranscriptTokenUsage | undefined {
+function turnUsageFrom(usage: JsonObject | undefined): TranscriptTokenUsage | undefined {
   if (!usage) return undefined;
   const inputInclusive = finiteNumberField(usage, "inputTokens", "input_tokens");
   const cacheRead = finiteNumberField(usage, "cachedReadTokens", "cache_read_input_tokens");
@@ -228,7 +228,7 @@ function turnUsageFrom(usage: JsonObject | null): TranscriptTokenUsage | undefin
 }
 
 /** The `modelUsage` entry with the most tokens — the model the turn billed against. */
-function dominantModel(modelUsage: JsonObject | null): string | undefined {
+function dominantModel(modelUsage: JsonObject | undefined): string | undefined {
   if (!modelUsage) return undefined;
   let best: { model: string; tokens: number } | undefined;
   for (const [model, value] of Object.entries(modelUsage)) {

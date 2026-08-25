@@ -1275,7 +1275,15 @@ export class CoreStore {
     beeId: string,
     generation: number,
     state: RuntimeState,
-    opts: { exitCause?: ExitCause; exitDetail?: string; pid?: number; pidStartedAt?: number; synthetic?: boolean } = {},
+    opts: {
+      exitCause?: ExitCause;
+      exitDetail?: string;
+      pid?: number;
+      pidStartedAt?: number;
+      synthetic?: boolean;
+      /** Turn-end projection: phase + last-output fact commit together. */
+      recordOutput?: boolean;
+    } = {},
   ): { applied: boolean } {
     if (!RUNTIME_TRANSITIONS[state]) {
       throw new IllegalTransitionError(`unknown runtime state: ${state}`);
@@ -1309,6 +1317,9 @@ export class CoreStore {
           `runtime ${beeId}#${generation}: exit_cause is only valid on stopped`,
         );
       }
+      if (opts.recordOutput === true && state !== "idle") {
+        throw new IllegalTransitionError("recordOutput is only valid on a transition to idle");
+      }
       if (opts.pid !== undefined && opts.pidStartedAt === undefined) {
         throw new CoreError("pid updates require pidStartedAt (boot re-adoption needs both)");
       }
@@ -1329,6 +1340,7 @@ export class CoreStore {
         .run(state, opts.exitCause ?? null, pid, pidStartedAt, bootEvidence, at, beeId, generation);
       const runtime = this.currentRuntime(beeId);
       this.audit("runtime.updated", beeId, { runtime });
+      if (opts.recordOutput === true) this.applyRecordOutput(beeId, at);
       // Spawn-failure budget (contract §4.2 spawn_failed, B5 bounded): a
       // runtime that dies on its own having proven NOTHING — still booting,
       // or running only on a synthetic booted (the 2026-08-18 soak loop) —
@@ -1512,7 +1524,7 @@ export class CoreStore {
   recordRuntimeProc(
     beeId: string,
     generation: number,
-    proc: { pid: number; pidStartedAt: number },
+    proc: { pid: number; pidStartedAt: number; observationCursor?: number },
   ): { applied: boolean } {
     return this.tx(() => {
       this.mustGetBee(beeId);
@@ -1526,11 +1538,75 @@ export class CoreStore {
         });
         return { applied: false };
       }
+      if (
+        proc.observationCursor !== undefined
+        && (!Number.isSafeInteger(proc.observationCursor) || proc.observationCursor < 0)
+      ) {
+        throw new CoreError("runtime observation cursor must be a non-negative safe integer");
+      }
       this.db
         .prepare("UPDATE runtimes SET pid = ?, pid_started_at = ? WHERE bee_id = ? AND generation = ?")
         .run(proc.pid, proc.pidStartedAt, beeId, generation);
+      if (proc.observationCursor !== undefined) {
+        this.db
+          .prepare(
+            `INSERT INTO runtime_observation_cursors(bee_id, generation, cursor, updated_at)
+             VALUES(?, ?, ?, ?)
+             ON CONFLICT(bee_id, generation) DO UPDATE SET
+               cursor = MAX(runtime_observation_cursors.cursor, excluded.cursor),
+               updated_at = excluded.updated_at`,
+          )
+          .run(beeId, generation, proc.observationCursor, this.now());
+      }
       const runtime = this.currentRuntime(beeId);
       this.audit("runtime.updated", beeId, { runtime });
+      return { applied: true };
+    });
+  }
+
+  /**
+   * v15 — the last runner-journal byte durably folded for exactly one runtime
+   * generation. Null is an explicit lack of recovery evidence, never cursor 0.
+   */
+  runtimeObservationCursor(beeId: string, generation: number): number | null {
+    const row = this.stmt(
+      "SELECT cursor FROM runtime_observation_cursors WHERE bee_id = ? AND generation = ?",
+    ).get(beeId, generation) as Row | undefined;
+    return row ? Number(row.cursor) : null;
+  }
+
+  /**
+   * Advance the applied runner-journal cursor monotonically for the CURRENT,
+   * live generation. The daemon calls this only after all observations,
+   * condition evidence, and session evidence through the cursor have committed.
+   * A stale generation or stopped runtime is a silent no-op: old runner bytes
+   * can never fence or mutate the current runtime.
+   */
+  advanceRuntimeObservationCursor(
+    beeId: string,
+    generation: number,
+    cursor: number,
+  ): { applied: boolean } {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new CoreError("runtime observation cursor must be a non-negative safe integer");
+    }
+    return this.tx(() => {
+      this.mustGetBee(beeId);
+      const current = this.currentRuntime(beeId);
+      if (!current || current.generation !== generation || current.state === "stopped") {
+        return { applied: false };
+      }
+      const previous = this.runtimeObservationCursor(beeId, generation);
+      if (previous !== null && cursor <= previous) return { applied: false };
+      this.db
+        .prepare(
+          `INSERT INTO runtime_observation_cursors(bee_id, generation, cursor, updated_at)
+           VALUES(?, ?, ?, ?)
+           ON CONFLICT(bee_id, generation) DO UPDATE SET
+             cursor = excluded.cursor,
+             updated_at = excluded.updated_at`,
+        )
+        .run(beeId, generation, cursor, this.now());
       return { applied: true };
     });
   }
@@ -1883,10 +1959,13 @@ export class CoreStore {
   recordOutput(beeId: string): void {
     this.tx(() => {
       this.mustGetBee(beeId);
-      const at = this.now();
-      this.stmt("UPDATE bees SET last_output_at = ? WHERE id = ?").run(at, beeId);
-      this.audit("output.recorded", beeId, { beeId, at });
+      this.applyRecordOutput(beeId, this.now());
     });
+  }
+
+  private applyRecordOutput(beeId: string, at: number): void {
+    this.stmt("UPDATE bees SET last_output_at = ? WHERE id = ?").run(at, beeId);
+    this.audit("output.recorded", beeId, { beeId, at });
   }
 
   // -------------------------------------------------------------------------

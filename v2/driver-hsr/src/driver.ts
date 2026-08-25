@@ -117,6 +117,17 @@ export interface SessionEvidence {
   sessionId: string;
 }
 
+/**
+ * Highest fully parsed runner-journal byte for one generation. The daemon
+ * commits this only after every normalized effect emitted before it has
+ * settled in the core store.
+ */
+export interface ObservationCursorEvidence {
+  beeId: string;
+  generation: number;
+  cursor: number;
+}
+
 interface ManagedProcess {
   beeId: string;
   generation: number;
@@ -136,7 +147,8 @@ interface ManagedProcess {
   /** First requested stop cause; fixes the exit cause of a signaled process. */
   stopCause: StopCause | null;
   killTimer: NodeJS.Timeout | null;
-  stdoutRest: string;
+  /** Incomplete final line from the output-only observation journal. */
+  stdoutRest: Buffer;
   exited: boolean;
   /**
    * Runner-host runtime (WP5): `child` is the detached HOST process; the
@@ -153,8 +165,16 @@ interface ManagedProcess {
   socketRetry: NodeJS.Timeout | null;
   socketPath: string | null;
   statusPath: string | null;
-  /** Byte offset consumed from the session log by the observation tail. */
+  /** Output-only journal (v15+) or the legacy shared transcript fallback. */
+  observationPath: string | null;
+  /** Byte offset consumed from observationPath by the observation tail. */
   logOffset: number;
+  /** Cursor exposed at spawn so core can durably establish the generation baseline. */
+  initialObservationCursor: number;
+  /** Highest signal-bearing line parsed since the daemon last checkpointed. */
+  pendingObservationCursor: number | null;
+  /** Legacy hosts only: their observation source is the bidirectional session log. */
+  legacySharedObservation: boolean;
   /**
    * Outbound lines the driver sent through the host (deliver/interrupt/
    * respond/boot). The host appends them to the session log in write order;
@@ -217,7 +237,10 @@ export class HsrDriver implements RuntimeDriver {
     return this.cfg.runnersDir ?? resolvePath(this.cfg.sessionLogDir, "..", "runners");
   }
 
-  private runnerPaths(beeId: string, generation: number): { config: string; socket: string; status: string } {
+  private runnerPaths(
+    beeId: string,
+    generation: number,
+  ): { config: string; socket: string; status: string; observations: string } {
     const base = join(this.runnersDir(), `${beeId}.${generation}`);
     // The unix socket CANNOT live beside the other artifacts: sun_path is
     // capped (104 bytes on macOS) and runnersDir under a test tmpdir already
@@ -232,6 +255,7 @@ export class HsrDriver implements RuntimeDriver {
       config: `${base}.json`,
       socket: join(tmpdir(), `hb-rh-${digest}.sock`),
       status: `${base}.status.json`,
+      observations: `${base}.observations.jsonl`,
     };
   }
 
@@ -272,11 +296,13 @@ export class HsrDriver implements RuntimeDriver {
     const paths = this.runnerPaths(beeId, generation);
     const hostConfig: RunnerHostConfig = {
       beeId,
+      generation,
       command: spec.command,
       args: spec.args,
       ...(spec.cwd !== undefined ? { cwd: spec.cwd } : {}),
       env: spec.env ?? ({ ...process.env } as Record<string, string>),
       sessionLogPath: this.sessionLogPath(beeId),
+      observationLogPath: paths.observations,
       sidecarPath: join(this.cfg.sessionLogDir, `${beeId}.stderr.log`),
       socketPath: paths.socket,
       statusPath: paths.status,
@@ -304,7 +330,7 @@ export class HsrDriver implements RuntimeDriver {
       turnId: null,
       stopCause: null,
       killTimer: null,
-      stdoutRest: "",
+      stdoutRest: Buffer.alloc(0),
       exited: false,
       spawnError: null,
       realEvidence: false,
@@ -314,10 +340,14 @@ export class HsrDriver implements RuntimeDriver {
       socketRetry: null,
       socketPath: paths.socket,
       statusPath: paths.status,
-      // The session log may carry previous generations; only new bytes are
-      // this runtime's stream.
-      logOffset: this.sessionLogSize(beeId),
-      outboundPending: [...hostConfig.bootLines],
+      observationPath: paths.observations,
+      // One output-only journal per generation starts at byte zero. Core
+      // persists this baseline with the pid identity before any fold.
+      logOffset: 0,
+      initialObservationCursor: 0,
+      pendingObservationCursor: null,
+      legacySharedObservation: false,
+      outboundPending: [],
       pendingWrites: [],
       socketBroken: false,
     };
@@ -569,10 +599,10 @@ export class HsrDriver implements RuntimeDriver {
     if (p.child == null && !pidAlive(p.pid)) this.finishHost(p);
   }
 
-  /** Read new session-log bytes; parse agent lines, skipping outbound echoes. */
+  /** Read new output-only journal bytes and normalize complete agent lines. */
   private pumpHostTail(p: ManagedProcess): void {
-    if (!p.adapter) return;
-    const path = this.sessionLogPath(p.beeId);
+    if (!p.adapter || !p.observationPath) return;
+    const path = p.observationPath;
     let size: number;
     try {
       size = statSync(path).size;
@@ -580,10 +610,15 @@ export class HsrDriver implements RuntimeDriver {
       return; // no log yet
     }
     if (size < p.logOffset) {
-      // Truncated/rotated underneath us (never normal): restart from zero
-      // rather than reading torn bytes at a stale offset.
-      p.logOffset = 0;
-      p.stdoutRest = "";
+      // A generation journal is append-only. Truncation destroys the replay
+      // proof; fail closed and let degraded-mail policy rotate this exact live
+      // process when work arrives. Never rewind and synthesize lifecycle edges.
+      p.degraded = true;
+      p.adapter = null;
+      p.observationPath = null;
+      p.stdoutRest = Buffer.alloc(0);
+      this.appendSidecar(p.beeId, `runner observation journal truncated for generation ${p.generation}\n`);
+      return;
     }
     if (size === p.logOffset) return;
     let fd: number;
@@ -592,24 +627,32 @@ export class HsrDriver implements RuntimeDriver {
     } catch {
       return;
     }
-    let chunk: string;
+    let chunk: Buffer;
+    const readOffset = p.logOffset;
     try {
       const length = size - p.logOffset;
       const buffer = Buffer.alloc(Math.min(length, 4 * 1024 * 1024));
       const bytesRead = readSync(fd, buffer, 0, buffer.length, p.logOffset);
       p.logOffset += bytesRead;
-      chunk = buffer.toString("utf8", 0, bytesRead);
+      chunk = buffer.subarray(0, bytesRead);
     } finally {
       closeSync(fd);
     }
-    const data = p.stdoutRest + chunk;
-    const lines = data.split("\n");
-    p.stdoutRest = lines.pop() ?? "";
-    for (const rawLine of lines) {
-      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const dataStart = readOffset - p.stdoutRest.length;
+    const data = p.stdoutRest.length === 0 ? chunk : Buffer.concat([p.stdoutRest, chunk]);
+    let lineStart = 0;
+    for (;;) {
+      const newline = data.indexOf(0x0a, lineStart);
+      if (newline < 0) break;
+      let raw = data.subarray(lineStart, newline);
+      if (raw.length > 0 && raw[raw.length - 1] === 0x0d) raw = raw.subarray(0, raw.length - 1);
+      const line = raw.toString("utf8");
+      const lineEndCursor = dataStart + newline + 1;
+      lineStart = newline + 1;
       if (line.trim().length === 0) continue;
-      // Outbound lines (deliver/interrupt/respond/boot) come back through the
-      // host's single-writer log in send order — skip, never parse.
+      // v15 journals contain runner output only. Legacy adopted hosts tail the
+      // shared bidirectional transcript from their adoption EOF and still need
+      // exact-match suppression for commands sent by THIS daemon generation.
       if (p.outboundPending.length > 0 && p.outboundPending[0] === line) {
         p.outboundPending.shift();
         continue;
@@ -620,7 +663,9 @@ export class HsrDriver implements RuntimeDriver {
         if (lateBoot && signal.kind === "turn_ended") continue;
         this.onSignal(p, signal);
       }
+      if (signals.length > 0) p.pendingObservationCursor = lineEndCursor;
     }
+    p.stdoutRest = Buffer.from(data.subarray(lineStart));
   }
 
   hasProcess(beeId: string, generation: number): boolean {
@@ -657,6 +702,7 @@ export class HsrDriver implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
+    lastAppliedObservationCursor?: number | null,
   ): boolean {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
@@ -668,13 +714,52 @@ export class HsrDriver implements RuntimeDriver {
     const paths = this.runnerPaths(beeId, generation);
     const status = readRunnerStatus(paths.status);
     if (status && status.hostPid === pid && !status.exited) {
+      const hasGenerationIdentity = status.beeId !== undefined || status.generation !== undefined;
+      const exactGenerationIdentity = status.beeId === beeId && status.generation === generation;
       let adapter: HarnessAdapter | null = null;
       try {
         adapter = this.cfg.resolve(beeId).adapter;
       } catch {
         adapter = null; // unresolvable harness: fall through to degraded
       }
-      if (adapter) {
+      // A v15 host proves its output-only journal belongs to this exact
+      // generation. A pre-v15 host has neither identity field: keep the old
+      // full-capability EOF behavior for NEW bytes, but do not replay its
+      // bidirectional transcript. A mismatched/partial identity is corrupt
+      // recovery evidence and falls through to conservative degraded adoption.
+      if (adapter && (!hasGenerationIdentity || exactGenerationIdentity)) {
+        let observationPath: string | null;
+        let observationOffset: number;
+        let legacySharedObservation: boolean;
+        if (exactGenerationIdentity) {
+          let journalSize: number | null = null;
+          try {
+            journalSize = statSync(paths.observations).size;
+          } catch {
+            journalSize = null;
+          }
+          const cursor = lastAppliedObservationCursor ?? 0;
+          const validCursor = Number.isSafeInteger(cursor) && cursor >= 0 && journalSize !== null && cursor <= journalSize;
+          if (status.observationError || !validCursor) {
+            adapter = null; // fail closed below: never guess an idle edge
+            observationPath = null;
+            observationOffset = 0;
+            legacySharedObservation = false;
+          } else {
+            observationPath = paths.observations;
+            observationOffset = cursor;
+            legacySharedObservation = false;
+          }
+        } else {
+          observationPath = this.sessionLogPath(beeId);
+          observationOffset = this.sessionLogSize(beeId);
+          legacySharedObservation = true;
+        }
+        if (!adapter) {
+          // The exact process is still adopted below, but without a trustworthy
+          // evidence/delivery lane. Pending mail rotates it through the normal
+          // degraded-runtime policy; silence never changes its phase.
+        } else {
         const proc: ManagedProcess = {
           beeId,
           generation,
@@ -695,7 +780,7 @@ export class HsrDriver implements RuntimeDriver {
           turnId: null,
           stopCause: null,
           killTimer: null,
-          stdoutRest: "",
+          stdoutRest: Buffer.alloc(0),
           exited: false,
           spawnError: null,
           realEvidence: false,
@@ -705,8 +790,14 @@ export class HsrDriver implements RuntimeDriver {
           socketRetry: null,
           socketPath: paths.socket,
           statusPath: paths.status,
-          // History edges were the previous daemon's; observe only new bytes.
-          logOffset: this.sessionLogSize(beeId),
+          observationPath,
+          // v15 resumes at the core's generation-scoped applied cursor. Legacy
+          // hosts have no separated journal, so only their post-adoption bytes
+          // are observable; history is never rewound heuristically.
+          logOffset: observationOffset,
+          initialObservationCursor: observationOffset,
+          pendingObservationCursor: null,
+          legacySharedObservation,
           outboundPending: [],
           pendingWrites: [],
           socketBroken: false,
@@ -714,6 +805,7 @@ export class HsrDriver implements RuntimeDriver {
         this.procs.set(beeId, proc);
         this.connectSocket(proc);
         return true;
+        }
       }
     }
     this.procs.set(beeId, {
@@ -732,7 +824,7 @@ export class HsrDriver implements RuntimeDriver {
       turnId: null,
       stopCause: null,
       killTimer: null,
-      stdoutRest: "",
+      stdoutRest: Buffer.alloc(0),
       exited: false,
       spawnError: null,
       // Degraded: no event stream, so no evidence can ever be parsed. The
@@ -745,7 +837,11 @@ export class HsrDriver implements RuntimeDriver {
       socketRetry: null,
       socketPath: null,
       statusPath: null,
+      observationPath: null,
       logOffset: 0,
+      initialObservationCursor: 0,
+      pendingObservationCursor: null,
+      legacySharedObservation: false,
       outboundPending: [],
       pendingWrites: [],
       socketBroken: false,

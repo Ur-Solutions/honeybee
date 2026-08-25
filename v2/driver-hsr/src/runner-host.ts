@@ -22,9 +22,10 @@ import { dirname } from "node:path";
  * decision stays in the daemon:
  *  - agent stdout  → session log file, verbatim non-empty lines (byte-
  *    identical to what the driver wrote in-process before — the transcript
- *    cache's file-lifetime identity depends on it). The driver OBSERVES by
- *    tailing this file, which is exactly the files-only observation mode the
- *    spec05 equivalence suite already proves.
+ *    cache's file-lifetime identity depends on it), AND an output-only,
+ *    generation-scoped observation journal. The driver observes the latter:
+ *    restart replay can never cross generations or mistake a daemon→agent
+ *    command from the bidirectional transcript for runner evidence.
  *  - agent stderr  → the `<beeId>.stderr.log` sidecar.
  *  - unix socket   → write-only lane INTO agent stdin: `{op:"write", line}`
  *    per newline-framed JSON. deliver/interrupt/respond all ride it. A
@@ -45,11 +46,14 @@ import { dirname } from "node:path";
 
 export interface RunnerHostConfig {
   beeId: string;
+  generation: number;
   command: string;
   args: string[];
   cwd?: string;
   env?: Record<string, string>;
   sessionLogPath: string;
+  /** Output-only structured evidence for exactly (beeId, generation). */
+  observationLogPath: string;
   sidecarPath: string;
   socketPath: string;
   statusPath: string;
@@ -59,9 +63,14 @@ export interface RunnerHostConfig {
 
 export interface RunnerStatus {
   hostPid: number;
+  /** Present on v15+ hosts; absence identifies a legacy non-replayable host. */
+  beeId?: string;
+  generation?: number;
   agentPid?: number;
   /** The stdin lane could not be established (e.g. socket path unusable). */
   socketError?: string;
+  /** Output-only journal persistence failed; recovery must fail closed. */
+  observationError?: string;
   spawnError?: string;
   exited?: boolean;
   exitCode?: number | null;
@@ -90,7 +99,16 @@ export function readRunnerStatus(path: string): RunnerStatus | null {
 
 export function runRunnerHost(configPath: string): void {
   const cfg = JSON.parse(readFileSync(configPath, "utf8")) as RunnerHostConfig;
-  const status: RunnerStatus = { hostPid: process.pid, at: Date.now() };
+  mkdirSync(dirname(cfg.sessionLogPath), { recursive: true });
+  mkdirSync(dirname(cfg.observationLogPath), { recursive: true });
+  // Exact generation journal exists before the status becomes adoptable.
+  writeFileSync(cfg.observationLogPath, "", { flag: "a" });
+  const status: RunnerStatus = {
+    hostPid: process.pid,
+    beeId: cfg.beeId,
+    generation: cfg.generation,
+    at: Date.now(),
+  };
   writeStatus(cfg.statusPath, status);
 
   // The host must outlive the daemon AND the agent's graceful stop signals:
@@ -100,7 +118,6 @@ export function runRunnerHost(configPath: string): void {
     process.on(signal, () => undefined);
   }
 
-  mkdirSync(dirname(cfg.sessionLogPath), { recursive: true });
   // NOT detached: the agent joins the host's process group, so the daemon's
   // existing group signaling (TERM/KILL to -pid) reaches the whole tree.
   const child: ChildProcess = spawn(cfg.command, cfg.args, {
@@ -157,10 +174,20 @@ export function runRunnerHost(configPath: string): void {
       const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
       if (line.trim().length === 0) continue;
       try {
+        // Recovery evidence first. If the daemon dies immediately after this
+        // synchronous append, its successor can replay the line from the core
+        // cursor even when the old daemon never observed it.
+        appendFileSync(cfg.observationLogPath, `${line}\n`);
+      } catch (error) {
+        status.observationError = String((error as Error)?.message ?? error);
+        status.at = Date.now();
+        writeStatus(cfg.statusPath, status);
+      }
+      try {
         appendFileSync(cfg.sessionLogPath, `${line}\n`);
       } catch {
-        // A failed append loses observation for this line only; the agent
-        // itself is unaffected. Never crash the host over it.
+        // Transcript diagnostics are independent from lifecycle evidence.
+        // Never crash the host or suppress the observation journal over it.
       }
     }
   });
