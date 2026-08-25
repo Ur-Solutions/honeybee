@@ -48,8 +48,19 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-/** Claude HSR lines carry no wall-clock timestamp; the feed orders by line. */
+/**
+ * HSR stream-json lines carry no wall-clock timestamp (the feed orders by
+ * line); native session-file lines carry an ISO `timestamp`. Each line's
+ * events take the line's stamp when it has one.
+ */
 const NO_TS: TranscriptIsoTs = null;
+
+function lineTimestamp(row: JsonObject): TranscriptIsoTs {
+  const raw = row.timestamp;
+  if (typeof raw === "string" && !Number.isNaN(Date.parse(raw))) return raw;
+  if (typeof raw === "number" && Number.isFinite(raw)) return new Date(raw).toISOString();
+  return NO_TS;
+}
 
 const NOISE_TYPES = new Set(["rate_limit_event", "tool_progress", "stream_event"]);
 const IMAGE_META_RE = /^\[Image:\s*original\s+\d+x\d+(?:,[^\]]*)?\]\s*$/i;
@@ -155,6 +166,7 @@ export function createClaudeProjector(): TranscriptProjector {
       const type = nonEmptyString(row.type);
       if (!type || NOISE_TYPES.has(type)) return [];
       const providerEventId = nonEmptyString(row.uuid);
+      const ts = lineTimestamp(row);
 
       if (type === "user") {
         const message = asObject(row.message);
@@ -173,7 +185,7 @@ export function createClaudeProjector(): TranscriptProjector {
             const images = imagesFromContent(block.content);
             events.push({
               kind: "tool_result",
-              ts: NO_TS,
+              ts,
               callId,
               isError: block.is_error === true,
               ...(output.trim().length > 0 ? { output } : {}),
@@ -192,10 +204,10 @@ export function createClaudeProjector(): TranscriptProjector {
         ) return [];
         if (text.trim().length === 0) return [];
         return [
-          { kind: "turn_start", ts: NO_TS },
+          { kind: "turn_start", ts },
           {
             kind: "message",
-            ts: NO_TS,
+            ts,
             role: "user",
             text,
             ...(providerEventId ? { providerEventId } : {}),
@@ -214,7 +226,7 @@ export function createClaudeProjector(): TranscriptProjector {
         const usageEvents: TranscriptProjectedEvent[] = usage
           ? [{
               kind: "token_usage",
-              ts: NO_TS,
+              ts,
               usage,
               scope: "turn",
               ...(messageId ? { providerTurnId: messageId } : {}),
@@ -227,7 +239,7 @@ export function createClaudeProjector(): TranscriptProjector {
           return text
             ? [{
                 kind: "message",
-                ts: NO_TS,
+                ts,
                 role: "assistant",
                 text,
                 ...(providerEventId ? { providerEventId } : {}),
@@ -245,7 +257,7 @@ export function createClaudeProjector(): TranscriptProjector {
               if (text) {
                 events.push({
                   kind: "message",
-                  ts: NO_TS,
+                  ts,
                   role: "assistant",
                   text,
                   ...(providerEventId ? { providerEventId } : {}),
@@ -259,18 +271,18 @@ export function createClaudeProjector(): TranscriptProjector {
               // its text is unavailable — the load-bearing redacted shape.
               events.push(
                 text
-                  ? { kind: "thinking", ts: NO_TS, redacted: false, text }
-                  : { kind: "thinking", ts: NO_TS, redacted: true },
+                  ? { kind: "thinking", ts, redacted: false, text }
+                  : { kind: "thinking", ts, redacted: true },
               );
               break;
             }
             case "redacted_thinking":
-              events.push({ kind: "thinking", ts: NO_TS, redacted: true });
+              events.push({ kind: "thinking", ts, redacted: true });
               break;
             case "tool_use": {
               events.push({
                 kind: "tool_call",
-                ts: NO_TS,
+                ts,
                 callId: nonEmptyString(block.id) ?? "claude:tool_use:unknown",
                 name: nonEmptyString(block.name) ?? "tool",
                 ...(block.input !== undefined ? { input: block.input } : {}),
@@ -299,7 +311,7 @@ export function createClaudeProjector(): TranscriptProjector {
           const model = dominantModel(asObject(row.modelUsage));
           events.push({
             kind: "token_usage",
-            ts: NO_TS,
+            ts,
             usage,
             scope: "turn",
             ...(model ? { model } : {}),
@@ -312,7 +324,7 @@ export function createClaudeProjector(): TranscriptProjector {
             : undefined;
         events.push({
           kind: "turn_end",
-          ts: NO_TS,
+          ts,
           ...(durationMs !== undefined ? { durationMs } : {}),
           ...(nonEmptyString(row.stop_reason) ? { finishReason: nonEmptyString(row.stop_reason) } : {}),
         });
@@ -322,7 +334,7 @@ export function createClaudeProjector(): TranscriptProjector {
       // system init/subtypes are lifecycle + progress chatter, not pane rows.
       if (type === "system") return [];
 
-      return [{ kind: "unknown", ts: NO_TS, nativeType: type }];
+      return [{ kind: "unknown", ts, nativeType: type }];
     },
     flush(): TranscriptProjectedEvent[] {
       return [];

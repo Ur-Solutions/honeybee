@@ -192,3 +192,22 @@ test("claude projector: usage carries the billed model; result rows carry the ha
   assert.equal(usage.model, "claude-fable-5");
   assert.equal(usage.providerTurnId, undefined);
 });
+
+test("claude projector: native session-file lines stamp their events; HSR lines stay unstamped", () => {
+  const p = createClaudeProjector();
+  const stamped = p.pushLine(line({
+    type: "assistant",
+    uuid: "a-20",
+    timestamp: "2026-08-24T10:00:00.000Z",
+    message: { id: "msg_20", role: "assistant", content: [{ type: "tool_use", id: "toolu_20", name: "Bash", input: {} }], usage: { input_tokens: 1, output_tokens: 1 } },
+  }));
+  assert.deepEqual(stamped.map((e) => e.ts), ["2026-08-24T10:00:00.000Z", "2026-08-24T10:00:00.000Z"]);
+  const result = p.pushLine(line({
+    type: "user",
+    timestamp: "2026-08-24T10:00:02.000Z",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_20", content: "ok" }] },
+  }));
+  assert.equal(result[0]?.ts, "2026-08-24T10:00:02.000Z");
+  const bare = p.pushLine(line({ type: "user", message: { role: "user", content: "next" } }));
+  assert.deepEqual(bare.map((e) => e.ts), [null, null]);
+});
