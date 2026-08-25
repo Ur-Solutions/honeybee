@@ -9,12 +9,24 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { HsrDriver, type SpawnSpec } from "../src/index.ts";
-import { stubAdapter } from "../../adapters/src/index.ts";
-import { AGENT_PATH, drainUntil, ofKind, pidAlive, sleep } from "./helpers.ts";
+import { codexAdapter, stubAdapter } from "../../adapters/src/index.ts";
+import type { DriverObservation } from "../../harness/src/driver.ts";
+import { AGENT_PATH, drainUntil as drainDriverUntil, ofKind, pidAlive, sleep } from "./helpers.ts";
+
+const FAKE_CODEX_PATH = join(dirname(AGENT_PATH), "fake-codex.mjs");
+const HOST_TEST_TIMEOUT_MS = 60_000;
+
+function drainUntil(
+  driver: HsrDriver,
+  predicate: (events: DriverObservation[]) => boolean,
+  timeoutMs = HOST_TEST_TIMEOUT_MS,
+): Promise<DriverObservation[]> {
+  return drainDriverUntil(driver, predicate, timeoutMs);
+}
 
 function makeDriver(dir: string): HsrDriver {
   return new HsrDriver({
@@ -32,6 +44,43 @@ function makeDriver(dir: string): HsrDriver {
   });
 }
 
+function makeCodexDriver(dir: string): HsrDriver {
+  return new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    stopKillGraceMs: 400,
+    resolve(): SpawnSpec {
+      return {
+        adapter: codexAdapter({ cwd: dir }),
+        command: process.execPath,
+        args: [FAKE_CODEX_PATH],
+        cwd: dir,
+        env: { ...process.env },
+      };
+    },
+  });
+}
+
+async function waitForJournal(path: string, predicate: (text: string) => boolean): Promise<string> {
+  const deadline = Date.now() + HOST_TEST_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const text = readFileSync(path, "utf8");
+      if (predicate(text)) return text;
+    } catch {
+      // The host creates the journal before it becomes adoptable; startup may
+      // still be racing this test's first probe.
+    }
+    if (Date.now() > deadline) throw new Error(`journal condition timed out: ${path}`);
+    await sleep(10);
+  }
+}
+
+function checkpointOf(driver: HsrDriver, beeId: string): number {
+  const evidence = driver.observeRecoveryCursors().find((row) => row.beeId === beeId);
+  assert.ok(evidence, `missing recovery cursor for ${beeId}`);
+  return evidence.cursor;
+}
+
 test("daemon restart: the runtime survives and the successor daemon delivers at full capability", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-host-"));
   const first = makeDriver(dir);
@@ -41,6 +90,7 @@ test("daemon restart: the runtime survives and the successor daemon delivers at 
     await drainUntil(first, (e) => ofKind(e, "booted").length > 0);
     assert.equal(first.deliver("bee-r", 1, 1, "hello before restart").accepted, true);
     await drainUntil(first, (e) => ofKind(e, "turn_ended").length > 0);
+    const checkpoint = checkpointOf(first, "bee-r");
     const proc = first.procOf("bee-r", 1)!;
     assert.ok(proc.pid > 0);
 
@@ -54,7 +104,7 @@ test("daemon restart: the runtime survives and the successor daemon delivers at 
     // The store knew the runtime was idle at shutdown; the hint opens the
     // accept point immediately and avoids fabricating a running turn (the
     // 2026-08-21 deploy-soak hang_stop lesson).
-    assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt, "idle"), true);
+    assert.equal(second.adopt("bee-r", 1, proc.pid, proc.pidStartedAt, "idle", checkpoint), true);
     assert.equal(second.isDegraded("bee-r", 1), false, "host adoption is never degraded");
     assert.ok(second.hasProcess("bee-r", 1));
 
@@ -84,6 +134,224 @@ test("daemon restart: the runtime survives and the successor daemon delivers at 
     await drainUntil(second, (e) => ofKind(e, "exited").length > 0);
     await sleep(30);
     assert.ok(!pidAlive(proc.pid), "host and agent must be gone after stop");
+  } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("adoption replays a runner-persisted completion missed by the dead daemon", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-recovery-"));
+  const first = makeDriver(dir);
+  let second: HsrDriver | null = null;
+  try {
+    first.start("bee-gap", 1);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    const checkpoint = checkpointOf(first, "bee-gap");
+    const proc = first.procOf("bee-gap", 1)!;
+
+    assert.equal(first.deliver("bee-gap", 1, 55, "@slow:80 persisted before crash").accepted, true);
+    const journal = first.observationLogPath("bee-gap", 1);
+    await waitForJournal(journal, (text) => text.includes('"turn_ended","messageId":55'));
+    // Do not call observe(): this is the crash gap — the runner owns the
+    // durable line but the old daemon never folds it.
+    first.detachAll();
+
+    second = makeDriver(dir);
+    assert.equal(second.adopt("bee-gap", 1, proc.pid, proc.pidStartedAt, "running", checkpoint), true);
+    assert.equal(second.isDegraded("bee-gap", 1), false);
+    const recovered = await drainUntil(second, (events) => ofKind(events, "turn_ended").length > 0);
+    assert.ok(ofKind(recovered, "turn_ended").some((event) => event.generation === 1));
+    assert.ok(checkpointOf(second, "bee-gap") > checkpoint);
+
+    second.stop("bee-gap", 1, "stopped_by_system");
+    await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
+  } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recovery replay after the completion fold is idempotent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-recovery-"));
+  const first = makeDriver(dir);
+  let second: HsrDriver | null = null;
+  try {
+    first.start("bee-dupe", 1);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    const checkpointBeforeTurn = checkpointOf(first, "bee-dupe");
+    const proc = first.procOf("bee-dupe", 1)!;
+    assert.equal(first.deliver("bee-dupe", 1, 56, "folded but not checkpointed").accepted, true);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    const checkpointAfterFold = checkpointOf(first, "bee-dupe");
+    assert.ok(checkpointAfterFold > checkpointBeforeTurn);
+    // The daemon commits phase/output/cursor as one observation fold. A crash
+    // after that fold resumes beyond the completion and cannot account twice.
+    first.detachAll();
+
+    second = makeDriver(dir);
+    assert.equal(
+      second.adopt("bee-dupe", 1, proc.pid, proc.pidStartedAt, "idle", checkpointAfterFold),
+      true,
+    );
+    const replayed = second.observe();
+    await sleep(70);
+    replayed.push(...second.observe());
+    assert.equal(ofKind(replayed, "turn_ended").length, 0, "already-idle completion normalizes away");
+    assert.equal(second.observeRecoveryCursors().length, 0, "no already-applied bytes are exposed again");
+
+    second.stop("bee-dupe", 1, "stopped_by_system");
+    await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
+  } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recovery preserves journal order when completion is followed by a newer turn start", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-recovery-"));
+  const first = makeDriver(dir);
+  let second: HsrDriver | null = null;
+  try {
+    first.start("bee-newer", 1);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    const checkpoint = checkpointOf(first, "bee-newer");
+    const proc = first.procOf("bee-newer", 1)!;
+
+    assert.equal(first.deliver("bee-newer", 1, 61, "first").accepted, true);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    // Deliberately leave the first turn's cursor uncommitted, then start a
+    // newer long-running turn before the daemon dies.
+    assert.equal(first.deliver("bee-newer", 1, 62, "@hang second").accepted, true);
+    await waitForJournal(
+      first.observationLogPath("bee-newer", 1),
+      (text) => text.includes('"turn_started","messageId":62'),
+    );
+    first.detachAll();
+
+    second = makeDriver(dir);
+    assert.equal(second.adopt("bee-newer", 1, proc.pid, proc.pidStartedAt, "running", checkpoint), true);
+    const recovered = await drainUntil(
+      second,
+      (events) => ofKind(events, "turn_ended").length > 0 && ofKind(events, "turn_started").length > 0,
+    );
+    const endIndex = recovered.findIndex((event) => event.kind === "turn_ended");
+    const startIndex = recovered.findIndex((event) => event.kind === "turn_started");
+    assert.ok(endIndex >= 0 && startIndex > endIndex, "newer start must win after the recovered completion");
+
+    second.stop("bee-newer", 1, "stopped_by_system");
+    await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
+  } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("missing or generation-corrupt recovery evidence fails closed without manufacturing idle", async () => {
+  for (const corruption of ["missing-journal", "wrong-generation"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-recovery-"));
+    const first = makeDriver(dir);
+    let second: HsrDriver | null = null;
+    try {
+      const beeId = `bee-${corruption}`;
+      first.start(beeId, 1);
+      await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+      const checkpoint = checkpointOf(first, beeId);
+      const proc = first.procOf(beeId, 1)!;
+      first.detachAll();
+
+      if (corruption === "missing-journal") {
+        unlinkSync(first.observationLogPath(beeId, 1));
+      } else {
+        const statusPath = join(dir, "runners", `${beeId}.1.status.json`);
+        const status = JSON.parse(readFileSync(statusPath, "utf8")) as Record<string, unknown>;
+        writeFileSync(statusPath, JSON.stringify({ ...status, generation: 999 }));
+      }
+
+      second = makeDriver(dir);
+      assert.equal(second.adopt(beeId, 1, proc.pid, proc.pidStartedAt, "running", checkpoint), true);
+      assert.equal(second.isDegraded(beeId, 1), true);
+      await sleep(70);
+      assert.equal(ofKind(second.observe(), "turn_ended").length, 0);
+      assert.deepEqual(second.deliver(beeId, 1, 77, "must not slip through"), {
+        accepted: false,
+        reason: "not_ready",
+      });
+
+      second.stop(beeId, 1, "stopped_by_system");
+      await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
+    } finally {
+      second?.disposeAll();
+      first.disposeAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a genuinely long-running silent turn stays running across adoption", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-recovery-"));
+  const first = makeDriver(dir);
+  let second: HsrDriver | null = null;
+  try {
+    first.start("bee-silent", 1);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    checkpointOf(first, "bee-silent");
+    const proc = first.procOf("bee-silent", 1)!;
+    assert.equal(first.deliver("bee-silent", 1, 81, "@hang").accepted, true);
+    await drainUntil(first, (events) => ofKind(events, "turn_started").length > 0);
+    await waitForJournal(
+      first.observationLogPath("bee-silent", 1),
+      (text) => text.includes('"turn_started","messageId":81'),
+    );
+    await sleep(70);
+    first.observe();
+    const runningCursor = checkpointOf(first, "bee-silent");
+    first.detachAll();
+
+    second = makeDriver(dir);
+    assert.equal(second.adopt("bee-silent", 1, proc.pid, proc.pidStartedAt, "running", runningCursor), true);
+    await sleep(180);
+    assert.equal(ofKind(second.observe(), "turn_ended").length, 0, "silence is never completion evidence");
+    assert.deepEqual(second.interrupt("bee-silent", 1), { interrupted: true });
+    await drainUntil(second, (events) => ofKind(events, "turn_ended").length > 0);
+
+    second.stop("bee-silent", 1, "stopped_by_system");
+    await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
+  } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex thread/status idle plus turn/completed maps through adoption to one turn end", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-codex-recovery-"));
+  const first = makeCodexDriver(dir);
+  let second: HsrDriver | null = null;
+  try {
+    first.start("bee-codex", 1);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    const checkpoint = checkpointOf(first, "bee-codex");
+    const proc = first.procOf("bee-codex", 1)!;
+    assert.equal(first.deliver("bee-codex", 1, 91, "persist codex completion").accepted, true);
+    const journal = await waitForJournal(
+      first.observationLogPath("bee-codex", 1),
+      (text) => text.includes('"method":"thread/status/changed"') && text.includes('"method":"turn/completed"'),
+    );
+    assert.match(journal, /"status":\{"type":"idle"\}/);
+    first.detachAll();
+
+    second = makeCodexDriver(dir);
+    assert.equal(second.adopt("bee-codex", 1, proc.pid, proc.pidStartedAt, "running", checkpoint), true);
+    const recovered = await drainUntil(second, (events) => ofKind(events, "turn_ended").length > 0);
+    assert.equal(ofKind(recovered, "turn_ended").length, 1);
+
+    second.stop("bee-codex", 1, "stopped_by_system");
+    await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
   } finally {
     second?.disposeAll();
     first.disposeAll();

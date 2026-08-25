@@ -5,6 +5,7 @@
 export {
   HsrDriver,
   type FlagEvidence,
+  type ObservationCursorEvidence,
   type SessionEvidence,
   type HsrDriverConfig,
   type SpawnSpec,

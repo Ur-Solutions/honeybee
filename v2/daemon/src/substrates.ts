@@ -21,7 +21,12 @@ import type {
   RuntimeDriver,
   StopCause,
 } from "../../harness/src/driver.ts";
-import type { HsrDriver, FlagEvidence, SessionEvidence } from "../../driver-hsr/src/index.ts";
+import type {
+  HsrDriver,
+  FlagEvidence,
+  ObservationCursorEvidence,
+  SessionEvidence,
+} from "../../driver-hsr/src/index.ts";
 import type { CellDriver } from "../../driver-cell/src/index.ts";
 import type { TmuxDriver } from "../../driver-tmux/src/index.ts";
 
@@ -105,15 +110,26 @@ export class SubstrateRouter implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
+    lastAppliedObservationCursor?: number | null,
   ): boolean {
-    return this.driverFor(beeId).adopt(beeId, generation, pid, pidStartedAt, lastKnownState);
+    return this.driverFor(beeId).adopt(
+      beeId,
+      generation,
+      pid,
+      pidStartedAt,
+      lastKnownState,
+      lastAppliedObservationCursor,
+    );
   }
 
   isDegraded(beeId: string, generation: number): boolean {
     return this.driverFor(beeId, generation).isDegraded(beeId, generation);
   }
 
-  procOf(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null {
+  procOf(
+    beeId: string,
+    generation: number,
+  ): { pid: number; pidStartedAt: number; observationCursor?: number } | null {
     return this.driverFor(beeId, generation).procOf(beeId, generation);
   }
 
@@ -123,6 +139,10 @@ export class SubstrateRouter implements RuntimeDriver {
 
   observeSessions(): SessionEvidence[] {
     return [...this.hsr.observeSessions(), ...this.cell.observeSessions(), ...this.tmux.observeSessions()];
+  }
+
+  observeRecoveryCursors(): ObservationCursorEvidence[] {
+    return [...this.hsr.observeRecoveryCursors(), ...this.cell.observeRecoveryCursors()];
   }
 
   /** Session logs share one directory across substrates (one `<beeId>.jsonl` per bee). */

@@ -17,8 +17,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
+import { join } from "node:path";
 import { pidAlive } from "../../driver-hsr/src/psutil.ts";
 import type {
+  AuditTailResult,
   CommandsResult,
   HealthResult,
   ListResult,
@@ -311,6 +313,85 @@ test("int.4: daemon SIGKILL mid-turn → restart → zero failed states (B7) + r
       try { process.kill(-pid, "SIGKILL"); } catch { /* no group — fall through */ }
       try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
     }
+    cleanup();
+  }
+});
+
+test("int.4b: runner-persisted completion recovers after SIGKILL and releases idle-urgency mail", async () => {
+  const { dir, cleanup } = makeDaemonDir({
+    // Delivery starts near one tick, the turn start folds at the next, and
+    // completion lands 200ms later. That leaves a deterministic crash window
+    // before the following fold without any production hook or live mutation.
+    tickMs: 1000,
+    stubEnv: { STUB_TURN_MS: "1200" },
+    bootHangTimeoutMs: 8000,
+  });
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    let client = await daemon.client();
+    const beeId = await spawnAndSettle(client, "recover-completion");
+    const before = await client.request<ViewResult>("view", { beeId });
+    assert.ok(before.view.lastOutputAt != null, "the boot completion established the baseline output fact");
+
+    const turn = await client.request<SendRpcResult>("send", { beeId, body: "finish before daemon crash" });
+    await waitDelivered(client, beeId, turn.messageId, "turn delivered");
+    await waitFor(async () => {
+      const view = await client.request<ViewResult>("view", { beeId });
+      return view.view.runtimeState === "running";
+    }, "turn start folded to running", 12_000);
+
+    const idleMail = await client.request<SendRpcResult>("send", {
+      beeId,
+      body: "@hang released only by recovered idle",
+      urgency: "idle",
+    });
+    const journalPath = join(dir, "runners", `${beeId}.1.observations.jsonl`);
+    await waitFor(() => {
+      try {
+        return readFileSync(journalPath, "utf8").includes(`\"turn_ended\",\"messageId\":${turn.messageId}`);
+      } catch {
+        return false;
+      }
+    }, "runner persisted completion before store fold", 12_000, 10);
+    const pendingBeforeCrash = await client.request<MailboxResult>("mailbox", { beeId });
+    assert.equal(
+      pendingBeforeCrash.messages.find((message) => message.id === idleMail.messageId)?.deliveredAt,
+      null,
+      "old daemon has not folded the completion",
+    );
+
+    client.close();
+    await daemon.kill();
+
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+    const health = await client.request<HealthResult>("health");
+    assert.equal(health.lastBoot?.adopted, 1, "same exact host pid/start-time was re-adopted");
+    assert.equal(
+      await waitDelivered(client, beeId, idleMail.messageId, "idle mail released by recovered completion"),
+      1,
+    );
+
+    const after = await client.request<ViewResult>("view", { beeId });
+    assert.equal(after.view.generation, 1, "recovery stays inside the adopted generation");
+    assert.ok(
+      (after.view.lastOutputAt ?? 0) > (before.view.lastOutputAt ?? 0),
+      "the recovered turn completion preserved last-output recency",
+    );
+    const audit = await client.request<AuditTailResult>("audit.tail", { beeId, limit: 1000 });
+    assert.equal(
+      audit.rows.filter((row) => row.kind === "output.recorded").length,
+      2,
+      "boot and recovered turn each record output exactly once",
+    );
+    const log = readFileSync(`${dir}/hived.log`, "utf8");
+    const recoveredAt = log.lastIndexOf(`obs.turn_ended bee=${beeId} gen=1`);
+    const deliveredAt = log.indexOf(`deliver bee=${beeId} msg=${idleMail.messageId} gen=1`);
+    assert.ok(recoveredAt >= 0 && deliveredAt > recoveredAt, "idle delivery follows the recovered state edge");
+    client.close();
+  } finally {
+    await daemon?.stop().catch(() => {});
     cleanup();
   }
 });

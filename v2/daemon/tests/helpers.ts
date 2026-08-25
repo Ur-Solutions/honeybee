@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DriverObservation, InterruptOutcome, LiveProcess, RuntimeDriver, StopCause } from "../../harness/src/driver.ts";
-import type { FlagEvidenceLike, SessionEvidenceLike } from "../src/loops.ts";
+import type { FlagEvidenceLike, ObservationCursorEvidenceLike, SessionEvidenceLike } from "../src/loops.ts";
 import type { NodeConfigFile } from "../src/config.ts";
 import { RpcClient } from "../../cli/src/client.ts";
 
@@ -52,6 +52,7 @@ export class FakeDriver implements RuntimeDriver {
   events: DriverObservation[] = [];
   evidence: FlagEvidenceLike[] = [];
   sessions: SessionEvidenceLike[] = [];
+  recoveryCursors: ObservationCursorEvidenceLike[] = [];
   readonly deliveredIds: number[] = [];
   /** The exact text handed over per delivery (envelope assertions). */
   readonly deliveredBodies: string[] = [];
@@ -196,6 +197,12 @@ export class FakeDriver implements RuntimeDriver {
     return out;
   }
 
+  observeRecoveryCursors(): ObservationCursorEvidenceLike[] {
+    const out = this.recoveryCursors;
+    this.recoveryCursors = [];
+    return out;
+  }
+
   procOf(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null {
     const p = this.procs.get(beeId);
     if (!p || p.generation !== generation) return null;
@@ -320,21 +327,30 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
     },
   };
   // Ready when the socket accepts a hello.
-  await waitFor(
-    async () => {
-      if (proc.exitCode != null) throw new Error(`daemon exited early (${proc.exitCode}):\n${out}`);
-      try {
-        const c = await RpcClient.connect(socketPath, 500);
-        c.close();
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    `daemon socket ${socketPath}`,
-    10_000,
-    20,
-  );
+  try {
+    await waitFor(
+      async () => {
+        if (proc.exitCode != null) throw new Error(`daemon exited early (${proc.exitCode}):\n${out}`);
+        try {
+          const c = await RpcClient.connect(socketPath, 500);
+          c.close();
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      `daemon socket ${socketPath}`,
+      60_000,
+      20,
+    );
+  } catch (error) {
+    // A startup timeout must not orphan a disposable daemon/runner tree and
+    // then make every later process-backed test less reliable.
+    proc.kill("SIGKILL");
+    await waitFor(() => proc.exitCode != null || proc.signalCode != null, "timed-out daemon killed", 10_000)
+      .catch(() => undefined);
+    throw error;
+  }
   return handle;
 }
 

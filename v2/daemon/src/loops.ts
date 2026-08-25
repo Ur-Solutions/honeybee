@@ -123,6 +123,13 @@ export interface SessionEvidenceLike {
   sessionId: string;
 }
 
+/** Applied cursor candidate from a generation-scoped runner observation journal. */
+export interface ObservationCursorEvidenceLike {
+  beeId: string;
+  generation: number;
+  cursor: number;
+}
+
 /**
  * Optional driver capabilities beyond the WP2 RuntimeDriver contract. All are
  * duck-typed: the SimDriver has none of them and the loops stay byte-for-byte
@@ -132,11 +139,16 @@ interface ExtendedDriver {
   /** Drain adapter flag evidence (HsrDriver.observeEvidence). */
   observeEvidence?(): FlagEvidenceLike[];
   /** Process identity captured at spawn (HsrDriver.procOf) — the WP2 pid-at-spawn amendment. */
-  procOf?(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null;
+  procOf?(
+    beeId: string,
+    generation: number,
+  ): { pid: number; pidStartedAt: number; observationCursor?: number } | null;
   /** Whether (bee, generation) is a re-adopted degraded process (no event stream). */
   isDegraded?(beeId: string, generation: number): boolean;
   /** Drain harness session ids learned from booted signals (HsrDriver.observeSessions). */
   observeSessions?(): SessionEvidenceLike[];
+  /** Drain runner-journal cursors only after all earlier normalized effects commit. */
+  observeRecoveryCursors?(): ObservationCursorEvidenceLike[];
 }
 
 /** One I1 deadline breach, shaped like the harness violation ledger. */
@@ -243,9 +255,17 @@ export class DaemonCore {
 
   /** One step of daemon work. May throw ExecutorCrashError (fault injection). */
   step(): void {
-    this.drainObservations();
-    this.applyEvidence();
-    this.applySessionIds();
+    // One crash-consistent observation fold. The journal cursor is written
+    // last inside the SAME SQLite transaction as lifecycle, flag, session,
+    // and last-output projections. A daemon death therefore leaves either
+    // all effects plus the cursor, or neither; there is no durable
+    // "completion applied, cursor stale" ambiguity to replay.
+    this.store.transact(() => {
+      this.drainObservations();
+      this.applyEvidence();
+      this.applySessionIds();
+      this.applyObservationCursors();
+    });
     const policySnapshot = this.stepSnapshot();
     this.bootHangPolicy(policySnapshot.rows);
     this.scaleToZeroPolicy(policySnapshot.rows, policySnapshot.pendingByBee);
@@ -388,8 +408,15 @@ export class DaemonCore {
       });
       this.log(`obs.booted bee=${obs.beeId} gen=${obs.generation} pid=${obs.pid}${obs.synthetic ? " synthetic" : ""}`);
     } else {
-      this.store.updateRuntimeState(obs.beeId, obs.generation, target);
-      if (obs.kind === "turn_ended") this.store.recordOutput(obs.beeId);
+      this.store.updateRuntimeState(
+        obs.beeId,
+        obs.generation,
+        target,
+        // The output/turn-completion fact and running→idle phase are one core
+        // transaction. A crash can replay the journal line, but can never
+        // persist idle without its corresponding last-output fact.
+        obs.kind === "turn_ended" ? { recordOutput: true } : {},
+      );
       this.log(`obs.${obs.kind} bee=${obs.beeId} gen=${obs.generation}`);
     }
   }
@@ -507,6 +534,26 @@ export class DaemonCore {
       }
       const { applied } = this.store.recordProviderSessionId(ev.beeId, ev.sessionId);
       if (applied) this.log(`session.recorded bee=${ev.beeId} gen=${ev.generation} id=${ev.sessionId}`);
+    }
+  }
+
+  /**
+   * Commit the runner journal cursor last in the observation-fold transaction.
+   * Every projection before this point is generation-fenced and idempotent; a
+   * crash rolls back both effects and cursor, while a committed cursor can
+   * never outrun core state.
+   */
+  private applyObservationCursors(): void {
+    if (typeof this.ext.observeRecoveryCursors !== "function") return;
+    for (const ev of this.ext.observeRecoveryCursors()) {
+      const { applied } = this.store.advanceRuntimeObservationCursor(
+        ev.beeId,
+        ev.generation,
+        ev.cursor,
+      );
+      if (applied) {
+        this.log(`obs.checkpoint bee=${ev.beeId} gen=${ev.generation} cursor=${ev.cursor}`);
+      }
     }
   }
 

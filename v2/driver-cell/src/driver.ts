@@ -31,6 +31,7 @@ import {
   HsrDriver,
   type FlagEvidence,
   type HsrDriverConfig,
+  type ObservationCursorEvidence,
   type SessionEvidence,
   type SpawnSpec,
 } from "../../driver-hsr/src/index.ts";
@@ -235,15 +236,26 @@ export class CellDriver implements RuntimeDriver {
     pid: number,
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
+    lastAppliedObservationCursor?: number | null,
   ): boolean {
-    return this.inner.adopt(beeId, generation, pid, pidStartedAt, lastKnownState);
+    return this.inner.adopt(
+      beeId,
+      generation,
+      pid,
+      pidStartedAt,
+      lastKnownState,
+      lastAppliedObservationCursor,
+    );
   }
 
   isDegraded(beeId: string, generation: number): boolean {
     return this.inner.isDegraded(beeId, generation);
   }
 
-  procOf(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null {
+  procOf(
+    beeId: string,
+    generation: number,
+  ): { pid: number; pidStartedAt: number; observationCursor: number } | null {
     return this.inner.procOf(beeId, generation);
   }
 
@@ -253,6 +265,10 @@ export class CellDriver implements RuntimeDriver {
 
   observeSessions(): SessionEvidence[] {
     return this.inner.observeSessions();
+  }
+
+  observeRecoveryCursors(): ObservationCursorEvidence[] {
+    return this.inner.observeRecoveryCursors();
   }
 
   sessionLogPath(beeId: string): string {

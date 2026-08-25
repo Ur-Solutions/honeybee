@@ -877,6 +877,86 @@ test("runtime policy: a running turn is never stopped because time elapsed", () 
   }
 });
 
+test("recovered completion checkpoints last, preserves output, and unlocks idle mail", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    rig.store.recordRuntimeProc("bee-1", 1, {
+      pid: rig.driver.procOf("bee-1", 1)!.pid,
+      pidStartedAt: rig.driver.procOf("bee-1", 1)!.pidStartedAt,
+      observationCursor: 7,
+    });
+    const message = rig.store.send("bee-1", "after recovery", { urgency: "idle" }).message;
+
+    // The runner persisted this edge and cursor; the restarted daemon drains
+    // it through the same observation path as live output.
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.driver.recoveryCursors.push({ beeId: "bee-1", generation: 1, cursor: 41 });
+    rig.core.step();
+
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.ok(rig.store.getBee("bee-1")?.lastOutputAt != null);
+    assert.equal(rig.store.runtimeObservationCursor("bee-1", 1), 41);
+    assert.equal(rig.store.getMessage(message.id)?.deliveredGeneration, 1);
+    assert.deepEqual(rig.driver.deliveredIds, [message.id]);
+
+    const outputRows = () => rig.store.auditRows().filter((row) => row.kind === "output.recorded");
+    assert.equal(outputRows().length, 2, "boot completion plus recovered completion");
+
+    // Crash after the state fold but before the cursor checkpoint: replaying
+    // the already-applied completion is a state/output no-op.
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.driver.recoveryCursors.push({ beeId: "bee-1", generation: 1, cursor: 41 });
+    rig.core.step();
+    assert.equal(outputRows().length, 2);
+    assert.equal(rig.store.runtimeObservationCursor("bee-1", 1), 41);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("recovery applies completion followed by a newer turn start in journal order", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    startTurn(rig);
+    rig.driver.events.push(
+      { beeId: "bee-1", generation: 1, kind: "turn_ended" },
+      { beeId: "bee-1", generation: 1, kind: "turn_started" },
+    );
+    rig.driver.recoveryCursors.push({ beeId: "bee-1", generation: 1, cursor: 73 });
+    rig.core.step();
+
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "running");
+    assert.ok(rig.store.getBee("bee-1")?.lastOutputAt != null, "the intervening completion remains a fact");
+    assert.equal(rig.store.runtimeObservationCursor("bee-1", 1), 73);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("stale-generation recovery observations and cursors cannot touch the current runtime", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    rig.store.updateRuntimeState("bee-1", 1, "stopped", { exitCause: "crashed" });
+    rig.store.reviveBee("bee-1");
+    rig.store.updateRuntimeState("bee-1", 2, "running", { pid: 202, pidStartedAt: 2002 });
+    rig.store.recordRuntimeProc("bee-1", 2, { pid: 202, pidStartedAt: 2002, observationCursor: 9 });
+
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.driver.recoveryCursors.push({ beeId: "bee-1", generation: 1, cursor: 999 });
+    rig.core.step();
+
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "running");
+    assert.equal(rig.store.runtimeObservationCursor("bee-1", 2), 9);
+    assert.equal(rig.store.runtimeObservationCursor("bee-1", 1), null);
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("urgency.d1: `idle` is not delivered while the runtime is running — it lands at turn end", () => {
   const rig = makeRig();
   try {

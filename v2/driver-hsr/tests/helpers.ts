@@ -58,7 +58,7 @@ export function makeRig(opts: { stopKillGraceMs?: number } = {}): TestRig {
 export async function drainUntil(
   driver: HsrDriver,
   pred: (events: DriverObservation[]) => boolean,
-  timeoutMs = 4000,
+  timeoutMs = 15_000,
 ): Promise<DriverObservation[]> {
   const acc: DriverObservation[] = [];
   const deadline = Date.now() + timeoutMs;
@@ -76,7 +76,7 @@ export async function drainUntil(
 export async function drainEvidenceUntil(
   driver: HsrDriver,
   pred: (evidence: FlagEvidence[]) => boolean,
-  timeoutMs = 4000,
+  timeoutMs = 15_000,
 ): Promise<FlagEvidence[]> {
   const acc: FlagEvidence[] = [];
   const deadline = Date.now() + timeoutMs;

@@ -30,6 +30,64 @@ test("send to a live runtime does not enqueue a wake", (t) => {
   store.close();
 });
 
+test("runner observation cursors are monotonic and fenced to the live generation", (t) => {
+  const h = harness();
+  t.after(() => h.cleanup());
+  const store = h.open();
+  const { bee } = makeBee(store);
+
+  assert.equal(store.runtimeObservationCursor(bee.id, 1), null);
+  assert.equal(
+    store.recordRuntimeProc(bee.id, 1, { pid: 101, pidStartedAt: 1001, observationCursor: 0 }).applied,
+    true,
+  );
+  assert.equal(store.runtimeObservationCursor(bee.id, 1), 0);
+  assert.equal(store.advanceRuntimeObservationCursor(bee.id, 1, 24).applied, true);
+  assert.equal(store.advanceRuntimeObservationCursor(bee.id, 1, 24).applied, false);
+  assert.equal(store.advanceRuntimeObservationCursor(bee.id, 1, 12).applied, false);
+  assert.equal(store.runtimeObservationCursor(bee.id, 1), 24);
+
+  store.updateRuntimeState(bee.id, 1, "stopped", { exitCause: "crashed" });
+  store.reviveBee(bee.id);
+  store.recordRuntimeProc(bee.id, 2, { pid: 202, pidStartedAt: 2002, observationCursor: 0 });
+  assert.equal(store.advanceRuntimeObservationCursor(bee.id, 1, 99).applied, false);
+  assert.equal(store.runtimeObservationCursor(bee.id, 1), 24);
+  assert.equal(store.runtimeObservationCursor(bee.id, 2), 0);
+  store.close();
+});
+
+test("turn completion commits idle and the last-output fact in one store transaction", (t) => {
+  const h = harness();
+  t.after(() => h.cleanup());
+  const store = h.open();
+  const { bee } = makeBee(store);
+  bootToRunning(store, bee.id, 11, 111);
+  store.recordRuntimeProc(bee.id, 1, { pid: 11, pidStartedAt: 111, observationCursor: 5 });
+
+  assert.equal(store.getBee(bee.id)?.lastOutputAt, null);
+  assert.throws(() => store.transact(() => {
+    store.updateRuntimeState(bee.id, 1, "idle", { recordOutput: true });
+    store.advanceRuntimeObservationCursor(bee.id, 1, 25);
+    throw new Error("simulated daemon death before observation-fold commit");
+  }));
+  assert.equal(store.currentRuntime(bee.id)?.state, "running");
+  assert.equal(store.getBee(bee.id)?.lastOutputAt, null);
+  assert.equal(store.runtimeObservationCursor(bee.id, 1), 5);
+
+  store.transact(() => {
+    store.updateRuntimeState(bee.id, 1, "idle", { recordOutput: true });
+    store.advanceRuntimeObservationCursor(bee.id, 1, 25);
+  });
+  assert.equal(store.currentRuntime(bee.id)?.state, "idle");
+  assert.ok(store.getBee(bee.id)?.lastOutputAt != null);
+  assert.equal(store.runtimeObservationCursor(bee.id, 1), 25);
+  assert.equal(
+    store.auditRows().filter((row) => row.beeId === bee.id && row.kind === "output.recorded").length,
+    1,
+  );
+  store.close();
+});
+
 test("repeat sends to a stopped bee dedupe to one pending send_wake", (t) => {
   const h = harness();
   t.after(() => h.cleanup());
@@ -143,7 +201,9 @@ test("batch undelivered read preserves per-bee FIFO and excludes delivered rows"
   store.markDelivered(delivered.id, 1);
   assert.deepEqual(
     store.listUndeliveredMessages().map((message) => [message.beeId, message.body]),
-    [[first.id, "first-pending"], [second.id, "second-pending"]].sort(([a], [b]) => a.localeCompare(b)),
+    [[first.id, "first-pending"], [second.id, "second-pending"]].sort((a, b) =>
+      String(a[0]).localeCompare(String(b[0])),
+    ),
   );
   store.close();
 });

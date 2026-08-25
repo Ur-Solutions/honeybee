@@ -75,6 +75,10 @@ rl.on("line", (raw) => {
         turnTimer = null;
         currentTurnId = null;
         emit({ jsonrpc: "2.0", method: "item/agentMessage/delta", params: { threadId, delta: "echo" } });
+        // Mirrors the real structured stream seen in the CO.751a incident.
+        // Lifecycle still derives from turn/completed; the status notification
+        // is deliberately non-authoritative in the Codex adapter.
+        emit({ jsonrpc: "2.0", method: "thread/status/changed", params: { threadId, status: { type: "idle" } } });
         emit({ jsonrpc: "2.0", method: "turn/completed", params: { threadId, turn: { id: turnId } } });
       }, slow ? Number(slow[1]) : 10);
       return;

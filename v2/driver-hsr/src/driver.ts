@@ -6,11 +6,10 @@
  * Spec: docs/design/specs/reset-03-hsr-driver.md.
  *
  * Behavior mapping to the spec:
- *  1. Parenthood — `start` spawns the agent CLI as a direct child in its OWN
- *     process group (detached:true), and captures pid + start-time AT SPAWN
- *     (`procOf`), so the caller can record them in core's createBee/reviveBee
- *     `proc` (the WP2 pid-at-spawn amendment) and a daemon restart at any
- *     point can re-adopt.
+ *  1. Parenthood — `start` spawns a detached runner host in its OWN process
+ *     group; that host owns the agent child and its pipes. The driver captures
+ *     host pid + start-time AT SPAWN (`procOf`), so core can record and exactly
+ *     re-adopt the durable runtime across daemon restarts.
  *  2. Truth = structured events — the driver consumes the child's stdout as an
  *     NDJSON line stream; no screen scraping. Every raw line is appended
  *     VERBATIM to the bee's session log (Q1: the log is the native stream;
@@ -30,20 +29,16 @@
  *     identity handed to core for cross-restart re-adoption. No name, alias
  *     or pane is ever a signal target (the CO.a8d2 lesson).
  *  6. observe() never blocks — events drain from an internal buffer fed by
- *     stdout-line and child-exit callbacks. Undrained events survive a daemon
- *     restart (the driver object outlives the store connection; a machine
- *     reboot kills driver and children together and B7 reconciliation takes
- *     over from snapshotLive()).
+ *     the runner's output-only, generation-scoped journal and host-exit facts.
+ *     The core checkpoints parsed journal bytes only after their effects, so
+ *     undrained evidence survives daemon death without transcript guessing.
  *
  * WP4 addition — cross-restart re-adoption (contract §3.2): when the daemon
- * PROCESS restarts, the ChildProcess handles and pipes are gone but detached
- * children may survive. `adopt(beeId, generation, pid, pidStartedAt)` verifies
- * exact identity (pid alive + OS start time within tolerance of the recorded
- * spawn stamp) and registers the process as *degraded*: it counts as live
- * (snapshotLive/hasProcess — so reconcileAtBoot keeps its runtime row, B7),
- * can be stopped (signaled by verified pid), and its death is observed by
- * polling — but it has no event stream and no stdin, so `deliver` refuses and
- * the daemon's degraded-runtime policy rotates it out when mail arrives.
+ * PROCESS restarts, ChildProcess handles are gone but the detached host and
+ * agent survive. `adopt(...)` verifies exact pid/start-time, reconnects the
+ * host socket, and resumes the exact generation journal at core's committed
+ * cursor. Missing/corrupt proof falls back to a conservative degraded exact-
+ * pid adoption; silence never manufactures idle.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, closeSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from "node:fs";
@@ -760,51 +755,51 @@ export class HsrDriver implements RuntimeDriver {
           // evidence/delivery lane. Pending mail rotates it through the normal
           // degraded-runtime policy; silence never changes its phase.
         } else {
-        const proc: ManagedProcess = {
-          beeId,
-          generation,
-          pid,
-          pidStartedAt,
-          child: null,
-          adapter,
-          degraded: false,
-          // The store's persisted runtime state is the phase truth at the
-          // moment the old daemon stopped (rows-are-truth): an idle runtime
-          // adopts with its accept point OPEN. The 2026-08-21 deploy soak
-          // showed why the blanket "running" claim was wrong for known-idle
-          // bees: it promised a turn_ended that could never come. Without a
-          // hint, "running" remains the conservative claim; the next tailed
-          // edge corrects it, and elapsed time alone never changes it.
-          phase: lastKnownState === "idle" ? "idle" : "running",
-          sessionId: null,
-          turnId: null,
-          stopCause: null,
-          killTimer: null,
-          stdoutRest: Buffer.alloc(0),
-          exited: false,
-          spawnError: null,
-          realEvidence: false,
-          hostStyle: true,
-          agentPid: typeof status.agentPid === "number" ? status.agentPid : null,
-          socket: null,
-          socketRetry: null,
-          socketPath: paths.socket,
-          statusPath: paths.status,
-          observationPath,
-          // v15 resumes at the core's generation-scoped applied cursor. Legacy
-          // hosts have no separated journal, so only their post-adoption bytes
-          // are observable; history is never rewound heuristically.
-          logOffset: observationOffset,
-          initialObservationCursor: observationOffset,
-          pendingObservationCursor: null,
-          legacySharedObservation,
-          outboundPending: [],
-          pendingWrites: [],
-          socketBroken: false,
-        };
-        this.procs.set(beeId, proc);
-        this.connectSocket(proc);
-        return true;
+          const proc: ManagedProcess = {
+            beeId,
+            generation,
+            pid,
+            pidStartedAt,
+            child: null,
+            adapter,
+            degraded: false,
+            // The store's persisted runtime state is the phase truth at the
+            // moment the old daemon stopped (rows-are-truth): an idle runtime
+            // adopts with its accept point OPEN. The 2026-08-21 deploy soak
+            // showed why the blanket "running" claim was wrong for known-idle
+            // bees: it promised a turn_ended that could never come. Without a
+            // hint, "running" remains the conservative claim; the next tailed
+            // edge corrects it, and elapsed time alone never changes it.
+            phase: lastKnownState === "idle" ? "idle" : "running",
+            sessionId: null,
+            turnId: null,
+            stopCause: null,
+            killTimer: null,
+            stdoutRest: Buffer.alloc(0),
+            exited: false,
+            spawnError: null,
+            realEvidence: false,
+            hostStyle: true,
+            agentPid: typeof status.agentPid === "number" ? status.agentPid : null,
+            socket: null,
+            socketRetry: null,
+            socketPath: paths.socket,
+            statusPath: paths.status,
+            observationPath,
+            // v15 resumes at the core's generation-scoped applied cursor. Legacy
+            // hosts have no separated journal, so only their post-adoption bytes
+            // are observable; history is never rewound heuristically.
+            logOffset: observationOffset,
+            initialObservationCursor: observationOffset,
+            pendingObservationCursor: null,
+            legacySharedObservation,
+            outboundPending: [],
+            pendingWrites: [],
+            socketBroken: false,
+          };
+          this.procs.set(beeId, proc);
+          this.connectSocket(proc);
+          return true;
         }
       }
     }
@@ -866,10 +861,17 @@ export class HsrDriver implements RuntimeDriver {
    * Process identity captured at spawn, for core's createBee/reviveBee `proc`
    * (the WP2 amendment). Available immediately after start() returns.
    */
-  procOf(beeId: string, generation: number): { pid: number; pidStartedAt: number } | null {
+  procOf(
+    beeId: string,
+    generation: number,
+  ): { pid: number; pidStartedAt: number; observationCursor: number } | null {
     const p = this.procs.get(beeId);
     if (!p || p.generation !== generation || p.pid <= 0) return null;
-    return { pid: p.pid, pidStartedAt: p.pidStartedAt };
+    return {
+      pid: p.pid,
+      pidStartedAt: p.pidStartedAt,
+      observationCursor: p.initialObservationCursor,
+    };
   }
 
   /** Drain condition-flag evidence (adapters report; the daemon acts). */
@@ -892,9 +894,31 @@ export class HsrDriver implements RuntimeDriver {
     return out;
   }
 
+  /**
+   * Drain the latest signal-bearing journal cursor per live generation. The
+   * daemon calls this after applying observations/evidence/session ids; if it
+   * crashes before the core-store checkpoint, the successor replays from the
+   * previous cursor and the idempotent projections settle again.
+   */
+  observeRecoveryCursors(): ObservationCursorEvidence[] {
+    this.pumpAll();
+    const out: ObservationCursorEvidence[] = [];
+    for (const p of this.procs.values()) {
+      if (p.pendingObservationCursor == null) continue;
+      out.push({ beeId: p.beeId, generation: p.generation, cursor: p.pendingObservationCursor });
+      p.pendingObservationCursor = null;
+    }
+    return out;
+  }
+
   /** Verbatim native-stream session log path for a bee (Q1). */
   sessionLogPath(beeId: string): string {
     return join(this.cfg.sessionLogDir, `${beeId}.jsonl`);
+  }
+
+  /** Output-only recovery journal for exactly one runtime generation. */
+  observationLogPath(beeId: string, generation: number): string {
+    return this.runnerPaths(beeId, generation).observations;
   }
 
   // --- DeliveryGroundTruth (invariant checker, spec test tier 3) -----------
@@ -967,11 +991,11 @@ export class HsrDriver implements RuntimeDriver {
     // lines live on stdin; the session log is the verbatim native stream in
     // BOTH directions so panes can render the operator's prompt.
     if (p.hostStyle) {
-      // The HOST is the session log's single writer: it appends the outbound
-      // line (before stdin) exactly as it appends agent stdout, keeping one
-      // append order the tail can skip against via `outboundPending`.
+      // The HOST is the transcript's single writer. v15 observation journals
+      // are output-only, so outbound suppression is needed only while talking
+      // to an adopted legacy host that still tails the shared transcript.
       try {
-        p.outboundPending.push(line);
+        if (p.legacySharedObservation) p.outboundPending.push(line);
         if (p.socket && !p.socket.destroyed) {
           p.socket.write(`${JSON.stringify({ op: "write", line })}\n`);
         } else {
