@@ -10,6 +10,7 @@ export {
   HANDLE_RE,
   handlePrefix,
   type CoreStoreOptions,
+  type BeeViewRow,
   type CreateBeeInput,
   type SendResult,
   type WakeResult,

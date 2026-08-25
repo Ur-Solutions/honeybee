@@ -54,7 +54,7 @@ function makeCodexDriver(dir: string): HsrDriver {
         command: process.execPath,
         args: [FAKE_CODEX_PATH],
         cwd: dir,
-        env: { ...process.env },
+        env: { ...(process.env as Record<string, string>) },
       };
     },
   });
