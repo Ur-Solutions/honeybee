@@ -6,7 +6,8 @@
  * codex app-server), the login seat (detached tmux running the harness's own
  * login against the account's home; credential change detected by mtime
  * past baseline or Keychain digest drift → recipe files captured into the
- * vault → status ok), the empty-home activation hook the driver's spawn
+ * vault → status ok; Cursor uses the same explicit-login digest bridge for
+ * its machine-global store), the empty-home activation hook the driver's spawn
  * resolve calls, and the read-only importer of the OLD ~/.hive/vault
  * registry into rows.
  *
@@ -60,6 +61,12 @@ import {
   fetchSecondaryProviderLimits,
   type ProviderLimitsHttp,
 } from "./providerLimits.ts";
+import {
+  cursorCredentialEnv,
+  parseCursorAuth,
+  readCursorLiveAuth,
+  type CursorAuthReader,
+} from "./cursorAuth.ts";
 
 // ---------------------------------------------------------------------------
 // injected transports
@@ -88,6 +95,8 @@ export interface AccountsServiceOptions {
   now?: () => number;
   keychainReader?: KeychainReader;
   keychainWriter?: KeychainWriter;
+  /** Cursor's machine-global credential store, injected so tests never touch a real login. */
+  cursorAuthReader?: CursorAuthReader;
   fetchers?: LimitsFetchers;
   /** Injectable HTTP boundary for Grok, Kimi, Cursor, and OpenCode limits. */
   providerHttp?: Partial<ProviderLimitsHttp>;
@@ -271,6 +280,7 @@ export class AccountsService {
   private readonly now: () => number;
   private readonly keychainReader: KeychainReader;
   private readonly keychainWriter: KeychainWriter;
+  private readonly cursorAuthReader: CursorAuthReader;
   private readonly fetchers: Required<LimitsFetchers>;
   private readonly providerHttp: ProviderLimitsHttp;
   private readonly seats = new Map<string, LoginSeat>();
@@ -289,6 +299,7 @@ export class AccountsService {
     this.now = opts.now ?? Date.now;
     this.keychainReader = opts.keychainReader ?? readClaudeKeychain;
     this.keychainWriter = opts.keychainWriter ?? writeClaudeKeychainEntry;
+    this.cursorAuthReader = opts.cursorAuthReader ?? readCursorLiveAuth;
     this.fetchers = {
       claudeUsage: opts.fetchers?.claudeUsage ?? defaultClaudeUsage(this.cfg.accounts.limitsFetchTimeoutMs),
       claudeRefresh: opts.fetchers?.claudeRefresh ?? defaultClaudeRefresh(this.cfg.accounts.limitsFetchTimeoutMs),
@@ -316,6 +327,15 @@ export class AccountsService {
   homeEnvOf(account: AccountRow): Record<string, string> {
     const key = homeEnvFor(account.harness);
     return { ...(key ? { [key]: account.homePath } : {}), ...recipeEnvFor(account.harness, account.homePath) };
+  }
+
+  /**
+   * Runtime-only credential overrides that must never be persisted in bee.env.
+   * Cursor's config dir does not relocate its secret store, so the account
+   * home's captured auth.json is lifted into the process environment here.
+   */
+  credentialEnvOf(account: AccountRow): Record<string, string> {
+    return account.harness === "cursor" ? cursorCredentialEnv(account.homePath) : {};
   }
 
   /**
@@ -428,6 +448,48 @@ export class AccountsService {
     const freshness = limitsAgeMs === null ? "" : `, limits ${Math.round(limitsAgeMs / 60_000)} min old${stale ? " (stale)" : ""}`;
     this.log(`account auto → ${winner.id}${usage ? ` (${usage}${freshness})` : freshness ? ` (${freshness.slice(2)})` : ""} — ${reason}`);
     return { ok: true, account: winner, reason, limitsAgeMs, stale, candidates: eligible.length };
+  }
+
+  /**
+   * Resolve `rr` for a harness. This deliberately ignores provider limits and
+   * commitments: it walks credentialed accounts in stable registration order,
+   * skipping paused/auth-failed accounts while a healthy candidate exists.
+   * Its durable cursor is namespaced away from auto's near-tie cursor.
+   */
+  pickRoundRobin(harness: string): PickOutcome {
+    const registered = this.store.listAccounts({ harness });
+    if (registered.length === 0) {
+      return { ok: false, code: "no_accounts", message: `No ${harness} accounts registered; add one with: hive account add ${harness} <label>` };
+    }
+    const pool = registered.filter((account) => account.status !== "paused");
+    if (pool.length === 0) {
+      return { ok: false, code: "all_paused", message: `Every ${harness} account is paused; unpause one with: hive account unpause <account>` };
+    }
+    const candidates = pool.filter((account) => this.credentialed(account));
+    if (candidates.length === 0) {
+      return { ok: false, code: "no_credentials", message: `No ${harness} account has credentials; log in with: hive account login <account>` };
+    }
+    const healthy = candidates.filter((account) => account.status !== "auth_needed");
+    const skipped = healthy.length > 0 ? candidates.filter((account) => account.status === "auth_needed") : [];
+    const eligible = healthy.length > 0 ? healthy : candidates;
+    const cursorKey = `rr:${harness}`;
+    const previous = this.store.getSelectionCursor(cursorKey)?.lastAccountId ?? null;
+    const previousIndex = previous == null ? -1 : eligible.findIndex((account) => account.id === previous);
+    const winner = eligible[(previousIndex + 1) % eligible.length] as AccountRow;
+    this.store.setSelectionCursor(cursorKey, winner.id);
+    const reason = [
+      previousIndex >= 0
+        ? `round-robin: next after ${previous}`
+        : eligible.length === 1
+          ? `only ${harness} account with credentials`
+          : "round-robin: first pick",
+      ...(skipped.length > 0 ? [`skipped ${skipped.length} account(s) for recent auth failure`] : []),
+      ...(healthy.length === 0 && candidates.some((account) => account.status === "auth_needed")
+        ? ["every credentialed account has a recent auth failure; using last resort"]
+        : []),
+    ].join("; ");
+    this.log(`account rr → ${winner.id} — ${reason}`);
+    return { ok: true, account: winner, reason, limitsAgeMs: null, stale: false, candidates: eligible.length };
   }
 
   /** The candidate ids a pick would consider (for "refresh stale before pick"). */
@@ -714,13 +776,33 @@ export class AccountsService {
     spawnSync("tmux", this.tmuxArgs("kill-session", "-t", `=${session}`), { stdio: "ignore" });
   }
 
+  private async externalLoginCredential(account: AccountRow): Promise<string | null> {
+    if (account.harness === "claude") return this.keychainReader(account.homePath).catch(() => null);
+    if (account.harness === "cursor") return (await this.cursorAuthReader().catch(() => null))?.raw ?? null;
+    return null;
+  }
+
+  private validPrimaryCredential(harness: string, primaryFile: string, raw: string | null): boolean {
+    if (raw === null || raw.trim().length === 0) return false;
+    if (harness === "claude") return parseClaudeCredentials(raw) !== null;
+    if (harness === "cursor") return parseCursorAuth(raw) !== null;
+    if (!primaryFile.endsWith(".json")) return true;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Start (or rejoin) the login seat for an account: a detached tmux session
    * running the harness's own login against the account's home, with the
    * home env set. Records the freshness baseline (primary credential mtime;
-   * for claude also the Keychain digest) and registers a watch the tick loop
-   * polls. Returns the seat handle (attach hint) immediately — the login is
-   * interactive; the operator completes it in the seat.
+   * for Claude/Cursor also the out-of-home credential digest) and registers a
+   * watch the tick loop polls. Returns the seat handle (attach hint)
+   * immediately — the login is interactive; the operator completes it in the
+   * seat.
    */
   async startLogin(account: AccountRow): Promise<{ seat: LoginSeat; rejoined: boolean }> {
     const recipe = recipeFor(account.harness);
@@ -732,8 +814,8 @@ export class AccountsService {
     const login = this.cfg.agents[account.harness]?.login ?? recipe.login;
     const env = { ...(this.cfg.agents[account.harness]?.env ?? {}), ...this.homeEnvOf(account) };
     const baselineMtime = primaryCredentialMtime(account.homePath, recipe);
-    const keychainRaw = account.harness === "claude" ? await this.keychainReader(account.homePath).catch(() => null) : null;
-    const baselineDigest = keychainRaw ? credentialDigest(keychainRaw) : null;
+    const externalRaw = await this.externalLoginCredential(account);
+    const baselineDigest = externalRaw ? credentialDigest(externalRaw) : null;
     if (this.tmuxHasSession(session)) this.tmuxKill(session);
     const envArgs = Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
     const command = [login.command, ...(login.args ?? [])].map(shellQuote).join(" ");
@@ -760,12 +842,11 @@ export class AccountsService {
   }
 
   /**
-   * Tick hook: poll every open seat for the credential change (mtime past
-   * the baseline, or Keychain digest drift for claude); on detection capture
-   * the recipe files into the vault (claude: the Keychain item as the vault's
-   * .credentials.json — the authoritative credential), mark the account ok +
-   * last_login_at, tear the seat down. Returns the completed logins so the
-   * daemon can clear bee flags. Bounded by the seat deadline.
+   * Tick hook: poll every open seat for a credential change (mtime past the
+   * baseline, Claude Keychain drift, or Cursor global-store drift). A valid
+   * primary credential is required and must be captured before the account is
+   * marked ok + last_login_at. Returns completed logins so the daemon can
+   * clear bee flags. The owned tmux seat is torn down on success or timeout.
    */
   async pollLoginSeats(): Promise<LoginOutcome[]> {
     if (this.pollingSeats || this.seats.size === 0) return [];
@@ -787,18 +868,52 @@ export class AccountsService {
         }
         const mtime = primaryCredentialMtime(account.homePath, recipe);
         let detectedBy: LoginOutcome["detectedBy"] | null = null;
-        let keychainRaw: string | null = null;
-        if (mtime !== null && (seat.baselineMtime === null || mtime > seat.baselineMtime)) detectedBy = "mtime";
-        if (!detectedBy && account.harness === "claude") {
-          keychainRaw = await this.keychainReader(account.homePath).catch(() => null);
-          const digest = keychainRaw ? credentialDigest(keychainRaw) : null;
-          if (digest !== null && digest !== seat.baselineDigest) detectedBy = "digest";
+        let externalRaw: string | null = null;
+        let externalDigest: string | null = null;
+        if (account.harness === "claude" || account.harness === "cursor") {
+          externalRaw = await this.externalLoginCredential(account);
+          externalDigest = externalRaw ? credentialDigest(externalRaw) : null;
+          if (externalDigest !== null && externalDigest !== seat.baselineDigest) detectedBy = "digest";
         }
+        // On macOS Claude and Cursor, the external store is authoritative. A
+        // home mtime is only a login signal when no external credential can
+        // be read (Linux/file fallback and test harnesses).
+        if (!detectedBy && externalRaw === null && mtime !== null && (seat.baselineMtime === null || mtime > seat.baselineMtime)) detectedBy = "mtime";
         if (detectedBy) {
-          if (account.harness === "claude" && !keychainRaw) keychainRaw = await this.keychainReader(account.homePath).catch(() => null);
           const overrides: Record<string, string> = {};
-          if (account.harness === "claude" && keychainRaw && parseClaudeCredentials(keychainRaw)) overrides[".credentials.json"] = keychainRaw;
+          if ((account.harness === "claude" || account.harness === "cursor") && externalRaw) {
+            overrides[primaryCredentialFile(recipe)] = externalRaw;
+          }
+          const primaryFile = primaryCredentialFile(recipe);
+          let primaryRaw = overrides[primaryFile] ?? null;
+          if (primaryRaw === null) {
+            try {
+              primaryRaw = readFileSync(join(account.homePath, primaryFile), "utf8");
+            } catch {
+              primaryRaw = null;
+            }
+          }
+          if (!this.validPrimaryCredential(account.harness, primaryFile, primaryRaw)) {
+            // Consume only the bad observation baseline. The seat remains open
+            // so a later valid provider write can still complete the login.
+            seat.baselineMtime = mtime;
+            seat.baselineDigest = externalDigest;
+            this.log(`account.login.rejected account=${account.id} by=${detectedBy} reason=invalid_primary`);
+            continue;
+          }
+          // Cursor's provider login lands outside CURSOR_CONFIG_DIR. Materialize
+          // that explicit login into this account's one authoritative home
+          // before taking the vault backup; no background/global sync exists.
+          if (account.harness === "cursor" && externalRaw) {
+            atomicWriteFileSync(join(account.homePath, primaryFile), externalRaw);
+          }
           const captured = captureHomeToVault(account.harness, account.homePath, this.vaultDirOf(account), overrides);
+          if (!captured.includes(primaryFile)) {
+            seat.baselineMtime = mtime;
+            seat.baselineDigest = externalDigest;
+            this.log(`account.login.rejected account=${account.id} by=${detectedBy} reason=primary_not_captured`);
+            continue;
+          }
           this.store.recordAccountLogin(account.id, now);
           this.seats.delete(seat.accountId);
           this.tmuxKill(seat.session);
@@ -808,7 +923,8 @@ export class AccountsService {
         }
         if (now > seat.deadline) {
           this.seats.delete(seat.accountId);
-          this.log(`account.login.timeout account=${account.id} session=${seat.session} (seat left running: ${seat.attach})`);
+          this.tmuxKill(seat.session);
+          this.log(`account.login.timeout account=${account.id} session=${seat.session} seat=stopped`);
           continue;
         }
         if (!this.tmuxHasSession(seat.session)) {

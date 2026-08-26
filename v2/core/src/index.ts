@@ -33,8 +33,10 @@ export {
   type CreateAccountInput,
   type PutAccountLimitsInput,
   type RecordNamingUsageInput,
+  type BeeViewRow,
 } from "./store.ts";
 export * from "./accountSelect.ts";
+export * from "./accountMatch.ts";
 export * from "./accountRecipes.ts";
 export * from "./accountLimitsParse.ts";
 export {

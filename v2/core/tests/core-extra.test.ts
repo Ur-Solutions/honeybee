@@ -199,6 +199,7 @@ test("batch undelivered read preserves per-bee FIFO and excludes delivered rows"
   store.send(first.id, "first-pending");
   store.send(second.id, "second-pending");
   store.markDelivered(delivered.id, 1);
+  const expected: Array<[string, string]> = [[first.id, "first-pending"], [second.id, "second-pending"]];
   assert.deepEqual(
     store.listUndeliveredMessages().map((message) => [message.beeId, message.body]),
     [[first.id, "first-pending"], [second.id, "second-pending"]].sort((a, b) =>

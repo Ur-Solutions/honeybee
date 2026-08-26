@@ -136,8 +136,8 @@ export const RPC_VERBS = [
   "seal.list",
   "seal.get",
   // v7 (spec 08 CORE, additive to v2/1): accounts + auth. `spawn` also takes
-  // `account?` ('auto' default → the calibrated selector; explicit id; null =
-  // unbound).
+  // `account?` ('auto' default → the calibrated selector; 'rr' → registration-
+  // order round robin; explicit id; null = unbound).
   "account.list",
   "account.get",
   "account.add",
@@ -208,6 +208,8 @@ export interface DedupMarkers {
 
 export interface SpawnResult extends DedupMarkers {
   beeId: string;
+  /** The concrete configured agent after resolving an embedded account selector. */
+  agent?: string;
   /** v10 — the minted display handle (`CL.a3f2`); what humans use from here on. */
   handle?: string | null;
   commandId: number;
@@ -215,7 +217,7 @@ export interface SpawnResult extends DedupMarkers {
   messageId?: number | null;
   /**
    * v7: the account the bee was bound to (null = unbound: no accounts for the
-   * harness, or `account: null` requested) and, for an `auto` pick, the
+   * harness, or `account: null` requested) and, for an `auto`/`rr` pick, the
    * selector's reason line.
    */
   account?: string | null;
@@ -243,7 +245,7 @@ export interface LoginSeatInfo {
   deadline: number;
 }
 
-/** `account.get {id}` — `account_not_found` when absent. */
+/** `account.get {id}` — id accepts an exact/unique fuzzy selector; `account_not_found` when absent. */
 export interface AccountGetResult {
   account: MirrorAccountRow;
   limits: MirrorAccountLimitsRow | null;
@@ -263,19 +265,19 @@ export interface AccountAddResult extends DedupMarkers {
   account: MirrorAccountRow;
 }
 
-/** `account.remove {id}` — `account_referenced` while bees carry it. */
+/** `account.remove {id}` — id is a selector; `account_referenced` while bees carry it. */
 export interface AccountRemoveResult extends DedupMarkers {
   account: MirrorAccountRow;
 }
 
-/** `account.pause {id}` / `account.unpause {id}` / `account.setPenalty {id, penalty}` — `applied:false` = already so. */
+/** Account edits accept selectors in `id`; `applied:false` = already in the requested state. */
 export interface AccountUpdateResult extends DedupMarkers {
   account: MirrorAccountRow;
   applied: boolean;
 }
 
 /**
- * `account.login {id}` — start (or rejoin) the login seat: a detached tmux
+ * `account.login {id}` — resolve id as a selector, then start (or rejoin) the login seat: a detached tmux
  * session running the harness's own login against the account's home. The
  * daemon watches for the credential change (mtime past baseline / Keychain
  * digest drift), captures the recipe files into the vault, marks the account
@@ -287,7 +289,7 @@ export interface AccountLoginResult extends DedupMarkers {
   rejoined: boolean;
 }
 
-/** `account.limits {id?}` — refresh now (all accounts when no id) and return the rows. */
+/** `account.limits {id?}` — resolve id as a selector, or refresh all accounts when omitted. */
 export interface AccountLimitsResult extends DedupMarkers {
   limits: MirrorAccountLimitsRow[];
 }
@@ -326,7 +328,7 @@ export interface AccountBackfillResult extends DedupMarkers {
 }
 
 /**
- * `bee.swapAccount {beeId, account}` — same-harness only (`harness_mismatch`),
+ * `bee.swapAccount {beeId, account}` — account is a selector; same-harness only (`harness_mismatch`),
  * `account_paused` refused, `account_not_found`. Rebinds the bee (account +
  * home env), then: a live runtime is stopped and revived with resume
  * (`stop_then_revive`, the stop command id); a stopped bee is just rebound

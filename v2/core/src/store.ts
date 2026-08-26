@@ -1032,7 +1032,7 @@ export class CoreStore {
       const account = input.account ?? null;
       if (account !== null) {
         if (typeof account !== "string" || account.length === 0) throw new CoreError("createBee: account must be a non-empty string or null");
-        if (account === "auto") throw new CoreError("createBee: account 'auto' is a selection intent, never a stored binding — resolve it first");
+        if (account === "auto" || account === "rr") throw new CoreError(`createBee: account '${account}' is a selection intent, never a stored binding — resolve it first`);
         this.mustGetAccount(account);
       }
       this.db
@@ -2681,7 +2681,7 @@ export class CoreStore {
     const harness = requireNonEmpty(input.harness, "createAccount: harness");
     const homePath = requireNonEmpty(input.homePath, "createAccount: homePath");
     const label = requireNonEmpty(input.label, "createAccount: label");
-    if (id === "auto") throw new CoreError("createAccount: 'auto' is reserved (the selection intent)");
+    if (id === "auto" || id === "rr") throw new CoreError(`createAccount: '${id}' is reserved (an account selection intent)`);
     const status = input.status ?? "ok";
     if (!(ACCOUNT_STATUSES as readonly string[]).includes(status)) throw new CoreError(`createAccount: status must be one of ${ACCOUNT_STATUSES.join("|")}`);
     const penalty = normalizePenalty(input.penalty ?? 0, "createAccount");
@@ -2797,7 +2797,7 @@ export class CoreStore {
    */
   setBeeAccount(beeId: string, account: string | null): { bee: BeeRow; applied: boolean } {
     if (account !== null && (typeof account !== "string" || account.length === 0)) throw new CoreError("setBeeAccount: account must be a non-empty string or null");
-    if (account === "auto") throw new CoreError("setBeeAccount: account 'auto' is a selection intent, never a stored binding");
+    if (account === "auto" || account === "rr") throw new CoreError(`setBeeAccount: account '${account}' is a selection intent, never a stored binding`);
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       if (account !== null) this.mustGetAccount(account);
@@ -3028,7 +3028,7 @@ export class CoreStore {
     return (this.stmt("SELECT * FROM selection_cursors ORDER BY harness").all() as Row[]).map(mapSelectionCursor);
   }
 
-  /** v7 — advance the per-harness near-tie rotation cursor. Audited `selection_cursor.set`. */
+  /** v7 — advance a durable selector cursor. Audited `selection_cursor.set`. */
   setSelectionCursor(harness: string, lastAccountId: string): SelectionCursorRow {
     requireNonEmpty(harness, "setSelectionCursor: harness");
     requireNonEmpty(lastAccountId, "setSelectionCursor: lastAccountId");

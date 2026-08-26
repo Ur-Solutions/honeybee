@@ -19,11 +19,16 @@ import {
   parseClaudeCredentials,
   parseClaudeUsage,
   parseCodexRateLimits,
+  recipeFor,
   recipeEnvFor,
   replayAudit,
   safeName,
 } from "../src/index.ts";
 import { harness, makeBee } from "./helpers.ts";
+
+test("v7.recipes: Claude login seats launch the native auth flow", () => {
+  assert.deepEqual(recipeFor("claude")?.login, { command: "claude", args: ["auth", "login"] });
+});
 
 test("v7.crud: create/get/list (registration order), remove; remove refused while a bee references it; replay", () => {
   const h = harness();
@@ -99,7 +104,7 @@ test("v7.edits: status/penalty/login/exhaustion/fields — audited as account.pu
   }
 });
 
-test("v7.binding: setBeeAccount requires an existing account, never stores 'auto'; setBeeEnv + rekeyBeeSession audit + replay", () => {
+test("v7.binding: setBeeAccount requires an existing account, never stores account selectors; setBeeEnv + rekeyBeeSession audit + replay", () => {
   const h = harness();
   try {
     const store = h.open();
@@ -108,8 +113,10 @@ test("v7.binding: setBeeAccount requires an existing account, never stores 'auto
     const { bee } = makeBee(store, "w");
     assert.equal(bee.account, null);
     assert.throws(() => store.createBee({ name: "x", agent: "claude", substrate: "hsr", cwd: "/tmp", account: "auto" }), /never a stored binding/);
+    assert.throws(() => store.createBee({ name: "x", agent: "claude", substrate: "hsr", cwd: "/tmp", account: "rr" }), /never a stored binding/);
     assert.throws(() => store.createBee({ name: "x", agent: "claude", substrate: "hsr", cwd: "/tmp", account: "nope" }), AccountNotFoundError);
     assert.throws(() => store.setBeeAccount(bee.id, "auto"), CoreError);
+    assert.throws(() => store.setBeeAccount(bee.id, "rr"), CoreError);
     assert.throws(() => store.setBeeAccount(bee.id, "nope"), AccountNotFoundError);
     const r1 = store.setBeeAccount(bee.id, "claude-a");
     assert.equal(r1.applied, true);

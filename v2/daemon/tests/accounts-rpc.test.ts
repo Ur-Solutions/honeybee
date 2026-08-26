@@ -27,6 +27,7 @@ import type {
   AccountAddResult,
   AccountBackfillResult,
   AccountGetResult,
+  AccountLimitsResult,
   AccountListResult,
   AccountRemoveResult,
   AccountUpdateResult,
@@ -156,6 +157,64 @@ test("rpc.accounts.1: CRUD verbs, typed errors, idempotent add, spawn binding (e
     await waitFor(() => frames.some((f) => f.type === "delta" && f.events.some((e) => e.kind === "account.put")), "account.put in the watch stream");
     await waitFor(() => frames.some((f) => f.type === "delta" && f.events.some((e) => e.kind === "account.removed")), "account.removed in the watch stream");
     watch.close();
+    client.close();
+  } finally {
+    if (daemon) await daemon.stop();
+    cleanup();
+  }
+});
+
+test("rpc.accounts.fuzzy: one selector works across account verbs, spawn agent shorthand, explicit override, and swap", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+    await client.request("account.add", { harness: "stub", label: "owner@gmail.com", id: "stub-personal" });
+    await client.request("account.add", { harness: "stub", label: "owner@company.com", id: "stub-work" });
+    await client.request("account.add", { harness: "stub", label: "remove-me", id: "stub-archive" });
+    await client.request("account.add", { harness: "codex", label: "coder@gmail.com", id: "codex-personal" });
+
+    const got = await client.request<AccountGetResult>("account.get", { id: "stub-gmail" });
+    assert.equal(got.account.id, "stub-personal");
+
+    assert.equal((await client.request<AccountUpdateResult>("account.pause", { id: "COMPANY" })).account.id, "stub-work");
+    assert.equal((await client.request<AccountUpdateResult>("account.unpause", { id: "stub-company" })).account.id, "stub-work");
+    const penalty = await client.request<AccountUpdateResult>("account.setPenalty", { id: "company", penalty: 17 });
+    assert.equal(penalty.account.id, "stub-work");
+    assert.equal(penalty.account.penalty, 17);
+    const limits = await client.request<AccountLimitsResult>("account.limits", { id: "company" });
+    assert.deepEqual(limits.limits.map((row) => row.account), ["stub-work"]);
+    // Stub intentionally has no login recipe. `invalid_request` (instead of
+    // account_not_found) proves the fuzzy selector reached that harness gate.
+    await rejects(() => client.request("account.login", { id: "stub-company" }), "invalid_request");
+
+    // Embedded selector: the daemon normalizes the concrete agent and binds
+    // the fuzzy account before creating the bee row.
+    const embedded = await client.request<SpawnResult>("spawn", { name: "fuzzy", agent: "stub-gmail", cwd: dir });
+    assert.equal(embedded.agent, "stub");
+    assert.equal(embedded.account, "stub-personal");
+    const embeddedView = await client.request<ViewResult>("view", { beeId: embedded.beeId });
+    assert.equal(embeddedView.bee?.agent, "stub");
+    assert.equal(embeddedView.bee?.account, "stub-personal");
+
+    // Explicit account selection still wins over the account embedded in the
+    // agent token, while the harness portion is normalized consistently.
+    const overridden = await client.request<SpawnResult>("spawn", {
+      name: "override",
+      agent: "stub-gmail",
+      account: "company",
+      cwd: dir,
+    });
+    assert.equal(overridden.agent, "stub");
+    assert.equal(overridden.account, "stub-work");
+
+    const swap = await client.request<SwapAccountResult>("bee.swapAccount", { beeId: embedded.beeId, account: "stub-company" });
+    assert.equal(swap.to, "stub-work");
+    const removed = await client.request<AccountRemoveResult>("account.remove", { id: "REMOVE" });
+    assert.equal(removed.account.id, "stub-archive");
+
+    await rejects(() => client.request("account.get", { id: "gmail" }), "invalid_request");
     client.close();
   } finally {
     if (daemon) await daemon.stop();

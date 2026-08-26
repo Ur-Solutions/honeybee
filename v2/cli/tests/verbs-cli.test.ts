@@ -12,7 +12,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
-import { runV2Cli, withModelArg, type CliIo } from "../src/main.ts";
+import {
+  agentAccountSelection,
+  loginSeatTmuxArgs,
+  runV2Cli,
+  shouldAutoAttachLogin,
+  withModelArg,
+  type CliIo,
+} from "../src/main.ts";
 import { stripAnsi } from "../src/style.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
@@ -20,6 +27,27 @@ function capture(): { io: CliIo; out: string[]; err: string[] } {
   const err: string[] = [];
   return { io: { out: (l) => out.push(stripAnsi(l)), err: (l) => err.push(stripAnsi(l)) }, out, err };
 }
+
+test("verbs.agent-account-selector: auto/rr suffixes collapse without hijacking ordinary hyphenated agents", () => {
+  assert.deepEqual(agentAccountSelection("codex-auto"), { agent: "codex", account: "auto" });
+  assert.deepEqual(agentAccountSelection("claude-rr"), { agent: "claude", account: "rr" });
+  assert.deepEqual(agentAccountSelection("my-agent"), { agent: "my-agent" });
+  assert.deepEqual(agentAccountSelection("-auto"), { agent: "-auto" });
+});
+
+test("verbs.login-seat: interactive human logins auto-attach; json/no-attach stay composable; tmux targets are exact", () => {
+  const interactive = { json: false, noAttach: false, forceAttach: false, stdinIsTTY: true, stdoutIsTTY: true };
+  assert.equal(shouldAutoAttachLogin(interactive), true);
+  assert.equal(shouldAutoAttachLogin({ ...interactive, json: true }), false);
+  assert.equal(shouldAutoAttachLogin({ ...interactive, json: true, forceAttach: true }), false);
+  assert.equal(shouldAutoAttachLogin({ ...interactive, noAttach: true }), false);
+  assert.equal(shouldAutoAttachLogin({ ...interactive, stdinIsTTY: false }), false);
+  assert.equal(shouldAutoAttachLogin({ ...interactive, stdinIsTTY: false, stdoutIsTTY: false, forceAttach: true }), true);
+
+  const seat = { session: "hive-login-claude-work", socket: "hive-accounts" };
+  assert.deepEqual(loginSeatTmuxArgs(seat), ["-L", "hive-accounts", "attach-session", "-t", "=hive-login-claude-work"]);
+  assert.deepEqual(loginSeatTmuxArgs({ ...seat, socket: null }, "has-session"), ["has-session", "-t", "=hive-login-claude-work"]);
+});
 
 async function idleBee(dir: string, needle: string): Promise<void> {
   await waitFor(async () => {
@@ -562,7 +590,7 @@ test("verbs.usage: renders the cached account_limits rows (stale, read-only) wit
 
     // [account] filter + --json
     const j = capture();
-    assert.equal(await runV2Cli(["usage", "claude-a", "--json", "--data-dir", dir], j.io), 0);
+    assert.equal(await runV2Cli(["usage", "CLAUDE-A", "--json", "--data-dir", dir], j.io), 0, "daemon-down usage shares the fuzzy/case-insensitive selector");
     const parsed = JSON.parse(j.out[0] ?? "{}") as { stale?: boolean; limits: Array<{ account: string }> };
     assert.equal(parsed.stale, true);
     assert.deepEqual(parsed.limits.map((l) => l.account), ["claude-a"]);
@@ -618,6 +646,18 @@ test("verbs.xa: v1 shape is <agent> (not a bee name); refuses pane-less substrat
     assert.equal(listed.bee?.name, "screenful");
     assert.equal(listed.bee?.agent, "stub");
     assert.equal(listed.bee?.substrate, "tmux");
+
+    const selected = capture();
+    assert.equal(
+      await runV2Cli(
+        ["xa", "stub-auto", "--name", "auto-screen", "--cwd", "/tmp", "--print", "--timeout", "10000", "--data-dir", dir, "--json"],
+        selected.io,
+      ),
+      0,
+    );
+    const selectedView = capture();
+    assert.equal(await runV2Cli(["view", "auto-screen", "--data-dir", dir, "--json"], selectedView.io), 0);
+    assert.equal((JSON.parse(selectedView.out[0] ?? "{}") as { bee?: { agent: string } }).bee?.agent, "stub");
   } finally {
     await daemon?.stop().catch(() => {});
     cleanup();

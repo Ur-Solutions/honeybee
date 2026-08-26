@@ -42,8 +42,8 @@
  *   v7 — accounts and auth (spec 08 CORE): adds the `accounts` table (a
  *        provider login identity: harness + home + label + status + penalty),
  *        `account_limits` (the latest limits snapshot per account, feeding
- *        the calibrated selector), `selection_cursors` (per-harness near-tie
- *        rotation cursor — a row, not a json file) and `bees.account`
+ *        the calibrated selector), `selection_cursors` (durable selector
+ *        cursors — rows, not a json file) and `bees.account`
  *        (declared intent, concrete after spawn — never 'auto'). Additive;
  *        migration = ALTER TABLE ADD COLUMN ×1 + CREATE TABLE IF NOT EXISTS ×3.
  *   v8 — delivery urgency (spec 01 Q2 amendment 2026-08-18): adds
@@ -340,8 +340,8 @@ CREATE TABLE IF NOT EXISTS account_limits (
   display_windows      TEXT NOT NULL DEFAULT '[]'
 ) STRICT;
 
--- v7: per-harness near-tie rotation cursor (the old round-robin.json
--- 'auto-tie:<harness>' key, now a row).
+-- v7: durable selector cursors. The bare harness key is auto's near-tie
+-- rotation; rr:<harness> is the explicit registration-order selector.
 CREATE TABLE IF NOT EXISTS selection_cursors (
   harness         TEXT PRIMARY KEY,
   last_account_id TEXT NOT NULL,

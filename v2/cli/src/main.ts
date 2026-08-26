@@ -90,6 +90,7 @@ import {
   freezeRoot,
   isTaskStatus,
   isTaskTransitionAction,
+  matchAccount,
   parseTaskListRef,
   TASK_STATUSES,
   type AuditRow,
@@ -260,6 +261,7 @@ const BOOL_FLAGS = new Set([
   "--on",
   "--off",
   "--attach",
+  "--no-attach",
   "--yolo",
   "--no-yolo",
   "--no-preamble",
@@ -483,9 +485,26 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 // ---------------------------------------------------------------------------
 
 const SPAWN_USAGE =
-  "usage: hive spawn <name> [agent] [--agent <agent>] [--account id|auto|none] [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
+  "usage: hive spawn <name> [agent[-account|-auto|-rr]] [--agent <agent[-account|-auto|-rr]>] [--account selector|auto|rr|none] [--cwd dir] [--title t] [--tag t]... [--arg a]... [--parent bee|--no-parent] [--idempotency-key k]\n" +
   "       hive spawn <name> [agent] --substrate cell --origin <repo> [--sha s] [--warm dir,dir|--warm] [--sandbox|--no-sandbox]\n" +
   "       (agent may be positional — v1 ergonomics — or --agent; default claude)";
+
+export type AgentAccountSelection = { agent: string; account?: "auto" | "rr" };
+
+/**
+ * V1-compatible account selectors embedded in an agent token. V2 keeps the
+ * harness and account intent separate on the wire, so collapse the suffix at
+ * the CLI edge and let the daemon choose/validate the concrete account.
+ */
+export function agentAccountSelection(token: string): AgentAccountSelection {
+  for (const account of ["auto", "rr"] as const) {
+    const suffix = `-${account}`;
+    if (token.endsWith(suffix) && token.length > suffix.length) {
+      return { agent: token.slice(0, -suffix.length), account };
+    }
+  }
+  return { agent: token };
+}
 
 /** The spawn RPC path (name = positional[1]) — shared by spawn and the x/run/xa sugar. */
 async function spawnBee(
@@ -509,7 +528,8 @@ async function spawnBee(
   if (stray !== undefined) {
     throw new Error(`${SPAWN_USAGE}\n(unexpected argument '${stray}' — spawn takes <name> and an optional agent)`);
   }
-  const agent = flagAgent ?? positionalAgent ?? "claude";
+  const selected = agentAccountSelection(flagAgent ?? positionalAgent ?? "claude");
+  const agent = selected.agent;
   const cwd = resolve((parsed.flags.get("--cwd") as string | undefined) ?? process.cwd());
   const substrate = (parsed.flags.get("--substrate") as string | undefined) ?? (parsed.flags.has("--origin") ? "cell" : "hsr");
   let cell: Record<string, unknown> | undefined;
@@ -544,9 +564,10 @@ async function spawnBee(
         if (list.views.some((v) => v.bee?.id === self)) parentId = self;
       }
     }
-    // v7: --account <id> | auto (default) | none (explicitly unbound).
+    // Explicit --account wins over an embedded <agent>-auto/-rr selector,
+    // matching the old CLI's account-binding precedence.
     const accountFlag = parsed.flags.get("--account") as string | undefined;
-    const account = accountFlag === undefined ? undefined : accountFlag === "none" ? null : accountFlag;
+    const account = accountFlag === undefined ? selected.account : accountFlag === "none" ? null : accountFlag;
     const env = envFrom(parsed.lists.get("--env") ?? []);
     return c.request<SpawnResult>("spawn", {
       name,
@@ -564,7 +585,7 @@ async function spawnBee(
       idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
     });
   });
-  return { ...result, agent, substrate };
+  return { ...result, agent: result.agent ?? agent, substrate };
 }
 
 function envFrom(entries: readonly string[]): Record<string, string> {
@@ -607,9 +628,59 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
 
 
 const ACCOUNT_USAGE =
-  "usage: hive account list [--harness h] | get <id> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
-  "       hive account remove|pause|unpause <id> | penalty <id> <0-100> | login <id> | limits [<id>]\n" +
+  "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
+  "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100> | login <selector> [--no-attach] | limits [<selector>]\n" +
   "       hive account import [--root ~/.hive] [--dry-run] | backfill [--dry-run]";
+
+export function loginSeatTmuxArgs(seat: Pick<AccountLoginResult["seat"], "session" | "socket">, command: "attach-session" | "has-session" = "attach-session"): string[] {
+  return [...(seat.socket ? ["-L", seat.socket] : []), command, "-t", `=${seat.session}`];
+}
+
+export function shouldAutoAttachLogin(options: {
+  json: boolean;
+  noAttach: boolean;
+  forceAttach: boolean;
+  stdinIsTTY: boolean;
+  stdoutIsTTY: boolean;
+}): boolean {
+  if (options.json || options.noAttach) return false;
+  return options.forceAttach || (options.stdinIsTTY && options.stdoutIsTTY);
+}
+
+async function waitForLoginCapture(ctx: CliContext, accountId: string, startedAt: number, timeoutMs = 2_000): Promise<AccountGetResult | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const account = await withClient(ctx, (client) => client.request<AccountGetResult>("account.get", { id: accountId }));
+    if (account.account.lastLoginAt !== null && account.account.lastLoginAt >= startedAt) return account;
+    if (Date.now() >= deadline) return null;
+    await sleep(100);
+  }
+}
+
+async function attachToLoginSeat(ctx: CliContext, result: AccountLoginResult): Promise<void> {
+  // A login can be launched from a shell that already happens to live inside
+  // tmux (including an Apiary terminal pane). Unset the nesting markers only
+  // for the child client so the login seat replaces that pane until it exits.
+  const env = { ...process.env };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  const attached = spawnSync("tmux", loginSeatTmuxArgs(result.seat), { stdio: "inherit", env });
+
+  // The daemon records the capture before it tears down the seat, but allow a
+  // short grace when the operator detached at the same instant as its poll.
+  const captured = await waitForLoginCapture(ctx, result.accountId, result.seat.startedAt);
+  if (captured) {
+    ctx.io.out(confirm("ok", "capture", `${result.accountId} (credentials saved to its account home and vault)`));
+    return;
+  }
+  if (attached.error) throw new Error(`tmux attach failed: ${attached.error.message}`);
+
+  const seatStillRunning = spawnSync("tmux", loginSeatTmuxArgs(result.seat, "has-session"), { stdio: "ignore", env }).status === 0;
+  if (seatStillRunning) {
+    throw new Error(`Login not completed; the seat is still running — rerun hive login ${result.accountId} or ${result.seat.attach}`);
+  }
+  throw new Error(`Login seat exited without fresh credentials; rerun: hive login ${result.accountId}`);
+}
 
 async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
   const sub = parsed.positional[1];
@@ -690,17 +761,30 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
     case "login": {
       const id = parsed.positional[2];
       if (!id) throw new Error(ACCOUNT_USAGE);
+      if (parsed.flags.get("--attach") === true && parsed.flags.get("--no-attach") === true) {
+        throw new Error("account login: --attach and --no-attach are mutually exclusive");
+      }
       const r = await withClient(ctx, (c) => c.request<AccountLoginResult>("account.login", { id, idempotencyKey: key }));
       emit(
         ctx,
         [
-          confirm("ok", r.rejoined ? "rejoined" : "started", `the login seat for ${r.accountId}: complete the login in the seat, then detach`, r.deduped),
+          confirm("ok", r.rejoined ? "rejoined" : "started", `the login seat for ${r.accountId}`, r.deduped),
           `  ${cyan(r.seat.attach)}`,
           dim("  (the daemon captures the credential into the vault and marks the account ok when it lands)"),
         ],
         r,
         false,
       );
+      if (shouldAutoAttachLogin({
+        json: ctx.json,
+        noAttach: parsed.flags.get("--no-attach") === true,
+        forceAttach: parsed.flags.get("--attach") === true,
+        stdinIsTTY: process.stdin.isTTY === true,
+        stdoutIsTTY: process.stdout.isTTY === true,
+      })) {
+        ctx.io.out(dim(`complete the ${r.accountId} login; exiting the provider CLI returns here automatically`));
+        await attachToLoginSeat(ctx, r);
+      }
       return 0;
     }
     case "limits": {
@@ -1829,20 +1913,6 @@ type TemplateInvocation = {
   wait: boolean;
 };
 
-/**
- * Old template files stored spawn tokens such as `codex-auto`. V2 stores the
- * harness and account selection separately, so collapse that legacy selector
- * at this compatibility edge. The daemon remains the sole authority that
- * chooses/validates the concrete account.
- */
-function templateAgentSelection(token: string): { agent: string; account?: string } {
-  const suffix = "-auto";
-  if (token.endsWith(suffix) && token.length > suffix.length) {
-    return { agent: token.slice(0, -suffix.length), account: "auto" };
-  }
-  return { agent: token };
-}
-
 function templateHarnessArgs(template: TemplateRow, agent: string, parsed: Parsed): string[] {
   const args = [...template.args];
   if (template.model) args.push("--model", template.model);
@@ -1914,7 +1984,7 @@ async function buildTemplateInvocation(
   if (attach && wait) throw new Error("--wait and --attach are mutually exclusive for template runs");
 
   const template = await loadTemplateForRun(ctx, templateName);
-  const selected = templateAgentSelection(template.agent);
+  const selected = agentAccountSelection(template.agent);
   const flags = new Map(parsed.flags);
   for (const control of ["--template", "--attach", "--wait", "--prompt", "--name", "--yolo", "--no-yolo", "--preamble", "--no-preamble"]) {
     flags.delete(control);
@@ -2250,7 +2320,7 @@ async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
   const name = parsed.positional[1];
   const prompt = promptOf(parsed, 2);
   if (!name || prompt.length === 0) {
-    throw new Error("usage: hive x <name> <prompt…> [--agent a] [--account id|auto|none] [--cwd d] [--tag t]... [--arg a]...");
+    throw new Error("usage: hive x <name> <prompt…> [--agent a[-account|-auto|-rr]] [--account selector|auto|rr|none] [--cwd d] [--tag t]... [--arg a]...");
   }
   const spawned = await spawnBee(ctx, { ...parsed, positional: ["spawn", name] }, prompt);
   if (spawned.messageId == null) throw new Error("spawn returned no first-message receipt");
@@ -2270,7 +2340,7 @@ async function cmdX(ctx: CliContext, parsed: Parsed): Promise<number> {
 }
 
 const XA_USAGE =
-  "usage: hive xa <agent> [--name n] [--cwd d] [--account id|auto|none] [--print] [--timeout ms]\n" +
+  "usage: hive xa <agent[-account|-auto|-rr]> [--name n] [--cwd d] [--account selector|auto|rr|none] [--print] [--timeout ms]\n" +
   "       spawn one tmux bee and attach (the v1 shape). pane-less substrates: use `x` + `tail`.";
 
 /**
@@ -2424,7 +2494,7 @@ async function cmdRun(ctx: CliContext, parsed: Parsed): Promise<number> {
   const name = parsed.positional[1];
   const prompt = promptOf(parsed, 2);
   if (!name || prompt.length === 0) {
-    throw new Error("usage: hive run <name> -p <prompt> [--agent a] [--account id|auto|none] [--cwd d] [--timeout ms] [--keep]");
+    throw new Error("usage: hive run <name> -p <prompt> [--agent a[-account|-auto|-rr]] [--account selector|auto|rr|none] [--cwd d] [--timeout ms] [--keep]");
   }
   const timeoutMs = numFlag(parsed, "--timeout", 600_000);
   const keep = parsed.flags.get("--keep") === true;
@@ -2865,7 +2935,15 @@ async function cmdUsage(ctx: CliContext, parsed: Parsed): Promise<number> {
     // Sweep-sized timeout: the daemon probes every account live (serialized,
     // one bounded fetch each) — the default 10s rpc timeout fires mid-sweep.
     (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}, 120_000),
-    (store) => ({ limits: store.accountLimits().filter((l) => id === undefined || l.account === id) }),
+    (store) => {
+      if (id === undefined) return { limits: store.accountLimits() };
+      const matched = matchAccount(store.accounts(), id);
+      if (!matched.ok) {
+        if (matched.reason === "ambiguous") throw new Error(`ambiguous account '${id}': ${matched.matches.map((account) => account.id).join(", ")}`);
+        throw new Error(`account not found: ${id}`);
+      }
+      return { limits: store.accountLimits().filter((limit) => limit.account === matched.account.id) };
+    },
   );
   if (result.limits.length === 0) {
     emit(ctx, [`${stale ? "stale: " : ""}${dim("no accounts")}${id ? ` matching ${id}` : ""} — add one with: hive account add <harness> <label>`], result, stale);
@@ -3269,7 +3347,7 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdAttach(ctx, parsed);
       case "login": {
         const id = parsed.positional[1];
-        if (!id) throw new Error("usage: hive login <account>");
+        if (!id) throw new Error("usage: hive login <account> [--no-attach]");
         return await cmdAccount(ctx, { ...parsed, positional: ["account", "login", id] });
       }
       case "swap-account": {

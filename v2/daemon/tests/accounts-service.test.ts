@@ -15,8 +15,9 @@
  *    populated home untouched byte for byte; no vault write ever from a
  *    spawn; claude keychain seed via injected writer
  *  - login seat (real tmux on a private socket, FAKE harness login): mtime
- *    detection (codex) and Keychain digest drift via injected reader
- *    (claude) → recipe files in the vault → status ok + last_login_at
+ *    detection (codex), Keychain digest drift (claude), and machine-global
+ *    digest drift (cursor) via injected readers → validated recipe files in
+ *    the vault → status ok + last_login_at
  *  - importer: the old registry layout → rows (dry-run + real, idempotent);
  *    env-only bee backfill by home path
  * SAFETY: temp dirs only. The one read of the REAL ~/.hive is a dry-run of
@@ -24,7 +25,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +33,7 @@ import { openCoreStore, type CoreStore } from "../../core/src/index.ts";
 import { AccountsService } from "../src/accountsService.ts";
 import { loadNodeConfig, type NodeConfigFile, type ResolvedNodeConfig } from "../src/config.ts";
 import { recipeFingerprint } from "../src/activation.ts";
+import { parseCursorAuth } from "../src/cursorAuth.ts";
 import { FAKE_LOGIN_PATH, waitFor } from "./helpers.ts";
 
 const HOUR = 60 * 60 * 1000;
@@ -264,6 +266,31 @@ test("select.5: near-ties rotate through the per-harness cursor ROW (a same-inst
     assert.ok(fable.ok);
     assert.equal(fable.account.id, "claude-b");
     assert.match(fable.reason, /Fable/);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("select.6: rr cycles in registration order, skips auth failures, and does not disturb auto's near-tie cursor", () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const a = addAccount(r, "claude", "a", { addedAt: 1 });
+    const bad = addAccount(r, "claude", "bad", { addedAt: 2, status: "auth_needed" });
+    const c = addAccount(r, "claude", "c", { addedAt: 3 });
+    r.store.setSelectionCursor("claude", a.id);
+
+    const picks = [svc.pickRoundRobin("claude"), svc.pickRoundRobin("claude"), svc.pickRoundRobin("claude")];
+    assert.ok(picks.every((pick) => pick.ok));
+    assert.deepEqual(picks.map((pick) => pick.ok ? pick.account.id : null), [a.id, c.id, a.id]);
+    assert.match(picks[0]!.reason, /skipped 1 account\(s\) for recent auth failure/);
+    assert.equal(r.store.getSelectionCursor("rr:claude")?.lastAccountId, a.id);
+    assert.equal(r.store.getSelectionCursor("claude")?.lastAccountId, a.id, "rr has a separate cursor from auto near-ties");
+    assert.ok(r.log.some((line) => line.startsWith("account rr → claude-a")));
+
+    r.store.setAccountStatus(bad.id, "ok");
+    const restored = [svc.pickRoundRobin("claude"), svc.pickRoundRobin("claude"), svc.pickRoundRobin("claude")];
+    assert.deepEqual(restored.map((pick) => pick.ok ? pick.account.id : null), [bad.id, c.id, a.id]);
   } finally {
     r.cleanup();
   }
@@ -762,6 +789,119 @@ test("login.2: claude — the Keychain item is the authoritative credential: dig
     assert.equal(readFileSync(join(r.vault, "claude", "claude-k", ".credentials.json"), "utf8"), keychain);
     assert.equal(r.store.getAccount("claude-k")?.status, "paused", "a login never un-pauses");
     assert.equal(r.store.getAccount("claude-k")?.lastLoginAt, r.now());
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("login.3: cursor — machine-global digest drift is captured into the account home/vault model and exposed only as runtime credential env", { skip: !tmuxAvailable && "tmux not installed" }, async () => {
+  const r = rig({
+    agents: {
+      cursor: { command: process.execPath, args: [], adapter: "cursor", login: { command: process.execPath, args: [FAKE_LOGIN_PATH] }, env: { FAKE_LOGIN_HOME_ENV: "CURSOR_CONFIG_DIR", FAKE_LOGIN_FILE: "cli-config.json", FAKE_LOGIN_DELAY_MS: "8000", FAKE_LOGIN_CONTENT: '{"authInfo":{"email":"new@example.com"}}' } },
+    },
+  });
+  try {
+    let live = parseCursorAuth('{"accessToken":"old-token","refreshToken":"old-refresh"}', "test");
+    const svc = service(r, { cursorAuthReader: async () => live });
+    const account = r.store.createAccount({ id: "cursor-new", harness: "cursor", homePath: join(r.homes, "cursor-new"), label: "new@example.com", status: "auth_needed" });
+    const started = await svc.startLogin(account);
+    assert.ok(started.seat.baselineDigest, "the global Cursor store is the login baseline");
+    assert.deepEqual(await svc.pollLoginSeats(), []);
+
+    mkdirSync(account.homePath, { recursive: true });
+    writeFileSync(join(account.homePath, "cli-config.json"), '{"authInfo":{"email":"new@example.com"}}');
+    live = parseCursorAuth('{"accessToken":"new-token","refreshToken":"new-refresh"}', "test");
+    const outcome = await waitFor(async () => (await svc.pollLoginSeats())[0] ?? null, "cursor digest captured", 5_000, 20);
+    assert.equal(outcome.detectedBy, "digest");
+    assert.deepEqual(outcome.captured, ["auth.json", "cli-config.json"]);
+    assert.equal(readFileSync(join(r.vault, "cursor", account.id, "auth.json"), "utf8"), live?.raw);
+    assert.equal(readFileSync(join(account.homePath, "auth.json"), "utf8"), live?.raw, "the explicit login lands in the account's authoritative home");
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
+
+    // The token is added only when a process is resolved; it is not part of
+    // persistent bee.env. A spawn leaves the now-populated home untouched.
+    const activated = svc.activateForSpawn(account, { cwd: "/tmp" });
+    assert.equal(activated.reason, "home_populated");
+    assert.deepEqual(svc.homeEnvOf(account), { CURSOR_CONFIG_DIR: account.homePath });
+    assert.deepEqual(svc.credentialEnvOf(account), { CURSOR_AUTH_TOKEN: "new-token" });
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("login.4: an invalid external credential never marks the account ok; a later valid write completes the same seat", { skip: !tmuxAvailable && "tmux not installed" }, async () => {
+  const r = rig({
+    agents: {
+      claude: { command: process.execPath, args: [], adapter: "claude", login: { command: process.execPath, args: [FAKE_LOGIN_PATH] }, env: { FAKE_LOGIN_HOME_ENV: "CLAUDE_CONFIG_DIR", FAKE_LOGIN_FILE: ".claude.json", FAKE_LOGIN_DELAY_MS: "8000", FAKE_LOGIN_CONTENT: "{}" } },
+    },
+  });
+  try {
+    let keychain: string | null = JSON.stringify({ claudeAiOauth: { accessToken: "old", expiresAt: 1 } });
+    const svc = service(r, { keychainReader: async () => keychain });
+    const account = r.store.createAccount({ id: "claude-invalid", harness: "claude", homePath: join(r.homes, "claude-invalid"), label: "invalid", status: "auth_needed" });
+    await svc.startLogin(account);
+
+    keychain = "not-json";
+    assert.deepEqual(await svc.pollLoginSeats(), []);
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+    assert.equal(r.store.getAccount(account.id)?.lastLoginAt, null);
+    assert.ok(svc.seatOf(account.id), "a rejected observation keeps the login seat open");
+    assert.ok(r.log.some((line) => line.includes("account.login.rejected account=claude-invalid")));
+
+    keychain = JSON.stringify({ claudeAiOauth: { accessToken: "fresh", expiresAt: 999, refreshToken: "r" } });
+    const outcome = await waitFor(async () => (await svc.pollLoginSeats())[0] ?? null, "valid credential after rejection", 5_000, 20);
+    assert.ok(outcome.captured.includes(".credentials.json"));
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("login.5: an invalid home credential is rejected before vault capture; a later valid primary completes", { skip: !tmuxAvailable && "tmux not installed" }, async () => {
+  const r = rig({
+    agents: {
+      codex: { command: process.execPath, args: [], adapter: "codex", login: { command: process.execPath, args: [FAKE_LOGIN_PATH] }, env: { FAKE_LOGIN_HOME_ENV: "CODEX_HOME", FAKE_LOGIN_FILE: "config.toml", FAKE_LOGIN_DELAY_MS: "8000", FAKE_LOGIN_CONTENT: "model = 'x'" } },
+    },
+  });
+  try {
+    const svc = service(r);
+    const account = r.store.createAccount({ id: "codex-invalid", harness: "codex", homePath: join(r.homes, "codex-invalid"), label: "invalid", status: "auth_needed" });
+    await svc.startLogin(account);
+    writeFileSync(join(account.homePath, "auth.json"), "not-json");
+    assert.deepEqual(await svc.pollLoginSeats(), []);
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+    assert.equal(existsSync(join(r.vault, "codex", account.id, "auth.json")), false);
+
+    const primary = join(account.homePath, "auth.json");
+    writeFileSync(primary, '{"tokens":{"access_token":"fresh"}}');
+    const future = Date.now() + 2_000;
+    utimesSync(primary, future / 1000, future / 1000);
+    const outcome = await waitFor(async () => (await svc.pollLoginSeats())[0] ?? null, "valid home credential after rejection", 5_000, 20);
+    assert.equal(outcome.detectedBy, "mtime");
+    assert.ok(outcome.captured.includes("auth.json"));
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("login.6: timeout closes the owned tmux seat instead of leaving an untracked login process", { skip: !tmuxAvailable && "tmux not installed" }, async () => {
+  const r = rig({
+    agents: {
+      codex: { command: process.execPath, args: [], adapter: "codex", login: { command: process.execPath, args: [FAKE_LOGIN_PATH] }, env: { FAKE_LOGIN_HOME_ENV: "CODEX_HOME", FAKE_LOGIN_FILE: "auth.json", FAKE_LOGIN_DELAY_MS: "8000", FAKE_LOGIN_CONTENT: '{"tokens":"late"}' } },
+    },
+  });
+  try {
+    const svc = service(r);
+    const account = r.store.createAccount({ id: "codex-timeout", harness: "codex", homePath: join(r.homes, "codex-timeout"), label: "timeout", status: "auth_needed" });
+    const { seat } = await svc.startLogin(account);
+    assert.equal(spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${seat.session}`], { stdio: "ignore" }).status, 0);
+    r.setNow(seat.deadline + 1);
+    assert.deepEqual(await svc.pollLoginSeats(), []);
+    assert.equal(svc.seatOf(account.id), null);
+    assert.notEqual(spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${seat.session}`], { stdio: "ignore" }).status, 0);
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+    assert.ok(r.log.some((line) => line === `account.login.timeout account=${account.id} session=${seat.session} seat=stopped`));
   } finally {
     r.cleanup();
   }

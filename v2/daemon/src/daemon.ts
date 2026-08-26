@@ -25,6 +25,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { monitorEventLoopDelay, type IntervalHistogram } from "node:perf_hooks";
 import {
   accountIdFor,
+  matchAccount,
   homeEnvFor,
   exportTemplate,
   exportTrack,
@@ -622,8 +623,8 @@ export class HiveDaemon {
     if (bee.account && this.accounts) {
       const account = store.getAccount(bee.account);
       if (!account) throw new Error(`resolve: bee ${beeId} is bound to unknown account ${bee.account}`);
-      accountEnv = this.accounts.homeEnvOf(account);
       this.accounts.activateForSpawn(account, bee);
+      accountEnv = { ...this.accounts.homeEnvOf(account), ...this.accounts.credentialEnvOf(account) };
     }
     return {
       adapter,
@@ -675,8 +676,8 @@ export class HiveDaemon {
     if (bee.account && this.accounts) {
       const account = store.getAccount(bee.account);
       if (!account) throw new Error(`resolveTmux: bee ${beeId} is bound to unknown account ${bee.account}`);
-      accountEnv = this.accounts.homeEnvOf(account);
       this.accounts.activateForSpawn(account, bee);
+      accountEnv = { ...this.accounts.homeEnvOf(account), ...this.accounts.credentialEnvOf(account) };
     }
     const env = { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...accountEnv, ...beeIdentityEnv(bee) };
     return tmuxSpawnSpec(spec, { agent: bee.agent, cwd: bee.cwd, args: bee.args, env });
@@ -765,7 +766,7 @@ export class HiveDaemon {
       case "account.add":
         return this.withIdempotency(verb, params, () => this.rpcAccountAdd(params));
       case "account.remove":
-        return this.withIdempotency(verb, params, () => ({ account: this.mustStore().removeAccount(this.param(params, "id")) }) satisfies AccountRemoveResult);
+        return this.withIdempotency(verb, params, () => ({ account: this.mustStore().removeAccount(this.requireAccount(params).id) }) satisfies AccountRemoveResult);
       case "account.pause":
         return this.withIdempotency(verb, params, () => this.rpcAccountStatus(params, "paused"));
       case "account.unpause":
@@ -1029,22 +1030,44 @@ export class HiveDaemon {
     const key = this.idempotencyKeyOf(params);
     // A replayed key answers from the record without paying a limits fetch.
     if (key != null && store.lookupRpcResult(key)) return this.withIdempotency("spawn", params, () => this.rpcSpawn(params, null));
-    const agent = this.param(params, "agent");
-    const request = this.accountParam(params);
+    const rawAgent = this.param(params, "agent");
+    const embedded = this.embeddedSpawnAccount(rawAgent, params.account !== undefined);
+    const normalizedParams = embedded.agent === rawAgent ? params : { ...params, agent: embedded.agent };
+    const agent = embedded.agent;
+    const request = embedded.account ?? this.accountParam(params);
     if (request === "auto" && this.accounts && store.listAccounts({ harness: agent }).length > 1) {
       // Refresh stale limits for the candidates (bounded; failures become
       // unreadable rows and never block the spawn).
-      await this.accounts.ensureFreshLimits(agent, { model: this.modelParamOf(params, agent) });
+      await this.accounts.ensureFreshLimits(agent, { model: this.modelParamOf(normalizedParams, agent) });
     }
-    return this.withIdempotency("spawn", params, () => this.rpcSpawn(params, request));
+    return this.withIdempotency("spawn", normalizedParams, () => this.rpcSpawn(normalizedParams, request));
   }
 
-  /** `account?` on spawn: undefined → 'auto'; null → unbound; string → explicit id (or 'auto'). */
+  /**
+   * V1-compatible agent-token selectors (`claude-gmail`, `codex-auto`,
+   * `claude-rr`). Exact configured agent names win, including hyphenated
+   * custom agents. Otherwise the longest configured `<agent>-` prefix is the
+   * harness and the suffix is account intent. An explicit `account` param
+   * still wins; only the agent token is normalized in that case.
+   */
+  private embeddedSpawnAccount(agentToken: string, explicitAccount: boolean): { agent: string; account?: string } {
+    if (this.cfg.agents[agentToken]) return { agent: agentToken };
+    const lowered = agentToken.toLowerCase();
+    const agent = Object.keys(this.cfg.agents)
+      .sort((a, b) => b.length - a.length)
+      .find((candidate) => lowered.startsWith(`${candidate.toLowerCase()}-`));
+    if (!agent) return { agent: agentToken };
+    if (explicitAccount) return { agent };
+    const suffix = agentToken.slice(agent.length + 1);
+    return { agent, account: suffix === "auto" || suffix === "rr" ? suffix : agentToken };
+  }
+
+  /** `account?` on spawn: undefined → 'auto'; null → unbound; string → explicit id, 'auto', or 'rr'. */
   private accountParam(params: Record<string, unknown>): string | null {
     const v = params.account;
     if (v === undefined) return "auto";
     if (v === null) return null;
-    if (typeof v !== "string" || v.length === 0) throw new RpcError("invalid_request", "spawn: account must be an account id, 'auto', or null");
+    if (typeof v !== "string" || v.length === 0) throw new RpcError("invalid_request", "spawn: account must be an account id, 'auto', 'rr', or null");
     return v;
   }
 
@@ -1065,16 +1088,22 @@ export class HiveDaemon {
   /**
    * Resolve the account for a new bee: explicit id → validated
    * (account_not_found / account_paused / harness_mismatch); 'auto' → the
-   * calibrated selector (unbound when the harness has no accounts at all;
-   * `account_unavailable` when it has some but none is usable); null →
-   * unbound.
+   * calibrated selector (unbound when the harness has no accounts at all);
+   * 'rr' → the next credentialed account in registration order; null →
+   * unbound. An explicit selector with no usable candidates is typed
+   * `account_unavailable`.
    */
   private resolveSpawnAccount(request: string | null, agent: string, params: Record<string, unknown>): { account: AccountRow | null; reason: string | null } {
     const store = this.mustStore();
     if (request === null) return { account: null, reason: null };
+    if (request === "rr") {
+      if (!this.accounts) throw new RpcError("account_unavailable", `Account selection is unavailable for ${agent}`);
+      const pick = this.accounts.pickRoundRobin(agent);
+      if (!pick.ok) throw new RpcError("account_unavailable", pick.message);
+      return { account: pick.account, reason: pick.reason };
+    }
     if (request !== "auto") {
-      const account = store.getAccount(request);
-      if (!account) throw new RpcError("account_not_found", `account not found: ${request}`);
+      const account = this.resolveAccountSelector(request, agent);
       if (account.harness !== agent) throw new RpcError("harness_mismatch", `account ${account.id} is a ${account.harness} account; the bee runs ${agent}`);
       if (account.status === "paused") throw new RpcError("account_paused", `account ${account.id} is paused; unpause it or pick another`);
       return { account, reason: "explicit" };
@@ -1165,6 +1194,7 @@ export class HiveDaemon {
     if (account) this.log(`spawn.account bee=${id} account=${account.id}${accountReason ? ` reason=${JSON.stringify(accountReason)}` : ""}`);
     return {
       beeId: id,
+      agent,
       handle: created.handle,
       commandId: cmd.id,
       messageId: sent?.message.id ?? null,
@@ -1888,10 +1918,22 @@ export class HiveDaemon {
   }
 
   private requireAccount(params: Record<string, unknown>, key = "id"): AccountRow {
-    const id = this.param(params, key);
-    const account = this.mustStore().getAccount(id);
-    if (!account) throw new RpcError("account_not_found", `account not found: ${id}`);
-    return account;
+    return this.resolveAccountSelector(this.param(params, key));
+  }
+
+  /** One daemon-owned resolver for every operator-facing account selector. */
+  private resolveAccountSelector(selector: string, preferredHarness?: string): AccountRow {
+    const all = this.mustStore().listAccounts();
+    let matched = matchAccount(all, selector);
+    if (!matched.ok && preferredHarness) {
+      const scoped = matchAccount(all.filter((account) => account.harness === preferredHarness), selector);
+      if (scoped.ok) matched = scoped;
+    }
+    if (matched.ok) return matched.account;
+    if (matched.reason === "ambiguous") {
+      throw new RpcError("invalid_request", `ambiguous account '${selector}': ${matched.matches.map((account) => account.id).join(", ")}`);
+    }
+    throw new RpcError("account_not_found", `account not found: ${selector}`);
   }
 
   private seatInfo(seat: LoginSeat | null): LoginSeatInfo | null {
@@ -2002,7 +2044,7 @@ export class HiveDaemon {
     const store = this.mustStore();
     const beeId = this.requireBee(params);
     const bee = store.getBee(beeId) as BeeRow;
-    const target = this.requireAccount(params, "account");
+    const target = this.resolveAccountSelector(this.param(params, "account"), bee.agent);
     return this.performSwap(bee, target, "operator");
   }
 

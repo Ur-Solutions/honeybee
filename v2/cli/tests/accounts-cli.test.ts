@@ -128,3 +128,75 @@ test("cli.accounts.2: `account list` falls back to the read-only store when the 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("cli.accounts.3: agent-auto and agent-rr collapse at the v2 CLI edge; rr advances the daemon-owned cursor", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const base = ["--data-dir", dir, "--json"];
+    assert.equal(await runV2Cli(["account", "add", "stub", "one", ...base], capture().io), 0);
+    assert.equal(await runV2Cli(["account", "add", "stub", "two", ...base], capture().io), 0);
+
+    const explicit = capture();
+    assert.equal(
+      await runV2Cli(["spawn", "explicit", "stub-rr", "--account", "stub-two", "--cwd", dir, ...base], explicit.io),
+      0,
+    );
+    assert.equal((JSON.parse(explicit.out[0] ?? "{}") as { account: string | null }).account, "stub-two");
+
+    const auto = capture();
+    assert.equal(await runV2Cli(["spawn", "auto", "stub-auto", "--cwd", dir, ...base], auto.io), 0);
+    const autoSpawn = JSON.parse(auto.out[0] ?? "{}") as { agent: string; account: string | null };
+    assert.equal(autoSpawn.agent, "stub");
+    assert.ok(["stub-one", "stub-two"].includes(autoSpawn.account ?? ""));
+
+    const first = capture();
+    const second = capture();
+    assert.equal(await runV2Cli(["spawn", "rr-one", "stub-rr", "--cwd", dir, ...base], first.io), 0);
+    assert.equal(await runV2Cli(["spawn", "rr-two", "stub-rr", "--cwd", dir, ...base], second.io), 0);
+    const firstSpawn = JSON.parse(first.out[0] ?? "{}") as { agent: string; account: string | null; accountReason?: string };
+    const secondSpawn = JSON.parse(second.out[0] ?? "{}") as { agent: string; account: string | null; accountReason?: string };
+    assert.equal(firstSpawn.agent, "stub");
+    assert.equal(secondSpawn.agent, "stub");
+    assert.deepEqual([firstSpawn.account, secondSpawn.account], ["stub-one", "stub-two"]);
+    assert.match(firstSpawn.accountReason ?? "", /round-robin: first pick/);
+    assert.match(secondSpawn.accountReason ?? "", /round-robin: next after stub-one/);
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
+test("cli.accounts.4: fuzzy selectors work through spawn shorthand and account/swap surfaces", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const base = ["--data-dir", dir, "--json"];
+    assert.equal(await runV2Cli(["account", "add", "stub", "owner@gmail.com", ...base], capture().io), 0);
+    assert.equal(await runV2Cli(["account", "add", "stub", "owner@company.com", ...base], capture().io), 0);
+    assert.equal(await runV2Cli(["account", "add", "codex", "coder@gmail.com", ...base], capture().io), 0);
+
+    const spawned = capture();
+    assert.equal(await runV2Cli(["spawn", "fuzzy", "stub-gmail", "--cwd", dir, ...base], spawned.io), 0);
+    const result = JSON.parse(spawned.out[0] ?? "{}") as { beeId: string; agent: string; account: string | null };
+    assert.equal(result.agent, "stub");
+    assert.equal(result.account, "stub-owner-gmail.com");
+
+    const get = capture();
+    assert.equal(await runV2Cli(["account", "get", "stub-company", ...base], get.io), 0);
+    assert.equal((JSON.parse(get.out[0] ?? "{}") as { account: { id: string } }).account.id, "stub-owner-company.com");
+
+    const swapped = capture();
+    assert.equal(await runV2Cli(["swap-account", "fuzzy", "stub-company", ...base], swapped.io), 0);
+    assert.equal((JSON.parse(swapped.out[0] ?? "{}") as { to: string }).to, "stub-owner-company.com");
+
+    const ambiguous = capture();
+    assert.equal(await runV2Cli(["account", "get", "gmail", ...base], ambiguous.io), 1);
+    assert.match(ambiguous.err[0] ?? "", /invalid_request.*ambiguous account.*stub-owner-gmail\.com.*codex-coder-gmail\.com/i);
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});

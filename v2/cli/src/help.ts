@@ -7,9 +7,9 @@ const GROUPS: Group[] = [
   {
     title: "Spawn & run",
     rows: [
-      ["spawn", "<name> [agent]", "start a bee (agent positional or --agent; default claude)"],
+      ["spawn", "<name> [agent]", "start a bee (supports claude-gmail, codex-auto, claude-rr; exact --account wins)"],
       ["x", "<name> <prompt…>", "spawn + first send, fire-and-forget (--agent/--account/--cwd…)"],
-      ["xa", "<agent> [--name n]", "spawn a tmux bee and attach (v1: hive xa claude)"],
+      ["xa", "<agent> [--name n]", "spawn + attach (e.g. claude-gmail fuzzy, codex-auto least-loaded, claude-rr round-robin)"],
       ["run", "<name> -p <prompt>", "spawn, send, wait, print the reply, archive (--keep skips)"],
       ["fork", "<bee> [--name n]", "new bee, same shape, continues the source's conversation"],
     ],
@@ -72,12 +72,12 @@ const GROUPS: Group[] = [
   {
     title: "Accounts",
     rows: [
-      ["account", "list [--harness h]", "accounts + latest limits · get <id>"],
+      ["account", "list [--harness h]", "accounts + latest limits · get <selector> (exact or unique fuzzy)"],
       ["account", "add <harness> <label>", "create an account [--id id] [--home dir] [--penalty n]"],
-      ["account", "remove|pause|unpause <id>", "lifecycle · penalty <id> <0-100>"],
-      ["login", "<account>", "the login seat (also: account login <id>)"],
+      ["account", "remove|pause|unpause <selector>", "lifecycle · penalty <selector> <0-100>"],
+      ["login", "<account>", "open + attach to the login seat (--no-attach leaves it detached)"],
       ["swap-account", "<bee> <account>", "move a bee to another account of the SAME harness"],
-      ["account", "limits [<id>]", "refresh + show provider limits (feeds the auto pick)"],
+      ["account", "limits [<selector>]", "refresh + show provider limits (feeds auto; rr uses registration order)"],
       ["account", "import [--root ~/.hive]", "import the old vault · account backfill [--dry-run]"],
     ],
   },

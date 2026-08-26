@@ -20,9 +20,10 @@ export interface IdentityRecipe {
   /** Explicit extra env for activated spawns. "{home}" expands to the home path. */
   extraEnv?: Record<string, string>;
   /**
-   * The harness's own login invocation for the login seat (bare = the
-   * interactive TUI, which offers /login). Node config `agents.<a>.login`
-   * overrides it.
+   * The harness's own login invocation for the login seat. Prefer a native
+   * login subcommand when the harness exposes one; bare interactive TUIs are
+   * reserved for tools whose login still lives in the TUI. Node config
+   * `agents.<a>.login` overrides it.
    */
   login: { command: string; args: string[] };
 }
@@ -33,7 +34,9 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
     // macOS the OAuth credential itself is the Keychain item for the home
     // (see daemon keychain.ts); the vault keeps it as .credentials.json.
     credentialFiles: [".credentials.json", ".claude.json", "settings.json"],
-    login: { command: "claude", args: [] },
+    // Claude Code 2.1.x exposes this directly. Starting the auth flow avoids
+    // relying on a correctly-timed `/login` keystroke after TUI boot.
+    login: { command: "claude", args: ["auth", "login"] },
   },
   codex: {
     credentialFiles: ["auth.json"],
