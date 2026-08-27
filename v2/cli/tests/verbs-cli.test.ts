@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
@@ -44,9 +44,9 @@ test("verbs.login-seat: interactive human logins auto-attach; json/no-attach sta
   assert.equal(shouldAutoAttachLogin({ ...interactive, stdinIsTTY: false }), false);
   assert.equal(shouldAutoAttachLogin({ ...interactive, stdinIsTTY: false, stdoutIsTTY: false, forceAttach: true }), true);
 
-  const seat = { session: "hive-login-claude-work", socket: "hive-accounts" };
-  assert.deepEqual(loginSeatTmuxArgs(seat), ["-L", "hive-accounts", "attach-session", "-t", "=hive-login-claude-work"]);
-  assert.deepEqual(loginSeatTmuxArgs({ ...seat, socket: null }, "has-session"), ["has-session", "-t", "=hive-login-claude-work"]);
+  const seat = { session: "hive-login-claude-work_example", socket: "hive-accounts" };
+  assert.deepEqual(loginSeatTmuxArgs(seat), ["-L", "hive-accounts", "attach-session", "-t", "=hive-login-claude-work_example:"]);
+  assert.deepEqual(loginSeatTmuxArgs({ ...seat, socket: null }, "has-session"), ["has-session", "-t", "=hive-login-claude-work_example:"]);
 });
 
 async function idleBee(dir: string, needle: string): Promise<void> {
@@ -562,6 +562,37 @@ test("verbs.aliases: ls and ps are list; usage is limits-shaped over account_lim
   }
 });
 
+test("verbs.account-capture: an already-authenticated home is validated, backed up, and marked logged in", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const addedOut = capture();
+    assert.equal(await runV2Cli(["account", "add", "codex", "recovery", "--data-dir", dir, "--json"], addedOut.io), 0);
+    const added = JSON.parse(addedOut.out[0] ?? "{}") as { account: { id: string; homePath: string } };
+    mkdirSync(added.account.homePath, { recursive: true });
+    const credential = '{"tokens":{"access_token":"fresh"}}';
+    writeFileSync(join(added.account.homePath, "auth.json"), credential);
+
+    const capturedOut = capture();
+    assert.equal(await runV2Cli(["account", "capture", "codex-recovery", "--data-dir", dir, "--json"], capturedOut.io), 0);
+    const captured = JSON.parse(capturedOut.out[0] ?? "{}") as {
+      account: { id: string; status: string; lastLoginAt: number | null };
+      captured: string[];
+      source: string;
+    };
+    assert.equal(captured.account.id, "codex-recovery");
+    assert.equal(captured.account.status, "ok");
+    assert.ok(captured.account.lastLoginAt !== null);
+    assert.deepEqual(captured.captured, ["auth.json"]);
+    assert.equal(captured.source, "home");
+    assert.equal(readFileSync(join(dir, "vault", "codex", "codex-recovery", "auth.json"), "utf8"), credential);
+  } finally {
+    await daemon?.stop().catch(() => {});
+    cleanup();
+  }
+});
+
 test("verbs.usage: renders the cached account_limits rows (stale, read-only) with pct + resets, v1-usage style", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
   try {
@@ -700,7 +731,7 @@ test("verbs.help: the grouped v1-style overview lists the new verbs under their 
   for (const section of ["Spawn & run:", "Message:", "Observe:", "Manage bees:", "Accounts:", "Daemon:"]) {
     assert.ok(text.includes(section), `help has section ${section}`);
   }
-  for (const verb of ["x <name>", "xa <agent>", "run <name> -p", "transcript <bee>", "tail <bee>", "last <bee>", "wait <bee>", "events [", "here [", "usage [", "set-model <bee>", "attach <bee>", "swap-account <bee>"]) {
+  for (const verb of ["x <name>", "xa <agent>", "run <name> -p", "transcript <bee>", "tail <bee>", "last <bee>", "wait <bee>", "events [", "here [", "usage [", "set-model <bee>", "attach <bee>", "account capture <selector>", "swap-account <bee>"]) {
     assert.ok(text.includes(verb), `help mentions ${verb}`);
   }
 });

@@ -27,6 +27,7 @@ import {
   RpcError,
   type AccountAddResult,
   type AccountBackfillResult,
+  type AccountCaptureResult,
   type AccountGetResult,
   type AccountImportRegistryResult,
   type AccountLimitsResult,
@@ -629,11 +630,12 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
 
 const ACCOUNT_USAGE =
   "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
-  "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100> | login <selector> [--no-attach] | limits [<selector>]\n" +
+  "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100> | login <selector> [--no-attach]\n" +
+  "       hive account capture <selector> | limits [<selector>]\n" +
   "       hive account import [--root ~/.hive] [--dry-run] | backfill [--dry-run]";
 
 export function loginSeatTmuxArgs(seat: Pick<AccountLoginResult["seat"], "session" | "socket">, command: "attach-session" | "has-session" = "attach-session"): string[] {
-  return [...(seat.socket ? ["-L", seat.socket] : []), command, "-t", `=${seat.session}`];
+  return [...(seat.socket ? ["-L", seat.socket] : []), command, "-t", `=${seat.session}:`];
 }
 
 export function shouldAutoAttachLogin(options: {
@@ -785,6 +787,25 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
         ctx.io.out(dim(`complete the ${r.accountId} login; exiting the provider CLI returns here automatically`));
         await attachToLoginSeat(ctx, r);
       }
+      return 0;
+    }
+    case "capture": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountCaptureResult>("account.capture", { id, idempotencyKey: key }));
+      emit(
+        ctx,
+        [
+          confirm(
+            "ok",
+            "captured",
+            `${r.account.id} from ${r.source === "external" ? "the provider credential store" : "its account home"} (${r.captured.join(", ")})`,
+            r.deduped,
+          ),
+        ],
+        r,
+        false,
+      );
       return 0;
     }
     case "limits": {

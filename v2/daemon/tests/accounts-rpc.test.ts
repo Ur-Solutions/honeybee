@@ -2,7 +2,9 @@
  * Spec 08 at the RPC tier — a REAL daemon process over a temp socket:
  *  - account CRUD verbs + typed errors (account_not_found, account_referenced,
  *    account_paused, harness_mismatch, account_unavailable); one-key
- *    idempotency on account.add; snapshot/watch carry accounts + limits
+ *    idempotency on account.add/account.capture; explicit recovery capture
+ *    validates the current credential and snapshots it into the vault;
+ *    snapshot/watch carry accounts + limits
  *  - spawn {account}: explicit → bees.account + home env in the runtime's
  *    env; paused / mismatch refused; 'auto' resolves BEFORE createBee (never
  *    stored) and short-circuits a lone candidate; null = unbound
@@ -26,6 +28,7 @@ import { RpcError, type ListResult, type MailboxResult, type SendRpcResult, type
 import type {
   AccountAddResult,
   AccountBackfillResult,
+  AccountCaptureResult,
   AccountGetResult,
   AccountLimitsResult,
   AccountListResult,
@@ -100,7 +103,19 @@ test("rpc.accounts.1: CRUD verbs, typed errors, idempotent add, spawn binding (e
     const two = await client.request<AccountAddResult>("account.add", { harness: "stub", label: "two", penalty: 10, homePath: join(dir, "custom-home") });
     assert.equal(two.account.penalty, 10);
     assert.equal(two.account.homePath, join(dir, "custom-home"));
-    await client.request<AccountAddResult>("account.add", { harness: "codex", label: "cx" });
+    const codex = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "cx" });
+    mkdirSync(codex.account.homePath, { recursive: true });
+    const currentCredential = '{"tokens":{"access_token":"fresh"}}';
+    writeFileSync(join(codex.account.homePath, "auth.json"), currentCredential);
+    const captured = await client.request<AccountCaptureResult>("account.capture", { id: "codex-cx", idempotencyKey: "acct-capture-1" });
+    assert.equal(captured.source, "home");
+    assert.deepEqual(captured.captured, ["auth.json"]);
+    assert.equal(captured.account.status, "ok");
+    assert.ok(captured.account.lastLoginAt !== null);
+    assert.equal(readFileSync(join(dir, "vault", "codex", "codex-cx", "auth.json"), "utf8"), currentCredential);
+    const captureReplay = await client.request<AccountCaptureResult>("account.capture", { id: "codex-cx", idempotencyKey: "acct-capture-1" });
+    assert.equal(captureReplay.deduped, true);
+    assert.equal(captureReplay.at, captured.at);
     const list = await client.request<AccountListResult>("account.list");
     assert.deepEqual(list.accounts.map((a) => a.id).sort(), ["codex-cx", "stub-alpha-one", "stub-two"]);
     assert.deepEqual((await client.request<AccountListResult>("account.list", { harness: "stub" })).accounts.map((a) => a.id).sort(), ["stub-alpha-one", "stub-two"]);
@@ -188,6 +203,7 @@ test("rpc.accounts.fuzzy: one selector works across account verbs, spawn agent s
     // Stub intentionally has no login recipe. `invalid_request` (instead of
     // account_not_found) proves the fuzzy selector reached that harness gate.
     await rejects(() => client.request("account.login", { id: "stub-company" }), "invalid_request");
+    await rejects(() => client.request("account.capture", { id: "stub-company" }), "invalid_request");
 
     // Embedded selector: the daemon normalizes the concrete agent and binds
     // the fuzzy account before creating the bee row.

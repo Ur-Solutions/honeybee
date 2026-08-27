@@ -107,6 +107,7 @@ import {
   SPAWN_SUBSTRATES,
   type AccountAddResult,
   type AccountBackfillResult,
+  type AccountCaptureResult,
   type AccountGetResult,
   type AccountImportRegistryResult,
   type AccountLimitsResult,
@@ -775,6 +776,8 @@ export class HiveDaemon {
         return this.withIdempotency(verb, params, () => this.rpcAccountSetPenalty(params));
       case "account.login":
         return this.rpcAccountLogin(params);
+      case "account.capture":
+        return this.rpcAccountCapture(params);
       case "account.limits":
         return this.rpcAccountLimits(params);
       case "account.importRegistry":
@@ -2012,6 +2015,35 @@ export class HiveDaemon {
     return result;
   }
 
+  private clearAccountAuthNeeded(accountId: string, reason: string, by: "capture" | "login"): void {
+    const store = this.mustStore();
+    for (const bee of store.beesOnAccount(accountId)) {
+      if (store.clearFlag(bee.id, "auth_needed", reason).applied) {
+        this.log(`flag.clear bee=${bee.id} flag=auth_needed by=${by}`);
+      }
+    }
+  }
+
+  private async rpcAccountCapture(params: Record<string, unknown>): Promise<AccountCaptureResult> {
+    const account = this.requireAccount(params);
+    const key = this.idempotencyKeyOf(params);
+    const store = this.mustStore();
+    if (key != null) {
+      const hit = store.lookupRpcResult(key);
+      if (hit) return { ...(hit.result as AccountCaptureResult), deduped: true };
+    }
+    let captured: AccountCaptureResult;
+    try {
+      captured = await this.mustAccounts().captureAccount(account);
+    } catch (err) {
+      throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
+    }
+    this.clearAccountAuthNeeded(account.id, `credentials captured for account ${account.id}`, "capture");
+    const result = captured;
+    if (key != null) store.recordRpcResult(key, "account.capture", null, result);
+    return result;
+  }
+
   private async rpcAccountLimits(params: Record<string, unknown>): Promise<AccountLimitsResult> {
     const accounts = this.mustAccounts();
     const ids = params.id === undefined || params.id === null ? undefined : [this.requireAccount(params).id];
@@ -2169,11 +2201,7 @@ export class HiveDaemon {
     }
     for (const done of outcomes) {
       if (this.stopping) return;
-      for (const bee of store.beesOnAccount(done.accountId)) {
-        if (store.clearFlag(bee.id, "auth_needed", `login completed for account ${done.accountId}`).applied) {
-          this.log(`flag.clear bee=${bee.id} flag=auth_needed by=login`);
-        }
-      }
+      this.clearAccountAuthNeeded(done.accountId, `login completed for account ${done.accountId}`, "login");
     }
   }
 

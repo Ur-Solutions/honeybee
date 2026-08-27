@@ -1903,6 +1903,17 @@ The sync manifest explicitly excludes the vault.
 
 ### `hive account`
 
+Honeybee v2 uses the daemon-owned forms below. `capture` is the recovery path
+when provider authentication has already completed but automatic login-seat
+capture did not observe a fresh credential write:
+
+```sh
+hive account login <selector> [--no-attach]
+hive account capture <selector>
+```
+
+The broader command list that follows documents the legacy CLI surface.
+
 ```sh
 hive account list [--json]
 hive account add <tool> <label> [--email <addr>]

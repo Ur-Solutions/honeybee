@@ -146,6 +146,7 @@ export const RPC_VERBS = [
   "account.unpause",
   "account.setPenalty",
   "account.login",
+  "account.capture",
   "account.limits",
   "account.importRegistry",
   "account.backfill",
@@ -287,6 +288,19 @@ export interface AccountLoginResult extends DedupMarkers {
   accountId: string;
   seat: LoginSeatInfo;
   rejoined: boolean;
+}
+
+/**
+ * `account.capture {id}` — recovery path for an already-authenticated account:
+ * validate the current home / external provider credential, snapshot the
+ * recipe files into the vault, mark the login complete, and close any owned
+ * login seat. Unlike `account.login`, this does not require freshness drift.
+ */
+export interface AccountCaptureResult extends DedupMarkers {
+  account: MirrorAccountRow;
+  captured: string[];
+  source: "external" | "home";
+  at: number;
 }
 
 /** `account.limits {id?}` — resolve id as a selector, or refresh all accounts when omitted. */

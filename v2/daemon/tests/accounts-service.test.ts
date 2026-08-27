@@ -17,7 +17,8 @@
  *  - login seat (real tmux on a private socket, FAKE harness login): mtime
  *    detection (codex), Keychain digest drift (claude), and machine-global
  *    digest drift (cursor) via injected readers → validated recipe files in
- *    the vault → status ok + last_login_at
+ *    the vault → status ok + last_login_at; explicit recovery capture accepts
+ *    the already-valid current credential without freshness drift
  *  - importer: the old registry layout → rows (dry-run + real, idempotent);
  *    env-only bee backfill by home path
  * SAFETY: temp dirs only. The one read of the REAL ~/.hive is a dry-run of
@@ -735,7 +736,7 @@ test("login.1: the login seat (tmux, FAKE harness login) — mtime past baseline
     utimesSync(join(account.homePath, "auth.json"), past / 1000, past / 1000);
     const started = await svc.startLogin(account);
     assert.equal(started.rejoined, false);
-    assert.match(started.seat.attach, /tmux -L hb-v2-acct-\S+ attach -t hive-login-codex-x/);
+    assert.match(started.seat.attach, /tmux -L 'hb-v2-acct-\S+' attach-session -t '=hive-login-codex-x:'/);
     assert.equal(started.seat.baselineMtime !== null, true);
     assert.equal(started.seat.baselineDigest, null);
     const rejoin = await svc.startLogin(account);
@@ -895,13 +896,78 @@ test("login.6: timeout closes the owned tmux seat instead of leaving an untracke
     const svc = service(r);
     const account = r.store.createAccount({ id: "codex-timeout", harness: "codex", homePath: join(r.homes, "codex-timeout"), label: "timeout", status: "auth_needed" });
     const { seat } = await svc.startLogin(account);
-    assert.equal(spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${seat.session}`], { stdio: "ignore" }).status, 0);
+    assert.equal(spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${seat.session}:`], { stdio: "ignore" }).status, 0);
     r.setNow(seat.deadline + 1);
     assert.deepEqual(await svc.pollLoginSeats(), []);
     assert.equal(svc.seatOf(account.id), null);
-    assert.notEqual(spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${seat.session}`], { stdio: "ignore" }).status, 0);
+    assert.notEqual(spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${seat.session}:`], { stdio: "ignore" }).status, 0);
     assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
     assert.ok(r.log.some((line) => line === `account.login.timeout account=${account.id} session=${seat.session} seat=stopped`));
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("capture.1: explicit recovery captures an unchanged valid Claude credential and closes a dotted login seat", { skip: !tmuxAvailable && "tmux not installed" }, async () => {
+  const r = rig({
+    agents: {
+      claude: { command: process.execPath, args: [], adapter: "claude", login: { command: process.execPath, args: [FAKE_LOGIN_PATH] }, env: { FAKE_LOGIN_HOME_ENV: "CLAUDE_CONFIG_DIR", FAKE_LOGIN_FILE: ".claude.json", FAKE_LOGIN_DELAY_MS: "8000", FAKE_LOGIN_CONTENT: "{}" } },
+    },
+  });
+  const current = JSON.stringify({ claudeAiOauth: { accessToken: "fresh", expiresAt: 999, refreshToken: "r" } });
+  try {
+    const svc = service(r, { keychainReader: async () => current });
+    const account = r.store.createAccount({
+      id: "claude-recovery.example",
+      harness: "claude",
+      homePath: join(r.homes, "claude-recovery.example"),
+      label: "recovery.example",
+      status: "auth_needed",
+    });
+    seedVault(r, "claude", account.id, {
+      ".credentials.json": JSON.stringify({ claudeAiOauth: { accessToken: "stale", expiresAt: 1 } }),
+    });
+    const started = await svc.startLogin(account);
+    assert.equal(started.seat.session, "hive-login-claude-recovery_example", "the daemon returns tmux's actual dot-normalized session name");
+    assert.ok(started.seat.baselineDigest, "the current credential is the freshness baseline");
+    assert.deepEqual(await svc.pollLoginSeats(), [], "auto-capture correctly sees no credential drift");
+    assert.equal(
+      spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${started.seat.session}:`], { stdio: "ignore" }).status,
+      0,
+      "the exact dot-normalized session target resolves",
+    );
+
+    const captured = await svc.captureAccount(account);
+    assert.equal(captured.source, "external");
+    assert.deepEqual(captured.captured, [".credentials.json"]);
+    assert.equal(readFileSync(join(r.vault, "claude", account.id, ".credentials.json"), "utf8"), current);
+    assert.equal(captured.account.status, "ok");
+    assert.equal(captured.account.lastLoginAt, r.now());
+    assert.equal(svc.seatOf(account.id), null);
+    assert.notEqual(
+      spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "has-session", "-t", `=${started.seat.session}:`], { stdio: "ignore" }).status,
+      0,
+      "successful recovery closes the owned seat",
+    );
+    assert.ok(r.log.some((line) => line === `account.capture account=${account.id} source=external files=.credentials.json`));
+  } finally {
+    spawnSync("tmux", ["-L", r.cfg.accounts.tmuxSocket as string, "kill-server"], { stdio: "ignore" });
+    r.cleanup();
+  }
+});
+
+test("capture.2: explicit recovery refuses an invalid current credential without touching the vault or login state", async () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const account = r.store.createAccount({ id: "codex-recovery-invalid", harness: "codex", homePath: join(r.homes, "codex-recovery-invalid"), label: "invalid", status: "auth_needed" });
+    mkdirSync(account.homePath, { recursive: true });
+    writeFileSync(join(account.homePath, "auth.json"), "not-json");
+
+    await assert.rejects(() => svc.captureAccount(account), /no valid codex credential found/);
+    assert.equal(existsSync(join(r.vault, "codex", account.id, "auth.json")), false);
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+    assert.equal(r.store.getAccount(account.id)?.lastLoginAt, null);
   } finally {
     r.cleanup();
   }

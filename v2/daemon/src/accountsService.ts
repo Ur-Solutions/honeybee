@@ -154,6 +154,13 @@ export interface LoginOutcome {
   at: number;
 }
 
+export interface CaptureOutcome {
+  account: AccountRow;
+  captured: string[];
+  source: "external" | "home";
+  at: number;
+}
+
 // ---------------------------------------------------------------------------
 // default transports
 // ---------------------------------------------------------------------------
@@ -267,6 +274,20 @@ function defaultCodexRateLimits(timeoutMs: number, command = "codex"): NonNullab
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** tmux target grammar: `=` is exact and `:` selects the session's active window. */
+function loginSeatTarget(session: string): string {
+  return `=${session}:`;
+}
+
+/**
+ * tmux silently rewrites dots in `new-session -s` names to underscores
+ * because dots delimit panes in targets. Return the name tmux will actually
+ * create so seat polling, attach, and cleanup all address the same session.
+ */
+function loginSeatSession(accountId: string): string {
+  return `hive-login-${accountId}`.replace(/\./g, "_").replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
 // ---------------------------------------------------------------------------
@@ -768,12 +789,12 @@ export class AccountsService {
   }
 
   private tmuxHasSession(session: string): boolean {
-    const r = spawnSync("tmux", this.tmuxArgs("has-session", "-t", `=${session}`), { stdio: "ignore" });
+    const r = spawnSync("tmux", this.tmuxArgs("has-session", "-t", loginSeatTarget(session)), { stdio: "ignore" });
     return r.status === 0;
   }
 
   private tmuxKill(session: string): void {
-    spawnSync("tmux", this.tmuxArgs("kill-session", "-t", `=${session}`), { stdio: "ignore" });
+    spawnSync("tmux", this.tmuxArgs("kill-session", "-t", loginSeatTarget(session)), { stdio: "ignore" });
   }
 
   private async externalLoginCredential(account: AccountRow): Promise<string | null> {
@@ -808,7 +829,7 @@ export class AccountsService {
     const recipe = recipeFor(account.harness);
     if (!recipe) throw new Error(`harness ${account.harness} has no identity recipe; cannot run a login seat`);
     const existing = this.seats.get(account.id);
-    const session = `hive-login-${account.id}`.replace(/[^A-Za-z0-9_.-]/g, "-");
+    const session = loginSeatSession(account.id);
     if (existing && this.tmuxHasSession(session)) return { seat: existing, rejoined: true };
     mkdirSync(account.homePath, { recursive: true, mode: 0o700 });
     const login = this.cfg.agents[account.harness]?.login ?? recipe.login;
@@ -829,7 +850,7 @@ export class AccountsService {
       accountId: account.id,
       session,
       socket,
-      attach: `tmux ${socket ? `-L ${socket} ` : ""}attach -t ${session}`,
+      attach: `tmux ${socket ? `-L ${shellQuote(socket)} ` : ""}attach-session -t ${shellQuote(loginSeatTarget(session))}`,
       startedAt: now,
       deadline: now + this.cfg.accounts.loginTimeoutMs,
       primaryFile: primaryCredentialFile(recipe),
@@ -839,6 +860,68 @@ export class AccountsService {
     this.seats.set(account.id, seat);
     this.log(`account.login.seat account=${account.id} session=${session} home=${account.homePath} baselineMtime=${baselineMtime ?? "-"} baselineDigest=${baselineDigest ? baselineDigest.slice(0, 8) : "-"}`);
     return { seat, rejoined: false };
+  }
+
+  private persistCredentialCapture(
+    account: AccountRow,
+    primaryFile: string,
+    primaryRaw: string | null,
+    overrides: Record<string, string>,
+  ):
+    | { ok: true; account: AccountRow; captured: string[]; at: number }
+    | { ok: false; reason: "invalid_primary" | "primary_not_captured" } {
+    if (!this.validPrimaryCredential(account.harness, primaryFile, primaryRaw)) {
+      return { ok: false, reason: "invalid_primary" };
+    }
+    // Cursor's provider login lands outside CURSOR_CONFIG_DIR. Materialize
+    // that explicit credential into the account home before vault backup.
+    if (account.harness === "cursor" && overrides[primaryFile] !== undefined) {
+      atomicWriteFileSync(join(account.homePath, primaryFile), overrides[primaryFile] as string);
+    }
+    const captured = captureHomeToVault(account.harness, account.homePath, this.vaultDirOf(account), overrides);
+    if (!captured.includes(primaryFile)) return { ok: false, reason: "primary_not_captured" };
+    const at = this.now();
+    const updated = this.store.recordAccountLogin(account.id, at).account;
+    const seat = this.seats.get(account.id);
+    if (seat) {
+      this.seats.delete(account.id);
+      this.tmuxKill(seat.session);
+    }
+    return { ok: true, account: updated, captured, at };
+  }
+
+  /**
+   * Explicit recovery capture. It snapshots the credential that is valid
+   * right now, without requiring the login seat's mtime/digest baseline to
+   * observe a fresh write. Claude/Cursor use their external provider store
+   * when present; file-based harnesses use the account home.
+   */
+  async captureAccount(account: AccountRow): Promise<CaptureOutcome> {
+    const recipe = recipeFor(account.harness);
+    if (!recipe) throw new Error(`harness ${account.harness} has no identity recipe; cannot capture credentials`);
+    const primaryFile = primaryCredentialFile(recipe);
+    const externalRaw = account.harness === "claude" || account.harness === "cursor"
+      ? await this.externalLoginCredential(account)
+      : null;
+    const source: CaptureOutcome["source"] = externalRaw !== null ? "external" : "home";
+    let primaryRaw = externalRaw;
+    if (primaryRaw === null) {
+      try {
+        primaryRaw = readFileSync(join(account.homePath, primaryFile), "utf8");
+      } catch {
+        primaryRaw = null;
+      }
+    }
+    const overrides = externalRaw === null ? {} : { [primaryFile]: externalRaw };
+    const result = this.persistCredentialCapture(account, primaryFile, primaryRaw, overrides);
+    if (!result.ok) {
+      if (result.reason === "invalid_primary") {
+        throw new Error(`no valid ${account.harness} credential found for ${account.id}; complete a provider login first`);
+      }
+      throw new Error(`failed to capture ${primaryFile} for ${account.id}`);
+    }
+    this.log(`account.capture account=${account.id} source=${source} files=${result.captured.join(",")}`);
+    return { account: result.account, captured: result.captured, source, at: result.at };
   }
 
   /**
@@ -872,6 +955,7 @@ export class AccountsService {
         let externalDigest: string | null = null;
         if (account.harness === "claude" || account.harness === "cursor") {
           externalRaw = await this.externalLoginCredential(account);
+          if (this.seats.get(seat.accountId) !== seat) continue;
           externalDigest = externalRaw ? credentialDigest(externalRaw) : null;
           if (externalDigest !== null && externalDigest !== seat.baselineDigest) detectedBy = "digest";
         }
@@ -893,32 +977,15 @@ export class AccountsService {
               primaryRaw = null;
             }
           }
-          if (!this.validPrimaryCredential(account.harness, primaryFile, primaryRaw)) {
-            // Consume only the bad observation baseline. The seat remains open
-            // so a later valid provider write can still complete the login.
+          const captured = this.persistCredentialCapture(account, primaryFile, primaryRaw, overrides);
+          if (!captured.ok) {
             seat.baselineMtime = mtime;
             seat.baselineDigest = externalDigest;
-            this.log(`account.login.rejected account=${account.id} by=${detectedBy} reason=invalid_primary`);
+            this.log(`account.login.rejected account=${account.id} by=${detectedBy} reason=${captured.reason}`);
             continue;
           }
-          // Cursor's provider login lands outside CURSOR_CONFIG_DIR. Materialize
-          // that explicit login into this account's one authoritative home
-          // before taking the vault backup; no background/global sync exists.
-          if (account.harness === "cursor" && externalRaw) {
-            atomicWriteFileSync(join(account.homePath, primaryFile), externalRaw);
-          }
-          const captured = captureHomeToVault(account.harness, account.homePath, this.vaultDirOf(account), overrides);
-          if (!captured.includes(primaryFile)) {
-            seat.baselineMtime = mtime;
-            seat.baselineDigest = externalDigest;
-            this.log(`account.login.rejected account=${account.id} by=${detectedBy} reason=primary_not_captured`);
-            continue;
-          }
-          this.store.recordAccountLogin(account.id, now);
-          this.seats.delete(seat.accountId);
-          this.tmuxKill(seat.session);
-          this.log(`account.login.captured account=${account.id} by=${detectedBy} files=${captured.join(",")}`);
-          done.push({ accountId: account.id, captured, detectedBy, at: now });
+          this.log(`account.login.captured account=${account.id} by=${detectedBy} files=${captured.captured.join(",")}`);
+          done.push({ accountId: account.id, captured: captured.captured, detectedBy, at: captured.at });
           continue;
         }
         if (now > seat.deadline) {
