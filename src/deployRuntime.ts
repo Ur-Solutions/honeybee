@@ -54,6 +54,12 @@ export type BuildArtifactContext = {
   /** Disposable temp dir for the clean checkout + build; removed afterwards. */
   workDir: string;
   log: (line: string) => void;
+  /**
+   * Skip the test gate (check + build still run). Never set by `hive deploy`;
+   * only scripts/build-runtime-artifact.mjs --skip-tests for local iteration,
+   * and such an artifact is marked `gate: "tests-skipped"` in its manifest.
+   */
+  skipTests?: boolean;
 };
 
 export type RestartDaemonContext = {

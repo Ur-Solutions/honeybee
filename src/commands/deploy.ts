@@ -69,7 +69,7 @@ async function runStep(command: string, args: string[], cwd: string, log: (line:
  * into the repo.
  */
 export async function buildDeployArtifact(
-  { repoRoot, sha, workDir, log }: BuildArtifactContext,
+  { repoRoot, sha, workDir, log, skipTests }: BuildArtifactContext,
 ): Promise<{ artifactDir: string }> {
   const checkout = join(workDir, "checkout");
   await mkdir(checkout, { recursive: true });
@@ -80,7 +80,9 @@ export async function buildDeployArtifact(
   await runStep("npm", ["ci"], checkout, log);
   await runStep("npm", ["run", "check"], checkout, log);
   await runStep("npm", ["run", "build"], checkout, log);
-  if (existsSync(join(storeRoot(), "FROZEN"))) {
+  if (skipTests === true) {
+    log("deploy: WARNING test gate skipped (--skip-tests) — this artifact is not release-grade");
+  } else if (existsSync(join(storeRoot(), "FROZEN"))) {
     // Post-flip node (WP7): the old suite's CLI-shelling tests don't override
     // the store root, so on a frozen machine they route into v2 and hang
     // (2026-08-19: deploy gate deadlocked against its own flip). The v2
