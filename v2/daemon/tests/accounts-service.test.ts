@@ -23,11 +23,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore, type CoreStore } from "../../core/src/index.ts";
-import { AccountsService } from "../src/accountsService.ts";
+import { AccountsService, defaultCodexRateLimits } from "../src/accountsService.ts";
 import { loadNodeConfig, type NodeConfigFile, type ResolvedNodeConfig } from "../src/config.ts";
 import { recipeFingerprint } from "../src/activation.ts";
 import { parseCursorAuth } from "../src/cursorAuth.ts";
@@ -297,6 +297,40 @@ test("select.6: rr cycles in registration order, skips auth failures, and does n
 // limits fetch → table; freshness policy
 // ---------------------------------------------------------------------------
 
+test("limits.0: the real Codex app-server transport returns typed success and authentication failures", async () => {
+  const r = rig();
+  try {
+    const stub = join(r.dir, "codex-stub");
+    const writeStub = (messages: unknown[]) => {
+      writeFileSync(stub, [
+        "#!/usr/bin/env node",
+        `for (const message of ${JSON.stringify(messages)}) process.stdout.write(JSON.stringify(message) + "\\n");`,
+        "setInterval(() => undefined, 1000);",
+      ].join("\n"));
+      chmodSync(stub, 0o700);
+    };
+    const home = join(r.homes, "codex-transport");
+    writeStub([
+      { id: 1, result: {} },
+      { id: 2, result: { rateLimits: { primary: { usedPercent: 9, windowDurationMins: 300 } } } },
+    ]);
+    assert.deepEqual(await defaultCodexRateLimits(1_000, stub)(home), {
+      ok: true,
+      limits: { primary: { usedPercent: 9, windowDurationMins: 300 } },
+    });
+
+    writeStub([{ id: 1, error: { code: 401, message: "Unauthorized credential" } }]);
+    const failed = await defaultCodexRateLimits(1_000, stub)(home);
+    assert.equal(failed.ok, false);
+    if (!failed.ok) {
+      assert.equal(failed.unreadableReason, "auth_failed");
+      assert.match(failed.error, /Unauthorized/);
+    }
+  } finally {
+    r.cleanup();
+  }
+});
+
 test("limits.1: fetch writes the table (claude via the home token + injected usage transport, codex via the injected app-server transport); failures = unreadable rows; auth failure → auth_needed, recovery → ok", async () => {
   const r = rig();
   try {
@@ -312,7 +346,7 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
         },
         codexRateLimits: async (home) => {
           codexCalls.push(home);
-          return { primary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 1_800_000_000 }, secondary: { usedPercent: 55, windowDurationMins: 10_080 }, planType: "pro" };
+          return { ok: true, limits: { primary: { usedPercent: 20, windowDurationMins: 300, resetsAt: 1_800_000_000 }, secondary: { usedPercent: 55, windowDurationMins: 10_080 }, planType: "pro" } };
         },
       },
       keychainReader: async () => null,
@@ -352,11 +386,14 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
     claudeFail = null;
     await svc.refreshLimits([claude.id]);
     assert.equal(r.store.getAccount(claude.id)?.status, "ok");
-    // a transport error is unreadable but NOT an auth failure
+    // A transient transport error is not an auth failure and cannot erase the
+    // readable snapshot that the selector and mirror already have.
     claudeFail = "fetch failed";
+    const lastGood = r.store.getAccountLimits(claude.id)!;
     await svc.refreshLimits([claude.id]);
     assert.equal(r.store.getAccount(claude.id)?.status, "ok");
-    assert.equal(r.store.getAccountLimits(claude.id)?.error, "fetch failed");
+    assert.deepEqual(r.store.getAccountLimits(claude.id), lastGood);
+    assert.ok(r.log.some((line) => line.includes(`account.limits.transient_failure account=${claude.id}`)));
     // an expired token is unreadable without a network call
     claudeFail = null;
     writeFileSync(join(claude.homePath, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "old", expiresAt: r.now() - 1 } }));
@@ -367,6 +404,57 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
     assert.match(r.store.getAccountLimits(claude.id)?.error ?? "", /expired/);
     assert.equal(r.store.getAccountLimits(claude.id)?.unreadableReason, "auth_expired");
     assert.equal(r.store.getAccount(claude.id)?.status, "ok", "expiry alone is not proof that the refresh chain is invalid");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("limits.1a: Codex probes are per-home single-flight; transient failure keeps the last good row while auth failure invalidates it", async () => {
+  const r = rig();
+  try {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const account = addAccount(r, "codex", "single");
+    const svc = service(r, {
+      fetchers: {
+        codexRateLimits: async () => {
+          calls += 1;
+          await gate;
+          return { ok: true, limits: { primary: { usedPercent: 14, windowDurationMins: 300 }, secondary: { usedPercent: 22, windowDurationMins: 10_080 } } };
+        },
+      },
+    });
+    const first = svc.refreshLimits([account.id]);
+    const second = svc.refreshLimits([account.id]);
+    await waitFor(() => (calls === 1 ? true : null), "single Codex probe started");
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(calls, 1);
+    assert.equal(a[0]?.weeklyPct, 22);
+    assert.equal(b[0]?.weeklyPct, 22);
+
+    const lastGood = r.store.getAccountLimits(account.id)!;
+    const transientSvc = service(r, {
+      fetchers: {
+        codexRateLimits: async () => ({ ok: false, unreadableReason: "timeout", error: "probe timed out" }),
+      },
+    });
+    const [preserved] = await transientSvc.refreshLimits([account.id]);
+    assert.deepEqual(preserved, lastGood);
+    assert.deepEqual(r.store.getAccountLimits(account.id), lastGood);
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
+
+    const authSvc = service(r, {
+      fetchers: {
+        codexRateLimits: async () => ({ ok: false, unreadableReason: "auth_failed", error: "Unauthorized" }),
+      },
+    });
+    const [invalidated] = await authSvc.refreshLimits([account.id]);
+    assert.equal(invalidated?.readable, false);
+    assert.equal(invalidated?.weeklyPct, null);
+    assert.equal(invalidated?.unreadableReason, "auth_failed");
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
   } finally {
     r.cleanup();
   }
@@ -575,39 +663,51 @@ test("limits.1d: the daemon never races a live Grok runtime's rotating refresh t
   }
 });
 
-test("limits.2: freshness policy — before an auto pick, rows older than limitsStaleMs (or missing) are refreshed, fresh rows are not, and a lone candidate never fetches", async () => {
+test("limits.2: freshness policy schedules stale candidates off the caller path, deduplicates the lane, and skips fresh/lone candidates", async () => {
   const r = rig({ accounts: { limitsStaleMs: HOUR } });
   try {
     const fetched: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let gated = true;
     const svc = service(r, {
       fetchers: {
         codexRateLimits: async (home) => {
           fetched.push(home);
-          return { primary: { usedPercent: home.endsWith("-a") ? 50 : 10, windowDurationMins: 300 }, secondary: { usedPercent: home.endsWith("-a") ? 50 : 10, windowDurationMins: 10_080 } };
+          if (gated) await firstGate;
+          return { ok: true, limits: { primary: { usedPercent: home.endsWith("-a") ? 50 : 10, windowDurationMins: 300 }, secondary: { usedPercent: home.endsWith("-a") ? 50 : 10, windowDurationMins: 10_080 } } };
         },
       },
     });
     const a = addAccount(r, "codex", "a", { addedAt: 1 });
     // one candidate: no fetch at all
-    assert.deepEqual((await svc.ensureFreshLimits("codex")).refreshed, []);
+    assert.deepEqual(svc.scheduleFreshLimits("codex").scheduled, []);
     assert.deepEqual(fetched, []);
     const b = addAccount(r, "codex", "b", { addedAt: 2 });
-    // two candidates, no rows: both fetched
-    const first = await svc.ensureFreshLimits("codex");
-    assert.deepEqual(first.refreshed.sort(), [a.id, b.id]);
+    // Two candidates, no rows: scheduling returns before the gated transport,
+    // and a burst joins the same background batch.
+    const first = svc.scheduleFreshLimits("codex");
+    assert.deepEqual(first.scheduled.sort(), [a.id, b.id]);
+    assert.deepEqual(svc.scheduleFreshLimits("codex").scheduled.sort(), [a.id, b.id]);
+    await waitFor(() => (fetched.length === 1 ? true : null), "detached Codex refresh started");
+    assert.equal(r.store.getAccountLimits(a.id), null, "schedule did not await the provider");
+    gated = false;
+    releaseFirst();
+    await waitFor(() => (fetched.length === 2 && r.store.getAccountLimits(b.id) ? true : null), "background refresh completed");
     assert.equal(fetched.length, 2);
     // 2 minutes later: fresh, nothing refetched; the pick rides the rows
     r.setNow(r.now() + 2 * 60_000);
-    assert.deepEqual((await svc.ensureFreshLimits("codex")).refreshed, []);
+    assert.deepEqual(svc.scheduleFreshLimits("codex").scheduled, []);
     assert.equal(fetched.length, 2);
     const pick = svc.pick("codex");
     assert.ok(pick.ok);
     assert.equal(pick.account.id, b.id);
     assert.equal(pick.stale, false);
-    // 61 minutes later: stale → refreshed before the pick
+    // 61 minutes later: stale → queued and refreshed in the background.
     r.setNow(r.now() + 61 * 60_000);
-    const again = await svc.ensureFreshLimits("codex");
-    assert.deepEqual(again.refreshed.sort(), [a.id, b.id]);
+    const again = svc.scheduleFreshLimits("codex");
+    assert.deepEqual(again.scheduled.sort(), [a.id, b.id]);
+    await waitFor(() => (fetched.length === 4 ? true : null), "stale background refresh completed");
     assert.equal(fetched.length, 4);
     // periodic tick: off at 0
     svc.periodicRefreshTick();
@@ -625,7 +725,7 @@ test("limits.3: the periodic in-daemon sweep runs every limitsRefreshMs, never o
       fetchers: {
         codexRateLimits: () => {
           calls += 1;
-          return new Promise(() => {}); // never answers: the timeout bounds it
+          return new Promise(() => {}); // never answers: the service timeout bounds it
         },
       },
     });

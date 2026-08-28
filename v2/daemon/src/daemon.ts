@@ -1069,9 +1069,10 @@ export class HiveDaemon {
 
   /**
    * v7 (spec 08): `spawn {account?}` — 'auto' (default) resolves to a concrete
-   * account BEFORE the bee row is written; the bounded limits refresh for
-   * stale rows happens first (async), then the pick + createBee + spawn
-   * command run in ONE store transaction under the idempotency wrapper.
+   * account BEFORE the bee row is written. Stale limits are queued onto the
+   * account service's bounded background lane; the pick reads the current
+   * snapshot, then createBee + spawn command run in ONE store transaction
+   * under the idempotency wrapper.
    */
   private async rpcSpawnWithAccount(params: Record<string, unknown>): Promise<SpawnResult> {
     const store = this.mustStore();
@@ -1084,9 +1085,10 @@ export class HiveDaemon {
     const agent = embedded.agent;
     const request = embedded.account ?? this.accountParam(params);
     if (request === "auto" && this.accounts && store.listAccounts({ harness: agent }).length > 1) {
-      // Refresh stale limits for the candidates (bounded; failures become
-      // unreadable rows and never block the spawn).
-      await this.accounts.ensureFreshLimits(agent, { model: this.modelParamOf(normalizedParams, agent) });
+      // Sampling must never sit on the spawn RPC accept path. The selector
+      // consumes last-known snapshots while this shared background lane
+      // refreshes stale candidates for subsequent picks.
+      this.accounts.scheduleFreshLimits(agent, { model: this.modelParamOf(normalizedParams, agent) });
     }
     return this.withIdempotency("spawn", normalizedParams, () => this.rpcSpawn(normalizedParams, request));
   }

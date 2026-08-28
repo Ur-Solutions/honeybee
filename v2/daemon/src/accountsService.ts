@@ -15,6 +15,7 @@
 import { spawn as spawnChild } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { withFileLock } from "../../../src/lock.ts";
 import {
   accountCommitments,
   accountIdFor,
@@ -32,6 +33,7 @@ import {
   isFableModel,
   type AccountLimits,
   type AccountLimitsRow,
+  type AccountLimitsUnreadableReason,
   type AccountRow,
   type AutoAccountCandidate,
   type ClaudeUsageResponse,
@@ -74,9 +76,13 @@ export interface LimitsFetchers {
   claudeUsage?: (accessToken: string) => Promise<ClaudeUsageResponse>;
   /** Rotate an expired Claude OAuth refresh token (default: real OAuth endpoint). */
   claudeRefresh?: (refreshToken: string) => Promise<RefreshedClaudeToken | null>;
-  /** `codex app-server` account/rateLimits/read against a home (default: real child process). Null = unavailable. */
-  codexRateLimits?: (homePath: string) => Promise<CodexLiveRateLimits | null>;
+  /** `codex app-server` account/rateLimits/read against a home (default: real child process). */
+  codexRateLimits?: (homePath: string) => Promise<CodexRateLimitsFetchResult>;
 }
+
+export type CodexRateLimitsFetchResult =
+  | { ok: true; limits: CodexLiveRateLimits }
+  | { ok: false; unreadableReason: AccountLimitsUnreadableReason; error: string };
 
 export interface RefreshedClaudeToken {
   accessToken: string;
@@ -189,64 +195,124 @@ function defaultClaudeRefresh(timeoutMs: number): NonNullable<LimitsFetchers["cl
   };
 }
 
+const CODEX_BOOT_LOCK_FILENAME = ".hive-app-server-boot.lock";
+const CODEX_BOOT_LOCK_STALE_MS = 2 * 60_000;
+const CODEX_LIMITS_BOOT_LOCK_MAX_MS = 3_000;
+
+function errorDetail(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const message = (error as { message?: unknown }).message;
+    const code = (error as { code?: unknown }).code;
+    if (typeof message === "string") return typeof code === "number" || typeof code === "string" ? `${code}: ${message}` : message;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+function codexFailure(error: unknown, fallback: AccountLimitsUnreadableReason = "provider_error"): CodexRateLimitsFetchResult {
+  const detail = errorDetail(error).replace(/\s+/g, " ").trim().slice(0, 500) || "unknown Codex limits probe failure";
+  return {
+    ok: false,
+    unreadableReason: isAuthFailureLimitsError(detail)
+      ? "auth_failed"
+      : /timed out|timeout/i.test(detail)
+        ? "timeout"
+        : fallback,
+    error: detail,
+  };
+}
+
 /**
  * Query `codex app-server` (JSON-RPC over stdio) for the account's live rate
- * limits, with CODEX_HOME pointed at the account's home. Null on any failure
- * — missing binary, stale auth, protocol drift. Bounded by `timeoutMs`.
+ * limits, with CODEX_HOME pointed at the account's home. The same per-home
+ * boot lock used by runner-host serializes this short-lived app-server with
+ * real Codex runtimes. Every failure remains typed and the total operation is
+ * bounded by `timeoutMs`.
  */
-function defaultCodexRateLimits(timeoutMs: number, command = "codex"): NonNullable<LimitsFetchers["codexRateLimits"]> {
-  return (homePath) =>
-    new Promise<CodexLiveRateLimits | null>((resolvePromise) => {
-      let child: ReturnType<typeof spawnChild>;
-      try {
-        child = spawnChild(command, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, CODEX_HOME: homePath } });
-      } catch {
-        resolvePromise(null);
-        return;
-      }
-      let settled = false;
-      const finish = (value: CodexLiveRateLimits | null) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        child.kill();
-        resolvePromise(value);
-      };
-      const timer = setTimeout(() => finish(null), timeoutMs);
-      child.on("error", () => finish(null));
-      child.on("exit", () => finish(null));
-      let buffer = "";
-      child.stdout?.on("data", (chunk: Buffer) => {
-        buffer += chunk.toString();
-        let newline: number;
-        while ((newline = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, newline);
-          buffer = buffer.slice(newline + 1);
-          if (!line.trim()) continue;
-          let message: { id?: number; result?: Record<string, unknown>; error?: unknown };
-          try {
-            message = JSON.parse(line) as typeof message;
-          } catch {
-            continue;
-          }
-          if (message.id === 1) {
-            if (message.error) {
-              finish(null);
+export function defaultCodexRateLimits(timeoutMs: number, command = "codex"): NonNullable<LimitsFetchers["codexRateLimits"]> {
+  return async (homePath) => {
+    const lockTimeoutMs = Math.min(CODEX_LIMITS_BOOT_LOCK_MAX_MS, Math.max(1, Math.floor(timeoutMs / 5)));
+    const settleMarginMs = Math.min(250, Math.max(1, Math.floor(timeoutMs / 20)));
+    const rpcTimeoutMs = Math.max(1, timeoutMs - lockTimeoutMs - settleMarginMs);
+    return withFileLock(join(homePath, CODEX_BOOT_LOCK_FILENAME), () =>
+      new Promise<CodexRateLimitsFetchResult>((resolvePromise) => {
+        let child: ReturnType<typeof spawnChild>;
+        try {
+          child = spawnChild(command, ["app-server"], { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CODEX_HOME: homePath } });
+        } catch (error) {
+          resolvePromise(codexFailure(error));
+          return;
+        }
+        let settled = false;
+        let stderr = "";
+        const finish = (value: CodexRateLimitsFetchResult) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          child.kill();
+          resolvePromise(value);
+        };
+        const timer = setTimeout(
+          () => finish(codexFailure(`codex app-server limits probe timed out after ${rpcTimeoutMs}ms`, "timeout")),
+          rpcTimeoutMs,
+        );
+        timer.unref();
+        child.on("error", (error) => finish(codexFailure(error)));
+        child.on("exit", (code, signal) => finish(codexFailure(
+          stderr || `codex app-server exited before answering account/rateLimits/read (code=${code ?? "-"}, signal=${signal ?? "-"})`,
+        )));
+        child.stderr?.on("data", (chunk: Buffer) => {
+          if (stderr.length < 500) stderr += chunk.toString().slice(0, 500 - stderr.length);
+        });
+        let buffer = "";
+        child.stdout?.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString();
+          let newline: number;
+          while ((newline = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, newline);
+            buffer = buffer.slice(newline + 1);
+            if (!line.trim()) continue;
+            let message: { id?: number; result?: Record<string, unknown>; error?: unknown };
+            try {
+              message = JSON.parse(line) as typeof message;
+            } catch {
+              continue;
+            }
+            if (message.id === 1) {
+              if (message.error) {
+                finish(codexFailure(message.error));
+                return;
+              }
+              child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} })}\n`);
+            }
+            if (message.id === 2) {
+              if (message.error) {
+                finish(codexFailure(message.error));
+                return;
+              }
+              const rateLimits = message.result?.rateLimits as CodexLiveRateLimits | undefined;
+              finish(rateLimits && (rateLimits.primary || rateLimits.secondary)
+                ? { ok: true, limits: rateLimits }
+                : codexFailure("codex app-server returned no rate-limit windows"));
               return;
             }
-            child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "account/rateLimits/read", params: {} })}\n`);
           }
-          if (message.id === 2) {
-            const rateLimits = message.result?.rateLimits as CodexLiveRateLimits | undefined;
-            finish(rateLimits && (rateLimits.primary || rateLimits.secondary) ? rateLimits : null);
-            return;
-          }
-        }
-      });
-      child.stdin?.write(
-        `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "hive", title: "hive", version: "0.0.1" } } })}\n`,
-      );
-    });
+        });
+        child.stdin?.write(
+          `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { clientInfo: { name: "hive", title: "hive", version: "0.0.1" } } })}\n`,
+        );
+      }),
+    {
+      timeoutMs: lockTimeoutMs,
+      staleMs: CODEX_BOOT_LOCK_STALE_MS,
+      pollMs: 25,
+    }).catch((error) => codexFailure(error));
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +331,10 @@ export class AccountsService {
   private readonly providerHttp: ProviderLimitsHttp;
   private lastPeriodicRefreshAt = 0;
   private refreshing: Promise<void> | null = null;
+  private readonly queuedRefreshIds = new Set<string>();
+  private readonly activeRefreshIds = new Set<string>();
+  /** All callers for one Codex home join one bounded app-server probe. */
+  private readonly codexFetches = new Map<string, Promise<PutAccountLimitsInput>>();
   /** Refresh tokens rotate on use: at most one refresh may run per account. */
   private readonly claudeRefreshes = new Map<string, Promise<ClaudeRefreshOutcome>>();
   /** Grok/Kimi refresh tokens also rotate; share the whole provider read. */
@@ -341,8 +411,8 @@ export class AccountsService {
    * auth_needed status are skipped while a healthy one exists (last resort
    * otherwise). One candidate short-circuits (no limits read). Otherwise the
    * ported selector ranks limits rows + live-bee commitments + penalty, and a
-   * near-tie rotates through the per-harness cursor row. Synchronous — the
-   * caller refreshes stale limits first (ensureFreshLimits) when it can.
+   * near-tie rotates through the per-harness cursor row. Synchronous: callers
+   * may schedule stale sampling, but selection always reads the current row.
    */
   pick(harness: string, opts: PickOptions = {}): PickOutcome {
     const now = this.now();
@@ -479,30 +549,29 @@ export class AccountsService {
   }
 
   /**
-   * Freshness policy (spec 08 "Limits"): before an `auto` pick, refresh the
-   * rows older than limitsStaleMs (or missing) for the harness's candidates —
-   * bounded, in-daemon, and only when more than one candidate exists (a lone
-   * candidate never pays a provider round-trip). Failures are recorded as
-   * unreadable rows and never block the pick.
+   * Freshness policy (spec 08 "Limits"): enqueue rows older than
+   * limitsStaleMs (or missing) for the harness's candidates. The spawn path
+   * reads the current snapshot immediately; provider sampling stays in the
+   * shared background lane and only runs when more than one candidate exists.
    */
-  async ensureFreshLimits(harness: string, opts: PickOptions = {}): Promise<{ refreshed: string[] }> {
+  scheduleFreshLimits(harness: string, opts: PickOptions = {}): { scheduled: string[] } {
     const ids = this.candidateIdsFor(harness, opts);
-    if (ids.length < 2) return { refreshed: [] };
+    if (ids.length < 2) return { scheduled: [] };
     const now = this.now();
     const stale = ids.filter((id) => {
       const row = this.store.getAccountLimits(id);
       return !row || now - row.fetchedAt > this.cfg.accounts.limitsStaleMs;
     });
-    if (stale.length === 0) return { refreshed: [] };
-    await this.refreshLimits(stale);
-    return { refreshed: stale };
+    if (stale.length === 0) return { scheduled: [] };
+    this.enqueueLimitsRefresh(stale);
+    return { scheduled: stale };
   }
 
   // -------------------------------------------------------------------------
   // limits — bounded in-daemon fetch
   // -------------------------------------------------------------------------
 
-  /** Refresh limits for the given accounts (all when omitted). Serialized: a concurrent call joins the in-flight sweep. */
+  /** Refresh limits for the given accounts (all when omitted). */
   async refreshLimits(accountIds?: string[]): Promise<AccountLimitsRow[]> {
     const ids = accountIds ?? this.store.listAccounts().map((a) => a.id);
     const out: AccountLimitsRow[] = [];
@@ -511,7 +580,15 @@ export class AccountsService {
       if (!account) continue;
       const fetched = await this.fetchOne(account);
       if (!this.store.getAccount(id)) continue; // removed mid-fetch
-      const row = this.store.putAccountLimits(id, fetched);
+      const previous = this.store.getAccountLimits(id);
+      const keepLastGood = previous?.readable === true
+        && !fetched.readable
+        && (fetched.unreadableReason === "provider_error" || fetched.unreadableReason === "timeout");
+      // A transient sampling failure is not evidence that the provider's last
+      // readable snapshot became false. Keep its fetchedAt and windows so the
+      // mirror and selector honestly expose stale, last-known-good data. Real
+      // auth failures still replace the row and drive auth_needed below.
+      const row = keepLastGood ? previous! : this.store.putAccountLimits(id, fetched);
       // The probe is the authentication check account health keys on: a REAL
       // auth failure sets auth_needed; a readable answer is contrary evidence.
       if (!fetched.readable && fetched.error && fetched.unreadableReason === "auth_failed") {
@@ -522,6 +599,9 @@ export class AccountsService {
         this.store.setAccountStatus(id, "ok", "limits probe authenticated");
         this.log(`account.auth_ok account=${id} by=limits_probe`);
       }
+      if (keepLastGood) {
+        this.log(`account.limits.transient_failure account=${id} reason=${fetched.unreadableReason} kept_fetched_at=${row.fetchedAt} error=${JSON.stringify(fetched.error ?? null)}`);
+      }
       this.log(`account.limits account=${id} readable=${row.readable}${row.readable ? ` weekly=${row.weeklyPct ?? "-"} 5h=${row.fiveHourPct ?? "-"}` : ` error=${JSON.stringify(row.error)}`}`);
       out.push(row);
     }
@@ -530,10 +610,29 @@ export class AccountsService {
 
   /** One account's limits via its harness's transport; never throws (an unreadable row instead). */
   private async fetchOne(account: AccountRow): Promise<PutAccountLimitsInput> {
+    if (account.harness === "codex") {
+      const joined = this.codexFetches.get(account.homePath);
+      if (joined) return joined;
+      const pending = this.fetchOneBounded(account);
+      this.codexFetches.set(account.homePath, pending);
+      try {
+        return await pending;
+      } finally {
+        if (this.codexFetches.get(account.homePath) === pending) this.codexFetches.delete(account.homePath);
+      }
+    }
+    return this.fetchOneBounded(account);
+  }
+
+  private async fetchOneBounded(account: AccountRow): Promise<PutAccountLimitsInput> {
     const timeout = this.cfg.accounts.limitsFetchTimeoutMs;
+    let timer: NodeJS.Timeout | undefined;
     try {
       const attempt = this.fetchByHarness(account);
-      const bounded = new Promise<PutAccountLimitsInput>((_, reject) => setTimeout(() => reject(new Error(`limits fetch timed out after ${timeout}ms`)), timeout).unref());
+      const bounded = new Promise<PutAccountLimitsInput>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`limits fetch timed out after ${timeout}ms`)), timeout);
+        timer.unref();
+      });
       return await Promise.race([attempt, bounded]);
     } catch (err) {
       const error = (err instanceof Error ? err.message : String(err)).slice(0, 500);
@@ -546,6 +645,8 @@ export class AccountsService {
             : "provider_error",
         error,
       };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -571,9 +672,9 @@ export class AccountsService {
         return parseClaudeUsage(usage, credential.subscriptionType ?? null);
       }
       case "codex": {
-        const limits = await this.fetchers.codexRateLimits(account.homePath);
-        if (!limits) return { readable: false, unreadableReason: "provider_error", error: "codex app-server did not answer account/rateLimits/read" };
-        return parseCodexRateLimits(limits);
+        const result = await this.fetchers.codexRateLimits(account.homePath);
+        if (!result.ok) return { readable: false, unreadableReason: result.unreadableReason, error: result.error };
+        return parseCodexRateLimits(result.limits);
       }
       case "grok":
       case "kimi":
@@ -692,20 +793,39 @@ export class AccountsService {
     }
   }
 
-  /** Tick hook: the periodic refresh (every limitsRefreshMs while the daemon runs; 0 = off). Never overlaps itself. */
-  periodicRefreshTick(): void {
-    const every = this.cfg.accounts.limitsRefreshMs;
-    if (every <= 0 || this.refreshing) return;
-    const now = this.now();
-    if (now - this.lastPeriodicRefreshAt < every) return;
-    this.lastPeriodicRefreshAt = now;
-    if (this.store.listAccounts().length === 0) return;
-    this.refreshing = this.refreshLimits()
-      .then(() => undefined)
+  private enqueueLimitsRefresh(accountIds: readonly string[]): void {
+    for (const id of accountIds) {
+      if (!this.activeRefreshIds.has(id)) this.queuedRefreshIds.add(id);
+    }
+    if (this.refreshing || this.queuedRefreshIds.size === 0) return;
+    this.refreshing = (async () => {
+      while (this.queuedRefreshIds.size > 0) {
+        const batch = [...this.queuedRefreshIds];
+        this.queuedRefreshIds.clear();
+        for (const id of batch) this.activeRefreshIds.add(id);
+        try {
+          await this.refreshLimits(batch);
+        } finally {
+          for (const id of batch) this.activeRefreshIds.delete(id);
+        }
+      }
+    })()
       .catch((err) => this.log(`account.limits.sweep_error ${err instanceof Error ? err.message : String(err)}`))
       .finally(() => {
         this.refreshing = null;
       });
+  }
+
+  /** Tick hook: the periodic refresh (every limitsRefreshMs while the daemon runs; 0 = off). Shares the background lane with spawn-triggered stale sampling. */
+  periodicRefreshTick(): void {
+    const every = this.cfg.accounts.limitsRefreshMs;
+    if (every <= 0) return;
+    const now = this.now();
+    if (now - this.lastPeriodicRefreshAt < every) return;
+    this.lastPeriodicRefreshAt = now;
+    const ids = this.store.listAccounts().map((account) => account.id);
+    if (ids.length === 0) return;
+    this.enqueueLimitsRefresh(ids);
   }
 
   // -------------------------------------------------------------------------
