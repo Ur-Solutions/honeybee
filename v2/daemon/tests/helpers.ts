@@ -256,7 +256,7 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
     retry: { maxAttempts: 4, backoffBaseMs: 50 },
     ...file,
     // v7 SAFETY: the vault + homes ALWAYS live inside the temp dir — never
-    // ~/.hive/vault or ~/.hive/homes; login seats use a private tmux socket.
+    // ~/.hive/vault or ~/.hive/homes; the private tmux socket only scopes legacy-seat cleanup.
     accounts: {
       vaultDir: join(dir, "vault"),
       homesDir: join(dir, "homes"),

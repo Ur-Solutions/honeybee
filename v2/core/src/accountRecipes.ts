@@ -1,6 +1,6 @@
 /**
  * Per-harness identity recipes (spec 08 "Vault"): how a provider's login
- * materializes on disk, so the login seat can capture credentials out of a
+ * materializes on disk, so a login flow can capture credentials out of a
  * home into the vault and activation can copy them back into an EMPTY home.
  * Ported from the old src/drivers.ts `identity` table — data only.
  *

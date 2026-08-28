@@ -26,7 +26,7 @@ import {
 } from "../src/index.ts";
 import { harness, makeBee } from "./helpers.ts";
 
-test("v7.recipes: Claude login seats launch the native auth flow", () => {
+test("v7.recipes: the Claude recipe's CLI login is the native auth flow", () => {
   assert.deepEqual(recipeFor("claude")?.login, { command: "claude", args: ["auth", "login"] });
 });
 

@@ -694,7 +694,7 @@ test("activation.1: an EMPTY home is activated from the vault (+ home defaults, 
     await waitFor(() => (written.length > 0 ? true : null), "keychain writer called");
     assert.equal(written[0]?.[0], claude.homePath);
     assert.match(written[0]?.[1] ?? "", /"accessToken":"t"/);
-    // an empty vault + empty home: nothing to activate (the login seat is the way in)
+    // an empty vault + empty home: nothing to activate (a login flow is the way in)
     const bare = r.store.createAccount({ id: "claude-bare", harness: "claude", homePath: join(r.homes, "claude-bare"), label: "bare" });
     assert.equal(svc.activateForSpawn(bare, { cwd: "/tmp" }).reason, "vault_empty");
     assert.equal(existsSync(join(r.homes, "claude-bare", ".credentials.json")), false);

@@ -2,7 +2,7 @@
  * Vault ↔ home file operations (spec 08 "Activation" + "The one design
  * change"): the HOME is authoritative. Activation copies vault → home ONLY
  * when the home is empty (no primary credential file); a populated home is
- * never touched by a spawn — byte for byte. The login seat's capture copies
+ * never touched by a spawn — byte for byte. A login flow's capture copies
  * home → vault (seed and backup, never synced). No locks, owner stamps or
  * generation fences: one account has exactly one home, so there is never a
  * second copy to reconcile.
