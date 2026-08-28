@@ -13,6 +13,7 @@
  * The shape snapshot test (tests/mirror.test.ts) fails on any drift.
  */
 import type { AccountLimitsRow, AccountRow, AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TaskRow, TaskSupplyRow, TemplateRow, TrackRow } from "./types.ts";
+import { LOGIN_FLOW_KEYS, type LoginFlowRow } from "./loginFlow.ts";
 
 /** One bee as apiaryd stores it: B8 view verbatim + record + current runtime. */
 export interface MirrorBeeRow {
@@ -46,6 +47,9 @@ export type MirrorTaskRow = TaskRow;
 /** v11: per-bee auto-supply config, verbatim (`hive_task_supply`). */
 export type MirrorTaskSupplyRow = TaskSupplyRow;
 
+/** v16: account login flows mirror as their store rows, verbatim (`hive_login_flows`). Safe descriptors only — no secrets, no raw worker output. */
+export type MirrorLoginFlowRow = LoginFlowRow;
+
 /**
  * The versioned snapshot: replace all mirror tables in one transaction
  * stamped `seq`, then apply deltas with `baseSeq === seq`. `questions` and
@@ -65,6 +69,8 @@ export interface MirrorSnapshot {
   /** v11 (additive): agent task lists + per-bee auto-supply config. */
   tasks: MirrorTaskRow[];
   taskSupply: MirrorTaskSupplyRow[];
+  /** v16 (additive): account login flows, store rows verbatim. */
+  loginFlows: MirrorLoginFlowRow[];
 }
 
 /** A watch delta is a contiguous run of audit rows (see daemon protocol.ts WatchFrame). */
@@ -117,6 +123,11 @@ export type MirrorDelta = AuditRow;
  *   task_supply.put  → { supply: TaskSupplyRow }                       (task_supply table: upsert)
  * bee.deleted cascades tasks + task_supply for that beeId (shared-list
  * tasks are untouched).
+ * v16 (account login flows) adds, all additive:
+ *   login_flow.put     → { flow: LoginFlowRow, outcome: "created"|"updated", changed?, reason? }  (login_flows table: upsert)
+ *   login_flow.removed → { flowId, account, reason }                     (login_flows table: delete)
+ * account.removed is preceded by one login_flow.removed per flow of that
+ * account in the same transaction, so a materializer never cascades itself.
  */
 export const MIRROR_TEMPLATE_AUDIT_KINDS = ["template.put", "template.deleted"] as const;
 export const MIRROR_TRACK_AUDIT_KINDS = ["track.put", "track.deleted"] as const;
@@ -126,6 +137,7 @@ export const MIRROR_ACCOUNT_AUDIT_KINDS = ["account.put", "account.removed"] as 
 export const MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS = ["account_limits.put", "account.removed"] as const;
 export const MIRROR_TASK_AUDIT_KINDS = ["task.put"] as const;
 export const MIRROR_TASK_SUPPLY_AUDIT_KINDS = ["task_supply.put"] as const;
+export const MIRROR_LOGIN_FLOW_AUDIT_KINDS = ["login_flow.put", "login_flow.removed"] as const;
 export type MirrorAccountAuditKind = (typeof MIRROR_ACCOUNT_AUDIT_KINDS)[number];
 export type MirrorAccountLimitsAuditKind = (typeof MIRROR_ACCOUNT_LIMITS_AUDIT_KINDS)[number];
 export type MirrorTemplateAuditKind = (typeof MIRROR_TEMPLATE_AUDIT_KINDS)[number];
@@ -134,6 +146,7 @@ export type MirrorQuestionAuditKind = (typeof MIRROR_QUESTION_AUDIT_KINDS)[numbe
 export type MirrorSealAuditKind = (typeof MIRROR_SEAL_AUDIT_KINDS)[number];
 export type MirrorTaskAuditKind = (typeof MIRROR_TASK_AUDIT_KINDS)[number];
 export type MirrorTaskSupplyAuditKind = (typeof MIRROR_TASK_SUPPLY_AUDIT_KINDS)[number];
+export type MirrorLoginFlowAuditKind = (typeof MIRROR_LOGIN_FLOW_AUDIT_KINDS)[number];
 
 /** Key lists — the shape snapshot; a materializer's column map must cover exactly these. */
 export const MIRROR_BEE_ROW_KEYS = ["view", "bee", "runtime"] as const;
@@ -286,3 +299,6 @@ export const MIRROR_TASK_KEYS = [
   "closedAt",
 ] as const;
 export const MIRROR_TASK_SUPPLY_KEYS = ["beeId", "on", "limit", "feeds", "paused"] as const;
+export const MIRROR_LOGIN_FLOW_KEYS = LOGIN_FLOW_KEYS;
+export const MIRROR_LOGIN_METHOD_KEYS = ["id", "kind", "label", "description", "remoteCapable", "fields"] as const;
+export const MIRROR_LOGIN_FIELD_KEYS = ["id", "label", "help", "required", "secret", "inputType", "placeholder", "pattern", "options", "scope"] as const;

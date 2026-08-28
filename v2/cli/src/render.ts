@@ -17,6 +17,7 @@ import type {
   QuestionListResult,
   SealListResult,
   ViewResult,
+  LoginFlowRow,
 } from "../../daemon/src/protocol.ts";
 import {
   actionLine,
@@ -289,9 +290,47 @@ export function renderAccountList(
 export function renderAccountGet(r: AccountGetResult): string[] {
   const lines = [accountLine(r.account, r.limits ?? undefined, false)];
   const bees = r.bees.length > 0 ? r.bees.join(",") : "-";
-  const seat = r.loginSeat ? `  loginSeat=${r.loginSeat.session} (${r.loginSeat.attach})` : "";
-  lines.push(`  ${dim("credentialed=")}${r.credentialed ? green("true") : dim("false")}  ${dim("bees=")}${bees}${seat}`);
+  const flow = r.loginFlow ? `  login=${r.loginFlow.phase}${r.loginFlow.methodId ? ` (${r.loginFlow.methodId})` : ""}` : "";
+  lines.push(`  ${dim("credentialed=")}${r.credentialed ? green("true") : dim("false")}  ${dim("bees=")}${bees}${flow}`);
   return lines;
+}
+
+/**
+ * The human view of a login flow row (v16): what to do next, never a
+ * terminal to attach to. Secrets never appear here (the row has none).
+ */
+export function renderLoginFlow(flow: LoginFlowRow): string[] {
+  const lines: string[] = [];
+  const method = flow.methods.find((m) => m.id === flow.methodId);
+  const head = `${bold(flow.account)}  ${blue(flow.harness)}  ${colorLoginPhase(flow.phase)}${method ? `  ${dim(method.label)}` : ""}  ${dim(`rev ${flow.revision}`)}`;
+  lines.push(head);
+  if (flow.detail) lines.push(`  ${flow.detail}`);
+  if (flow.authorizationUrl) lines.push(`  ${dim("open:")} ${cyan(flow.authorizationUrl)}`);
+  if (flow.userCode) lines.push(`  ${dim("code:")} ${bold(flow.userCode)}`);
+  for (const field of flow.inputFields) {
+    lines.push(`  ${dim("needs:")} ${field.label}${field.required ? "" : dim(" (optional)")}${field.help ? `  ${dim(field.help)}` : ""}`);
+  }
+  if (flow.error) lines.push(`  ${red(flow.error.code)}: ${flow.error.message}${flow.retryable ? dim("  (retry: hive account login <account>)") : ""}`);
+  const others = flow.methods.filter((m) => m.id !== flow.methodId);
+  if (others.length > 0 && flow.phase !== "succeeded") {
+    lines.push(`  ${dim("other methods:")} ${others.map((m) => `${m.id} (${m.label})`).join(", ")}`);
+  }
+  return lines;
+}
+
+function colorLoginPhase(phase: LoginFlowRow["phase"]): string {
+  switch (phase) {
+    case "succeeded":
+      return green(phase);
+    case "failed":
+    case "expired":
+    case "interrupted":
+      return red(phase);
+    case "cancelled":
+      return dim(phase);
+    default:
+      return yellow(phase);
+  }
 }
 
 export function renderAccountLimits(limits: AccountLimitsResult["limits"]): string[] {

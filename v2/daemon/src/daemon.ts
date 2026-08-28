@@ -48,7 +48,9 @@ import {
   type Scope,
   type Urgency,
 } from "../../core/src/index.ts";
-import { AccountsService, type LimitsFetchers, type LoginSeat } from "./accountsService.ts";
+import { AccountsService, type LimitsFetchers } from "./accountsService.ts";
+import { LoginFlowService, type LoginTransports } from "./loginFlows.ts";
+import type { PtySpawner } from "./loginWorker.ts";
 import type { KeychainReader, KeychainWriter } from "./keychain.ts";
 import type { FlagEvidenceLike } from "./loops.ts";
 import { realPreflightProbes } from "./import-probes.ts";
@@ -108,15 +110,20 @@ import {
   type AccountAddResult,
   type AccountBackfillResult,
   type AccountCaptureResult,
+  type AccountLoginCancelResult,
+  type AccountLoginGetResult,
+  type AccountLoginRetryResult,
+  type AccountLoginSelectMethodResult,
+  type AccountLoginStartResult,
+  type AccountLoginSubmitResult,
+  DAEMON_CAPABILITIES,
   type AccountGetResult,
   type AccountImportRegistryResult,
   type AccountLimitsResult,
   type AccountListResult,
-  type AccountLoginResult,
   type AccountRemoveResult,
   type AccountUpdateResult,
   type AuditTailResult,
-  type LoginSeatInfo,
   type SwapAccountResult,
   type CellCaptureMode,
   type CellCaptureResult,
@@ -307,6 +314,10 @@ export interface HiveDaemonDeps {
   keychainReader?: KeychainReader;
   keychainWriter?: KeychainWriter;
   fetchers?: LimitsFetchers;
+  /** v16: login-flow provider transports (token exchange / key checks) and the PTY backend, injectable for tests. */
+  loginTransports?: Partial<LoginTransports>;
+  loginSpawner?: PtySpawner | null;
+  loginTmuxExec?: (args: string[]) => { status: number | null; stdout: string };
 }
 
 /** Rate-limit cause classifier for resource_blocked evidence (spec 08 rotation trigger). */
@@ -345,6 +356,7 @@ export class HiveDaemon {
   private publishedSeq = 0;
   private readonly opLog: string[] = [];
   private accounts: AccountsService | null = null;
+  private loginFlows: LoginFlowService | null = null;
   private readonly deps: HiveDaemonDeps;
   /** v7 rotation bound: one attempt per (bee, generation) exhaustion event. */
   private readonly rotatedGenerations = new Map<string, number>();
@@ -358,10 +370,16 @@ export class HiveDaemon {
     this.naming = cfg.naming;
   }
 
-  /** The account plane (tests reach the selector / login seat / importer through it). */
+  /** The account plane (tests reach the selector / capture / importer through it). */
   get accountsService(): AccountsService {
     if (!this.accounts) throw new Error("daemon not started");
     return this.accounts;
+  }
+
+  /** v16: the login-flow plane (tests reach worker status / boot reconciliation through it). */
+  get loginFlowService(): LoginFlowService {
+    if (!this.loginFlows) throw new Error("daemon not started");
+    return this.loginFlows;
   }
 
   // -------------------------------------------------------------------------
@@ -401,6 +419,16 @@ export class HiveDaemon {
       keychainReader: this.deps.keychainReader,
       keychainWriter: this.deps.keychainWriter,
       fetchers: this.deps.fetchers,
+    });
+    this.loginFlows = new LoginFlowService({
+      store,
+      cfg: this.cfg,
+      accounts: this.accounts,
+      log: (op) => this.log(op),
+      ...(this.deps.loginTransports ? { transports: this.deps.loginTransports } : {}),
+      ...(this.deps.loginSpawner !== undefined ? { spawner: this.deps.loginSpawner } : {}),
+      ...(this.deps.loginTmuxExec ? { tmuxExec: this.deps.loginTmuxExec } : {}),
+      onCompleted: (accountId) => this.clearAccountAuthNeeded(accountId, `login completed for account ${accountId}`, "login"),
     });
     const hsrConfig = {
       sessionLogDir: this.cfg.sessionLogDir,
@@ -468,6 +496,10 @@ export class HiveDaemon {
     // reconcileAtBoot keeps their rows live instead of stopping them.
     this.adoptSurvivors(store, driver);
     this.lastBoot = this.core.boot();
+    // v16: login workers do not survive a daemon restart (a PTY cannot be
+    // re-adopted): settle their flows as interrupted, then remove the
+    // retired tmux login seats this node's own daemons created.
+    this.loginFlows.reconcileAtBoot();
     this.publishedSeq = store.lastAuditSeq();
     this.rpc = new RpcServer({
       socketPath: this.cfg.socketPath,
@@ -503,6 +535,8 @@ export class HiveDaemon {
     this.tickTimer = null;
     this.titleGenerator?.close();
     this.titleGenerator = null;
+    // v16: no login worker outlives the daemon (boot marks their flows interrupted).
+    await this.loginFlows?.shutdown();
     await this.rpc?.close();
     this.store?.close();
     this.telemetry?.close();
@@ -543,10 +577,10 @@ export class HiveDaemon {
       tStep = Date.now();
       this.ticks += 1;
       this.lastTickAt = tStep;
-      // v7: bounded in-daemon limits refresh + login-seat watch (no forks).
+      // v7: bounded in-daemon limits refresh; v16: login-flow expiry + credential landing.
       this.accounts?.periodicRefreshTick();
       tAccounts = Date.now();
-      void this.pollLoginSeats();
+      this.loginFlows?.tick();
       void this.autoTitle?.()
         .then((outcomes) => {
           for (const outcome of outcomes) {
@@ -767,7 +801,7 @@ export class HiveDaemon {
       case "account.add":
         return this.withIdempotency(verb, params, () => this.rpcAccountAdd(params));
       case "account.remove":
-        return this.withIdempotency(verb, params, () => ({ account: this.mustStore().removeAccount(this.requireAccount(params).id) }) satisfies AccountRemoveResult);
+        return this.rpcAccountRemove(params);
       case "account.pause":
         return this.withIdempotency(verb, params, () => this.rpcAccountStatus(params, "paused"));
       case "account.unpause":
@@ -775,7 +809,18 @@ export class HiveDaemon {
       case "account.setPenalty":
         return this.withIdempotency(verb, params, () => this.rpcAccountSetPenalty(params));
       case "account.login":
-        return this.rpcAccountLogin(params);
+      case "account.login.start":
+        return this.rpcAccountLoginStart(params);
+      case "account.login.get":
+        return this.rpcAccountLoginGet(params);
+      case "account.login.selectMethod":
+        return this.rpcAccountLoginSelectMethod(params);
+      case "account.login.submit":
+        return this.rpcAccountLoginSubmit(params);
+      case "account.login.retry":
+        return this.rpcAccountLoginRetry(params);
+      case "account.login.cancel":
+        return this.withIdempotency(verb, params, () => this.rpcAccountLoginCancel(params));
       case "account.capture":
         return this.rpcAccountCapture(params);
       case "account.limits":
@@ -1860,6 +1905,7 @@ export class HiveDaemon {
   private rpcDeployInfo(): DeployInfoResult {
     return {
       protocol: PROTOCOL,
+      capabilities: DAEMON_CAPABILITIES,
       daemonVersion: DAEMON_VERSION,
       nodeVersion: process.version,
       pid: process.pid,
@@ -1908,6 +1954,7 @@ export class HiveDaemon {
       accountLimits: store.listAccountLimits(),
       tasks: store.listTasks(),
       taskSupply: store.listTaskSupply(),
+      loginFlows: store.listLoginFlows(),
     };
   }
 
@@ -1939,11 +1986,6 @@ export class HiveDaemon {
     throw new RpcError("account_not_found", `account not found: ${selector}`);
   }
 
-  private seatInfo(seat: LoginSeat | null): LoginSeatInfo | null {
-    if (!seat) return null;
-    return { accountId: seat.accountId, session: seat.session, socket: seat.socket, attach: seat.attach, startedAt: seat.startedAt, deadline: seat.deadline };
-  }
-
   private rpcAccountList(params: Record<string, unknown>): AccountListResult {
     const store = this.mustStore();
     const harness = typeof params.harness === "string" && params.harness.length > 0 ? params.harness : undefined;
@@ -1960,8 +2002,15 @@ export class HiveDaemon {
       limits: store.getAccountLimits(account.id),
       bees: store.beesOnAccount(account.id).map((b) => b.id),
       credentialed: this.mustAccounts().credentialed(account),
-      loginSeat: this.seatInfo(this.mustAccounts().seatOf(account.id)),
+      loginFlow: store.latestLoginFlow(account.id),
     };
+  }
+
+  private async rpcAccountRemove(params: Record<string, unknown>): Promise<AccountRemoveResult> {
+    const account = this.requireAccount(params);
+    // v16: a login worker never outlives its account (the store cascades the rows).
+    await this.mustLoginFlows().abandonAccount(account.id);
+    return this.withIdempotency("account.remove", params, () => ({ account: this.mustStore().removeAccount(account.id) }) satisfies AccountRemoveResult);
   }
 
   private rpcAccountAdd(params: Record<string, unknown>): AccountAddResult {
@@ -1996,23 +2045,95 @@ export class HiveDaemon {
     return { account: res.account, applied: res.applied };
   }
 
-  private async rpcAccountLogin(params: Record<string, unknown>): Promise<AccountLoginResult> {
-    const account = this.requireAccount(params);
+  private mustLoginFlows(): LoginFlowService {
+    if (!this.loginFlows || this.stopping) throw new RpcError("node_stopped", "daemon is shutting down");
+    return this.loginFlows;
+  }
+
+  /**
+   * One-key idempotency for the ASYNC login verbs (they await provider
+   * transports / worker start, so the sync transactional wrapper does not
+   * apply): a seen key answers with the recorded SAFE result (the flow row)
+   * and never re-executes; a failed execution records nothing.
+   */
+  private async withAsyncIdempotency<T extends object>(verb: RpcVerb, params: Record<string, unknown>, fn: () => Promise<T>): Promise<T | (T & { deduped: true })> {
     const key = this.idempotencyKeyOf(params);
     const store = this.mustStore();
     if (key != null) {
       const hit = store.lookupRpcResult(key);
-      if (hit) return { ...(hit.result as AccountLoginResult), deduped: true };
+      if (hit) {
+        this.log(`rpc.dedup verb=${verb} key=${key}`);
+        return { ...(hit.result as T), deduped: true as const };
+      }
     }
-    let started: { seat: LoginSeat; rejoined: boolean };
-    try {
-      started = await this.mustAccounts().startLogin(account);
-    } catch (err) {
-      throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
-    }
-    const result: AccountLoginResult = { accountId: account.id, seat: this.seatInfo(started.seat) as LoginSeatInfo, rejoined: started.rejoined };
-    if (key != null) store.recordRpcResult(key, "account.login", null, result);
+    const result = await fn();
+    if (key != null) store.recordRpcResult(key, verb, null, result);
     return result;
+  }
+
+  private flowIdParam(params: Record<string, unknown>): string {
+    return this.param(params, "flowId");
+  }
+
+  /** `account.login.start {id, methodId?, remote?}` (alias: `account.login {id}`). */
+  private rpcAccountLoginStart(params: Record<string, unknown>): Promise<AccountLoginStartResult> {
+    const account = this.requireAccount(params);
+    const methodId = params.methodId === undefined || params.methodId === null ? null : this.param(params, "methodId");
+    if (params.remote !== undefined && typeof params.remote !== "boolean") throw new RpcError("invalid_request", "account.login.start: remote must be a boolean");
+    const remote = params.remote === true;
+    return this.withAsyncIdempotency("account.login.start", params, async () => {
+      const started = await this.mustLoginFlows().start(account, { methodId, remote });
+      return { accountId: account.id, flow: started.flow, rejoined: started.rejoined } satisfies AccountLoginStartResult;
+    });
+  }
+
+  /** `account.login.get {flowId}` | `{id}` (account selector → latest flow). */
+  private rpcAccountLoginGet(params: Record<string, unknown>): AccountLoginGetResult {
+    const store = this.mustStore();
+    if (typeof params.flowId === "string" && params.flowId.length > 0) {
+      const flow = store.getLoginFlow(params.flowId);
+      if (!flow) throw new RpcError("login_flow_not_found", `login flow not found: ${params.flowId}`);
+      return { flow };
+    }
+    const account = this.requireAccount(params);
+    const flow = store.latestLoginFlow(account.id);
+    if (!flow) throw new RpcError("login_flow_not_found", `account ${account.id} has no login flow`);
+    return { flow };
+  }
+
+  private rpcAccountLoginSelectMethod(params: Record<string, unknown>): Promise<AccountLoginSelectMethodResult> {
+    const flowId = this.flowIdParam(params);
+    const methodId = this.param(params, "methodId");
+    return this.withAsyncIdempotency("account.login.selectMethod", params, async () => ({ flow: await this.mustLoginFlows().selectMethod(flowId, methodId) }));
+  }
+
+  /**
+   * `account.login.submit {flowId, values}` — SENSITIVE. `values` is read
+   * once, handed to the flow service, and never logged, audited, or recorded
+   * (the idempotency record is the safe flow row only).
+   */
+  private rpcAccountLoginSubmit(params: Record<string, unknown>): Promise<AccountLoginSubmitResult> {
+    const flowId = this.flowIdParam(params);
+    const raw = params.values;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new RpcError("invalid_request", "account.login.submit: values must be an object of strings");
+    const values: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v !== "string") throw new RpcError("invalid_request", `account.login.submit: field '${k}' must be a string`);
+      if (v.length > 8192) throw new RpcError("invalid_request", `account.login.submit: field '${k}' is too long`);
+      values[k] = v;
+    }
+    return this.withAsyncIdempotency("account.login.submit", params, async () => ({ flow: await this.mustLoginFlows().submit(flowId, values) }));
+  }
+
+  private rpcAccountLoginRetry(params: Record<string, unknown>): Promise<AccountLoginRetryResult> {
+    const flowId = this.flowIdParam(params);
+    return this.withAsyncIdempotency("account.login.retry", params, async () => ({ flow: await this.mustLoginFlows().retry(flowId) }));
+  }
+
+  private rpcAccountLoginCancel(params: Record<string, unknown>): AccountLoginCancelResult {
+    const flowId = this.flowIdParam(params);
+    const res = this.mustLoginFlows().cancel(flowId);
+    return { flow: res.flow, applied: res.applied };
   }
 
   private clearAccountAuthNeeded(accountId: string, reason: string, by: "capture" | "login"): void {
@@ -2185,24 +2306,6 @@ export class HiveDaemon {
       else if (a.startsWith("--model=")) model = a.slice("--model=".length);
     }
     return model;
-  }
-
-  /** Tick: poll open login seats; a completed login clears auth_needed on the account's bees (contrary evidence). */
-  private async pollLoginSeats(): Promise<void> {
-    const accounts = this.accounts;
-    const store = this.store;
-    if (!accounts || !store || this.stopping) return;
-    let outcomes;
-    try {
-      outcomes = await accounts.pollLoginSeats();
-    } catch (err) {
-      this.log(`account.login.poll_error ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
-    for (const done of outcomes) {
-      if (this.stopping) return;
-      this.clearAccountAuthNeeded(done.accountId, `login completed for account ${done.accountId}`, "login");
-    }
   }
 
   // -------------------------------------------------------------------------

@@ -2,6 +2,7 @@
  * Closed vocabularies and row shapes for the v2 core store.
  * Spec: docs/design/specs/reset-01-core.md — the lists here are CLOSED (contract §4, invariant 4).
  */
+import type { LoginFlowRow } from "./loginFlow.ts";
 
 export const LIFECYCLES = ["active", "archived", "deleted"] as const;
 export type Lifecycle = (typeof LIFECYCLES)[number];
@@ -595,6 +596,8 @@ export interface StateDump {
   /** v11 */
   tasks: TaskRow[];
   taskSupply: TaskSupplyRow[];
+  /** v16 */
+  loginFlows: LoginFlowRow[];
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@
  */
 import { execFile, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { defaultDataDir, loadNodeConfig, type ResolvedNodeConfig } from "../../daemon/src/config.ts";
@@ -32,7 +33,11 @@ import {
   type AccountImportRegistryResult,
   type AccountLimitsResult,
   type AccountListResult,
-  type AccountLoginResult,
+  type AccountLoginGetResult,
+  type AccountLoginStartResult,
+  type AccountLoginSubmitResult,
+  type AccountLoginCancelResult,
+  type LoginFlowRow,
   type AccountRemoveResult,
   type AccountUpdateResult,
   type SwapAccountResult,
@@ -121,6 +126,7 @@ import {
   confirm,
   questionLine,
   registryLine,
+  renderLoginFlow,
   renderAccountGet,
   renderAccountLimits,
   renderAccountList,
@@ -630,58 +636,100 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
 
 const ACCOUNT_USAGE =
   "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
-  "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100> | login <selector> [--no-attach]\n" +
+  "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100>\n" +
+  "       hive account login <selector> [--method <id>] [--remote] [--no-wait] | login-status <selector> | login-cancel <selector>\n" +
   "       hive account capture <selector> | limits [<selector>]\n" +
   "       hive account import [--root ~/.hive] [--dry-run] | backfill [--dry-run]";
 
-export function loginSeatTmuxArgs(seat: Pick<AccountLoginResult["seat"], "session" | "socket">, command: "attach-session" | "has-session" = "attach-session"): string[] {
-  return [...(seat.socket ? ["-L", seat.socket] : []), command, "-t", `=${seat.session}:`];
+/** Exit code for a settled login flow: success is 0; every other terminal phase is 1. */
+export function loginFlowExitCode(phase: LoginFlowRow["phase"]): number {
+  return phase === "succeeded" ? 0 : 1;
 }
 
-export function shouldAutoAttachLogin(options: {
-  json: boolean;
-  noAttach: boolean;
-  forceAttach: boolean;
-  stdinIsTTY: boolean;
-  stdoutIsTTY: boolean;
-}): boolean {
-  if (options.json || options.noAttach) return false;
-  return options.forceAttach || (options.stdinIsTTY && options.stdoutIsTTY);
+/** Whether the CLI should drive the flow interactively (prompt for input, wait for the outcome). */
+export function shouldFollowLogin(options: { json: boolean; noWait: boolean; stdinIsTTY: boolean; stdoutIsTTY: boolean }): boolean {
+  if (options.json || options.noWait) return false;
+  return options.stdinIsTTY && options.stdoutIsTTY;
 }
 
-async function waitForLoginCapture(ctx: CliContext, accountId: string, startedAt: number, timeoutMs = 2_000): Promise<AccountGetResult | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const account = await withClient(ctx, (client) => client.request<AccountGetResult>("account.get", { id: accountId }));
-    if (account.account.lastLoginAt !== null && account.account.lastLoginAt >= startedAt) return account;
-    if (Date.now() >= deadline) return null;
-    await sleep(100);
+/** Read one line from the terminal; secrets are typed without echo (raw mode) so they never land in a scrollback. */
+async function promptLine(label: string, secret: boolean): Promise<string> {
+  const stdin = process.stdin;
+  process.stdout.write(`${label}: `);
+  if (!secret || !stdin.isTTY) {
+    const rl = createInterface({ input: stdin, terminal: false });
+    try {
+      return await new Promise<string>((resolve) => rl.once("line", (line) => resolve(line)));
+    } finally {
+      rl.close();
+    }
+  }
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.setEncoding("utf8");
+  let value = "";
+  try {
+    return await new Promise<string>((resolve) => {
+      const onData = (chunk: string) => {
+        for (const ch of chunk) {
+          if (ch === "\r" || ch === "\n") {
+            stdin.off("data", onData);
+            process.stdout.write("\n");
+            resolve(value);
+            return;
+          }
+          if (ch === "\u0003") {
+            stdin.off("data", onData);
+            process.stdout.write("\n");
+            resolve("");
+            return;
+          }
+          if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+          else value += ch;
+        }
+      };
+      stdin.on("data", onData);
+    });
+  } finally {
+    stdin.setRawMode(false);
+    stdin.pause();
   }
 }
 
-async function attachToLoginSeat(ctx: CliContext, result: AccountLoginResult): Promise<void> {
-  // A login can be launched from a shell that already happens to live inside
-  // tmux (including an Apiary terminal pane). Unset the nesting markers only
-  // for the child client so the login seat replaces that pane until it exits.
-  const env = { ...process.env };
-  delete env.TMUX;
-  delete env.TMUX_PANE;
-  const attached = spawnSync("tmux", loginSeatTmuxArgs(result.seat), { stdio: "inherit", env });
-
-  // The daemon records the capture before it tears down the seat, but allow a
-  // short grace when the operator detached at the same instant as its poll.
-  const captured = await waitForLoginCapture(ctx, result.accountId, result.seat.startedAt);
-  if (captured) {
-    ctx.io.out(confirm("ok", "capture", `${result.accountId} (credentials saved to its account home and vault)`));
-    return;
+/**
+ * Drive a login flow from the terminal: print each phase change, ask for
+ * the fields the daemon requests (secrets without echo), and stop at a
+ * terminal phase. Nothing is attached to; the daemon owns the sign-in.
+ */
+async function followLoginFlow(ctx: CliContext, initial: LoginFlowRow): Promise<number> {
+  let flow = initial;
+  let shown = `${flow.phase}:${flow.revision}:${flow.authorizationUrl ?? ""}:${flow.userCode ?? ""}:${flow.inputFields.map((f) => f.id).join(",")}:${flow.error?.code ?? ""}`;
+  for (;;) {
+    if (flow.phase === "waiting_input" && flow.inputFields.length > 0) {
+      const values: Record<string, string> = {};
+      for (const field of flow.inputFields) {
+        if (field.inputType === "select" && field.options) {
+          ctx.io.out(dim(`  ${field.label}: ${field.options.map((o) => `${o.value} (${o.label})`).join(", ")}`));
+        }
+        const value = await promptLine(`  ${field.label}${field.required ? "" : " (optional, Enter to skip)"}`, field.secret);
+        if (value.length > 0 || field.required) values[field.id] = value;
+      }
+      const submitted = await withClient(ctx, (c) => c.request<AccountLoginSubmitResult>("account.login.submit", { flowId: flow.id, values }));
+      flow = submitted.flow;
+    } else {
+      await sleep(400);
+      const got = await withClient(ctx, (c) => c.request<AccountLoginGetResult>("account.login.get", { flowId: flow.id }));
+      flow = got.flow;
+    }
+    const key = `${flow.phase}:${flow.revision}:${flow.authorizationUrl ?? ""}:${flow.userCode ?? ""}:${flow.inputFields.map((f) => f.id).join(",")}:${flow.error?.code ?? ""}`;
+    if (key !== shown) {
+      shown = key;
+      for (const line of renderLoginFlow(flow)) ctx.io.out(line);
+    }
+    if (flow.phase === "succeeded" || flow.phase === "failed" || flow.phase === "cancelled" || flow.phase === "expired" || flow.phase === "interrupted") {
+      return loginFlowExitCode(flow.phase);
+    }
   }
-  if (attached.error) throw new Error(`tmux attach failed: ${attached.error.message}`);
-
-  const seatStillRunning = spawnSync("tmux", loginSeatTmuxArgs(result.seat, "has-session"), { stdio: "ignore", env }).status === 0;
-  if (seatStillRunning) {
-    throw new Error(`Login not completed; the seat is still running — rerun hive login ${result.accountId} or ${result.seat.attach}`);
-  }
-  throw new Error(`Login seat exited without fresh credentials; rerun: hive login ${result.accountId}`);
 }
 
 async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
@@ -763,30 +811,45 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
     case "login": {
       const id = parsed.positional[2];
       if (!id) throw new Error(ACCOUNT_USAGE);
-      if (parsed.flags.get("--attach") === true && parsed.flags.get("--no-attach") === true) {
-        throw new Error("account login: --attach and --no-attach are mutually exclusive");
-      }
-      const r = await withClient(ctx, (c) => c.request<AccountLoginResult>("account.login", { id, idempotencyKey: key }));
+      const methodId = parsed.flags.get("--method") as string | undefined;
+      const remote = parsed.flags.get("--remote") === true;
+      const r = await withClient(ctx, (c) =>
+        c.request<AccountLoginStartResult>("account.login.start", {
+          id,
+          idempotencyKey: key,
+          ...(methodId ? { methodId } : {}),
+          ...(remote ? { remote: true } : {}),
+        }),
+      );
       emit(
         ctx,
-        [
-          confirm("ok", r.rejoined ? "rejoined" : "started", `the login seat for ${r.accountId}`, r.deduped),
-          `  ${cyan(r.seat.attach)}`,
-          dim("  (the daemon captures the credential into the vault and marks the account ok when it lands)"),
-        ],
+        [confirm("ok", r.rejoined ? "rejoined" : "started", `the login for ${r.accountId}`, r.deduped), ...renderLoginFlow(r.flow)],
         r,
         false,
       );
-      if (shouldAutoAttachLogin({
+      if (shouldFollowLogin({
         json: ctx.json,
-        noAttach: parsed.flags.get("--no-attach") === true,
-        forceAttach: parsed.flags.get("--attach") === true,
+        noWait: parsed.flags.get("--no-wait") === true,
         stdinIsTTY: process.stdin.isTTY === true,
         stdoutIsTTY: process.stdout.isTTY === true,
       })) {
-        ctx.io.out(dim(`complete the ${r.accountId} login; exiting the provider CLI returns here automatically`));
-        await attachToLoginSeat(ctx, r);
+        return await followLoginFlow(ctx, r.flow);
       }
+      return 0;
+    }
+    case "login-status": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountLoginGetResult>("account.login.get", { id }));
+      emit(ctx, renderLoginFlow(r.flow), r, false);
+      return 0;
+    }
+    case "login-cancel": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const got = await withClient(ctx, (c) => c.request<AccountLoginGetResult>("account.login.get", { id }));
+      const r = await withClient(ctx, (c) => c.request<AccountLoginCancelResult>("account.login.cancel", { flowId: got.flow.id, idempotencyKey: key }));
+      emit(ctx, [confirm(r.applied ? "ok" : "info", r.applied ? "cancelled" : "unchanged", `login for ${r.flow.account} (${r.flow.phase})`, r.deduped)], r, false);
       return 0;
     }
     case "capture": {
@@ -3368,7 +3431,7 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdAttach(ctx, parsed);
       case "login": {
         const id = parsed.positional[1];
-        if (!id) throw new Error("usage: hive login <account> [--no-attach]");
+        if (!id) throw new Error("usage: hive login <account> [--method <id>] [--remote] [--no-wait]");
         return await cmdAccount(ctx, { ...parsed, positional: ["account", "login", id] });
       }
       case "swap-account": {

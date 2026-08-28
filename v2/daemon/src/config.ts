@@ -92,10 +92,20 @@ export interface AccountsConfig {
   limitsRefreshMs?: number;
   /** Per-fetch bound for a provider limits read. Default 15s. */
   limitsFetchTimeoutMs?: number;
-  /** tmux socket name (`tmux -L <name>`) for login seats; absent = the default server. Tests use a private one. */
+  /**
+   * tmux socket name (`tmux -L <name>`) the RETIRED login seats ran on; kept
+   * only so boot can clean up legacy `hive-login-*` sessions the daemon
+   * itself created. Absent = the default server.
+   */
   tmuxSocket?: string;
-  /** How long a login seat is watched for the credential change. Default 10 min. */
+  /** How long a login flow may stay open before it expires. Default 10 min. */
   loginTimeoutMs?: number;
+  /**
+   * Native login worker backend for CLI-driven methods: `auto` (node-pty when
+   * installed, else pipes for CLIs that do not need a TTY), `pipe` (never load
+   * node-pty; TTY-requiring methods refuse with `pty_unavailable`). Default auto.
+   */
+  loginWorkerBackend?: "auto" | "pipe";
   /** Rotation cool-off: an account with rate-limit exhaustion evidence younger than this is not rotated ONTO. Default 5h. */
   exhaustionCoolOffMs?: number;
 }
@@ -487,6 +497,10 @@ function accountsOf(raw: Record<string, unknown>): ResolvedNodeConfig["accounts"
   if (socket !== undefined && (typeof socket !== "string" || socket.length === 0)) {
     throw new ConfigError("config: accounts.tmuxSocket must be a non-empty string when given");
   }
+  const backend = a.loginWorkerBackend === undefined ? "auto" : a.loginWorkerBackend;
+  if (backend !== "auto" && backend !== "pipe") {
+    throw new ConfigError("config: accounts.loginWorkerBackend must be 'auto' or 'pipe' when given");
+  }
   return {
     vaultDir: str(a, "vaultDir", join(homedir(), ".hive", "vault")),
     homesDir: str(a, "homesDir", join(homedir(), ".hive", "homes")),
@@ -496,6 +510,7 @@ function accountsOf(raw: Record<string, unknown>): ResolvedNodeConfig["accounts"
     loginTimeoutMs: num(a, "loginTimeoutMs", DEFAULTS.loginTimeoutMs),
     exhaustionCoolOffMs: num(a, "exhaustionCoolOffMs", DEFAULTS.exhaustionCoolOffMs),
     tmuxSocket: (socket as string | undefined) ?? null,
+    loginWorkerBackend: backend,
   };
 }
 

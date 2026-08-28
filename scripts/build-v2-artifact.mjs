@@ -3,7 +3,7 @@
  * Bundle the v2 CLI (which transitively contains the v2 daemon, RPC surface
  * and core store) into dist/v2/cli.js so the OLD compiled `hive` binary can
  * route `hive v2 …` without a TypeScript loader at runtime. The bundle is
- * plain ESM; only node builtins stay external.
+ * plain ESM; only node builtins (and the optional native node-pty) stay external.
  */
 import { mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
@@ -24,6 +24,9 @@ await build({
   minify: false,
   preserveSymlinks: true,
   logLevel: "silent",
+  // node-pty is a native optional dependency (the login worker's PTY
+  // backend); it is resolved at runtime from node_modules, never bundled.
+  external: ["node-pty"],
 });
 await build({
   absWorkingDir: root,

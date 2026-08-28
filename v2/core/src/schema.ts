@@ -99,8 +99,13 @@
  *        daemon advances it only after every normalized effect through that
  *        cursor has committed; restart replay is therefore deterministic and
  *        at-least-once without crossing runtime generations.
+ *  v16 — account login flows (tmux-independent login, 2026-08-28): adds
+ *        `login_flows`, the durable, mirrored record of one account's
+ *        sign-in (methods, phase, authorization URL / device code, requested
+ *        input descriptors, typed error, revision). Carries no secret and no
+ *        raw worker output. Additive; migration = CREATE TABLE IF NOT EXISTS.
  */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -347,6 +352,33 @@ CREATE TABLE IF NOT EXISTS selection_cursors (
   last_account_id TEXT NOT NULL,
   updated_at      INTEGER NOT NULL
 ) STRICT;
+
+-- v16: account login flows — the daemon-owned sign-in record clients
+-- mirror (hive_login_flows). One ACTIVE flow per account at a time; terminal
+-- rows are pruned to the latest per account. methods / input_fields / error
+-- are JSON documents of safe descriptors; no column ever holds a secret.
+CREATE TABLE IF NOT EXISTS login_flows (
+  id                TEXT PRIMARY KEY,
+  account           TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  harness           TEXT NOT NULL,
+  provider          TEXT,
+  revision          INTEGER NOT NULL DEFAULT 1,
+  method_id         TEXT,
+  methods           TEXT NOT NULL DEFAULT '[]',
+  phase             TEXT NOT NULL CHECK (phase IN ('starting','waiting_browser','waiting_device','waiting_input','validating','succeeded','failed','cancelled','expired','interrupted')),
+  detail            TEXT,
+  authorization_url TEXT,
+  user_code         TEXT,
+  input_fields      TEXT NOT NULL DEFAULT '[]',
+  error             TEXT,
+  retryable         INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0,1)),
+  remote            INTEGER NOT NULL DEFAULT 0 CHECK (remote IN (0,1)),
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  completed_at      INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS login_flows_account ON login_flows(account, created_at);
 
 -- v11: agent task lists. Bee lists (bee:id) cascade with the bee;
 -- shared lists (shared:name) have bee_id NULL. sort_order is the FIFO

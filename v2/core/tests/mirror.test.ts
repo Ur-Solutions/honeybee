@@ -14,6 +14,10 @@ import {
   MIRROR_BEE_RECORD_KEYS,
   MIRROR_BEE_ROW_KEYS,
   MIRROR_BEE_VIEW_KEYS,
+  MIRROR_LOGIN_FIELD_KEYS,
+  MIRROR_LOGIN_FLOW_AUDIT_KINDS,
+  MIRROR_LOGIN_FLOW_KEYS,
+  MIRROR_LOGIN_METHOD_KEYS,
   MIRROR_QUESTION_AUDIT_KINDS,
   MIRROR_QUESTION_KEYS,
   MIRROR_RUNTIME_KEYS,
@@ -78,6 +82,26 @@ test("mirror.1: live rows carry exactly the declared keys — bees (view/bee/run
     const account = store.createAccount({ id: "claude-a", harness: "claude", homePath: "/tmp/h", label: "a" });
     assert.deepEqual(keysOf(account), [...MIRROR_ACCOUNT_KEYS].sort());
     const limits = store.putAccountLimits("claude-a", { readable: true, weekly: { usedPercent: 10 } });
+    // v16: login flows mirror as store rows, verbatim; method/field descriptors carry only safe metadata keys.
+    const flow = store.createLoginFlow({
+      id: "lf-1",
+      account: "claude-a",
+      harness: "claude",
+      methods: [
+        {
+          id: "m",
+          kind: "browser_code",
+          label: "Sign in with your browser",
+          description: null,
+          remoteCapable: true,
+          fields: [{ id: "code", label: "Code", help: null, required: true, secret: true, inputType: "password", placeholder: null, pattern: null, options: null, scope: null }],
+        },
+      ],
+      expiresAt: h.now() + 60_000,
+    });
+    assert.deepEqual(keysOf(flow), [...MIRROR_LOGIN_FLOW_KEYS].sort());
+    assert.deepEqual(keysOf(flow.methods[0] as object), [...MIRROR_LOGIN_METHOD_KEYS].sort());
+    assert.deepEqual(keysOf((flow.methods[0] as { fields: object[] }).fields[0] as object), [...MIRROR_LOGIN_FIELD_KEYS].sort());
     assert.deepEqual(keysOf(limits), [...MIRROR_ACCOUNT_LIMITS_KEYS].sort());
     // v11: tasks + supply mirror as store rows, verbatim.
     const added = store.addTask({
@@ -136,6 +160,7 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       accountLimits: [limits],
       tasks: [],
       taskSupply: [],
+      loginFlows: [],
     };
     // Neutralize the nondeterministic values (bee uuid, minted handle) then freeze.
     const text = JSON.stringify(snapshot, null, 2)
@@ -316,7 +341,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
     }
   ],
   "tasks": [],
-  "taskSupply": []
+  "taskSupply": [],
+  "loginFlows": []
 }`,
     );
     store.close();

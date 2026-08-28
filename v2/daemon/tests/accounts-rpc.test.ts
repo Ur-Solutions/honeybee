@@ -32,6 +32,7 @@ import type {
   AccountGetResult,
   AccountLimitsResult,
   AccountListResult,
+  AccountLoginStartResult,
   AccountRemoveResult,
   AccountUpdateResult,
   SwapAccountResult,
@@ -122,7 +123,7 @@ test("rpc.accounts.1: CRUD verbs, typed errors, idempotent add, spawn binding (e
     await rejects(() => client.request("account.get", { id: "nope" }), "account_not_found");
     const got = await client.request<AccountGetResult>("account.get", { id: "stub-two" });
     assert.equal(got.credentialed, true, "the stub harness has no recipe: always credentialed");
-    assert.equal(got.loginSeat, null);
+    assert.equal(got.loginFlow, null);
     assert.deepEqual(got.bees, []);
 
     // pause / unpause / penalty
@@ -202,7 +203,11 @@ test("rpc.accounts.fuzzy: one selector works across account verbs, spawn agent s
     assert.deepEqual(limits.limits.map((row) => row.account), ["stub-work"]);
     // Stub intentionally has no login recipe. `invalid_request` (instead of
     // account_not_found) proves the fuzzy selector reached that harness gate.
-    await rejects(() => client.request("account.login", { id: "stub-company" }), "invalid_request");
+    // v16: a harness without a login recipe gets a flow row carrying the typed
+    // refusal (never an RPC error, never a terminal); capture still refuses.
+    const refused = await client.request<AccountLoginStartResult>("account.login", { id: "stub-company" });
+    assert.equal(refused.flow.phase, "failed");
+    assert.equal(refused.flow.error?.code, "unsupported_method");
     await rejects(() => client.request("account.capture", { id: "stub-company" }), "invalid_request");
 
     // Embedded selector: the daemon normalizes the concrete agent and binds

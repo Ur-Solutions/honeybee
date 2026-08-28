@@ -23,10 +23,13 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "../../core/src/index.ts";
+import { LoginFlowRefusal } from "./loginFlows.ts";
 import {
+  DAEMON_CAPABILITIES,
   PROTOCOL,
   RPC_VERBS,
   RpcError,
+  type HelloFrame,
   type RpcErrorCode,
   type RpcVerb,
   type WatchFrame,
@@ -63,6 +66,7 @@ interface Connection extends RpcConn {
 /** Map any thrown error onto the closed RPC error list. */
 export function toRpcError(err: unknown): { code: RpcErrorCode; message: string } {
   if (err instanceof RpcError) return { code: err.code, message: err.message };
+  if (err instanceof LoginFlowRefusal) return { code: err.code, message: err.message };
   if (err instanceof BeeNotFoundError) return { code: "bee_not_found", message: err.message };
   if (err instanceof TemplateNotFoundError) return { code: "template_not_found", message: err.message };
   if (err instanceof TrackNotFoundError) return { code: "track_not_found", message: err.message };
@@ -170,8 +174,9 @@ export class RpcServer {
     };
     this.conns.add(conn);
     socket.setEncoding("utf8");
-    // Versioned hello, server side (negotiated once).
-    conn.send({ protocol: PROTOCOL });
+    // Versioned hello, server side (negotiated once). Capability tags are
+    // additive: a pre-v16 client ignores the extra key.
+    conn.send({ protocol: PROTOCOL, capabilities: DAEMON_CAPABILITIES } satisfies HelloFrame);
     socket.on("data", (chunk: string) => this.onData(conn, chunk));
     socket.on("error", () => socket.destroy());
     socket.on("close", () => this.conns.delete(conn));

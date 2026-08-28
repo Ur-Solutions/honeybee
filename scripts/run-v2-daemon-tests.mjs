@@ -14,6 +14,8 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 const UNIT_FILES = new Set([
   "v2/daemon/tests/accounts-service.test.ts",
+  "v2/daemon/tests/login-flows.test.ts",
+  "v2/daemon/tests/login-worker.test.ts",
   "v2/daemon/tests/config.test.ts",
   "v2/daemon/tests/naming.test.ts",
   "v2/daemon/tests/autoTitle.test.ts",

@@ -1903,14 +1903,25 @@ The sync manifest explicitly excludes the vault.
 
 ### `hive account`
 
-Honeybee v2 uses the daemon-owned forms below. `capture` is the recovery path
-when provider authentication has already completed but automatic login-seat
-capture did not observe a fresh credential write:
+Honeybee v2 uses the daemon-owned forms below. `login` runs the account's
+typed login FLOW (2026-08-28: tmux-independent — the daemon owns a native
+worker or talks to the provider directly; nothing to attach to). `capture` is
+the recovery path when provider authentication already completed outside a
+flow (validate the current credential, snapshot it into the vault, mark ok):
 
 ```sh
-hive account login <selector> [--no-attach]
+hive account login <selector> [--method <id>] [--remote] [--no-wait]
+hive account login-status <selector>
+hive account login-cancel <selector>
 hive account capture <selector>
 ```
+
+`login` prints the flow (method, sign-in URL, device code, requested fields)
+and, on a TTY, drives it: URLs are for your browser, secrets are typed without
+echo, and the command exits 0 once the credential is validated and captured.
+`--method` picks an advertised method (`hive account get <selector>` lists
+them on the flow), `--remote` asks for methods that do not need a browser on
+this node (device codes, API keys), `--no-wait` just starts the flow.
 
 The broader command list that follows documents the legacy CLI surface.
 
@@ -1952,9 +1963,11 @@ skips the question, and a non-interactive caller gets a hard error instead.
 `account resume` puts it back in rotation. Paused accounts show `paused` in
 `account list`, and the autoswap daemon never rotates a bee onto one.
 
-`account login` creates or reuses an account and opens a scratch tmux login
-seat. When fresh credentials appear, they are captured into the vault and the
-seat is torn down. Use `--no-wait` to leave the seat running and capture later.
+`account login` (legacy form) created or reused an account and opened a scratch
+tmux login seat. The v2 daemon no longer runs tmux seats: the login is a
+daemon-owned flow (`account.login.start` / `.submit` / `.retry` / `.cancel`)
+mirrored to clients; boot removes any `hive-login-*` seat a previous daemon
+created for a known account.
 
 Credential rotation notes:
 
@@ -1983,24 +1996,23 @@ hive activate codex-work --home 2
 
 ### `hive login`
 
-Interactive login by existing account.
+Interactive login by existing account — an alias of `hive account login`.
 
 ```sh
-hive login <account> [--no-wait] [--popup]
+hive login <account> [--method <id>] [--remote] [--no-wait]
 ```
 
 Examples:
 
 ```sh
 hive login claude-work
-hive login claude-work --popup
+hive login codex-work --method codex-api-key
+hive login codex-work --remote        # device code instead of the localhost callback
 ```
 
-`--popup` prints a tmux popup command:
-
-```sh
-tmux display-popup -E "hive login <account-id>"
-```
+There is no tmux popup or attach target: the daemon runs the vendor's login
+itself (direct provider OAuth / API-key validation, or its own native PTY
+worker for CLIs that need a terminal) and publishes typed progress.
 
 ### `hive swap-account`
 

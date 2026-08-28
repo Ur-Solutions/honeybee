@@ -14,12 +14,14 @@ import { openCoreStore } from "../../core/src/index.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "../../daemon/tests/helpers.ts";
 import {
   agentAccountSelection,
-  loginSeatTmuxArgs,
+  loginFlowExitCode,
   runV2Cli,
-  shouldAutoAttachLogin,
+  shouldFollowLogin,
   withModelArg,
   type CliIo,
 } from "../src/main.ts";
+import { renderLoginFlow } from "../src/render.ts";
+import type { LoginFlowRow } from "../../daemon/src/protocol.ts";
 import { stripAnsi } from "../src/style.ts";
 
 function capture(): { io: CliIo; out: string[]; err: string[] } {
@@ -35,18 +37,46 @@ test("verbs.agent-account-selector: auto/rr suffixes collapse without hijacking 
   assert.deepEqual(agentAccountSelection("-auto"), { agent: "-auto" });
 });
 
-test("verbs.login-seat: interactive human logins auto-attach; json/no-attach stay composable; tmux targets are exact", () => {
-  const interactive = { json: false, noAttach: false, forceAttach: false, stdinIsTTY: true, stdoutIsTTY: true };
-  assert.equal(shouldAutoAttachLogin(interactive), true);
-  assert.equal(shouldAutoAttachLogin({ ...interactive, json: true }), false);
-  assert.equal(shouldAutoAttachLogin({ ...interactive, json: true, forceAttach: true }), false);
-  assert.equal(shouldAutoAttachLogin({ ...interactive, noAttach: true }), false);
-  assert.equal(shouldAutoAttachLogin({ ...interactive, stdinIsTTY: false }), false);
-  assert.equal(shouldAutoAttachLogin({ ...interactive, stdinIsTTY: false, stdoutIsTTY: false, forceAttach: true }), true);
+test("verbs.login-flow: interactive logins are driven from the terminal; json/no-wait just start; the rendered flow carries no secret and no attach target", () => {
+  const interactive = { json: false, noWait: false, stdinIsTTY: true, stdoutIsTTY: true };
+  assert.equal(shouldFollowLogin(interactive), true);
+  assert.equal(shouldFollowLogin({ ...interactive, json: true }), false);
+  assert.equal(shouldFollowLogin({ ...interactive, noWait: true }), false);
+  assert.equal(shouldFollowLogin({ ...interactive, stdinIsTTY: false }), false);
+  assert.equal(loginFlowExitCode("succeeded"), 0);
+  for (const phase of ["failed", "cancelled", "expired", "interrupted"] as const) assert.equal(loginFlowExitCode(phase), 1);
 
-  const seat = { session: "hive-login-claude-work_example", socket: "hive-accounts" };
-  assert.deepEqual(loginSeatTmuxArgs(seat), ["-L", "hive-accounts", "attach-session", "-t", "=hive-login-claude-work_example:"]);
-  assert.deepEqual(loginSeatTmuxArgs({ ...seat, socket: null }, "has-session"), ["has-session", "-t", "=hive-login-claude-work_example:"]);
+  const flow: LoginFlowRow = {
+    id: "lf-1",
+    account: "claude-work",
+    harness: "claude",
+    provider: null,
+    revision: 2,
+    methodId: "claude-oauth",
+    methods: [
+      { id: "claude-oauth", kind: "browser_code", label: "Sign in with Claude", description: null, remoteCapable: true, fields: [] },
+      { id: "other", kind: "api_key", label: "Use a key", description: null, remoteCapable: true, fields: [] },
+    ],
+    phase: "waiting_input",
+    detail: "Paste the code from the sign-in page.",
+    authorizationUrl: "https://claude.ai/oauth/authorize?x=1",
+    userCode: null,
+    inputFields: [{ id: "code", label: "Authorization code", help: "Paste it", required: true, secret: true, inputType: "password", placeholder: null, pattern: null, options: null, scope: null }],
+    error: { code: "invalid_credential", message: "rejected" },
+    retryable: true,
+    remote: false,
+    createdAt: 1,
+    updatedAt: 2,
+    expiresAt: 3,
+    completedAt: null,
+  };
+  const text = renderLoginFlow(flow).map(stripAnsi).join("\n");
+  assert.match(text, /claude-work/);
+  assert.match(text, /open: https:\/\/claude\.ai\/oauth\/authorize\?x=1/);
+  assert.match(text, /needs: Authorization code/);
+  assert.match(text, /invalid_credential: rejected/);
+  assert.match(text, /other methods: other \(Use a key\)/);
+  assert.doesNotMatch(text, /tmux|attach/);
 });
 
 async function idleBee(dir: string, needle: string): Promise<void> {

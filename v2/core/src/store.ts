@@ -89,6 +89,16 @@ import {
   TASK_TRANSITIONS,
 } from "./tasks.ts";
 import { BEES_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import {
+  LOGIN_FLOW_PHASES,
+  isTerminalLoginPhase,
+  type LoginFieldDescriptor,
+  type LoginFlowError,
+  type LoginFlowPatch,
+  type LoginFlowPhase,
+  type LoginFlowRow,
+  type LoginMethodDescriptor,
+} from "./loginFlow.ts";
 import { deriveBeeView } from "./view.ts";
 import {
   fieldsEqual,
@@ -208,6 +218,20 @@ export interface CreateAccountInput {
   lastLoginAt?: number | null;
   /** Registration timestamp override (the importer preserves the old registry's addedAt). */
   addedAt?: number;
+}
+
+/** v16 — `createLoginFlow` input (the daemon's flow service builds it from the recipe). */
+export interface CreateLoginFlowInput {
+  id: string;
+  account: string;
+  harness: string;
+  provider?: string | null;
+  methodId?: string | null;
+  methods: LoginMethodDescriptor[];
+  phase?: LoginFlowPhase;
+  detail?: string | null;
+  remote?: boolean;
+  expiresAt: number;
 }
 
 /** v7 — `putAccountLimits` input (the fetcher's parsed snapshot). */
@@ -479,6 +503,48 @@ function displayWindowsOrEmpty(value: unknown): AccountLimitsDisplayWindow[] {
   } catch {
     return [];
   }
+}
+
+function jsonArrayOrEmpty<T>(value: unknown): T[] {
+  if (typeof value !== "string" || value.length === 0) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function mapLoginFlow(r: Row): LoginFlowRow {
+  let error: LoginFlowError | null = null;
+  if (typeof r.error === "string" && r.error.length > 0) {
+    try {
+      error = JSON.parse(r.error) as LoginFlowError;
+    } catch {
+      error = null;
+    }
+  }
+  return {
+    id: r.id as string,
+    account: r.account as string,
+    harness: r.harness as string,
+    provider: (r.provider as string | null) ?? null,
+    revision: Number(r.revision),
+    methodId: (r.method_id as string | null) ?? null,
+    methods: jsonArrayOrEmpty<LoginMethodDescriptor>(r.methods),
+    phase: r.phase as LoginFlowPhase,
+    detail: (r.detail as string | null) ?? null,
+    authorizationUrl: (r.authorization_url as string | null) ?? null,
+    userCode: (r.user_code as string | null) ?? null,
+    inputFields: jsonArrayOrEmpty<LoginFieldDescriptor>(r.input_fields),
+    error,
+    retryable: Number(r.retryable) === 1,
+    remote: Number(r.remote) === 1,
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    expiresAt: Number(r.expires_at),
+    completedAt: r.completed_at == null ? null : Number(r.completed_at),
+  };
 }
 
 function mapAccountLimits(r: Row): AccountLimitsRow {
@@ -2717,6 +2783,12 @@ export class CoreStore {
       const account = this.mustGetAccount(id);
       const referenced = this.beesOnAccount(id).map((b) => b.id);
       if (referenced.length > 0) throw new AccountReferencedError(id, referenced);
+      // v16: login flows belong to the account; audit each removal explicitly
+      // so mirrors fold them without re-deriving the cascade.
+      for (const flow of this.listLoginFlows({ account: id })) {
+        this.stmt("DELETE FROM login_flows WHERE id = ?").run(flow.id);
+        this.audit("login_flow.removed", null, { flowId: flow.id, account: id, reason: "account_removed" });
+      }
       this.stmt("DELETE FROM accounts WHERE id = ?").run(id);
       // A cursor pointing at the removed account is stale but harmless (the
       // rotation treats an unknown last id as "start over"); drop it anyway
@@ -2850,6 +2922,133 @@ export class CoreStore {
 
   listAccountLimits(): AccountLimitsRow[] {
     return (this.stmt("SELECT * FROM account_limits ORDER BY account").all() as Row[]).map(mapAccountLimits);
+  }
+
+  // -------------------------------------------------------------------------
+  // v16 — account login flows (tmux-independent login)
+  // -------------------------------------------------------------------------
+
+  getLoginFlow(id: string): LoginFlowRow | null {
+    const row = this.stmt("SELECT * FROM login_flows WHERE id = ?").get(id) as Row | undefined;
+    return row ? mapLoginFlow(row) : null;
+  }
+
+  /** Flows, oldest first (per account when filtered) — snapshot order. */
+  listLoginFlows(filter: { account?: string } = {}): LoginFlowRow[] {
+    const rows = (
+      filter.account
+        ? this.stmt("SELECT * FROM login_flows WHERE account = ? ORDER BY created_at, id").all(filter.account)
+        : this.stmt("SELECT * FROM login_flows ORDER BY created_at, id").all()
+    ) as Row[];
+    return rows.map(mapLoginFlow);
+  }
+
+  /** The one non-terminal flow for an account, if any (the invariant createLoginFlow enforces). */
+  activeLoginFlow(accountId: string): LoginFlowRow | null {
+    return this.listLoginFlows({ account: accountId }).find((flow) => !isTerminalLoginPhase(flow.phase)) ?? null;
+  }
+
+  /** The newest flow for an account regardless of phase (what a client renders after a terminal outcome). */
+  latestLoginFlow(accountId: string): LoginFlowRow | null {
+    const flows = this.listLoginFlows({ account: accountId });
+    return flows[flows.length - 1] ?? null;
+  }
+
+  /**
+   * v16 — admit a login flow. Exactly one active flow per account: a second
+   * create while one is live is a CoreError (the daemon rejoins instead).
+   * Older terminal flows for the account are pruned here (audited
+   * `login_flow.removed`) so the mirror carries at most the current flow and
+   * its immediate predecessor's outcome never lingers. Audited
+   * `login_flow.put {flow, outcome:"created"}`.
+   */
+  createLoginFlow(input: CreateLoginFlowInput): LoginFlowRow {
+    const id = requireNonEmpty(input.id, "createLoginFlow: id");
+    const account = requireNonEmpty(input.account, "createLoginFlow: account");
+    const harness = requireNonEmpty(input.harness, "createLoginFlow: harness");
+    if (!Array.isArray(input.methods)) throw new CoreError("createLoginFlow: methods must be an array");
+    const phase = input.phase ?? "starting";
+    if (!(LOGIN_FLOW_PHASES as readonly string[]).includes(phase)) throw new CoreError(`createLoginFlow: phase must be one of ${LOGIN_FLOW_PHASES.join("|")}`);
+    if (!Number.isFinite(input.expiresAt)) throw new CoreError("createLoginFlow: expiresAt must be a finite epoch-ms number");
+    return this.tx(() => {
+      this.mustGetAccount(account);
+      if (this.getLoginFlow(id)) throw new CoreError(`login flow already exists: ${id}`);
+      const active = this.activeLoginFlow(account);
+      if (active) throw new CoreError(`account ${account} already has an active login flow: ${active.id}`);
+      for (const stale of this.listLoginFlows({ account })) {
+        this.stmt("DELETE FROM login_flows WHERE id = ?").run(stale.id);
+        this.audit("login_flow.removed", null, { flowId: stale.id, account, reason: "superseded" });
+      }
+      const at = this.now();
+      this.db
+        .prepare(
+          `INSERT INTO login_flows(id, account, harness, provider, revision, method_id, methods, phase, detail, authorization_url, user_code,
+                                   input_fields, error, retryable, remote, created_at, updated_at, expires_at, completed_at)
+           VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL, '[]', NULL, 0, ?, ?, ?, ?, NULL)`,
+        )
+        .run(id, account, harness, input.provider ?? null, input.methodId ?? null, JSON.stringify(input.methods), phase, input.detail ?? null, input.remote ? 1 : 0, at, at, input.expiresAt);
+      const flow = this.getLoginFlow(id) as LoginFlowRow;
+      this.audit("login_flow.put", null, { flow, outcome: "created" });
+      return flow;
+    });
+  }
+
+  /**
+   * v16 — patch a flow (the runner's only write path). Identical = silent
+   * no-op. A terminal phase stamps `completedAt`. Audited
+   * `login_flow.put {flow, outcome:"updated", changed, reason}` — the payload
+   * is the full (safe) row, never the request that caused it.
+   */
+  updateLoginFlow(id: string, patch: LoginFlowPatch, reason: string | null = null): { flow: LoginFlowRow; applied: boolean } {
+    if (patch.phase !== undefined && !(LOGIN_FLOW_PHASES as readonly string[]).includes(patch.phase)) {
+      throw new CoreError(`updateLoginFlow: phase must be one of ${LOGIN_FLOW_PHASES.join("|")}`);
+    }
+    return this.tx(() => {
+      const before = this.getLoginFlow(id);
+      if (!before) throw new CoreError(`login flow not found: ${id}`);
+      const next: LoginFlowRow = { ...before, ...patch };
+      if (patch.phase !== undefined && isTerminalLoginPhase(patch.phase) && patch.completedAt === undefined && before.completedAt === null) {
+        next.completedAt = this.now();
+      }
+      const changed = (Object.keys(next) as Array<keyof LoginFlowRow>).filter((k) => JSON.stringify(before[k]) !== JSON.stringify(next[k]));
+      if (changed.length === 0) return { flow: before, applied: false };
+      const at = this.now();
+      this.db
+        .prepare(
+          `UPDATE login_flows SET provider = ?, revision = ?, method_id = ?, phase = ?, detail = ?, authorization_url = ?, user_code = ?,
+                                  input_fields = ?, error = ?, retryable = ?, expires_at = ?, completed_at = ?, updated_at = ? WHERE id = ?`,
+        )
+        .run(
+          next.provider,
+          next.revision,
+          next.methodId,
+          next.phase,
+          next.detail,
+          next.authorizationUrl,
+          next.userCode,
+          JSON.stringify(next.inputFields),
+          next.error ? JSON.stringify(next.error) : null,
+          next.retryable ? 1 : 0,
+          next.expiresAt,
+          next.completedAt,
+          at,
+          id,
+        );
+      const flow = this.getLoginFlow(id) as LoginFlowRow;
+      this.audit("login_flow.put", null, { flow, outcome: "updated", changed, reason });
+      return { flow, applied: true };
+    });
+  }
+
+  /** v16 — drop a flow row (retention / operator cleanup). Audited `login_flow.removed`. */
+  removeLoginFlow(id: string, reason = "removed"): boolean {
+    return this.tx(() => {
+      const flow = this.getLoginFlow(id);
+      if (!flow) return false;
+      this.stmt("DELETE FROM login_flows WHERE id = ?").run(id);
+      this.audit("login_flow.removed", null, { flowId: id, account: flow.account, reason });
+      return true;
+    });
   }
 
   /** v14 — append one immutable generator attempt. Telemetry is not audit-replayed state. */
@@ -3399,6 +3598,7 @@ export class CoreStore {
       selectionCursors: this.listSelectionCursors(),
       tasks: (this.stmt("SELECT * FROM tasks ORDER BY id").all() as Row[]).map(mapTask),
       taskSupply: (this.stmt("SELECT * FROM task_supply ORDER BY bee_id").all() as Row[]).map(mapTaskSupply),
+      loginFlows: this.listLoginFlows(),
     };
   }
 }

@@ -22,6 +22,7 @@ import type {
   TemplateRow,
   TrackRow,
 } from "./types.ts";
+import type { LoginFlowRow } from "./loginFlow.ts";
 
 export function replayAudit(rows: AuditRow[]): StateDump {
   const bees = new Map<string, BeeRow>();
@@ -38,6 +39,7 @@ export function replayAudit(rows: AuditRow[]): StateDump {
   const selectionCursors = new Map<string, SelectionCursorRow>();
   const tasks = new Map<string, TaskRow>();
   const taskSupply = new Map<string, TaskSupplyRow>();
+  const loginFlows = new Map<string, LoginFlowRow>();
 
   const rtKey = (beeId: string, generation: number) => `${beeId}#${generation}`;
   const mustBee = (id: string): BeeRow => {
@@ -115,6 +117,16 @@ export function replayAudit(rows: AuditRow[]): StateDump {
         const bee = mustBee(p.beeId as string);
         bee.forkSeed = p.forkSeed as string;
         bee.providerSessionId = null;
+        break;
+      }
+      case "login_flow.put": {
+        const flow = p.flow as LoginFlowRow;
+        loginFlows.set(flow.id, { ...flow });
+        break;
+      }
+      case "login_flow.removed": {
+        const id = p.flowId as string;
+        if (!loginFlows.delete(id)) throw new Error(`audit replay: unknown login flow ${id}`);
         break;
       }
       case "account.put": {
@@ -328,5 +340,6 @@ export function replayAudit(rows: AuditRow[]): StateDump {
     selectionCursors: [...selectionCursors.values()].sort((a, b) => (a.harness < b.harness ? -1 : a.harness > b.harness ? 1 : 0)),
     tasks: [...tasks.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     taskSupply: [...taskSupply.values()].sort((a, b) => (a.beeId < b.beeId ? -1 : a.beeId > b.beeId ? 1 : 0)),
+    loginFlows: [...loginFlows.values()].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
   };
 }

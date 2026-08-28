@@ -75,7 +75,7 @@ const GROUPS: Group[] = [
       ["account", "list [--harness h]", "accounts + latest limits · get <selector> (exact or unique fuzzy)"],
       ["account", "add <harness> <label>", "create an account [--id id] [--home dir] [--penalty n]"],
       ["account", "remove|pause|unpause <selector>", "lifecycle · penalty <selector> <0-100>"],
-      ["login", "<account>", "open + attach to the login seat (--no-attach leaves it detached)"],
+      ["login", "<account>", "sign in (browser / code / API key — driven from this terminal; --no-wait just starts it)"],
       ["account", "capture <selector>", "snapshot an already-authenticated home/provider credential into the vault"],
       ["swap-account", "<bee> <account>", "move a bee to another account of the SAME harness"],
       ["account", "limits [<selector>]", "refresh + show provider limits (feeds auto; rr uses registration order)"],

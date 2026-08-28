@@ -19,8 +19,10 @@
 import type {
   AuditRow,
   BeeRow,
+  LoginFlowRow,
   MirrorAccountLimitsRow,
   MirrorAccountRow,
+  MirrorLoginFlowRow,
   BeeView,
   CommandRow,
   CommandStatus,
@@ -43,6 +45,24 @@ import type { BootReport } from "./loops.ts";
 
 export const PROTOCOL = "v2/1";
 export const DAEMON_VERSION = "2.0.0-wp4";
+
+/**
+ * Additive capability tags (2026-08-28). The protocol stays `v2/1`; a client
+ * that needs a feature newer than the hello gates on these instead of
+ * sniffing verbs. The server hello is `{protocol, capabilities}` (an older
+ * client ignores the extra key) and `deployInfo` repeats the list.
+ */
+export const DAEMON_CAPABILITIES = [
+  /** Typed, tmux-independent account login flows: account.login.* verbs + the login_flows snapshot table. */
+  "account.login.flow.v1",
+] as const;
+export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
+
+/** The server's first frame on a connection. */
+export interface HelloFrame {
+  protocol: string;
+  capabilities: readonly DaemonCapability[];
+}
 
 /** Closed-list, typed errors — never fuzzy (spec 04). */
 export const RPC_ERROR_CODES = [
@@ -75,6 +95,12 @@ export const RPC_ERROR_CODES = [
   "account_referenced",
   /** `auto` found no usable account (none registered/credentialed, all paused, or none untried). */
   "account_unavailable",
+  /** v16 (account login flows): the flow id is unknown (or belongs to a removed account). */
+  "login_flow_not_found",
+  /** v16: the verb does not apply in the flow's current phase / the field is not being requested. */
+  "login_flow_refused",
+  /** v16: the harness has no login recipe or the requested method is not offered (or not remote-capable). */
+  "login_method_unsupported",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -146,6 +172,14 @@ export const RPC_VERBS = [
   "account.unpause",
   "account.setPenalty",
   "account.login",
+  // v16 (2026-08-28, additive): typed, tmux-independent login flows. `account.login`
+  // stays as the alias of `account.login.start` for the CLI edge.
+  "account.login.start",
+  "account.login.get",
+  "account.login.selectMethod",
+  "account.login.submit",
+  "account.login.retry",
+  "account.login.cancel",
   "account.capture",
   "account.limits",
   "account.importRegistry",
@@ -235,17 +269,6 @@ export interface AccountListResult {
   limits: MirrorAccountLimitsRow[];
 }
 
-/** The login seat handle (a detached tmux session; the operator attaches to complete the login). */
-export interface LoginSeatInfo {
-  accountId: string;
-  session: string;
-  socket: string | null;
-  /** The attach command line. */
-  attach: string;
-  startedAt: number;
-  deadline: number;
-}
-
 /** `account.get {id}` — id accepts an exact/unique fuzzy selector; `account_not_found` when absent. */
 export interface AccountGetResult {
   account: MirrorAccountRow;
@@ -254,8 +277,8 @@ export interface AccountGetResult {
   bees: string[];
   /** Whether the vault / home hold the harness's primary credential. */
   credentialed: boolean;
-  /** An open login seat, if any. */
-  loginSeat: LoginSeatInfo | null;
+  /** v16: the account's current login flow (active or its latest outcome), if any. */
+  loginFlow: MirrorLoginFlowRow | null;
 }
 
 /**
@@ -277,18 +300,71 @@ export interface AccountUpdateResult extends DedupMarkers {
   applied: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// v16 (2026-08-28) — typed, tmux-independent account login flows. The flow
+// row (core `LoginFlowRow`) is the ONLY progress channel: it rides the
+// snapshot (`loginFlows`) and the watch stream (`login_flow.put/removed`).
+// No verb ever returns raw worker output; no param is echoed back.
+// ---------------------------------------------------------------------------
+
 /**
- * `account.login {id}` — resolve id as a selector, then start (or rejoin) the login seat: a detached tmux
- * session running the harness's own login against the account's home. The
- * daemon watches for the credential change (mtime past baseline / Keychain
- * digest drift), captures the recipe files into the vault, marks the account
- * ok + last_login_at and clears auth_needed on its bees. Returns immediately.
+ * `account.login.start {id, methodId?, remote?, idempotencyKey?}` — resolve
+ * the account selector, then start OR REJOIN its login flow: an active flow
+ * for the account is returned (`rejoined: true`) without spawning another
+ * worker. `remote: true` declares that the operator's browser cannot reach
+ * this node's loopback (Apiary on another machine): non-remote-capable
+ * methods are filtered out; a harness with none refuses inside the flow row
+ * (`remote_loopback_unsupported`). An already-authenticated account still
+ * gets a flow (re-login is legitimate). `account.login {id}` is an alias.
  */
-export interface AccountLoginResult extends DedupMarkers {
+export interface AccountLoginStartResult extends DedupMarkers {
   accountId: string;
-  seat: LoginSeatInfo;
+  flow: MirrorLoginFlowRow;
   rejoined: boolean;
 }
+
+/** `account.login.get {flowId}` | `{id}` (account selector → its latest flow). `login_flow_not_found` when absent. */
+export interface AccountLoginGetResult {
+  flow: MirrorLoginFlowRow;
+}
+
+/**
+ * `account.login.selectMethod {flowId, methodId, idempotencyKey?}` — switch
+ * an active flow to another advertised method (the current worker is
+ * stopped; a new revision starts). `login_method_unsupported` for an
+ * unknown / non-remote-capable method; `login_flow_refused` on a terminal flow.
+ */
+export interface AccountLoginSelectMethodResult extends DedupMarkers {
+  flow: MirrorLoginFlowRow;
+}
+
+/**
+ * `account.login.submit {flowId, values: Record<fieldId, string>, idempotencyKey?}`
+ * — deliver the input the flow is currently requesting (`inputFields`).
+ * SENSITIVE: `values` may carry secrets; the daemon consumes them in
+ * memory, never audits/logs/stores them, and the recorded idempotent result
+ * is the safe flow row only. Refused (`login_flow_refused`) when the flow is
+ * not `waiting_input` or a field is not being requested; `invalid_request`
+ * for a missing required field. Validation failures are NOT errors: the
+ * flow row returns to `waiting_input` with a typed `invalid_credential` /
+ * `invalid_input` error so the client re-asks.
+ */
+export interface AccountLoginSubmitResult extends DedupMarkers {
+  flow: MirrorLoginFlowRow;
+}
+
+/** `account.login.retry {flowId, idempotencyKey?}` — a failed/expired/interrupted (or cancelled) flow restarts as a new revision. */
+export interface AccountLoginRetryResult extends DedupMarkers {
+  flow: MirrorLoginFlowRow;
+}
+
+/** `account.login.cancel {flowId, idempotencyKey?}` — stop the worker and mark the flow cancelled; a terminal flow is a no-op (`applied:false`). */
+export interface AccountLoginCancelResult extends DedupMarkers {
+  flow: MirrorLoginFlowRow;
+  applied: boolean;
+}
+
+export type { LoginFlowRow };
 
 /**
  * `account.capture {id}` — recovery path for an already-authenticated account:
@@ -662,6 +738,8 @@ export interface AuditTailResult {
 
 export interface DeployInfoResult {
   protocol: string;
+  /** v16 (additive): the capability tags this daemon offers (also in the hello). */
+  capabilities: readonly DaemonCapability[];
   daemonVersion: string;
   nodeVersion: string;
   pid: number;
@@ -700,6 +778,8 @@ export interface SnapshotResult {
   /** v11 (additive): agent task lists + per-bee auto-supply, store rows verbatim. */
   tasks: MirrorTaskRow[];
   taskSupply: MirrorTaskSupplyRow[];
+  /** v16 (additive): account login flows, store rows verbatim. */
+  loginFlows: MirrorLoginFlowRow[];
 }
 
 // ---------------------------------------------------------------------------
