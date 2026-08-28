@@ -641,6 +641,8 @@ const ACCOUNT_USAGE =
   "       hive account capture <selector> | limits [<selector>]\n" +
   "       hive account import [--root ~/.hive] [--dry-run] | backfill [--dry-run]";
 
+const ACCOUNT_LIMITS_RPC_TIMEOUT_MS = 120_000;
+
 /** Exit code for a settled login flow: success is 0; every other terminal phase is 1. */
 export function loginFlowExitCode(phase: LoginFlowRow["phase"]): number {
   return phase === "succeeded" ? 0 : 1;
@@ -873,7 +875,9 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
     }
     case "limits": {
       const id = parsed.positional[2];
-      const r = await withClient(ctx, (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}));
+      const r = await withClient(ctx, (c) =>
+        c.request<AccountLimitsResult>("account.limits", id ? { id } : {}, ACCOUNT_LIMITS_RPC_TIMEOUT_MS),
+      );
       emit(ctx, renderAccountLimits(r.limits), r, false);
       return 0;
     }
@@ -3018,7 +3022,7 @@ async function cmdUsage(ctx: CliContext, parsed: Parsed): Promise<number> {
     ctx,
     // Sweep-sized timeout: the daemon probes every account live (serialized,
     // one bounded fetch each) — the default 10s rpc timeout fires mid-sweep.
-    (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}, 120_000),
+    (c) => c.request<AccountLimitsResult>("account.limits", id ? { id } : {}, ACCOUNT_LIMITS_RPC_TIMEOUT_MS),
     (store) => {
       if (id === undefined) return { limits: store.accountLimits() };
       const matched = matchAccount(store.accounts(), id);
