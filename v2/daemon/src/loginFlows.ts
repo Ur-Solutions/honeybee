@@ -20,7 +20,7 @@
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   defaultLoginMethodId,
@@ -195,7 +195,12 @@ type Runner =
       checking: boolean;
       /** The phase to return to when a prompt is withdrawn. */
       idlePhase: "starting" | "waiting_browser" | "waiting_device";
+      /** Landing checks are throttled (external-store reads are not free). */
+      lastLandingCheckAt: number;
     };
+
+/** How often a CLI flow's credential landing is probed (keychain / global-store reads are not free). */
+const LANDING_CHECK_INTERVAL_MS = 1000;
 
 const STATIC_DETAIL = {
   starting: "Starting the sign-in…",
@@ -256,7 +261,8 @@ function plausibleOption(value: string, kind: "url" | "text"): boolean {
   if (kind !== "url") return true;
   try {
     const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:";
+    // A key is sent to this host during the check: https, or loopback http (local proxies).
+    return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
   } catch {
     return false;
   }
@@ -286,6 +292,8 @@ export class LoginFlowService {
   private readonly onCompleted: (accountId: string) => void;
   private readonly tmuxExec: (args: string[]) => { status: number | null; stdout: string };
   private readonly runners = new Map<string, Runner>();
+  /** Flows whose runner is being replaced (selectMethod / retry await a kill): submits refuse, cancels win. */
+  private readonly switching = new Set<string>();
   private spawner: PtySpawner | null | undefined;
   private spawnerLoading: Promise<PtySpawner | null> | null = null;
   private readonly loadSpawner: () => Promise<PtySpawner | null>;
@@ -381,10 +389,17 @@ export class LoginFlowService {
   /** Switch method on an active flow: stop the current runner, bump the revision, start the new method. */
   async selectMethod(flowId: string, methodId: string): Promise<LoginFlowRow> {
     const flow = this.mustActive(flowId);
-    if (!flow.methods.some((m) => m.id === methodId)) throw new LoginFlowRefusal("login_method_unsupported", `login flow ${flowId} does not offer method '${methodId}'`);
+    if (!flow.methods.some((m) => m.id === methodId)) throw new LoginFlowRefusal("login_method_unsupported", `login flow ${flowId} does not offer method '${methodId.slice(0, 64)}'`);
     if (flow.methodId === methodId && !flow.error) return flow;
-    await this.stopRunner(flowId);
-    this.patch(flowId, { revision: flow.revision + 1, phase: "starting", detail: STATIC_DETAIL.starting, authorizationUrl: null, userCode: null, inputFields: [], error: null, retryable: false, provider: null }, "method selected");
+    this.switching.add(flowId);
+    try {
+      await this.stopRunner(flowId);
+      // A cancel (or expiry) that landed while the old worker was dying wins.
+      const current = this.mustActive(flowId);
+      this.patch(flowId, { revision: current.revision + 1, phase: "starting", detail: STATIC_DETAIL.starting, authorizationUrl: null, userCode: null, inputFields: [], error: null, retryable: false, provider: null, completedAt: null }, "method selected");
+    } finally {
+      this.switching.delete(flowId);
+    }
     return this.run(flowId, methodId);
   }
 
@@ -399,12 +414,13 @@ export class LoginFlowService {
     }
     const requested = new Map(flow.inputFields.map((f) => [f.id, f]));
     for (const key of Object.keys(values)) {
-      if (!requested.has(key)) throw new LoginFlowRefusal("login_flow_refused", `login flow ${flowId} is not requesting field '${key}'`);
+      if (!requested.has(key)) throw new LoginFlowRefusal("login_flow_refused", `login flow ${flowId} is not requesting field '${key.slice(0, 64)}'`);
       if (typeof values[key] !== "string") throw new LoginFlowRefusal("invalid_request", `field '${key}' must be a string`);
     }
     for (const field of flow.inputFields) {
       if (field.required && !(values[field.id] ?? "").trim()) throw new LoginFlowRefusal("invalid_request", `field '${field.id}' is required`);
     }
+    if (this.switching.has(flowId)) throw new LoginFlowRefusal("login_flow_refused", `login flow ${flowId} is switching method; wait for the new prompt`);
     const runner = this.runners.get(flowId);
     if (!runner) {
       return this.patch(flowId, { phase: "interrupted", inputFields: [], error: err("daemon_restarted", "Honeybee restarted while this sign-in was waiting; retry to get a fresh sign-in."), retryable: true }, "no runner on submit");
@@ -442,15 +458,30 @@ export class LoginFlowService {
     if (!account) throw new LoginFlowRefusal("login_flow_not_found", `login flow ${flowId} belongs to a removed account`);
     if (!isTerminal(flow.phase) && this.runners.has(flowId)) {
       // A live flow "retried" = restart its method (fresh URL / worker).
-      await this.stopRunner(flowId);
+      this.switching.add(flowId);
+      try {
+        await this.stopRunner(flowId);
+        this.mustActive(flowId); // a cancel that landed meanwhile wins
+      } finally {
+        this.switching.delete(flowId);
+      }
     }
     const remote = flow.remote;
     const methodId = flow.methodId ?? defaultLoginMethodId(flow.harness, { remote });
-    if (!methodId) return this.fail(flowId, err("remote_loopback_unsupported", `${flow.harness} has no login method usable from a remote node.`), false);
+    if (!methodId) {
+      return this.fail(
+        flowId,
+        recipeFor(flow.harness)
+          ? err("remote_loopback_unsupported", `${flow.harness} has no login method usable from a remote node.`)
+          : err("unsupported_method", `${flow.harness} has no login recipe.`),
+        false,
+      );
+    }
+    const latest = this.mustFlow(flowId);
     this.patch(
       flowId,
       {
-        revision: flow.revision + 1,
+        revision: latest.revision + 1,
         phase: "starting",
         detail: STATIC_DETAIL.starting,
         authorizationUrl: null,
@@ -550,7 +581,10 @@ export class LoginFlowService {
           this.log(`account.login.expired flow=${flowId}`);
           continue;
         }
-        if (runner.kind === "cli") void this.checkLanding(flowId, runner);
+        if (runner.kind === "cli" && now - runner.lastLandingCheckAt >= LANDING_CHECK_INTERVAL_MS) {
+          runner.lastLandingCheckAt = now;
+          void this.checkLanding(flowId, runner);
+        }
       }
     } finally {
       this.ticking = false;
@@ -574,6 +608,7 @@ export class LoginFlowService {
 
   private async run(flowId: string, methodId: string): Promise<LoginFlowRow> {
     const flow = this.mustFlow(flowId);
+    if (isTerminal(flow.phase)) return flow;
     const account = this.store.getAccount(flow.account);
     if (!account) throw new LoginFlowRefusal("login_flow_not_found", `login flow ${flowId} belongs to a removed account`);
     const method = loginMethodFor(flow.harness, methodId);
@@ -599,8 +634,11 @@ export class LoginFlowService {
   }
 
   private startClaudeOauth(flowId: string, method: LoginMethodDescriptor): LoginFlowRow {
+    // The verifier never leaves this process; `state` is an independent
+    // nonce (the authorization URL — and thus the mirrored row — carries
+    // only the challenge and the state).
     const codeVerifier = pkceVerifier();
-    const state = codeVerifier;
+    const state = randomBytes(16).toString("base64url");
     this.runners.set(flowId, { kind: "claude_oauth", codeVerifier, state });
     const url = safeAuthorizationUrl(claudeAuthorizeUrl(codeVerifier, state));
     return this.patch(
@@ -750,21 +788,25 @@ export class LoginFlowService {
     // the method's own command, else the recipe's login command.
     const configured = this.cfg.agents[account.harness]?.login;
     const launch = configured ?? spec.command ?? recipe.login;
+    // A minimal environment: the daemon's own provider keys / tokens must
+    // never reach a vendor login CLI (some would silently use them instead
+    // of signing in), and no worker inherits a tmux context.
     const env: Record<string, string> = {
-      ...(process.env as Record<string, string>),
+      ...workerBaseEnv(process.env),
       ...(this.cfg.agents[account.harness]?.env ?? {}),
       ...this.accounts.homeEnvOf(account),
       ...(spec.env ?? {}),
       TERM: "xterm-256color",
     };
-    // Never let a worker inherit a tmux context.
-    delete env.TMUX;
-    delete env.TMUX_PANE;
     mkdirSync(account.homePath, { recursive: true, mode: 0o700 });
     const baselineMtime = primaryCredentialMtime(account.homePath, recipe);
     const externalRaw = spec.landing === "external_digest" ? await this.accounts.externalLoginCredential(account) : null;
     const baselineDigest = externalRaw ? credentialDigest(externalRaw) : null;
     if (!this.stillActive(flowId)) return this.flowOf(flowId) as LoginFlowRow;
+    // Events are bound to THIS runner: a superseded worker (cancel → retry,
+    // method switch) whose exit lands late must never be attributed to its
+    // successor.
+    let runner: Runner | null = null;
     const worker = new LoginWorker({
       spawner,
       launch: { command: launch.command, args: [...(launch.args ?? [])], cwd: account.homePath, env },
@@ -772,18 +814,19 @@ export class LoginFlowService {
       now: this.now,
       killGraceMs: this.workerKillGraceMs,
       ...(this.workerSettleMs !== undefined ? { settleMs: this.workerSettleMs } : {}),
-      onEvent: (event) => this.onWorkerEvent(flowId, event),
+      onEvent: (event) => {
+        if (runner && this.runners.get(flowId) === runner) this.onWorkerEvent(flowId, runner, event);
+      },
     });
-    const runner: Runner = { kind: "cli", worker, spec, baselineMtime, baselineDigest, failureIndex: null, checking: false, idlePhase: "starting" };
+    runner = { kind: "cli", worker, spec, baselineMtime, baselineDigest, failureIndex: null, checking: false, idlePhase: "starting", lastLandingCheckAt: 0 };
     this.runners.set(flowId, runner);
     worker.start();
     this.log(`account.login.worker flow=${flowId} account=${account.id} method=${method.id} backend=${spawner.kind} pid=${worker.pid} baselineMtime=${baselineMtime ?? "-"} baselineDigest=${baselineDigest ? baselineDigest.slice(0, 8) : "-"}`);
     return this.flowOf(flowId) as LoginFlowRow;
   }
 
-  private onWorkerEvent(flowId: string, event: LoginWorkerEvent): void {
-    const runner = this.runners.get(flowId);
-    if (!runner || runner.kind !== "cli") return;
+  private onWorkerEvent(flowId: string, runner: Runner, event: LoginWorkerEvent): void {
+    if (runner.kind !== "cli") return;
     const flow = this.store.getLoginFlow(flowId);
     if (!flow || isTerminal(flow.phase)) return;
     const method = flow.methodId ? loginMethodFor(flow.harness, flow.methodId) : undefined;
@@ -971,6 +1014,22 @@ function isTerminal(phase: LoginFlowRow["phase"]): boolean {
   return phase === "succeeded" || phase === "failed" || phase === "cancelled" || phase === "expired" || phase === "interrupted";
 }
 
+/** Env keys a login worker inherits from the daemon (everything else — provider keys, tokens — is withheld). */
+export const WORKER_ENV_ALLOWLIST = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+] as const;
+
+export function workerBaseEnv(source: NodeJS.ProcessEnv): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of WORKER_ENV_ALLOWLIST) {
+    const value = source[key];
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
 /** The name tmux gave the retired login seat for an account (dots/colons → underscores, the rest of the old safe-name rule). */
 export function legacyLoginSeatName(accountId: string): string {
   return `hive-login-${accountId}`.replace(/\./g, "_").replace(/[^A-Za-z0-9_-]/g, "-");
@@ -985,10 +1044,6 @@ function writePrivateRaw(path: string, raw: string): void {
 function safeMessage(error: unknown): string {
   const text = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
   return text.replace(/[A-Za-z0-9_\-]{32,}/g, "…").slice(0, 200);
-}
-
-export function existsFile(path: string): boolean {
-  return existsSync(path);
 }
 
 export type { LoginFieldDescriptor };

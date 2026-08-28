@@ -71,17 +71,39 @@ test("worker.parser: device codes, repeated prompt lines, prompts that scroll aw
   assert.equal(p.settle(1500).prompt?.id, "code", "the prompt is asked again");
 });
 
+test("worker.parser: a failure cue fires again after the prompt is answered; a code inside a URL is never a device code; split escape sequences do not leave residue", () => {
+  const p = new LoginOutputParser({ cues: CUES, settleMs: 50 });
+  p.feed("Login failed: invalid code\nPaste code here if prompted: ", 1000);
+  assert.equal(p.settle(1100).failure, 0);
+  p.consumePrompt();
+  assert.equal(p.state().failure, null);
+  assert.equal(p.state().prompt, null);
+  p.feed("\nLogin failed: invalid code\nPaste code here if prompted: ", 1200);
+  assert.equal(p.settle(1300).failure, 0, "the second rejection is reported again");
+  // a URL path that looks like a code is not a device code; a real one is
+  p.feed("Open https://auth.example.com/device/enter-code/ABCD-1234 now\n", 1400);
+  assert.equal(p.state().userCode, null);
+  p.feed("Enter this one-time code: WXYZ-9876\n", 1500);
+  assert.equal(p.state().userCode, "WXYZ-9876");
+  // an escape sequence split across two chunks is cleaned whole
+  const q = new LoginOutputParser({ cues: CUES, settleMs: 50 });
+  q.feed("\u001b[3", 2000);
+  q.feed("2mPaste code here if prompted: \u001b[0m", 2010);
+  assert.equal(q.settle(2100).prompt?.id, "code", "no `[32m` residue on the prompt line");
+  assert.equal(cleanTerminalText("https://x.example/a?s=1\u001b[2;1HPress enter"), "https://x.example/a?s=1 Press enter", "a cursor move separates TUI fragments");
+});
+
 test("worker.parser: buffers are bounded and a masked secret never survives in the tail", () => {
   const p = new LoginOutputParser({ cues: CUES, settleMs: 50, maxTailChars: 2000 });
   p.feed("x".repeat(100_000), 1000);
-  assert.ok(p.tailChars <= 4096, `pending bounded: ${p.tailChars}`);
+  assert.ok(p.tailChars <= 8192, `pending bounded: ${p.tailChars}`);
   let fed = 100_000;
   for (let i = 0; i < 200; i += 1) {
     const line = `line ${i} ${"y".repeat(100)}\n`;
     fed += line.length;
     p.feed(line, 1001 + i);
   }
-  assert.ok(p.tailChars <= 2000 + 4096, `tail bounded: ${p.tailChars}`);
+  assert.ok(p.tailChars <= 2000 + 8192, `tail bounded: ${p.tailChars}`);
   assert.equal(p.bytesSeen, fed);
   const secret = "SENTINEL-SECRET-VALUE-0001";
   p.mask(secret);

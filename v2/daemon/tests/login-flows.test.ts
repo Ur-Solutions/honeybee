@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { ACCOUNT_RECIPES, defaultLoginMethodId, loginMethodsFor, openCoreStore, type CoreStore, type LoginFlowRow } from "../../core/src/index.ts";
 import { AccountsService } from "../src/accountsService.ts";
 import { loadNodeConfig, type NodeConfigFile, type ResolvedNodeConfig } from "../src/config.ts";
-import { LoginFlowService, LoginFlowRefusal, claudeAuthorizeUrl, legacyLoginSeatName, plausibleApiKey, splitClaudeCode, type LoginTransports } from "../src/loginFlows.ts";
+import { LoginFlowService, LoginFlowRefusal, WORKER_ENV_ALLOWLIST, claudeAuthorizeUrl, legacyLoginSeatName, plausibleApiKey, splitClaudeCode, workerBaseEnv, type LoginTransports } from "../src/loginFlows.ts";
 import { pipeSpawner } from "../src/loginWorker.ts";
 import { waitFor } from "./helpers.ts";
 
@@ -628,6 +628,60 @@ test("flows.boot: a live flow from a previous daemon is marked interrupted (retr
     assert.equal(retried.revision, 2);
     await waitFor(() => (r.store.getLoginFlow(flow.id)?.authorizationUrl ? true : null), "url after retry", 5000, 20);
     await second.flows.shutdown();
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("flows.pkce: the authorization URL carries a challenge and an independent state — never the verifier", async () => {
+  const r = rig();
+  try {
+    const exchanges: Array<{ codeVerifier: string; state: string }> = [];
+    const { flows } = services(r, { transports: { claudeTokenExchange: async (i) => { exchanges.push({ codeVerifier: i.codeVerifier, state: i.state }); return null; } } });
+    const acct = account(r, "claude", "pkce");
+    const { flow } = await flows.start(acct);
+    const url = new URL(flow.authorizationUrl as string);
+    await flows.submit(flow.id, { code: "x#y" });
+    const verifier = exchanges[0]!.codeVerifier;
+    assert.ok(verifier.length >= 40);
+    assert.notEqual(url.searchParams.get("state"), verifier);
+    assert.doesNotMatch(flow.authorizationUrl as string, new RegExp(verifier));
+    assert.doesNotMatch(leakSurfaces(r), new RegExp(verifier), "the verifier never leaves daemon memory");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("flows.worker-env: a login worker gets an allowlisted environment — the daemon's provider keys never reach a vendor CLI", () => {
+  const env = workerBaseEnv({ PATH: "/bin", HOME: "/h", OPENAI_API_KEY: "sk-daemon-secret", ANTHROPIC_API_KEY: "sk-ant-daemon", GH_TOKEN: "ghp", TMUX: "x", HTTPS_PROXY: "http://p", LANG: "C" });
+  assert.deepEqual(env, { PATH: "/bin", HOME: "/h", HTTPS_PROXY: "http://p", LANG: "C" });
+  assert.ok(!WORKER_ENV_ALLOWLIST.some((k) => /KEY|TOKEN|SECRET|TMUX/i.test(k)));
+});
+
+test("flows.races: a superseded worker's late exit never fails its successor; cancel during a method switch wins", async () => {
+  const r = rig({ agents: fakeCliAgent("codex", "CODEX_HOME", "auth.json", { FAKE_CLI_URL: "https://auth.openai.com/oauth/authorize?x=1", FAKE_CLI_HANG: "1" }) });
+  try {
+    const { flows } = services(r, { transports: { openaiKeyCheck: async () => "valid" } });
+    const acct = account(r, "codex", "race");
+    const { flow } = await flows.start(acct);
+    await waitFor(() => (r.store.getLoginFlow(flow.id)?.authorizationUrl ? true : null), "url", 5000, 20);
+    // cancel → retry immediately: the old worker is still dying while the new one starts
+    flows.cancel(flow.id);
+    const retried = await flows.retry(flow.id);
+    assert.equal(retried.revision, 2);
+    await waitFor(() => (r.store.getLoginFlow(flow.id)?.authorizationUrl ? true : null), "url after retry", 5000, 20);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const after = r.store.getLoginFlow(flow.id) as LoginFlowRow;
+    assert.equal(after.phase, "waiting_browser", "the first worker's exit was not attributed to revision 2");
+    assert.ok(flows.workerStatus(flow.id)?.alive, "revision 2's worker is alive");
+
+    // cancel racing a method switch: the cancel wins, no third worker
+    const switching = flows.selectMethod(flow.id, "codex-api-key");
+    const cancelled = flows.cancel(flow.id);
+    assert.equal(cancelled.applied, true);
+    await assert.rejects(switching, (e: unknown) => e instanceof LoginFlowRefusal && e.code === "login_flow_refused");
+    assert.equal(r.store.getLoginFlow(flow.id)?.phase, "cancelled");
+    assert.equal(flows.hasRunner(flow.id), false);
   } finally {
     r.cleanup();
   }

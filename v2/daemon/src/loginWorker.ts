@@ -184,9 +184,14 @@ const ANSI_RE =
   /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[()][0-9A-Za-z]|\u001b[@-Z\\-_]|\u009b[0-?]*[ -/]*[@-~]/g;
 const CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 
+// Cursor-movement CSI sequences (A-H, S, T, f, s, u) separate text that a
+// TUI drew at different positions; erase sequences (J, K), colors and modes
+// are dropped without a separator.
+const CURSOR_MOVE_RE = /\u001b\[[0-?]*[ -/]*[A-HSTfsu]/g;
+
 /** Strip terminal control sequences and resolve `\r` redraws within a line (the last overwrite wins). */
 export function cleanTerminalText(raw: string): string {
-  const stripped = raw.replace(ANSI_RE, "").replace(/\r\n/g, "\n");
+  const stripped = raw.replace(CURSOR_MOVE_RE, " ").replace(ANSI_RE, "").replace(/\r\n/g, "\n");
   return stripped
     .split("\n")
     .map((line) => {
@@ -274,15 +279,17 @@ export class LoginOutputParser {
   feed(raw: string, now: number): ParsedLoginState {
     this.bytes += raw.length;
     this.lastChunkAt = now;
-    let text = cleanTerminalText(this.pending + raw);
-    for (const secret of this.masks) text = text.split(secret).join("••••••••");
+    // `pending` stays RAW so an escape sequence split across chunks is
+    // cleaned whole once its tail arrives (cleaning a fragment would leave
+    // `[32m`-style residue on the exact line the prompt regexes test).
+    const text = this.pending + raw;
     const lastNl = text.lastIndexOf("\n");
     if (lastNl < 0) {
-      this.pending = text.slice(-4096);
+      this.pending = text.slice(-8192);
       return this.current;
     }
-    const complete = text.slice(0, lastNl + 1);
-    this.pending = text.slice(lastNl + 1).slice(-4096);
+    const complete = this.clean(text.slice(0, lastNl + 1));
+    this.pending = text.slice(lastNl + 1).slice(-8192);
     this.tail = (this.tail + complete).slice(-this.maxTail);
     this.scan(complete, false);
     return this.current;
@@ -290,8 +297,19 @@ export class LoginOutputParser {
 
   /** Evaluate the unfinished last line once output has been quiet for settleMs. */
   settle(now: number): ParsedLoginState {
-    if (this.pending.length > 0 && now - this.lastChunkAt >= this.settleMs) this.scan(this.pending, true);
+    if (this.pending.length > 0 && now - this.lastChunkAt >= this.settleMs) this.scan(this.clean(this.pending), true);
     return this.current;
+  }
+
+  /** A prompt was answered: the next prompt line is a NEW ask and a failure cue may fire again. */
+  consumePrompt(): void {
+    this.current = { ...this.current, prompt: null, failure: null };
+  }
+
+  private clean(raw: string): string {
+    let text = cleanTerminalText(raw);
+    for (const secret of this.masks) text = text.split(secret).join("••••••••");
+    return text;
   }
 
   state(): ParsedLoginState {
@@ -308,9 +326,11 @@ export class LoginOutputParser {
       if (this.current.url !== url) this.current = { ...this.current, url };
     }
     if (this.codeRe) {
-      const codeMatch = this.codeRe.exec(text);
+      // Never read a device code out of a URL path segment, and codes are
+      // upper-case by convention (the cue regex itself is case-insensitive).
+      const codeMatch = this.codeRe.exec(text.replace(/https?:\/\/[^\s'"<>)\]]+/g, " "));
       const code = codeMatch?.[1] ?? null;
-      if (code && this.current.userCode !== code) this.current = { ...this.current, userCode: code };
+      if (code && code === code.toUpperCase() && this.current.userCode !== code) this.current = { ...this.current, userCode: code };
     }
     for (let i = 0; i < this.failures.length; i += 1) {
       if ((this.failures[i] as RegExp).test(text) && this.current.failure === null) this.current = { ...this.current, failure: i };
@@ -424,8 +444,10 @@ export class LoginWorker {
     if (!this.handle || !this.alive) return;
     if (secret) this.parser.mask(value);
     this.handle.write(`${value}\r`);
-    // The prompt is consumed; a repeated prompt line must be a NEW ask.
-    this.last = { ...this.last, prompt: null };
+    // The prompt is consumed; a repeated prompt line must be a NEW ask and a
+    // repeated failure cue must fire again.
+    this.parser.consumePrompt();
+    this.last = { ...this.last, prompt: null, failure: null };
   }
 
   /** Terminate the whole process group: SIGTERM, then SIGKILL after the grace. Idempotent. */
