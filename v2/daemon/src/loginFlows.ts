@@ -3,157 +3,65 @@
  * login, operator decision 2026-08-28). Owns every login flow end to end:
  *
  *  - the durable, mirrored flow row (`login_flows`; one active per account)
- *  - the provider recipe's advertised methods and their runners:
- *      direct  → typed provider integrations in this file (Claude OAuth
- *                PKCE + code, Codex API key, OpenCode provider API keys)
- *      cli     → the harness's own login CLI in a Honeybee-owned native
- *                worker (loginWorker.ts) whose parsed progress drives phases
+ *  - the provider recipe's advertised methods, each executed by a runner
+ *    behind one contract (login/runner.ts):
+ *      claude_oauth → direct PKCE + pasted code        (login/claudeOauth.ts)
+ *      direct_key   → Codex / OpenCode API keys        (login/directKey.ts)
+ *      cli          → the harness's own login CLI in a Honeybee-owned
+ *                     native worker whose parsed progress drives phases
+ *                                                     (login/cliRunner.ts)
  *  - input routing (typed values only reach the field the flow asked for)
- *  - credential validation + atomic capture (home is authoritative; vault
- *    is the backup; restrictive modes) — a process exit is never success
- *  - expiry, cancel, retry (new revision), method switching, worker
+ *  - expiry, cancel, retry (new revision), method switching, runner
  *    cleanup, daemon-restart reconciliation, legacy tmux-seat cleanup
+ *
+ * The service is the flow row's only writer: runners transition their flow
+ * through a scoped host, and a superseded runner's late events are dropped.
  *
  * Secret safety: typed values live in local variables for the duration of
  * one submit; they are never logged, audited, stored on the flow row, or
  * recorded as an idempotency result. Worker output stays inside the worker.
  */
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
 import {
   defaultLoginMethodId,
   loginMethodFor,
   loginMethodsFor,
-  parseClaudeCredentials,
   recipeFor,
-  safeAuthorizationUrl,
-  OPENCODE_API_KEY_PROVIDERS,
   type AccountRow,
   type CoreStore,
-  type IdentityRecipe,
-  type LoginCliSpec,
   type LoginFieldDescriptor,
   type LoginFlowError,
-  type LoginFlowErrorCode,
   type LoginFlowPatch,
   type LoginFlowRow,
   type LoginMethodDescriptor,
   type LoginMethodRun,
 } from "../../core/src/index.ts";
 import type { AccountsService } from "./accountsService.ts";
-import { primaryCredentialFile, primaryCredentialMtime } from "./activation.ts";
 import type { ResolvedNodeConfig } from "./config.ts";
-import { seedClaudeHomeAcceptance, seedClaudeHomeDefaults, atomicWriteFileSync } from "./homeDefaults.ts";
-import { credentialDigest } from "./keychain.ts";
-import { LoginWorker, loadNodePtySpawner, pipeSpawner, type LoginWorkerEvent, type LoginWorkerStatus, type PtySpawner } from "./loginWorker.ts";
+import { ClaudeOauthRunner } from "./login/claudeOauth.ts";
+import { CliRunner } from "./login/cliRunner.ts";
+import { STATIC_DETAIL, err, isTerminal, safeMessage } from "./login/common.ts";
+import { DirectKeyRunner } from "./login/directKey.ts";
+import type { LoginRunner, LoginRunnerHost } from "./login/runner.ts";
+import { defaultLoginTransports, type LoginTransports } from "./login/transports.ts";
+import { loadNodePtySpawner, type LoginWorkerStatus, type PtySpawner } from "./loginWorker.ts";
 
-// ---------------------------------------------------------------------------
-// injected transports (defaults are the real providers)
-// ---------------------------------------------------------------------------
-
-export interface ClaudeTokenGrant {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-  scopes: string[];
-}
-
-export type KeyCheck = "valid" | "invalid" | "unverified";
-
-export interface LoginTransports {
-  /** Exchange a pasted `code#state` for tokens (PKCE). null = the provider rejected it. Throws on transport failure. */
-  claudeTokenExchange: (input: { code: string; state: string; codeVerifier: string; redirectUri: string; clientId: string }) => Promise<ClaudeTokenGrant | null>;
-  /** Prove the access token authenticates (the usage endpoint) — the validation step. Throws on transport failure; false on 401/403. */
-  claudeTokenCheck: (accessToken: string) => Promise<boolean>;
-  /** Best-effort subscription type for the credential document (Claude Code reads it); null when unknown. */
-  claudeSubscriptionType: (accessToken: string) => Promise<string | null>;
-  /** OpenAI API key check (`GET /v1/models`). */
-  openaiKeyCheck: (apiKey: string, baseUrl?: string) => Promise<KeyCheck>;
-  /** Anthropic API key check (`GET /v1/models`). */
-  anthropicKeyCheck: (apiKey: string, baseUrl?: string) => Promise<KeyCheck>;
-}
-
-// Claude Code's public OAuth client id (the one the CLI itself uses).
-export const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-export const CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
-export const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
-export const CLAUDE_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
-export const CLAUDE_OAUTH_SCOPES = ["org:create_api_key", "user:profile", "user:inference"];
-
-async function checkedJson(response: Response): Promise<unknown> {
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
-
-function keyCheckFromStatus(status: number): KeyCheck {
-  if (status === 401 || status === 403) return "invalid";
-  if (status >= 200 && status < 300) return "valid";
-  return "unverified";
-}
-
-export function defaultLoginTransports(timeoutMs: number): LoginTransports {
-  return {
-    claudeTokenExchange: async ({ code, state, codeVerifier, redirectUri, clientId }) => {
-      const response = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ grant_type: "authorization_code", code, state, client_id: clientId, redirect_uri: redirectUri, code_verifier: codeVerifier }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (response.status === 400 || response.status === 401 || response.status === 403) return null;
-      const body = (await checkedJson(response)) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; scope?: unknown };
-      if (typeof body.access_token !== "string" || typeof body.refresh_token !== "string") return null;
-      return {
-        accessToken: body.access_token,
-        refreshToken: body.refresh_token,
-        expiresAt: Date.now() + (typeof body.expires_in === "number" ? body.expires_in : 3600) * 1000,
-        scopes: typeof body.scope === "string" ? body.scope.split(" ").filter(Boolean) : CLAUDE_OAUTH_SCOPES,
-      };
-    },
-    claudeTokenCheck: async (accessToken) => {
-      const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
-        headers: { Authorization: `Bearer ${accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (response.status === 401 || response.status === 403) return false;
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return true;
-    },
-    claudeSubscriptionType: async (accessToken) => {
-      try {
-        const response = await fetch("https://api.anthropic.com/api/oauth/profile", {
-          headers: { Authorization: `Bearer ${accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (!response.ok) return null;
-        const body = (await response.json()) as { organization?: { organization_type?: unknown }; account?: { has_claude_max?: unknown; has_claude_pro?: unknown } };
-        const type = body.organization?.organization_type;
-        if (typeof type === "string" && type.startsWith("claude_")) return type.slice("claude_".length);
-        if (body.account?.has_claude_max === true) return "max";
-        if (body.account?.has_claude_pro === true) return "pro";
-        return null;
-      } catch {
-        return null;
-      }
-    },
-    openaiKeyCheck: async (apiKey, baseUrl) => {
-      const response = await fetch(`${(baseUrl ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      return keyCheckFromStatus(response.status);
-    },
-    anthropicKeyCheck: async (apiKey, baseUrl) => {
-      const response = await fetch(`${(baseUrl ?? "https://api.anthropic.com/v1").replace(/\/+$/, "")}/models`, {
-        headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      return keyCheckFromStatus(response.status);
-    },
-  };
-}
+// Stable public surface: the pieces tests and the daemon reach for by name.
+export { claudeAuthorizeUrl, splitClaudeCode } from "./login/claudeOauth.ts";
+export { LANDING_CHECK_INTERVAL_MS, WORKER_ENV_ALLOWLIST, workerBaseEnv } from "./login/cliRunner.ts";
+export { plausibleApiKey, plausibleOption } from "./login/directKey.ts";
+export {
+  CLAUDE_OAUTH_AUTHORIZE_URL,
+  CLAUDE_OAUTH_CLIENT_ID,
+  CLAUDE_OAUTH_REDIRECT_URI,
+  CLAUDE_OAUTH_SCOPES,
+  CLAUDE_OAUTH_TOKEN_URL,
+  defaultLoginTransports,
+} from "./login/transports.ts";
+export type { ClaudeTokenGrant, KeyCheck, LoginTransports } from "./login/transports.ts";
+export type { LoginRunner, LoginRunnerHost, LoginRunnerKind } from "./login/runner.ts";
+export type { LoginFieldDescriptor };
 
 // ---------------------------------------------------------------------------
 // service
@@ -180,107 +88,7 @@ export interface LoginFlowServiceOptions {
   workerSettleMs?: number;
 }
 
-type Runner =
-  | { kind: "claude_oauth"; codeVerifier: string; state: string }
-  | { kind: "direct_key" }
-  | {
-      kind: "cli";
-      worker: LoginWorker;
-      spec: LoginCliSpec;
-      baselineMtime: number | null;
-      baselineDigest: string | null;
-      /** Set when a failure cue matched; reported when the process exits. */
-      failureIndex: number | null;
-      /** Landing check in flight (keychain reads are async). */
-      checking: boolean;
-      /** The phase to return to when a prompt is withdrawn. */
-      idlePhase: "starting" | "waiting_browser" | "waiting_device";
-      /** Landing checks are throttled (external-store reads are not free). */
-      lastLandingCheckAt: number;
-    };
-
-/** How often a CLI flow's credential landing is probed (keychain / global-store reads are not free). */
-const LANDING_CHECK_INTERVAL_MS = 1000;
-
-const STATIC_DETAIL = {
-  starting: "Starting the sign-in…",
-  browser: "Finish signing in in your browser.",
-  device: "Enter the code on the sign-in page.",
-  code: "Paste the code from the sign-in page.",
-  input: "Enter the requested details.",
-  validating: "Checking the credential…",
-  succeeded: "Signed in.",
-} as const;
-
-function err(code: LoginFlowErrorCode, message: string): LoginFlowError {
-  return { code, message };
-}
-
-function pkceVerifier(): string {
-  return randomBytes(32).toString("base64url");
-}
-
-function pkceChallenge(verifier: string): string {
-  return createHash("sha256").update(verifier).digest("base64url");
-}
-
-/** Build the Claude authorize URL for a verifier/state pair (pure; unit-tested). */
-export function claudeAuthorizeUrl(codeVerifier: string, state: string): string {
-  const url = new URL(CLAUDE_OAUTH_AUTHORIZE_URL);
-  url.searchParams.set("code", "true");
-  url.searchParams.set("client_id", CLAUDE_OAUTH_CLIENT_ID);
-  url.searchParams.set("response_type", "code");
-  url.searchParams.set("redirect_uri", CLAUDE_OAUTH_REDIRECT_URI);
-  url.searchParams.set("scope", CLAUDE_OAUTH_SCOPES.join(" "));
-  url.searchParams.set("code_challenge", pkceChallenge(codeVerifier));
-  url.searchParams.set("code_challenge_method", "S256");
-  url.searchParams.set("state", state);
-  return url.toString();
-}
-
-/** The pasted Claude code is `code#state`; a bare code uses the flow's own state. */
-export function splitClaudeCode(pasted: string, flowState: string): { code: string; state: string } | null {
-  const trimmed = pasted.trim();
-  if (trimmed.length === 0 || trimmed.length > 4096 || /\s/.test(trimmed)) return null;
-  const hash = trimmed.indexOf("#");
-  if (hash < 0) return { code: trimmed, state: flowState };
-  const code = trimmed.slice(0, hash);
-  const state = trimmed.slice(hash + 1);
-  if (!code || !state) return null;
-  return { code, state };
-}
-
-/** Reject keys that are obviously not keys (whitespace, control chars, absurd length). Never logs the value. */
-export function plausibleApiKey(value: string): boolean {
-  return value.length >= 8 && value.length <= 4096 && !/[\s\u0000-\u001f\u007f]/.test(value);
-}
-
-/** Non-secret, bounded field values (base URL / organization / project). */
-function plausibleOption(value: string, kind: "url" | "text"): boolean {
-  if (value.length === 0 || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) return false;
-  if (kind !== "url") return true;
-  try {
-    const url = new URL(value);
-    // A key is sent to this host during the check: https, or loopback http (local proxies).
-    return url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
-  } catch {
-    return false;
-  }
-}
-
-function readJsonObject(path: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
-}
-
-function writePrivateJson(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  atomicWriteFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 0o600);
-}
+type RecipeMethod = LoginMethodDescriptor & { run: LoginMethodRun };
 
 export class LoginFlowService {
   private readonly store: CoreStore;
@@ -291,8 +99,8 @@ export class LoginFlowService {
   private readonly transports: LoginTransports;
   private readonly onCompleted: (accountId: string) => void;
   private readonly tmuxExec: (args: string[]) => { status: number | null; stdout: string };
-  private readonly runners = new Map<string, Runner>();
-  /** Flows whose runner is being replaced (selectMethod / retry await a kill): submits refuse, cancels win. */
+  private readonly runners = new Map<string, LoginRunner>();
+  /** Flows whose runner is being replaced (selectMethod / live retry): submits are refused meanwhile. */
   private readonly switching = new Set<string>();
   private spawner: PtySpawner | null | undefined;
   private spawnerLoading: Promise<PtySpawner | null> | null = null;
@@ -330,8 +138,7 @@ export class LoginFlowService {
 
   /** Bounded, redacted worker status for diagnostics (never terminal contents). */
   workerStatus(flowId: string): LoginWorkerStatus | null {
-    const runner = this.runners.get(flowId);
-    return runner?.kind === "cli" ? runner.worker.status() : null;
+    return this.runners.get(flowId)?.workerStatus() ?? null;
   }
 
   /** Whether the flow has a live in-memory runner (a daemon restart loses these). */
@@ -425,26 +232,13 @@ export class LoginFlowService {
     if (!runner) {
       return this.patch(flowId, { phase: "interrupted", inputFields: [], error: err("daemon_restarted", "Honeybee restarted while this sign-in was waiting; retry to get a fresh sign-in."), retryable: true }, "no runner on submit");
     }
-    const method = flow.methodId ? loginMethodFor(flow.harness, flow.methodId) : undefined;
-    if (!method) throw new LoginFlowRefusal("login_flow_refused", `login flow ${flowId} has no method`);
+    if (!flow.methodId || !loginMethodFor(flow.harness, flow.methodId)) throw new LoginFlowRefusal("login_flow_refused", `login flow ${flowId} has no method`);
+    if (!this.store.getAccount(flow.account)) throw new LoginFlowRefusal("login_flow_not_found", `login flow ${flowId} belongs to a removed account`);
+    // The fields the flow asked for, captured before `validating` clears them.
+    const fields = flow.inputFields.map((f) => ({ ...f }));
     this.patch(flowId, { phase: "validating", detail: STATIC_DETAIL.validating, inputFields: [], error: null }, "input received");
     try {
-      switch (runner.kind) {
-        case "claude_oauth":
-          return await this.completeClaudeOauth(flowId, runner, values.code ?? "");
-        case "direct_key":
-          return await this.completeDirectKey(flowId, method.run, values);
-        case "cli": {
-          for (const field of flow.inputFields) {
-            const value = values[field.id];
-            if (value !== undefined) runner.worker.submit(value, field.secret);
-          }
-          // The CLI validates; landing (tick) or exit settles the flow.
-          return this.flowOf(flowId) as LoginFlowRow;
-        }
-        default:
-          return this.flowOf(flowId) as LoginFlowRow;
-      }
+      return await runner.submit(values, fields);
     } catch (error) {
       return this.fail(flowId, err("provider_error", `The provider could not be reached: ${safeMessage(error)}`), true);
     }
@@ -557,7 +351,7 @@ export class LoginFlowService {
     return killed;
   }
 
-  /** Tick: expiry, orphaned runners (flow/account removed), and credential-landing checks for CLI flows. */
+  /** Tick: expiry, orphaned runners (flow/account removed), and each live runner's periodic work (credential-landing checks). */
   tick(): void {
     if (this.ticking || this.stopping) return;
     this.ticking = true;
@@ -581,10 +375,7 @@ export class LoginFlowService {
           this.log(`account.login.expired flow=${flowId}`);
           continue;
         }
-        if (runner.kind === "cli" && now - runner.lastLandingCheckAt >= LANDING_CHECK_INTERVAL_MS) {
-          runner.lastLandingCheckAt = now;
-          void this.checkLanding(flowId, runner);
-        }
+        runner.tick(now);
       }
     } finally {
       this.ticking = false;
@@ -606,6 +397,7 @@ export class LoginFlowService {
   // runners
   // -------------------------------------------------------------------------
 
+  /** Register the method's runner for the flow and start it; any throw is a typed provider_error. */
   private async run(flowId: string, methodId: string): Promise<LoginFlowRow> {
     const flow = this.mustFlow(flowId);
     if (isTerminal(flow.phase)) return flow;
@@ -614,148 +406,57 @@ export class LoginFlowService {
     const method = loginMethodFor(flow.harness, methodId);
     if (!method) return this.fail(flowId, err("unsupported_method", `${flow.harness} does not offer '${methodId}'.`), false);
     this.patch(flowId, { methodId }, "method");
+    const runner = this.createRunner(this.hostFor(flowId, account, method));
+    if (!runner) return this.fail(flowId, err("unsupported_method", `unknown direct runner`), false);
+    this.runners.set(flowId, runner);
     try {
-      if (method.run.mode === "direct") {
-        switch (method.run.runner) {
-          case "claude_oauth":
-            return this.startClaudeOauth(flowId, method);
-          case "codex_api_key":
-          case "opencode_api_key":
-            this.runners.set(flowId, { kind: "direct_key" });
-            return this.patch(flowId, { phase: "waiting_input", detail: STATIC_DETAIL.input, inputFields: method.fields.map((f) => ({ ...f })) }, "fields requested");
-          default:
-            return this.fail(flowId, err("unsupported_method", `unknown direct runner`), false);
-        }
-      }
-      return await this.startCli(flowId, account, method, method.run.cli);
+      return await runner.start();
     } catch (error) {
       return this.fail(flowId, err("provider_error", safeMessage(error)), true);
     }
   }
 
-  private startClaudeOauth(flowId: string, method: LoginMethodDescriptor): LoginFlowRow {
-    // The verifier never leaves this process; `state` is an independent
-    // nonce (the authorization URL — and thus the mirrored row — carries
-    // only the challenge and the state).
-    const codeVerifier = pkceVerifier();
-    const state = randomBytes(16).toString("base64url");
-    this.runners.set(flowId, { kind: "claude_oauth", codeVerifier, state });
-    const url = safeAuthorizationUrl(claudeAuthorizeUrl(codeVerifier, state));
-    return this.patch(
+  /** One runner per `LoginMethodRun` shape; null for a direct runner this daemon does not know. */
+  private createRunner(host: LoginRunnerHost): LoginRunner | null {
+    const run = host.method.run;
+    if (run.mode === "cli") return new CliRunner(host, run.cli);
+    switch (run.runner) {
+      case "claude_oauth":
+        return new ClaudeOauthRunner(host);
+      case "codex_api_key":
+      case "opencode_api_key":
+        return new DirectKeyRunner(host, run.runner);
+      default:
+        return null;
+    }
+  }
+
+  /** The service's write path, scoped to one flow — what a runner is allowed to do. */
+  private hostFor(flowId: string, account: AccountRow, method: RecipeMethod): LoginRunnerHost {
+    return {
       flowId,
-      { phase: "waiting_input", detail: STATIC_DETAIL.code, authorizationUrl: url, inputFields: method.fields.map((f) => ({ ...f })) },
-      "authorization url issued",
-    );
-  }
-
-  private async completeClaudeOauth(flowId: string, runner: Extract<Runner, { kind: "claude_oauth" }>, pasted: string): Promise<LoginFlowRow> {
-    const flow = this.mustFlow(flowId);
-    const account = this.store.getAccount(flow.account);
-    if (!account) throw new LoginFlowRefusal("login_flow_not_found", `login flow ${flowId} belongs to a removed account`);
-    const split = splitClaudeCode(pasted, runner.state);
-    if (!split) return this.reask(flowId, err("invalid_input", "That does not look like an authorization code. Paste the whole code shown on the sign-in page."));
-    const grant = await this.transports.claudeTokenExchange({ code: split.code, state: split.state, codeVerifier: runner.codeVerifier, redirectUri: CLAUDE_OAUTH_REDIRECT_URI, clientId: CLAUDE_OAUTH_CLIENT_ID });
-    if (!grant) return this.reask(flowId, err("invalid_credential", "The sign-in page rejected that code. Open the sign-in page again and paste a fresh code."));
-    const ok = await this.transports.claudeTokenCheck(grant.accessToken);
-    if (!ok) return this.reask(flowId, err("invalid_credential", "The credential did not authenticate. Open the sign-in page again and paste a fresh code."));
-    if (!this.stillActive(flowId)) return this.flowOf(flowId) as LoginFlowRow;
-    const subscriptionType = await this.transports.claudeSubscriptionType(grant.accessToken);
-    const document = {
-      claudeAiOauth: {
-        accessToken: grant.accessToken,
-        refreshToken: grant.refreshToken,
-        expiresAt: grant.expiresAt,
-        scopes: grant.scopes,
-        ...(subscriptionType ? { subscriptionType } : {}),
+      account,
+      method,
+      store: this.store,
+      accounts: this.accounts,
+      cfg: this.cfg,
+      transports: this.transports,
+      log: this.log,
+      now: this.now,
+      workerKillGraceMs: this.workerKillGraceMs,
+      workerSettleMs: this.workerSettleMs,
+      flow: () => this.store.getLoginFlow(flowId),
+      stillActive: () => this.stillActive(flowId),
+      isCurrent: (runner) => this.runners.get(flowId) === runner,
+      release: (runner) => {
+        if (this.runners.get(flowId) === runner) this.runners.delete(flowId);
       },
+      resolveSpawner: () => this.resolveSpawner(),
+      patch: (patch, reason) => this.patch(flowId, patch, reason),
+      fail: (error, retryable) => this.fail(flowId, error, retryable),
+      reask: (error) => this.reask(flowId, error),
+      succeed: (detail) => this.succeed(flowId, account.id, detail),
     };
-    const raw = JSON.stringify(document);
-    if (!parseClaudeCredentials(raw)) return this.reask(flowId, err("invalid_credential", "The provider returned an unusable credential."));
-    // Home is authoritative: land the credential there (0600), seed the
-    // home defaults a fresh Claude home needs, then capture into the vault.
-    mkdirSync(account.homePath, { recursive: true, mode: 0o700 });
-    atomicWriteFileSync(join(account.homePath, ".credentials.json"), raw, 0o600);
-    seedClaudeHomeDefaults(account.homePath);
-    seedClaudeHomeAcceptance(account.homePath, { yolo: true });
-    const keychainWritten = await this.accounts.writeClaudeKeychain(account, raw).catch(() => false);
-    const captured = this.accounts.persistCredentialCapture(account, ".credentials.json", raw, { ".credentials.json": raw });
-    if (!captured.ok) return this.fail(flowId, err("capture_failed", "The credential could not be saved into the account's vault."), true);
-    this.log(`account.login.captured flow=${flowId} account=${account.id} by=claude_oauth keychain=${keychainWritten} files=${captured.captured.join(",")}`);
-    return this.succeed(flowId, account.id);
-  }
-
-  private async completeDirectKey(flowId: string, run: LoginMethodRun, values: Record<string, string>): Promise<LoginFlowRow> {
-    const flow = this.mustFlow(flowId);
-    const account = this.store.getAccount(flow.account);
-    if (!account) throw new LoginFlowRefusal("login_flow_not_found", `login flow ${flowId} belongs to a removed account`);
-    const apiKey = (values.apiKey ?? "").trim();
-    if (!plausibleApiKey(apiKey)) return this.reask(flowId, err("invalid_input", "That does not look like an API key."));
-    if (run.mode !== "direct") return this.flowOf(flowId) as LoginFlowRow;
-    if (run.runner === "codex_api_key") {
-      const check = await this.transports.openaiKeyCheck(apiKey);
-      if (check === "invalid") return this.reask(flowId, err("invalid_credential", "OpenAI rejected that API key."));
-      if (check === "unverified") return this.reask(flowId, err("network_error", "OpenAI could not be reached to check the key. Try again."));
-      if (!this.stillActive(flowId)) return this.flowOf(flowId) as LoginFlowRow;
-      const raw = `${JSON.stringify({ OPENAI_API_KEY: apiKey, tokens: null, last_refresh: null }, null, 2)}\n`;
-      mkdirSync(account.homePath, { recursive: true, mode: 0o700 });
-      atomicWriteFileSync(join(account.homePath, "auth.json"), raw, 0o600);
-      const recipe = recipeFor("codex") as IdentityRecipe;
-      for (const [canonical, mirror] of Object.entries(recipe.activationMirrors ?? {})) {
-        if (canonical === "auth.json") writePrivateRaw(join(account.homePath, mirror), raw);
-      }
-      const captured = this.accounts.persistCredentialCapture(account, "auth.json", raw, {});
-      if (!captured.ok) return this.fail(flowId, err("capture_failed", "The credential could not be saved into the account's vault."), true);
-      this.log(`account.login.captured flow=${flowId} account=${account.id} by=codex_api_key files=${captured.captured.join(",")}`);
-      return this.succeed(flowId, account.id);
-    }
-    // opencode_api_key
-    const provider = (values.provider ?? "").trim();
-    const known = OPENCODE_API_KEY_PROVIDERS.find((p) => p.id === provider);
-    if (!known) return this.reask(flowId, err("invalid_input", "Pick a provider."));
-    const options: Record<string, unknown> = {};
-    const headers: Record<string, string> = {};
-    const baseUrl = (values.baseUrl ?? "").trim();
-    if (baseUrl) {
-      if (!known.baseUrl || !plausibleOption(baseUrl, "url")) return this.reask(flowId, err("invalid_input", "The base URL must be an http(s) URL."));
-      options.baseURL = baseUrl;
-    }
-    const organization = (values.organization ?? "").trim();
-    if (organization) {
-      if (!known.organization || !plausibleOption(organization, "text")) return this.reask(flowId, err("invalid_input", "Invalid organization id."));
-      headers["OpenAI-Organization"] = organization;
-    }
-    const project = (values.project ?? "").trim();
-    if (project) {
-      if (!known.project || !plausibleOption(project, "text")) return this.reask(flowId, err("invalid_input", "Invalid project id."));
-      headers["OpenAI-Project"] = project;
-    }
-    let check: KeyCheck = "unverified";
-    if (provider === "openai") check = await this.transports.openaiKeyCheck(apiKey, baseUrl || undefined);
-    else if (provider === "anthropic") check = await this.transports.anthropicKeyCheck(apiKey, baseUrl || undefined);
-    if (check === "invalid") return this.reask(flowId, err("invalid_credential", `${known.label} rejected that API key.`));
-    if (!this.stillActive(flowId)) return this.flowOf(flowId) as LoginFlowRow;
-    this.patch(flowId, { provider }, "provider");
-    const authPath = join(account.homePath, "xdg-data", "opencode", "auth.json");
-    const auth = readJsonObject(authPath);
-    auth[provider] = { type: "api", key: apiKey };
-    writePrivateJson(authPath, auth);
-    if (Object.keys(options).length > 0 || Object.keys(headers).length > 0) {
-      const configPath = join(account.homePath, "opencode.json");
-      const config = readJsonObject(configPath);
-      const providers = (config.provider && typeof config.provider === "object" && !Array.isArray(config.provider) ? config.provider : {}) as Record<string, unknown>;
-      const entry = (providers[provider] && typeof providers[provider] === "object" ? providers[provider] : {}) as Record<string, unknown>;
-      const existingOptions = (entry.options && typeof entry.options === "object" ? entry.options : {}) as Record<string, unknown>;
-      const existingHeaders = (existingOptions.headers && typeof existingOptions.headers === "object" ? existingOptions.headers : {}) as Record<string, unknown>;
-      entry.options = { ...existingOptions, ...options, ...(Object.keys(headers).length > 0 ? { headers: { ...existingHeaders, ...headers } } : {}) };
-      providers[provider] = entry;
-      config.provider = providers;
-      writePrivateJson(configPath, config);
-    }
-    const raw = readFileSync(authPath, "utf8");
-    const captured = this.accounts.persistCredentialCapture(account, "xdg-data/opencode/auth.json", raw, {});
-    if (!captured.ok) return this.fail(flowId, err("capture_failed", "The credential could not be saved into the account's vault."), true);
-    this.log(`account.login.captured flow=${flowId} account=${account.id} by=opencode_api_key provider=${provider} verified=${check === "valid"} files=${captured.captured.join(",")}`);
-    return this.succeed(flowId, account.id, check === "valid" ? undefined : `Saved. ${known.label} keys are checked by format only; OpenCode verifies them on first use.`);
   }
 
   private async resolveSpawner(): Promise<PtySpawner | null> {
@@ -772,170 +473,6 @@ export class LoginFlowService {
         });
     }
     return this.spawnerLoading;
-  }
-
-  private async startCli(flowId: string, account: AccountRow, method: LoginMethodDescriptor, spec: LoginCliSpec): Promise<LoginFlowRow> {
-    const recipe = recipeFor(account.harness);
-    if (!recipe) return this.fail(flowId, err("unsupported_method", `${account.harness} has no login recipe.`), false);
-    const pty = await this.resolveSpawner();
-    let spawner: PtySpawner;
-    if (pty) spawner = pty;
-    else if (spec.tty) {
-      return this.fail(flowId, err("pty_unavailable", `${account.harness}'s login needs a terminal, and this Honeybee node has no PTY backend (node-pty). Install it or use another sign-in method.`), false);
-    } else spawner = pipeSpawner();
-    // Node config `agents.<harness>.login` overrides every CLI method's
-    // command (an operator-level override / the tests' fake CLI); otherwise
-    // the method's own command, else the recipe's login command.
-    const configured = this.cfg.agents[account.harness]?.login;
-    const launch = configured ?? spec.command ?? recipe.login;
-    // A minimal environment: the daemon's own provider keys / tokens must
-    // never reach a vendor login CLI (some would silently use them instead
-    // of signing in), and no worker inherits a tmux context.
-    const env: Record<string, string> = {
-      ...workerBaseEnv(process.env),
-      ...(this.cfg.agents[account.harness]?.env ?? {}),
-      ...this.accounts.homeEnvOf(account),
-      ...(spec.env ?? {}),
-      TERM: "xterm-256color",
-    };
-    mkdirSync(account.homePath, { recursive: true, mode: 0o700 });
-    const baselineMtime = primaryCredentialMtime(account.homePath, recipe);
-    const externalRaw = spec.landing === "external_digest" ? await this.accounts.externalLoginCredential(account) : null;
-    const baselineDigest = externalRaw ? credentialDigest(externalRaw) : null;
-    if (!this.stillActive(flowId)) return this.flowOf(flowId) as LoginFlowRow;
-    // Events are bound to THIS runner: a superseded worker (cancel → retry,
-    // method switch) whose exit lands late must never be attributed to its
-    // successor.
-    let runner: Runner | null = null;
-    const worker = new LoginWorker({
-      spawner,
-      launch: { command: launch.command, args: [...(launch.args ?? [])], cwd: account.homePath, env },
-      cues: spec.cues,
-      now: this.now,
-      killGraceMs: this.workerKillGraceMs,
-      ...(this.workerSettleMs !== undefined ? { settleMs: this.workerSettleMs } : {}),
-      onEvent: (event) => {
-        if (runner && this.runners.get(flowId) === runner) this.onWorkerEvent(flowId, runner, event);
-      },
-    });
-    runner = { kind: "cli", worker, spec, baselineMtime, baselineDigest, failureIndex: null, checking: false, idlePhase: "starting", lastLandingCheckAt: 0 };
-    this.runners.set(flowId, runner);
-    worker.start();
-    this.log(`account.login.worker flow=${flowId} account=${account.id} method=${method.id} backend=${spawner.kind} pid=${worker.pid} baselineMtime=${baselineMtime ?? "-"} baselineDigest=${baselineDigest ? baselineDigest.slice(0, 8) : "-"}`);
-    return this.flowOf(flowId) as LoginFlowRow;
-  }
-
-  private onWorkerEvent(flowId: string, runner: Runner, event: LoginWorkerEvent): void {
-    if (runner.kind !== "cli") return;
-    const flow = this.store.getLoginFlow(flowId);
-    if (!flow || isTerminal(flow.phase)) return;
-    const method = flow.methodId ? loginMethodFor(flow.harness, flow.methodId) : undefined;
-    switch (event.kind) {
-      case "url": {
-        const url = safeAuthorizationUrl(event.url);
-        if (!url) return;
-        const reissued = flow.authorizationUrl !== null && flow.authorizationUrl !== url;
-        const device = method?.kind === "device_code";
-        runner.idlePhase = device ? (flow.userCode ? "waiting_device" : "waiting_browser") : "waiting_browser";
-        const phase = flow.phase === "waiting_input" || flow.phase === "validating" ? flow.phase : runner.idlePhase;
-        this.patch(flowId, { authorizationUrl: url, phase, detail: phase === runner.idlePhase ? (runner.idlePhase === "waiting_device" ? STATIC_DETAIL.device : STATIC_DETAIL.browser) : flow.detail, ...(reissued ? { revision: flow.revision + 1 } : {}) }, reissued ? "authorization url reissued" : "authorization url");
-        return;
-      }
-      case "user_code": {
-        runner.idlePhase = "waiting_device";
-        const phase = flow.phase === "waiting_input" || flow.phase === "validating" ? flow.phase : "waiting_device";
-        this.patch(flowId, { userCode: event.code, phase, detail: phase === "waiting_device" ? STATIC_DETAIL.device : flow.detail }, "user code");
-        return;
-      }
-      case "prompt": {
-        if (event.field) {
-          this.patch(flowId, { phase: "waiting_input", detail: event.field.id === "code" ? STATIC_DETAIL.code : STATIC_DETAIL.input, inputFields: [{ ...event.field }], ...(runner.failureIndex !== null && flow.phase === "validating" ? { error: err("invalid_input", "The CLI did not accept that; try again.") } : {}) }, "prompt");
-          runner.failureIndex = null;
-        } else if (flow.phase === "waiting_input") {
-          this.patch(flowId, { phase: runner.idlePhase, detail: runner.idlePhase === "waiting_device" ? STATIC_DETAIL.device : runner.idlePhase === "waiting_browser" ? STATIC_DETAIL.browser : STATIC_DETAIL.starting, inputFields: [] }, "prompt withdrawn");
-        }
-        return;
-      }
-      case "failure":
-        runner.failureIndex = event.index;
-        return;
-      case "spawn_error": {
-        this.runners.delete(flowId);
-        const missing = /ENOENT|not found|could not start/i.test(event.message);
-        this.fail(flowId, missing ? err("cli_missing", `The ${flow.harness} CLI could not be started on this node; install it or use another sign-in method.`) : err("worker_died", "The sign-in process could not be started."), !missing);
-        return;
-      }
-      case "exit": {
-        // A process exit is never success by itself: one final landing check decides.
-        void this.checkLanding(flowId, runner, true).then((landed) => {
-          if (landed) return;
-          const current = this.store.getLoginFlow(flowId);
-          if (!current || isTerminal(current.phase)) return;
-          this.runners.delete(flowId);
-          const failed = runner.failureIndex !== null;
-          this.fail(
-            flowId,
-            failed
-              ? err("cli_failed", `The ${flow.harness} sign-in reported a failure. Retry to start over.`)
-              : err("process_exited", `The ${flow.harness} sign-in ended without saving a credential. Retry to start over.`),
-            true,
-          );
-          this.log(`account.login.exited flow=${flowId} code=${event.code ?? "-"} signal=${event.signal ?? "-"} failureCue=${runner.failureIndex ?? "-"}`);
-        });
-        return;
-      }
-      default:
-        return;
-    }
-  }
-
-  /** Credential landing for CLI flows: mtime past baseline / external-store digest drift → validate → capture → succeeded. */
-  private async checkLanding(flowId: string, runner: Extract<Runner, { kind: "cli" }>, final = false): Promise<boolean> {
-    if (runner.checking && !final) return false;
-    runner.checking = true;
-    try {
-      const flow = this.store.getLoginFlow(flowId);
-      if (!flow || isTerminal(flow.phase)) return false;
-      const account = this.store.getAccount(flow.account);
-      if (!account) return false;
-      const recipe = recipeFor(account.harness);
-      if (!recipe) return false;
-      const primaryFile = primaryCredentialFile(recipe);
-      let externalRaw: string | null = null;
-      let detectedBy: "mtime" | "digest" | null = null;
-      if (runner.spec.landing === "external_digest") {
-        externalRaw = await this.accounts.externalLoginCredential(account);
-        if (this.runners.get(flowId) !== runner) return false;
-        const digest = externalRaw ? credentialDigest(externalRaw) : null;
-        if (digest !== null && digest !== runner.baselineDigest) detectedBy = "digest";
-      }
-      const mtime = primaryCredentialMtime(account.homePath, recipe);
-      if (!detectedBy && externalRaw === null && mtime !== null && (runner.baselineMtime === null || mtime > runner.baselineMtime)) detectedBy = "mtime";
-      if (!detectedBy) return false;
-      const overrides: Record<string, string> = externalRaw ? { [primaryFile]: externalRaw } : {};
-      let primaryRaw = overrides[primaryFile] ?? null;
-      if (primaryRaw === null) {
-        try {
-          primaryRaw = readFileSync(join(account.homePath, primaryFile), "utf8");
-        } catch {
-          primaryRaw = null;
-        }
-      }
-      if (!this.stillActive(flowId)) return false;
-      const captured = this.accounts.persistCredentialCapture(account, primaryFile, primaryRaw, overrides);
-      if (!captured.ok) {
-        // Not a credential yet (partial write / invalid): re-baseline and keep waiting.
-        runner.baselineMtime = mtime;
-        runner.baselineDigest = externalRaw ? credentialDigest(externalRaw) : runner.baselineDigest;
-        this.log(`account.login.rejected flow=${flowId} account=${account.id} by=${detectedBy} reason=${captured.reason}`);
-        return false;
-      }
-      this.log(`account.login.captured flow=${flowId} account=${account.id} by=${detectedBy} files=${captured.captured.join(",")}`);
-      this.succeed(flowId, account.id);
-      return true;
-    } finally {
-      runner.checking = false;
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -983,7 +520,7 @@ export class LoginFlowService {
     const runner = this.runners.get(flowId);
     if (!runner) return;
     this.runners.delete(flowId);
-    if (runner.kind === "cli") await runner.worker.kill();
+    await runner.stop();
   }
 
   private mustFlow(flowId: string): LoginFlowRow {
@@ -1010,40 +547,7 @@ export class LoginFlowRefusal extends Error {
   }
 }
 
-function isTerminal(phase: LoginFlowRow["phase"]): boolean {
-  return phase === "succeeded" || phase === "failed" || phase === "cancelled" || phase === "expired" || phase === "interrupted";
-}
-
-/** Env keys a login worker inherits from the daemon (everything else — provider keys, tokens — is withheld). */
-export const WORKER_ENV_ALLOWLIST = [
-  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
-  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
-] as const;
-
-export function workerBaseEnv(source: NodeJS.ProcessEnv): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const key of WORKER_ENV_ALLOWLIST) {
-    const value = source[key];
-    if (typeof value === "string") env[key] = value;
-  }
-  return env;
-}
-
 /** The name tmux gave the retired login seat for an account (dots/colons → underscores, the rest of the old safe-name rule). */
 export function legacyLoginSeatName(accountId: string): string {
   return `hive-login-${accountId}`.replace(/\./g, "_").replace(/[^A-Za-z0-9_-]/g, "-");
 }
-
-function writePrivateRaw(path: string, raw: string): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  atomicWriteFileSync(path, raw, 0o600);
-}
-
-/** Bounded error text with anything token-shaped removed. */
-function safeMessage(error: unknown): string {
-  const text = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
-  return text.replace(/[A-Za-z0-9_\-]{32,}/g, "…").slice(0, 200);
-}
-
-export type { LoginFieldDescriptor };
