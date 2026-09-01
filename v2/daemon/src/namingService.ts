@@ -230,6 +230,7 @@ export class CodexNamingAppServer {
     this.child = child;
     this.buffer = "";
     this.stderrTail = "";
+    child.stdin.on("error", (error) => this.onExit(child, error));
     child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
     child.stderr.on("data", (chunk: Buffer) => {
       this.stderrTail = `${this.stderrTail}${chunk.toString()}`.slice(-2_000);
