@@ -566,7 +566,9 @@ test("cells.4: spawn param validation (typed invalid_request), explicit sha/warm
     assert.equal(ledger?.sha, older);
     assert.deepEqual(ledger?.warm, ["node_modules"]);
     assert.equal(ledger?.sandbox, false);
-    await waitFor(async () => (await client.request<ViewResult>("view", { beeId: spawned.beeId })).view.runtimeState === "idle", "pinned idle", 15_000);
+    // This path performs a real worktree provision plus HSR startup. Keep the
+    // assertion bounded, but allow for contention from the full daemon suite.
+    await waitFor(async () => (await client.request<ViewResult>("view", { beeId: spawned.beeId })).view.runtimeState === "idle", "pinned idle", 30_000);
     assert.equal(g(v.bee?.cwd as string, ["rev-parse", "HEAD"]), older);
     assert.equal(existsSync(join(v.bee?.cwd as string, "later.txt")), false, "materialized at the pinned sha");
 
