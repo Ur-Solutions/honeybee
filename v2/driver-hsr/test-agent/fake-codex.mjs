@@ -2,7 +2,7 @@
 /**
  * Fake `codex app-server` for the WP7 continuity test (spec 07 §F): a
  * JSON-RPC 2.0 stdio peer speaking the subset the codex adapter drives —
- * initialize → initialized → thread/start | thread/resume → turn/start —
+ * initialize → initialized → thread/start | thread/resume → turn/start | turn/steer —
  * and HONORS `thread/resume {threadId}` the way the real app-server does:
  * the response carries the same `thread.id`. `thread/fork {threadId}` (v6
  * bee.fork) answers with a NEW thread id (the app-server copies the rollout);
@@ -81,6 +81,19 @@ rl.on("line", (raw) => {
         emit({ jsonrpc: "2.0", method: "thread/status/changed", params: { threadId, status: { type: "idle" } } });
         emit({ jsonrpc: "2.0", method: "turn/completed", params: { threadId, turn: { id: turnId } } });
       }, slow ? Number(slow[1]) : 10);
+      return;
+    }
+    case "turn/steer": {
+      const expected = String(msg.params?.expectedTurnId ?? "");
+      if (turnTimer && currentTurnId === expected) {
+        emit({ jsonrpc: "2.0", id: msg.id, result: { turnId: currentTurnId } });
+      } else {
+        emit({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32600, message: `fake-codex: active turn does not match ${expected}` },
+        });
+      }
       return;
     }
     case "turn/interrupt": {

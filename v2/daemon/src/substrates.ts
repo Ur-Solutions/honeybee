@@ -111,6 +111,7 @@ export class SubstrateRouter implements RuntimeDriver {
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
     lastAppliedObservationCursor?: number | null,
+    providerSessionId?: string | null,
   ): boolean {
     return this.driverFor(beeId).adopt(
       beeId,
@@ -119,6 +120,7 @@ export class SubstrateRouter implements RuntimeDriver {
       pidStartedAt,
       lastKnownState,
       lastAppliedObservationCursor,
+      providerSessionId,
     );
   }
 

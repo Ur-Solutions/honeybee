@@ -154,9 +154,9 @@ test("codex: inbound server request is refused (method-not-found), never left ha
   });
 });
 
-test("codex: encodeMessage requires the learned thread id; encodes a turn/start request", () => {
-  assert.equal(adapter.encodeMessage("hi", { sessionId: null, messageId: 3 }), null);
-  const encoded = adapter.encodeMessage("hi", { sessionId: "thread-abc", messageId: 3 });
+test("codex: encodeMessage requires the learned thread id; idle encodes turn/start", () => {
+  assert.equal(adapter.encodeMessage("hi", { sessionId: null, messageId: 3, turnActive: false, turnId: null }), null);
+  const encoded = adapter.encodeMessage("hi", { sessionId: "thread-abc", messageId: 3, turnActive: false, turnId: null });
   assert.ok(encoded);
   assert.deepEqual(JSON.parse(encoded), {
     jsonrpc: "2.0",
@@ -164,18 +164,47 @@ test("codex: encodeMessage requires the learned thread id; encodes a turn/start 
     method: "turn/start",
     params: { threadId: "thread-abc", input: [{ type: "text", text: "hi", text_elements: [] }] },
   });
-  assert.equal(adapter.acceptsMidTurn, false); // turn/start collides with an active turn
+  assert.equal(adapter.acceptsMidTurn, true);
+  assert.equal(adapter.midTurnMessageNeedsTurnId, true);
+  assert.equal(adapter.confirmsDelivery, true);
 });
 
-test("codex: turn/start error response with auth signature → auth_needed set", () => {
+test("codex: a running turn encodes turn/steer with its native id and refuses safely before that id is known", () => {
+  assert.equal(
+    adapter.encodeMessage("steer me", { sessionId: "thread-abc", messageId: 4, turnActive: true, turnId: null }),
+    null,
+  );
+  const encoded = adapter.encodeMessage("steer me", {
+    sessionId: "thread-abc",
+    messageId: 4,
+    turnActive: true,
+    turnId: "turn-live",
+  });
+  assert.ok(encoded);
+  assert.deepEqual(JSON.parse(encoded), {
+    jsonrpc: "2.0",
+    id: 1004,
+    method: "turn/steer",
+    params: {
+      threadId: "thread-abc",
+      input: [{ type: "text", text: "steer me", text_elements: [] }],
+      expectedTurnId: "turn-live",
+    },
+  });
+});
+
+test("codex: turn delivery responses confirm or refuse the mailbox message; errors still surface flags", () => {
+  assert.deepEqual(adapter.parseLine(JSON.stringify({ jsonrpc: "2.0", id: 1003, result: { turnId: "turn-1" } })), [
+    { kind: "delivery_confirmed", messageId: 3 },
+  ]);
   const signals = adapter.parseLine(JSON.stringify({
     jsonrpc: "2.0",
     id: 1003,
     error: { code: -32000, message: "401 unauthorized" },
   }));
-  assert.equal(signals.length, 1);
-  assert.equal(signals[0]!.kind, "flag");
-  if (signals[0]!.kind === "flag") assert.equal(signals[0]!.flag, "auth_needed");
+  assert.deepEqual(signals[0], { kind: "delivery_refused", messageId: 3 });
+  assert.equal(signals[1]!.kind, "flag");
+  if (signals[1]!.kind === "flag") assert.equal(signals[1]!.flag, "auth_needed");
 });
 
 test("codex: resumeThreadId (spec 07 §F) — handshake sends thread/resume {threadId,…} instead of thread/start; the response's thread.id → booted; no argv resume", () => {

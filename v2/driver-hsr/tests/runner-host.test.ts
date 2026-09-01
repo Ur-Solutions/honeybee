@@ -81,6 +81,22 @@ function checkpointOf(driver: HsrDriver, beeId: string): number {
   return evidence.cursor;
 }
 
+async function deliverUntilAccepted(
+  driver: HsrDriver,
+  beeId: string,
+  generation: number,
+  messageId: number,
+  body: string,
+): Promise<void> {
+  const deadline = Date.now() + HOST_TEST_TIMEOUT_MS;
+  for (;;) {
+    driver.observe();
+    if (driver.deliver(beeId, generation, messageId, body).accepted) return;
+    if (Date.now() > deadline) throw new Error(`delivery ${messageId} was never confirmed for ${beeId}`);
+    await sleep(10);
+  }
+}
+
 test("daemon restart: the runtime survives and the successor daemon delivers at full capability", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-runner-host-"));
   const first = makeDriver(dir);
@@ -337,7 +353,7 @@ test("Codex thread/status idle plus turn/completed maps through adoption to one 
     await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
     const checkpoint = checkpointOf(first, "bee-codex");
     const proc = first.procOf("bee-codex", 1)!;
-    assert.equal(first.deliver("bee-codex", 1, 91, "persist codex completion").accepted, true);
+    await deliverUntilAccepted(first, "bee-codex", 1, 91, "persist codex completion");
     const journal = await waitForJournal(
       first.observationLogPath("bee-codex", 1),
       (text) => text.includes('"method":"thread/status/changed"') && text.includes('"method":"turn/completed"'),
@@ -353,6 +369,66 @@ test("Codex thread/status idle plus turn/completed maps through adoption to one 
     second.stop("bee-codex", 1, "stopped_by_system");
     await drainUntil(second, (events) => ofKind(events, "exited").length > 0);
   } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex adoption restores the durable thread and active turn, then confirms steer and idle delivery", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-codex-adopt-context-"));
+  const first = makeCodexDriver(dir);
+  let second: HsrDriver | null = null;
+  let third: HsrDriver | null = null;
+  try {
+    first.start("bee-codex-adopt", 1);
+    await drainUntil(first, (events) => ofKind(events, "turn_ended").length > 0);
+    const sessionId = first.observeSessions().find((row) => row.beeId === "bee-codex-adopt")?.sessionId;
+    assert.ok(sessionId, "the original daemon learns the Codex thread id");
+
+    await deliverUntilAccepted(first, "bee-codex-adopt", 1, 92, "@slow:10000 original turn");
+    await waitForJournal(
+      first.observationLogPath("bee-codex-adopt", 1),
+      (text) => text.includes('"method":"turn/started"'),
+    );
+    await sleep(70);
+    first.observe();
+    const runningCursor = checkpointOf(first, "bee-codex-adopt");
+    const proc = first.procOf("bee-codex-adopt", 1)!;
+    first.detachAll();
+
+    second = makeCodexDriver(dir);
+    assert.equal(
+      second.adopt("bee-codex-adopt", 1, proc.pid, proc.pidStartedAt, "running", runningCursor, sessionId),
+      true,
+    );
+    await deliverUntilAccepted(second, "bee-codex-adopt", 1, 93, "steered after daemon restart");
+    const logPath = join(dir, "logs", "bee-codex-adopt.jsonl");
+    await waitForJournal(
+      logPath,
+      (text) => text.includes('"method":"turn/steer"') && text.includes("steered after daemon restart"),
+    );
+    assert.deepEqual(second.interrupt("bee-codex-adopt", 1), { interrupted: true });
+    await drainUntil(second, (events) => ofKind(events, "turn_ended").length > 0);
+
+    const idleCursor = checkpointOf(second, "bee-codex-adopt");
+    const sameProc = second.procOf("bee-codex-adopt", 1)!;
+    second.detachAll();
+    third = makeCodexDriver(dir);
+    assert.equal(
+      third.adopt("bee-codex-adopt", 1, sameProc.pid, sameProc.pidStartedAt, "idle", idleCursor, sessionId),
+      true,
+    );
+    await deliverUntilAccepted(third, "bee-codex-adopt", 1, 94, "@slow:200 fresh turn after idle adoption");
+    await drainUntil(third, (events) => ofKind(events, "turn_ended").length > 0);
+    const log = readFileSync(logPath, "utf8");
+    assert.match(log, /"method":"turn\/steer"/);
+    assert.match(log, /"method":"turn\/start"/);
+
+    third.stop("bee-codex-adopt", 1, "stopped_by_system");
+    await drainUntil(third, (events) => ofKind(events, "exited").length > 0);
+  } finally {
+    third?.disposeAll();
     second?.disposeAll();
     first.disposeAll();
     rmSync(dir, { recursive: true, force: true });

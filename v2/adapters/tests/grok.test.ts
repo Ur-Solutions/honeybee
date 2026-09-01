@@ -134,8 +134,13 @@ test("grok: resume handshake uses session/load", () => {
 });
 
 test("grok: encodeMessage needs a session id; prompt result ends the turn", () => {
-  assert.equal(adapter.encodeMessage("hi", { sessionId: null, messageId: 4 }), null);
-  const encoded = JSON.parse(adapter.encodeMessage("hi", { sessionId: "sess-abc", messageId: 4 })!) as Record<string, unknown>;
+  assert.equal(adapter.encodeMessage("hi", { sessionId: null, messageId: 4, turnActive: false, turnId: null }), null);
+  const encoded = JSON.parse(adapter.encodeMessage("hi", {
+    sessionId: "sess-abc",
+    messageId: 4,
+    turnActive: false,
+    turnId: null,
+  })!) as Record<string, unknown>;
   assert.equal(encoded.method, "session/prompt");
   assert.equal(encoded.id, 1004);
   assert.deepEqual(encoded.params, { sessionId: "sess-abc", prompt: [{ type: "text", text: "hi" }] });

@@ -237,6 +237,7 @@ export class CellDriver implements RuntimeDriver {
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
     lastAppliedObservationCursor?: number | null,
+    providerSessionId?: string | null,
   ): boolean {
     return this.inner.adopt(
       beeId,
@@ -245,6 +246,7 @@ export class CellDriver implements RuntimeDriver {
       pidStartedAt,
       lastKnownState,
       lastAppliedObservationCursor,
+      providerSessionId,
     );
   }
 

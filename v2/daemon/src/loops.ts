@@ -833,6 +833,11 @@ export class DaemonCore {
             `deliver.interrupt bee=${bee.id} msg=${urgent.id} gen=${rt.generation} interrupted=${res.interrupted}` +
               (res.reason ? ` reason=${res.reason}` : ""),
           );
+          // A successful interrupt closes the current accept point
+          // asynchronously. Do not race an immediate delivery (Codex would
+          // reject turn/steer after turn/interrupt; tmux could type before
+          // the TUI settles). The observed turn_ended opens the next point.
+          if (res.interrupted) continue;
         }
       }
       const msg = eligible[0] as (typeof eligible)[number];

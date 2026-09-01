@@ -56,7 +56,12 @@ test("stub: text, unknown events and non-JSON → []", () => {
 });
 
 test("stub: encodeMessage carries the mailbox message id verbatim", () => {
-  assert.deepEqual(JSON.parse(stubAdapter.encodeMessage("do the thing", { sessionId: "s", messageId: 42 })!), {
+  assert.deepEqual(JSON.parse(stubAdapter.encodeMessage("do the thing", {
+    sessionId: "s",
+    messageId: 42,
+    turnActive: false,
+    turnId: null,
+  })!), {
     type: "message",
     id: 42,
     body: "do the thing",

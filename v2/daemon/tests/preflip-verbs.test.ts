@@ -65,19 +65,31 @@ async function spawnAndSettle(client: RpcClient, name: string, extra: Record<str
   return spawned.beeId;
 }
 
-async function waitDelivered(client: RpcClient, beeId: string, messageId: number, what: string): Promise<number> {
+async function waitDelivered(
+  client: RpcClient,
+  beeId: string,
+  messageId: number,
+  what: string,
+  timeoutMs = 12_000,
+): Promise<number> {
   return (await waitFor(async () => {
     const { messages } = await client.request<MailboxResult>("mailbox", { beeId });
     const m = messages.find((x) => x.id === messageId);
     return m?.deliveredAt != null ? m.deliveredGeneration : null;
-  }, what, 12_000)) as number;
+  }, what, timeoutMs)) as number;
 }
 
-async function waitState(client: RpcClient, beeId: string, state: string, what: string): Promise<ViewResult> {
+async function waitState(
+  client: RpcClient,
+  beeId: string,
+  state: string,
+  what: string,
+  timeoutMs = 12_000,
+): Promise<ViewResult> {
   return waitFor(async () => {
     const v = await client.request<ViewResult>("view", { beeId });
     return v.view.runtimeState === state ? v : null;
-  }, what, 12_000);
+  }, what, timeoutMs);
 }
 
 test("v6.rpc.1: rename / tag / children round-trips, idempotent replays, typed refusals; snapshot + watch carry the new rows/kinds", async () => {
@@ -330,6 +342,63 @@ test("v6.rpc.4: bee.fork (codex) — the fork's handshake sends thread/fork {thr
     client.close();
   } finally {
     await daemon?.stop();
+    cleanup();
+  }
+});
+
+test("daemon restart: adopted Codex keeps its thread id and confirms queued mail", async () => {
+  const rpcLog = join(process.env.TMPDIR ?? "/tmp", `hb-v6-codex-adopt-${process.pid}-${Date.now()}.jsonl`);
+  const { dir, cleanup } = makeDaemonDir({
+    agents: {
+      codex: { command: process.execPath, args: [FAKE_CODEX, "app-server"], adapter: "codex", env: { FAKE_CODEX_RPC_LOG: rpcLog } },
+    },
+  });
+  let daemon: DaemonHandle | null = null;
+  let client: RpcClient | null = null;
+  let hostPid: number | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+    const spawned = await client.request<SpawnResult>("spawn", { name: "codex-adopt", agent: "codex", cwd: dir });
+    const threadId = await waitFor(
+      async () => (await client!.request<ViewResult>("view", { beeId: spawned.beeId })).bee?.providerSessionId,
+      "codex thread id",
+      30_000,
+    );
+    const before = await waitState(client, spawned.beeId, "idle", "codex idle before restart", 30_000);
+    hostPid = before.runtime?.pid ?? null;
+    assert.ok(hostPid != null && hostPid > 0);
+
+    client.close();
+    client = null;
+    await daemon.kill();
+    daemon = await startDaemon(dir);
+    client = await daemon.client();
+
+    const adopted = await client.request<ViewResult>("view", { beeId: spawned.beeId });
+    assert.equal(adopted.view.generation, 1, "the surviving runtime is adopted, not replaced");
+    assert.equal(adopted.bee?.providerSessionId, threadId);
+    const sent = await client.request<SendRpcResult>("send", { beeId: spawned.beeId, body: "after restart" });
+    assert.equal(
+      await waitDelivered(client, spawned.beeId, sent.messageId, "post-restart Codex delivery", 30_000),
+      1,
+    );
+    await waitFor(
+      async () => jsonl<{ method: string; params: Record<string, unknown> | null }>(rpcLog)
+        .some((call) => call.method === "turn/start" && call.params?.threadId === threadId),
+      "post-restart turn/start targets restored thread",
+      30_000,
+    );
+    await waitState(client, spawned.beeId, "idle", "codex idle after restart", 30_000);
+    await client.request("stop", { beeId: spawned.beeId });
+    await waitState(client, spawned.beeId, "stopped", "codex stopped", 30_000);
+  } finally {
+    client?.close();
+    await daemon?.stop().catch(() => {});
+    if (hostPid != null) {
+      try { process.kill(-hostPid, "SIGKILL"); } catch { /* already stopped */ }
+      try { process.kill(hostPid, "SIGKILL"); } catch { /* already stopped */ }
+    }
     cleanup();
   }
 });

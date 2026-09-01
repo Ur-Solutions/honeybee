@@ -732,6 +732,7 @@ export class HiveDaemon {
         rt.pidStartedAt,
         lastKnownState,
         observationCursor,
+        bee.providerSessionId,
       );
       this.log(`boot.adopt bee=${bee.id} gen=${rt.generation} pid=${rt.pid} ok=${adopted}`);
     }

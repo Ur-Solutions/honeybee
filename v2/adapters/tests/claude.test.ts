@@ -110,7 +110,10 @@ test("claude: adapter surface — mid-turn accept, no boot lines, stable parse i
   const line = fixtureLines()[0]!;
   // Stateless: same line always yields the same signals (normalization is re-derivable, Q1).
   assert.deepEqual(claudeAdapter.parseLine(line), claudeAdapter.parseLine(line));
-  assert.equal(claudeAdapter.encodeMessage("x", { sessionId: null, messageId: 1 }), encodeClaudeMessage("x"));
+  assert.equal(
+    claudeAdapter.encodeMessage("x", { sessionId: null, messageId: 1, turnActive: false, turnId: null }),
+    encodeClaudeMessage("x"),
+  );
 });
 
 test("claude: resumeArgs (spec 07 §F) — `--resume <id>`; init after resume echoes the same session id → booted carries it", () => {

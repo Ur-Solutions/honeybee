@@ -139,6 +139,10 @@ interface ManagedProcess {
   sessionId: string | null;
   /** v6: the harness-native id of the turn in flight (codex turn/started), for turn/interrupt. */
   turnId: string | null;
+  /** RPC deliveries written but not yet accepted by the harness. */
+  pendingDeliveries: Set<number>;
+  /** Durable protocol acknowledgements waiting for the daemon to mark mailbox truth. */
+  confirmedDeliveries: Set<number>;
   /** First requested stop cause; fixes the exit cause of a signaled process. */
   stopCause: StopCause | null;
   killTimer: NodeJS.Timeout | null;
@@ -196,6 +200,77 @@ interface ManagedProcess {
    * spawn-failure budget resets on that, never on the synthetic booted).
    */
   realEvidence: boolean;
+}
+
+interface RecoveredAdapterContext {
+  sessionId: string | null;
+  turnId: string | null;
+  confirmedDeliveries: Set<number>;
+}
+
+/**
+ * Rebuild adapter-local delivery context from the exact generation journal
+ * prefix already committed by core. This is not lifecycle inference from a
+ * rendered transcript: every line is the native output-only protocol stream
+ * and is normalized by the same pure adapter used live.
+ */
+function recoverAdapterContext(
+  adapter: HarnessAdapter,
+  path: string,
+  endOffset: number,
+  providerSessionId: string | null,
+): RecoveredAdapterContext {
+  let sessionId = providerSessionId;
+  let turnId: string | null = null;
+  const confirmedDeliveries = new Set<number>();
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    let offset = 0;
+    let rest = Buffer.alloc(0);
+    while (offset < endOffset) {
+      const wanted = Math.min(256 * 1024, endOffset - offset);
+      const chunk = Buffer.alloc(wanted);
+      const bytesRead = readSync(fd, chunk, 0, wanted, offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
+      const data = rest.length === 0 ? chunk.subarray(0, bytesRead) : Buffer.concat([rest, chunk.subarray(0, bytesRead)]);
+      let lineStart = 0;
+      for (;;) {
+        const newline = data.indexOf(0x0a, lineStart);
+        if (newline < 0) break;
+        let raw = data.subarray(lineStart, newline);
+        if (raw.length > 0 && raw[raw.length - 1] === 0x0d) raw = raw.subarray(0, raw.length - 1);
+        lineStart = newline + 1;
+        if (raw.length === 0) continue;
+        for (const signal of adapter.parseLine(raw.toString("utf8"))) {
+          if (signal.kind === "booted" && signal.sessionId && sessionId == null) {
+            sessionId = signal.sessionId;
+            continue;
+          }
+          if (signal.kind === "delivery_confirmed") {
+            confirmedDeliveries.add(signal.messageId);
+            continue;
+          }
+          if (signal.kind === "delivery_refused") {
+            confirmedDeliveries.delete(signal.messageId);
+            continue;
+          }
+          if (signal.kind !== "turn_started" && signal.kind !== "turn_ended") continue;
+          if (signal.threadId && sessionId && signal.threadId !== sessionId) continue;
+          if (signal.kind === "turn_started") turnId = signal.turnId ?? null;
+          else turnId = null;
+        }
+      }
+      rest = Buffer.from(data.subarray(lineStart));
+    }
+  } catch {
+    // Supplemental context recovery fails closed: durable phase/session truth
+    // still adopts, while turn-addressed delivery refuses until new evidence.
+  } finally {
+    if (fd != null) closeSync(fd);
+  }
+  return { sessionId, turnId, confirmedDeliveries };
 }
 
 export class HsrDriver implements RuntimeDriver {
@@ -323,6 +398,8 @@ export class HsrDriver implements RuntimeDriver {
       phase: "booting",
       sessionId: null,
       turnId: null,
+      pendingDeliveries: new Set(),
+      confirmedDeliveries: new Set(),
       stopCause: null,
       killTimer: null,
       stdoutRest: Buffer.alloc(0),
@@ -442,7 +519,19 @@ export class HsrDriver implements RuntimeDriver {
     if (p.phase === "running" && !p.adapter.acceptsMidTurn) {
       return { accepted: false, reason: "not_ready" };
     }
-    const encoded = p.adapter.encodeMessage(body, { sessionId: p.sessionId, messageId });
+    if (p.adapter.confirmsDelivery) {
+      if (p.confirmedDeliveries.delete(messageId)) {
+        this.consumed.set(messageId, generation);
+        return { accepted: true };
+      }
+      if (p.pendingDeliveries.has(messageId)) return { accepted: false, reason: "not_ready" };
+    }
+    const encoded = p.adapter.encodeMessage(body, {
+      sessionId: p.sessionId,
+      messageId,
+      turnActive: p.phase === "running",
+      turnId: p.turnId,
+    });
     if (encoded == null) return { accepted: false, reason: "not_ready" };
     if (p.hostStyle && p.socketBroken) return { accepted: false, reason: "not_ready" };
     if (!p.hostStyle && (!p.child?.stdin || p.child.stdin.destroyed || !p.child.stdin.writable)) {
@@ -454,8 +543,8 @@ export class HsrDriver implements RuntimeDriver {
     // pipe gave. A host that never comes up exits and rotates the generation,
     // exactly like a child that died after a buffered write.
     this.writeLine(p, encoded);
-    // Ground truth recorded at the accept point, deterministic (spec point 3).
-    this.consumed.set(messageId, generation);
+    if (p.adapter.confirmsDelivery) p.pendingDeliveries.add(messageId);
+    else this.consumed.set(messageId, generation);
     if (p.phase === "idle") {
       // The driver owns the turn_started edge: input was injected into an
       // idle runtime (claude emits no explicit turn-start line; adapters that
@@ -465,7 +554,9 @@ export class HsrDriver implements RuntimeDriver {
       p.phase = "running";
       this.events.push({ beeId, generation, kind: "turn_started", synthetic: true });
     }
-    return { accepted: true };
+    return p.adapter.confirmsDelivery
+      ? { accepted: false, reason: "not_ready" }
+      : { accepted: true };
   }
 
   stop(beeId: string, generation: number, cause: StopCause): { hadProcess: boolean } {
@@ -698,6 +789,7 @@ export class HsrDriver implements RuntimeDriver {
     pidStartedAt: number,
     lastKnownState?: "booting" | "running" | "idle",
     lastAppliedObservationCursor?: number | null,
+    providerSessionId?: string | null,
   ): boolean {
     if (pid <= 0) return false;
     if (this.procs.has(beeId) || this.pendingStarts.has(beeId)) return false;
@@ -726,6 +818,11 @@ export class HsrDriver implements RuntimeDriver {
         let observationPath: string | null;
         let observationOffset: number;
         let legacySharedObservation: boolean;
+        let recovered: RecoveredAdapterContext = {
+          sessionId: providerSessionId ?? null,
+          turnId: null,
+          confirmedDeliveries: new Set(),
+        };
         if (exactGenerationIdentity) {
           let journalSize: number | null = null;
           try {
@@ -744,6 +841,13 @@ export class HsrDriver implements RuntimeDriver {
             observationPath = paths.observations;
             observationOffset = cursor;
             legacySharedObservation = false;
+            if (
+              recovered.sessionId == null
+              || adapter.midTurnMessageNeedsTurnId === true && lastKnownState === "running"
+              || adapter.confirmsDelivery === true
+            ) {
+              recovered = recoverAdapterContext(adapter, observationPath, observationOffset, recovered.sessionId);
+            }
           }
         } else {
           observationPath = this.sessionLogPath(beeId);
@@ -771,8 +875,14 @@ export class HsrDriver implements RuntimeDriver {
             // hint, "running" remains the conservative claim; the next tailed
             // edge corrects it, and elapsed time alone never changes it.
             phase: lastKnownState === "idle" ? "idle" : "running",
-            sessionId: null,
-            turnId: null,
+            // The durable provider thread is a bee fact. Adapter-local active
+            // turn and accepted-request evidence are replayed from the exact
+            // generation journal so a daemon deploy cannot strand either a
+            // mid-turn steer or an acknowledgement in the crash gap.
+            sessionId: recovered.sessionId,
+            turnId: lastKnownState === "running" ? recovered.turnId : null,
+            pendingDeliveries: new Set(),
+            confirmedDeliveries: recovered.confirmedDeliveries,
             stopCause: null,
             killTimer: null,
             stdoutRest: Buffer.alloc(0),
@@ -817,6 +927,8 @@ export class HsrDriver implements RuntimeDriver {
       phase: "running",
       sessionId: null,
       turnId: null,
+      pendingDeliveries: new Set(),
+      confirmedDeliveries: new Set(),
       stopCause: null,
       killTimer: null,
       stdoutRest: Buffer.alloc(0),
@@ -1118,6 +1230,16 @@ export class HsrDriver implements RuntimeDriver {
         if (p.phase !== "running") return;
         p.phase = "idle";
         this.events.push({ beeId: p.beeId, generation: p.generation, kind: "turn_ended" });
+        return;
+      }
+      case "delivery_confirmed": {
+        p.pendingDeliveries.delete(signal.messageId);
+        p.confirmedDeliveries.add(signal.messageId);
+        return;
+      }
+      case "delivery_refused": {
+        p.pendingDeliveries.delete(signal.messageId);
+        p.confirmedDeliveries.delete(signal.messageId);
         return;
       }
       case "flag": {

@@ -1028,16 +1028,18 @@ test("urgency.d4: ordering — urgency governs WHEN a message is eligible; among
     const m2 = rig.store.send("bee-1", "next-2").message;
     const m3 = rig.store.send("bee-1", "idle-3", { urgency: "idle" }).message;
     const m4 = rig.store.send("bee-1", "now-4", { urgency: "now" }).message;
-    // Mid-turn: m1/m3 are held; m2 and m4 are eligible; m2 (older) delivers
-    // first; m4's now-ness still interrupts the turn.
+    // Mid-turn: m1/m3 are held; m2 and m4 are eligible; m4's now-ness
+    // interrupts the turn. Delivery waits for the resulting turn_ended so it
+    // cannot race the interrupt against the old accept point.
     rig.core.step();
-    assert.deepEqual(rig.driver.deliveredIds, [m2.id], "idle does not block a later next");
+    assert.deepEqual(rig.driver.deliveredIds, [], "a successful interrupt defers delivery until turn end");
     assert.deepEqual(rig.driver.interrupts, [{ beeId: "bee-1", generation: 1 }], "the pending now interrupts");
     // The interrupt's turn_ended drains → idle: everything is eligible, FIFO wins.
     rig.core.step();
     rig.core.step();
     rig.core.step();
-    assert.deepEqual(rig.driver.deliveredIds, [m2.id, m1.id, m3.id, m4.id], "enqueue order among eligible");
+    rig.core.step();
+    assert.deepEqual(rig.driver.deliveredIds, [m1.id, m2.id, m3.id, m4.id], "enqueue order among eligible");
   } finally {
     rig.cleanup();
   }

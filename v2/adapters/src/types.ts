@@ -43,6 +43,14 @@ export type AdapterSignal =
    */
   | { kind: "turn_started"; turnId?: string; threadId?: string }
   | { kind: "turn_ended"; threadId?: string }
+  /**
+   * Application-level acknowledgement for a delivered mailbox message.
+   * RPC harnesses emit this only after the provider accepted the request;
+   * the driver keeps the durable mailbox row pending until then.
+   */
+  | { kind: "delivery_confirmed"; messageId: number }
+  /** The RPC request was rejected and may be retried at a later accept point. */
+  | { kind: "delivery_refused"; messageId: number }
   /** Condition-flag evidence. The adapter reports; the daemon decides. */
   | { kind: "flag"; flag: AdapterFlag; action: "set" | "clear"; detail: string }
   /**
@@ -57,6 +65,10 @@ export interface EncodeContext {
   sessionId: string | null;
   /** The mailbox message id being delivered (stable across retries). */
   messageId: number;
+  /** Whether the driver is currently inside a real or synthetic turn. */
+  turnActive: boolean;
+  /** Harness-native id of that active turn, when the protocol reports one. */
+  turnId: string | null;
 }
 
 /** Context the driver supplies when encoding a turn interrupt (v6 `bee.interrupt`). */
@@ -76,6 +88,19 @@ export interface HarnessAdapter {
    * booting refusal.
    */
   readonly acceptsMidTurn: boolean;
+  /**
+   * Whether a mid-turn delivery cannot be encoded until the active native
+   * turn id is known. The HSR driver uses this to recover the id from the
+   * durable observation journal when adopting a surviving runtime.
+   */
+  readonly midTurnMessageNeedsTurnId?: boolean;
+  /**
+   * Whether writing the encoded line is only a request, not yet the harness
+   * accept point. Such adapters emit delivery_confirmed/refused from the
+   * corresponding protocol response; the mailbox is marked delivered only
+   * after confirmation.
+   */
+  readonly confirmsDelivery?: boolean;
   /**
    * Whether the runtime is deliverable the moment it is spawned. claude's
    * stream-json mode emits NOTHING (not even init) until the first user

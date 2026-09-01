@@ -173,11 +173,20 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
       if (err) return errorSignals(String(err.message ?? `codex ${threadRequest.method} failed`));
       return [];
     }
-    // A turn/start request error response (our TURN_REQUEST_ID_BASE+messageId
-    // ids): surface flag evidence; turn-state recovery is the daemon's job.
-    if (typeof msg.id === "number" && msg.id >= TURN_REQUEST_ID_BASE && "error" in msg) {
-      const err = asObject(msg.error);
-      return errorSignals(String(err?.message ?? "codex turn/start failed"));
+    // A delivered-message request response (turn/start or turn/steer). The
+    // JSON-RPC acknowledgement is the application-level accept point: socket
+    // write alone cannot prove a stale expectedTurnId was accepted.
+    if (typeof msg.id === "number" && msg.id >= TURN_REQUEST_ID_BASE) {
+      const messageId = msg.id - TURN_REQUEST_ID_BASE;
+      if (!Number.isSafeInteger(messageId) || messageId < 0) return [];
+      if ("error" in msg) {
+        const err = asObject(msg.error);
+        return [
+          { kind: "delivery_refused", messageId },
+          ...errorSignals(String(err?.message ?? "codex turn delivery failed")),
+        ];
+      }
+      if ("result" in msg) return [{ kind: "delivery_confirmed", messageId }];
     }
     return [];
   }
@@ -227,10 +236,11 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
 
   return {
     harness: "codex",
-    // turn/start while a turn is active collides with it (steering is a
-    // different RPC, out of WP3 scope) — the driver refuses mid-turn and the
-    // daemon retries at the next idle.
-    acceptsMidTurn: false,
+    // Codex has a native active-turn accept point: turn/steer with the exact
+    // turn id reported by turn/started.
+    acceptsMidTurn: true,
+    midTurnMessageNeedsTurnId: true,
+    confirmsDelivery: true,
     readyAtSpawn: false,
     bootLines(): string[] {
       return [JSON.stringify({
@@ -243,11 +253,16 @@ export function codexAdapter(opts: CodexAdapterOptions): HarnessAdapter {
     parseLine,
     encodeMessage(body: string, ctx: EncodeContext): string | null {
       if (!ctx.sessionId) return null; // thread id not learned yet → not_ready
+      if (ctx.turnActive && !ctx.turnId) return null; // cannot safely steer without the native precondition
       return JSON.stringify({
         jsonrpc: "2.0",
         id: TURN_REQUEST_ID_BASE + ctx.messageId,
-        method: "turn/start",
-        params: { threadId: ctx.sessionId, input: [{ type: "text", text: body, text_elements: [] }] },
+        method: ctx.turnActive ? "turn/steer" : "turn/start",
+        params: {
+          threadId: ctx.sessionId,
+          input: [{ type: "text", text: body, text_elements: [] }],
+          ...(ctx.turnActive ? { expectedTurnId: ctx.turnId } : {}),
+        },
       });
     },
     // v6 interrupt: `turn/interrupt {threadId, turnId}` (the OLD adapter's
