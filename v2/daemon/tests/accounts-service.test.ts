@@ -300,6 +300,11 @@ test("select.6: rr cycles in registration order, skips auth failures, and does n
 test("limits.0: the real Codex app-server transport returns typed success and authentication failures", async () => {
   const r = rig();
   try {
+    // This smoke includes a real process spawn. Keep its test budget above
+    // the production-path timing assertions exercised with injected clocks;
+    // loaded developer/CI hosts routinely need more than the 750 ms RPC
+    // slice produced by a 1 s aggregate timeout.
+    const smokeTimeoutMs = 5_000;
     const stub = join(r.dir, "codex-stub");
     const writeStub = (messages: unknown[]) => {
       writeFileSync(stub, [
@@ -314,13 +319,13 @@ test("limits.0: the real Codex app-server transport returns typed success and au
       { id: 1, result: {} },
       { id: 2, result: { rateLimits: { primary: { usedPercent: 9, windowDurationMins: 300 } } } },
     ]);
-    assert.deepEqual(await defaultCodexRateLimits(1_000, stub)(home), {
+    assert.deepEqual(await defaultCodexRateLimits(smokeTimeoutMs, stub)(home), {
       ok: true,
       limits: { primary: { usedPercent: 9, windowDurationMins: 300 } },
     });
 
     writeStub([{ id: 1, error: { code: 401, message: "Unauthorized credential" } }]);
-    const failed = await defaultCodexRateLimits(1_000, stub)(home);
+    const failed = await defaultCodexRateLimits(smokeTimeoutMs, stub)(home);
     assert.equal(failed.ok, false);
     if (!failed.ok) {
       assert.equal(failed.unreadableReason, "auth_failed");
