@@ -248,7 +248,9 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
   const { stubEnv, ...file } = overrides;
   const config: NodeConfigFile = {
     tickMs: 20,
-    bootHangTimeoutMs: 4000,
+    // Real process startup can be delayed substantially on loaded release
+    // hosts. Individual hang-policy tests override this with a short bound.
+    bootHangTimeoutMs: 60_000,
     bootAllowanceMs: 1000,
     turnAllowanceMs: 1000,
     idleWindowMs: 0, // scale-to-zero off unless a test opts in

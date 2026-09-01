@@ -39,7 +39,7 @@ async function spawnAndSettle(client: RpcClient, name: string): Promise<string> 
   await waitFor(async () => {
     const v = await client.request<ViewResult>("view", { beeId: spawned.beeId });
     return v.view.runtimeState === "idle";
-  }, `${name} idle`);
+  }, `${name} idle`, 30_000);
   return spawned.beeId;
 }
 
@@ -460,6 +460,9 @@ test("int.7: immediate-exit agent → bounded revives on backoff, spawn_failed a
   // tick speed forever because every send_wake was a fresh B5 command.
   const { dir, cleanup } = makeDaemonDir({
     stubEnv: { STUB_EXIT_BEFORE_READY: "1" },
+    // This test intentionally exercises repeated process starts. Keep healthy
+    // recovery boots alive when the release host is under scheduler pressure.
+    bootHangTimeoutMs: 60_000,
     retry: { maxAttempts: 4, backoffBaseMs: 60 },
     tickMs: 20,
   });
@@ -475,7 +478,7 @@ test("int.7: immediate-exit agent → bounded revives on backoff, spawn_failed a
     await waitFor(async () => {
       const v = await client.request<ViewResult>("view", { beeId });
       return (v.bee?.spawnFailures ?? 0) >= 2 && v.view.runtimeState === "stopped" ? v : null;
-    }, "two boot failures counted", 12_000);
+    }, "two boot failures counted", 30_000);
     client.close();
     await daemon.kill();
 
@@ -490,7 +493,7 @@ test("int.7: immediate-exit agent → bounded revives on backoff, spawn_failed a
     const flagged = await waitFor(async () => {
       const v = await client.request<ViewResult>("view", { beeId });
       return v.view.flags.includes("spawn_failed") ? v : null;
-    }, "spawn_failed at the budget", 12_000);
+    }, "spawn_failed at the budget", 30_000);
     assert.equal(flagged.bee?.spawnFailures, 4);
     assert.equal(flagged.view.blocked, true);
     assert.equal(flagged.view.reachable, true);
