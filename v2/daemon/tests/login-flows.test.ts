@@ -24,7 +24,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACCOUNT_RECIPES, defaultLoginMethodId, loginMethodsFor, openCoreStore, type CoreStore, type LoginFlowRow } from "../../core/src/index.ts";
+import { ACCOUNT_RECIPES, defaultLoginMethodId, loginMethodFor, loginMethodsFor, openCoreStore, type CoreStore, type LoginFlowRow } from "../../core/src/index.ts";
 import { AccountsService } from "../src/accountsService.ts";
 import { loadNodeConfig, type NodeConfigFile, type ResolvedNodeConfig } from "../src/config.ts";
 import { LoginFlowService, LoginFlowRefusal, WORKER_ENV_ALLOWLIST, claudeAuthorizeUrl, legacyLoginSeatName, plausibleApiKey, splitClaudeCode, workerBaseEnv, type LoginTransports } from "../src/loginFlows.ts";
@@ -166,11 +166,15 @@ test("flows.recipes: every registered harness advertises at least one method wit
       }
     }
     assert.ok(defaultLoginMethodId(harness), `${harness} local default`);
-    assert.ok(defaultLoginMethodId(harness, { remote: true }), `${harness} remote default`);
+    const remoteCapable = methods.some((m) => m.remoteCapable);
+    assert.equal(defaultLoginMethodId(harness, { remote: true }) !== null, remoteCapable, `${harness} remote default iff a remote-capable method exists`);
   }
   assert.equal(defaultLoginMethodId("codex"), "codex-browser");
   assert.equal(defaultLoginMethodId("codex", { remote: true }), "codex-device");
   assert.equal(defaultLoginMethodId("codex", { remote: true, requested: "codex-browser" }), null, "loopback method refused remotely");
+  // `grok login` redirects to a 127.0.0.1 callback (fixtures/login/grok-grok-cli.json): browser-on-the-node only.
+  assert.equal(defaultLoginMethodId("grok", { remote: true }), null, "grok's loopback login is refused remotely");
+  assert.equal(loginMethodFor("kimi", "kimi-cli")?.kind, "device_code", "`kimi login` is a device-code flow");
   assert.equal(defaultLoginMethodId("codex", { requested: "nope" }), null);
   assert.equal(defaultLoginMethodId("stub"), null, "no recipe → no method");
   const opencode = loginMethodsFor("opencode")[0]!;

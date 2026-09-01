@@ -174,8 +174,16 @@ function opencodeFields(): LoginFieldDescriptor[] {
   ];
 }
 
-/** Generic cue set for CLIs that print a sign-in URL and may ask for a pasted code or an API key. */
-const GENERIC_URL = "(https?://[^\\s'\"<>)\\]]+)";
+/**
+ * Generic cue set for CLIs that print a sign-in URL and may ask for a pasted
+ * code or an API key. Validated against real vendor output captured with
+ * scripts/capture-login-fixture.ts (v2/daemon/tests/fixtures/login/*.json,
+ * replayed by login-cues.test.ts) — extend the fixtures when a cue changes.
+ */
+// https only: `codex login` first announces its loopback callback server
+// ("Starting local login server on http://localhost:1455") — never the page
+// to open.
+const GENERIC_URL = "(https://[^\\s'\"<>)\\]]+)";
 // A prompt is a line that ENDS in a prompt terminator (`:` / `>`); a device
 // line such as "Enter this one-time code: ABCD-1234" ends in the code and
 // is never an ask.
@@ -183,8 +191,27 @@ const GENERIC_PROMPTS: LoginCliCue[] = [
   { match: "(paste|enter)[^\\n]{0,60}\\b(code|token)\\b[^\\n]{0,40}[:>]\\s*$", field: LOGIN_FIELD_CODE },
   { match: "(paste|enter)[^\\n]{0,60}\\bapi[ -]?key\\b[^\\n]{0,40}[:>]\\s*$", field: LOGIN_FIELD_API_KEY },
 ];
-const GENERIC_USER_CODE = "\\b(?:code|enter)[^\\n]{0,40}?\\b([A-Z0-9]{4,6}-[A-Z0-9]{4,6})\\b";
+// The code may sit on the line AFTER the ask (`codex login --device-auth`
+// prints "Enter this one-time code (expires in 15 minutes)\n   ABCD-12345").
+const GENERIC_USER_CODE = "\\b(?:code|enter)[^\\n]{0,60}?(?:\\n[ \\t]*)?\\b([A-Z0-9]{4,6}-[A-Z0-9]{4,6})\\b";
 const GENERIC_FAILURE = ["\\b(login|authentication|authorization) (failed|error|denied)\\b", "\\binvalid (code|token|api key)\\b"];
+
+/**
+ * `grok login` opens the browser against a loopback callback
+ * (`redirect_uri=http://127.0.0.1:<port>/callback`) and, for a browser that
+ * cannot reach this computer, asks for the address it landed on — that
+ * address carries the authorization code, so it is a secret.
+ */
+const GROK_FIELD_CALLBACK_URL: LoginFieldDescriptor = field({
+  id: "callbackUrl",
+  label: "Redirect address",
+  help: "Only if the browser could not connect back to this computer: paste the address it landed on after you approved access.",
+  required: false,
+  secret: true,
+  inputType: "password",
+  placeholder: "http://127.0.0.1:…/callback?code=…",
+});
+const GROK_PROMPTS: LoginCliCue[] = [{ match: "paste the url[^\\n]{0,80}[:>]\\s*$", field: GROK_FIELD_CALLBACK_URL }, ...GENERIC_PROMPTS];
 
 export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   claude: {
@@ -296,7 +323,9 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   grok: {
     credentialFiles: ["auth.json"],
     configFiles: ["config.toml"],
-    login: { command: "grok", args: [] },
+    // Grok 1.0.x has a native `grok login` (PKCE in the browser, loopback
+    // callback); the bare TUI's welcome-screen login is no longer the path.
+    login: { command: "grok", args: ["login"] },
     loginFlow: {
       defaultMethodId: "grok-cli",
       methods: [
@@ -304,15 +333,16 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
           id: "grok-cli",
           kind: "browser_code",
           label: "Sign in with Grok",
-          description: "Approve access in your browser; paste back a code if Grok asks for one.",
-          remoteCapable: true,
-          fields: [],
+          description: "Approve access in your browser; Grok finishes the sign-in on this computer.",
+          // The callback is a loopback listener on the node — the browser must run there.
+          remoteCapable: false,
+          fields: [GROK_FIELD_CALLBACK_URL],
           run: {
             mode: "cli",
             cli: {
               tty: true,
               env: { BROWSER: "true" },
-              cues: { url: GENERIC_URL, userCode: GENERIC_USER_CODE, prompts: GENERIC_PROMPTS, failure: GENERIC_FAILURE },
+              cues: { url: GENERIC_URL, prompts: GROK_PROMPTS, failure: GENERIC_FAILURE },
               landing: "home_mtime",
             },
           },
@@ -323,15 +353,17 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   kimi: {
     credentialFiles: ["credentials/kimi-code.json"],
     configFiles: ["config.toml", "tui.toml"],
-    login: { command: "kimi", args: [] },
+    // Kimi Code CLI 0.34+ has a native `kimi login` — a device-code flow
+    // (prints the authorize URL + one-time code, then polls).
+    login: { command: "kimi", args: ["login"] },
     loginFlow: {
       defaultMethodId: "kimi-cli",
       methods: [
         {
           id: "kimi-cli",
-          kind: "browser_code",
+          kind: "device_code",
           label: "Sign in with Kimi",
-          description: "Approve access in your browser; enter the code Kimi shows if it asks for one.",
+          description: "Open the sign-in page anywhere and enter the code shown here.",
           remoteCapable: true,
           fields: [],
           run: {
@@ -339,7 +371,7 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
             cli: {
               tty: true,
               env: { BROWSER: "true" },
-              cues: { url: GENERIC_URL, userCode: GENERIC_USER_CODE, prompts: GENERIC_PROMPTS, failure: GENERIC_FAILURE },
+              cues: { url: GENERIC_URL, userCode: GENERIC_USER_CODE, prompts: [], failure: GENERIC_FAILURE },
               landing: "home_mtime",
             },
           },

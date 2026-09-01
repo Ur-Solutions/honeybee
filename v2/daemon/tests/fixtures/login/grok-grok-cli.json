@@ -1,0 +1,37 @@
+{
+  "harness": "grok",
+  "methodId": "grok-cli",
+  "command": [
+    "grok",
+    "login"
+  ],
+  "backend": "pty",
+  "cliVersion": "grok 1.0.5 (5115b46bc909)",
+  "capturedAt": "2026-08-30",
+  "captureMs": 10000,
+  "exit": {
+    "code": null,
+    "signal": "SIGTERM"
+  },
+  "parsed": {
+    "url": "https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492-073a-47ea-816f-4c329264a828&redirect_uri=http%3A%2F%2F127.0.0.1%3A53876%2Fcallback&scope=openid%20profile%20email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess%20conversations%3Aread%20conversations%3Awrite%20workspaces%3Aread%20workspaces%3Awrite&code_challenge=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_xx&code_challenge_method=S256&state=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&nonce=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&referrer=grok-build",
+    "userCode": null,
+    "prompt": "callbackUrl",
+    "failure": null
+  },
+  "expect": {
+    "url": "https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492-073a-47ea-816f-4c329264a828&redirect_uri=http%3A%2F%2F127.0.0.1%3A53876%2Fcallback&scope=openid%20profile%20email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess%20conversations%3Aread%20conversations%3Awrite%20workspaces%3Aread%20workspaces%3Awrite&code_challenge=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_xx&code_challenge_method=S256&state=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&nonce=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&referrer=grok-build",
+    "userCode": null,
+    "prompt": "callbackUrl"
+  },
+  "chunks": [
+    {
+      "t": 3823,
+      "data": "\r\nSigning in with Grok...\r\n\r\n"
+    },
+    {
+      "t": 4151,
+      "data": "Open this URL to sign in:\r\n  https://auth.x.ai/oauth2/authorize?response_type=code&client_id=b1a00492-073a-47ea-816f-4c329264a828&redirect_uri=http%3A%2F%2F127.0.0.1%3A53876%2Fcallback&scope=openid%20profile%20email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess%20conversations%3Aread%20conversations%3Awrite%20workspaces%3Aread%20workspaces%3Awrite&code_challenge=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_xx&code_challenge_method=S256&state=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&nonce=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&referrer=grok-build\r\n\r\nPaste the URL here if it doesn't connect:\r\n"
+    }
+  ]
+}

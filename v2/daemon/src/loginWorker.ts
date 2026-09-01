@@ -227,9 +227,22 @@ export interface LoginOutputParserOptions {
 }
 
 const DEFAULT_URL_CUE = "(https?://[^\\s'\"<>)\\]]+)";
+/** How much of the cleaned tail the URL / code cues see (a few screen lines; the tail itself is bounded separately). */
+const CONTEXT_CHARS = 4096;
 
-function compile(source: string): RegExp {
-  return new RegExp(source, "i");
+function compile(source: string, flags = "i"): RegExp {
+  return new RegExp(source, flags);
+}
+
+/** The last match of a global regex in `text` (the most recently printed URL / code wins). */
+function lastMatch(re: RegExp, text: string): RegExpExecArray | null {
+  let last: RegExpExecArray | null = null;
+  re.lastIndex = 0;
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    last = m;
+    if (m[0].length === 0) re.lastIndex += 1;
+  }
+  return last;
 }
 
 /**
@@ -253,10 +266,10 @@ export class LoginOutputParser {
   private current: ParsedLoginState = { url: null, userCode: null, prompt: null, failure: null };
 
   constructor(opts: LoginOutputParserOptions) {
-    this.urlRe = compile(opts.cues.url ?? DEFAULT_URL_CUE);
-    this.codeRe = opts.cues.userCode ? compile(opts.cues.userCode) : null;
+    this.urlRe = compile(opts.cues.url ?? DEFAULT_URL_CUE, "gi");
+    this.codeRe = opts.cues.userCode ? compile(opts.cues.userCode, "gi") : null;
     this.prompts = opts.cues.prompts.map((cue) => ({ re: compile(cue.match), cue }));
-    this.failures = (opts.cues.failure ?? []).map(compile);
+    this.failures = (opts.cues.failure ?? []).map((source) => compile(source));
     this.maxTail = opts.maxTailChars ?? 16_384;
     this.settleMs = opts.settleMs ?? 200;
   }
@@ -317,10 +330,15 @@ export class LoginOutputParser {
   }
 
   private scan(text: string, isPending: boolean): void {
-    // URL: the first one wins; a DIFFERENT later URL is a reissue. A URL that
-    // is still being written (the pending line ends inside it) waits for the
-    // line to settle.
-    const urlMatch = this.urlRe.exec(text);
+    // URL and code are matched against the recent TAIL, not just the new
+    // text: real CLIs split "Enter this one-time code" and the code line
+    // across writes, and a URL's line may complete in a later chunk. The
+    // most recently printed value wins, so a DIFFERENT later URL is a
+    // reissue and a redraw of the same one is not a change.
+    const context = (isPending ? this.tail + text : this.tail).slice(-CONTEXT_CHARS);
+    // A URL that is still being written (the pending line ends inside it)
+    // waits for the line to settle.
+    const urlMatch = lastMatch(this.urlRe, context);
     if (urlMatch) {
       const url = (urlMatch[1] ?? urlMatch[0]).replace(/[.,;:]+$/, "");
       if (this.current.url !== url) this.current = { ...this.current, url };
@@ -328,7 +346,7 @@ export class LoginOutputParser {
     if (this.codeRe) {
       // Never read a device code out of a URL path segment, and codes are
       // upper-case by convention (the cue regex itself is case-insensitive).
-      const codeMatch = this.codeRe.exec(text.replace(/https?:\/\/[^\s'"<>)\]]+/g, " "));
+      const codeMatch = lastMatch(this.codeRe, context.replace(/https?:\/\/[^\s'"<>)\]]+/g, " "));
       const code = codeMatch?.[1] ?? null;
       if (code && code === code.toUpperCase() && this.current.userCode !== code) this.current = { ...this.current, userCode: code };
     }

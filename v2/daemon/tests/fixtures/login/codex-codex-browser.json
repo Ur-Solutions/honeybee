@@ -1,0 +1,33 @@
+{
+  "harness": "codex",
+  "methodId": "codex-browser",
+  "command": [
+    "codex",
+    "login"
+  ],
+  "backend": "pipe",
+  "cliVersion": "codex-cli 0.149.1",
+  "capturedAt": "2026-08-30",
+  "captureMs": 6000,
+  "exit": {
+    "code": 0,
+    "signal": null
+  },
+  "parsed": {
+    "url": "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&code_challenge=xxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxx&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&originator=codex_cli_rs",
+    "userCode": null,
+    "prompt": null,
+    "failure": null
+  },
+  "expect": {
+    "url": "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&code_challenge=xxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxx&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&originator=codex_cli_rs",
+    "userCode": null,
+    "prompt": null
+  },
+  "chunks": [
+    {
+      "t": 381,
+      "data": "Starting local login server on http://localhost:1455.\nIf your browser did not open, navigate to this URL to authenticate:\n\nhttps://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&code_challenge=xxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxx&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&originator=codex_cli_rs\n\nOn a remote or headless machine? Use `codex login --device-auth` instead.\n"
+    }
+  ]
+}

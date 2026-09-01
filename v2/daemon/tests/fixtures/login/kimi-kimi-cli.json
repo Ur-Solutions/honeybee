@@ -1,0 +1,33 @@
+{
+  "harness": "kimi",
+  "methodId": "kimi-cli",
+  "command": [
+    "kimi",
+    "login"
+  ],
+  "backend": "pty",
+  "cliVersion": "0.34.0",
+  "capturedAt": "2026-08-30",
+  "captureMs": 25000,
+  "exit": {
+    "code": null,
+    "signal": "SIGTERM"
+  },
+  "parsed": {
+    "url": "https://www.kimi.com/code/authorize_device?user_code=xxxx-xxxx",
+    "userCode": "XX0X-XXX0",
+    "prompt": null,
+    "failure": null
+  },
+  "expect": {
+    "url": "https://www.kimi.com/code/authorize_device?user_code=xxxx-xxxx",
+    "userCode": "XX0X-XXX0",
+    "prompt": null
+  },
+  "chunks": [
+    {
+      "t": 15909,
+      "data": "\r\nOpening browser for Kimi device login: https://www.kimi.com/code/authorize_device?user_code=xxxx-xxxx\r\nIf the browser did not open, paste the URL above and enter code: XX0X-XXX0\r\nCode expires in 1800s.\r\nWaiting for authorization to complete...\r\n"
+    }
+  ]
+}
