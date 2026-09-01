@@ -39,6 +39,7 @@ import {
   isTaskTransitionAction,
   MESSAGE_URGENCIES,
   openCoreStore,
+  recipeFor,
   resolveExecutable,
   resolveSpawnCommand,
   TASK_TRANSITION_ACTIONS,
@@ -52,6 +53,7 @@ import {
   type Urgency,
 } from "../../core/src/index.ts";
 import { AccountsService, type LimitsFetchers } from "./accountsService.ts";
+import { dirHasCredentials } from "./activation.ts";
 import { LoginFlowService, type LoginTransports } from "./loginFlows.ts";
 import type { PtySpawner } from "./loginWorker.ts";
 import type { KeychainReader, KeychainWriter } from "./keychain.ts";
@@ -2064,10 +2066,15 @@ export class HiveDaemon {
 
   private rpcAccountList(params: Record<string, unknown>): AccountListResult {
     const store = this.mustStore();
+    const accounts = this.mustAccounts();
     const harness = typeof params.harness === "string" && params.harness.length > 0 ? params.harness : undefined;
-    const accounts = store.listAccounts(harness ? { harness } : {});
-    const ids = new Set(accounts.map((a) => a.id));
-    return { accounts, limits: store.listAccountLimits().filter((l) => ids.has(l.account)) };
+    const rows = store.listAccounts(harness ? { harness } : {});
+    const ids = new Set(rows.map((a) => a.id));
+    return {
+      accounts: rows,
+      limits: store.listAccountLimits().filter((l) => ids.has(l.account)),
+      credentialHealth: Object.fromEntries(rows.map((a) => [a.id, accounts.credentialHealthOf(a)])),
+    };
   }
 
   private rpcAccountGet(params: Record<string, unknown>): AccountGetResult {
@@ -2078,6 +2085,7 @@ export class HiveDaemon {
       limits: store.getAccountLimits(account.id),
       bees: store.beesOnAccount(account.id).map((b) => b.id),
       credentialed: this.mustAccounts().credentialed(account),
+      credentialHealth: this.mustAccounts().credentialHealthOf(account),
       loginFlow: store.latestLoginFlow(account.id),
     };
   }
@@ -2091,16 +2099,40 @@ export class HiveDaemon {
 
   private rpcAccountAdd(params: Record<string, unknown>): AccountAddResult {
     const store = this.mustStore();
+    const accounts = this.mustAccounts();
     const harness = this.param(params, "harness");
     const label = this.param(params, "label");
     const id = typeof params.id === "string" && params.id.length > 0 ? params.id : accountIdFor(harness, label);
-    const homePath = typeof params.homePath === "string" && params.homePath.length > 0 ? resolve(params.homePath) : this.mustAccounts().defaultHomeOf(id);
+    const homePath = typeof params.homePath === "string" && params.homePath.length > 0 ? resolve(params.homePath) : accounts.defaultHomeOf(id);
     const penalty = params.penalty === undefined ? 0 : params.penalty;
     if (typeof penalty !== "number") throw new RpcError("invalid_request", "account.add: penalty must be a number");
+    const importExisting = params.importExisting === undefined ? false : params.importExisting;
+    if (typeof importExisting !== "boolean") throw new RpcError("invalid_request", "account.add: importExisting must be a boolean");
     if (store.getAccount(id)) throw new RpcError("invalid_request", `account already exists: ${id}`);
+    // F2: a fresh account starts LOGGED OUT. Pre-existing credentials at the
+    // home (a machine's live harness home handed in as homePath) or in a
+    // leftover vault entry for this id would be silently adopted by the
+    // credentialed()/activation machinery — that adoption must be an explicit
+    // choice, and even then it is `unverified` until something validates it.
+    const recipe = recipeFor(harness);
+    if (recipe && !importExisting) {
+      const found: string[] = [];
+      if (dirHasCredentials(homePath, recipe)) found.push(`home ${homePath}`);
+      const vaultDir = accounts.vaultDirOf({ harness, id });
+      if (dirHasCredentials(vaultDir, recipe)) found.push(`vault ${vaultDir}`);
+      if (found.length > 0) {
+        throw new RpcError(
+          "account_home_populated",
+          `account.add: existing ${harness} credentials found (${found.join("; ")}); a new account starts logged out — ` +
+            `log in fresh with account.login, or pass importExisting:true to adopt them ` +
+            `(may sign the machine's regular ${harness} CLI out: refresh tokens rotate on use)`,
+        );
+      }
+    }
     const account = store.createAccount({ id, harness, label, homePath, penalty });
-    this.log(`account.add id=${id} harness=${harness} home=${homePath}`);
-    return { account };
+    const credentialHealth = accounts.credentialHealthOf(account);
+    this.log(`account.add id=${id} harness=${harness} home=${homePath} importExisting=${importExisting} credentialHealth=${credentialHealth}`);
+    return { account, credentialHealth };
   }
 
   private rpcAccountStatus(params: Record<string, unknown>, status: "paused" | "ok"): AccountUpdateResult {

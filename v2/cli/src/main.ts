@@ -273,6 +273,8 @@ const BOOL_FLAGS = new Set([
   "--yolo",
   "--no-yolo",
   "--no-preamble",
+  // F2: account add — adopting pre-existing harness credentials is explicit.
+  "--import-existing",
 ]);
 
 const KNOWN_FLAGS = new Set([...VALUE_FLAGS, ...BOOL_FLAGS, ...OPTIONAL_VALUE_FLAGS]);
@@ -636,7 +638,7 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
 
 
 const ACCOUNT_USAGE =
-  "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
+  "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n] [--import-existing]\n" +
   "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100>\n" +
   "       hive account login <selector> [--method <id>] [--remote] [--no-wait] | login-status <selector> | login-cancel <selector>\n" +
   "       hive account capture <selector> | limits [<selector>]\n" +
@@ -769,16 +771,20 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
           ...(parsed.flags.has("--id") ? { id: parsed.flags.get("--id") as string } : {}),
           ...(parsed.flags.has("--home") ? { homePath: resolve(parsed.flags.get("--home") as string) } : {}),
           ...(penaltyFlag !== undefined ? { penalty: Number(penaltyFlag) } : {}),
+          ...(parsed.flags.get("--import-existing") === true ? { importExisting: true } : {}),
           idempotencyKey: key,
         }),
       );
+      const health = r.credentialHealth === "unverified"
+        ? " — adopted existing credentials (unverified until a login/capture/limits probe)"
+        : ` — log in with: hive account login ${r.account.id}`;
       emit(
         ctx,
         [
           confirm(
             "ok",
             "added",
-            `account ${r.account.id} (${r.account.harness}; home ${r.account.homePath}) — log in with: hive account login ${r.account.id}`,
+            `account ${r.account.id} (${r.account.harness}; home ${r.account.homePath})${health}`,
             r.deduped,
           ),
         ],

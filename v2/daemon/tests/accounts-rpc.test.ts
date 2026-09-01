@@ -262,8 +262,9 @@ test("rpc.accounts.2: bee.swapAccount (fake-claude) — same-harness stop → re
     seedVault(dir, "claude", "claude-b", ".credentials.json", '{"claudeAiOauth":{"accessToken":"b","expiresAt":1}}');
     daemon = await startDaemon(dir);
     const client = await daemon.client();
-    await client.request("account.add", { harness: "claude", label: "a" });
-    await client.request("account.add", { harness: "claude", label: "b" });
+    // Pre-seeded vaults = existing credentials: adoption is explicit (F2).
+    await client.request("account.add", { harness: "claude", label: "a", importExisting: true });
+    await client.request("account.add", { harness: "claude", label: "b", importExisting: true });
     await client.request("account.add", { harness: "codex", label: "c" });
     const homeA = join(dir, "homes", "claude-a");
     const homeB = join(dir, "homes", "claude-b");
@@ -355,8 +356,8 @@ test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) 
     seedVault(dir, "claude", "claude-b", ".credentials.json");
     daemon = await startDaemon(dir);
     const client = await daemon.client();
-    await client.request("account.add", { harness: "claude", label: "a" });
-    await client.request("account.add", { harness: "claude", label: "b" });
+    await client.request("account.add", { harness: "claude", label: "a", importExisting: true });
+    await client.request("account.add", { harness: "claude", label: "b", importExisting: true });
     const homeB = join(dir, "homes", "claude-b");
 
     // 1) rotation: a bee on A hits the wall → swapped to B → next turn on B
@@ -419,6 +420,60 @@ test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) 
     await waitDelivered(client, au.beeId, a2.messageId, "authenticated turn delivered");
     await waitFor(async () => (await client.request<AccountGetResult>("account.get", { id: "claude-b" })).account.status === "ok" ? true : null, "account back to ok");
     await waitFor(async () => !(await client.request<ViewResult>("view", { beeId: au.beeId })).view.flags.includes("auth_needed") ? true : null, "bee flag cleared");
+    client.close();
+  } finally {
+    if (daemon) await daemon.stop();
+    cleanup();
+  }
+});
+
+test("rpc.accounts.f2: add refuses pre-existing credentials by default; importExisting adopts as unverified; health is validation evidence, never file-existence", async () => {
+  const { dir, cleanup } = makeDaemonDir();
+  let daemon: DaemonHandle | null = null;
+  try {
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+
+    // The F2 shape: a machine home that already holds harness credentials
+    // (the wizard handing in ~/.codex). Default add must refuse — a fresh
+    // account starts logged out, and adopting a stale login is a choice.
+    const machineHome = join(dir, "machine-codex-home");
+    mkdirSync(machineHome, { recursive: true });
+    writeFileSync(join(machineHome, "auth.json"), '{"tokens":{"access_token":"stale-april"}}');
+    await rejects(
+      () => client.request("account.add", { harness: "codex", label: "adopt", homePath: machineHome }),
+      "account_home_populated",
+    );
+
+    // A leftover vault entry for the id is the same silent import.
+    seedVault(dir, "codex", "codex-ghost", "auth.json");
+    await rejects(() => client.request("account.add", { harness: "codex", label: "ghost" }), "account_home_populated");
+
+    // Explicit opt-in adopts — and the credential is UNVERIFIED, not ok-shaped.
+    const adopted = await client.request<AccountAddResult>("account.add", {
+      harness: "codex",
+      label: "adopt",
+      homePath: machineHome,
+      importExisting: true,
+    });
+    assert.equal(adopted.credentialHealth, "unverified");
+    const got = await client.request<AccountGetResult>("account.get", { id: adopted.account.id });
+    assert.equal(got.credentialed, true);
+    assert.equal(got.credentialHealth, "unverified", "a credential FILE existing is not health");
+
+    // A default fresh add: empty home, empty vault, health absent.
+    const fresh = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "fresh" });
+    assert.equal(fresh.credentialHealth, "absent");
+    const list = await client.request<AccountListResult>("account.list", { harness: "codex" });
+    assert.equal(list.credentialHealth[adopted.account.id], "unverified");
+    assert.equal(list.credentialHealth[fresh.account.id], "absent");
+
+    // Real validation evidence upgrades honestly: an explicit capture
+    // validates the credential and records the login.
+    const captured = await client.request<AccountCaptureResult>("account.capture", { id: adopted.account.id });
+    assert.ok(captured.account.lastLoginAt != null);
+    const verified = await client.request<AccountGetResult>("account.get", { id: adopted.account.id });
+    assert.equal(verified.credentialHealth, "verified");
     client.close();
   } finally {
     if (daemon) await daemon.stop();

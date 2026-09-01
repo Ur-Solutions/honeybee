@@ -39,6 +39,7 @@ import {
   type ClaudeUsageResponse,
   type CodexLiveRateLimits,
   type CoreStore,
+  type CredentialHealth,
   type PutAccountLimitsInput,
   type WindowUsage,
 } from "../../core/src/index.ts";
@@ -396,6 +397,22 @@ export class AccountsService {
     const recipe = recipeFor(account.harness);
     if (!recipe) return true;
     return dirHasCredentials(this.vaultDirOf(account), recipe) || dirHasCredentials(account.homePath, recipe);
+  }
+
+  /**
+   * F2 honesty: "a credential file exists" is not account health. Derived,
+   * never stored — `absent` (no primary credential anywhere), `unverified`
+   * (file present, zero validation evidence: the shape an importExisting
+   * add or an adopted pre-existing home starts in), `verified` (a recorded
+   * login/capture or a readable limits probe once proved the credential).
+   * A later auth failure lives on `status` (`auth_needed`), which clients
+   * must render over a historical `verified`.
+   */
+  credentialHealthOf(account: AccountRow): CredentialHealth {
+    if (!this.credentialed(account)) return "absent";
+    if (account.lastLoginAt != null) return "verified";
+    if (this.store.getAccountLimits(account.id)?.readable === true) return "verified";
+    return "unverified";
   }
 
   // -------------------------------------------------------------------------

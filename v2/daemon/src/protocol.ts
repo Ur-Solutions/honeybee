@@ -19,6 +19,7 @@
 import type {
   AuditRow,
   BeeRow,
+  CredentialHealth,
   ExecutableResolutionSource,
   LoginFlowRow,
   MirrorAccountLimitsRow,
@@ -104,6 +105,13 @@ export const RPC_ERROR_CODES = [
   "login_flow_refused",
   /** v16: the harness has no login recipe or the requested method is not offered (or not remote-capable). */
   "login_method_unsupported",
+  /**
+   * F2: `account.add` without `importExisting:true` found pre-existing
+   * harness credentials at the account's home (or a leftover vault entry) —
+   * a fresh account must start logged out; adopting a machine's existing
+   * login is an explicit choice, never a default.
+   */
+  "account_home_populated",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -274,6 +282,8 @@ export interface SpawnResult extends DedupMarkers {
 export interface AccountListResult {
   accounts: MirrorAccountRow[];
   limits: MirrorAccountLimitsRow[];
+  /** F2: derived credential-validation evidence per account id (see CredentialHealth). */
+  credentialHealth: Record<string, CredentialHealth>;
 }
 
 /** `account.get {id}` — id accepts an exact/unique fuzzy selector; `account_not_found` when absent. */
@@ -284,16 +294,30 @@ export interface AccountGetResult {
   bees: string[];
   /** Whether the vault / home hold the harness's primary credential. */
   credentialed: boolean;
+  /** F2: a file existing is not health — the derived validation evidence. */
+  credentialHealth: CredentialHealth;
   /** v16: the account's current login flow (active or its latest outcome), if any. */
   loginFlow: MirrorLoginFlowRow | null;
 }
 
 /**
- * `account.add {harness, label, id?, homePath?, penalty?}` — id defaults to
- * `<harness>-<safe(label)>`, homePath to `<homesDir>/<id>`. Audit account.put.
+ * `account.add {harness, label, id?, homePath?, penalty?, importExisting?}` —
+ * id defaults to `<harness>-<safe(label)>`, homePath to `<homesDir>/<id>`.
+ * Audit account.put.
+ *
+ * F2: a fresh account starts LOGGED OUT (empty vault; credentials arrive
+ * through the typed `account.login.*` flows). When the home (or a leftover
+ * vault entry for the id) already holds the harness's primary credential,
+ * the add is refused with `account_home_populated` unless
+ * `importExisting:true` explicitly opts into adopting those credentials —
+ * which are then reported as `credentialHealth:"unverified"` until a
+ * login/capture/limits probe actually validates them. Import can sign the
+ * machine's regular CLI out of that provider (refresh tokens rotate on use).
  */
 export interface AccountAddResult extends DedupMarkers {
   account: MirrorAccountRow;
+  /** `unverified` after an importExisting adoption; `absent` for a fresh logged-out account. */
+  credentialHealth: CredentialHealth;
 }
 
 /** `account.remove {id}` — id is a selector; `account_referenced` while bees carry it. */

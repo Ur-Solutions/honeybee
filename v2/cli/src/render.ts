@@ -291,7 +291,8 @@ export function renderAccountGet(r: AccountGetResult): string[] {
   const lines = [accountLine(r.account, r.limits ?? undefined, false)];
   const bees = r.bees.length > 0 ? r.bees.join(",") : "-";
   const flow = r.loginFlow ? `  login=${r.loginFlow.phase}${r.loginFlow.methodId ? ` (${r.loginFlow.methodId})` : ""}` : "";
-  lines.push(`  ${dim("credentialed=")}${r.credentialed ? green("true") : dim("false")}  ${dim("bees=")}${bees}${flow}`);
+  const health = r.credentialHealth === "verified" ? green("verified") : r.credentialHealth === "unverified" ? yellow("unverified") : dim("absent");
+  lines.push(`  ${dim("credentials=")}${health}  ${dim("bees=")}${bees}${flow}`);
   return lines;
 }
 

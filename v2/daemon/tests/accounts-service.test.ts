@@ -958,3 +958,39 @@ test("import.2 (READ-ONLY): a dry-run of the importer against the REAL ~/.hive p
     r.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// credential health (F2): validation evidence, never file-existence
+// ---------------------------------------------------------------------------
+
+test("health.1: credentialHealthOf — absent without a primary credential; a file alone is unverified; login or a readable limits probe verify", () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+
+    // No vault, no home: absent.
+    const bare = r.store.createAccount({ id: "codex-bare", harness: "codex", homePath: join(r.homes, "codex-bare"), label: "bare" });
+    assert.equal(svc.credentialHealthOf(bare), "absent");
+
+    // A credential FILE (vault or home) with zero validation evidence: unverified.
+    const filed = addAccount(r, "codex", "filed");
+    assert.equal(svc.credentialHealthOf(filed), "unverified");
+
+    // A recorded login (login flow / explicit capture) is validation evidence.
+    const login = r.store.recordAccountLogin(filed.id).account;
+    assert.equal(svc.credentialHealthOf(login), "verified");
+
+    // A readable limits probe is validation evidence too (probe == auth check).
+    const probed = addAccount(r, "codex", "probed");
+    assert.equal(svc.credentialHealthOf(probed), "unverified");
+    limitsRow(r, probed.id, 10, 5, r.now() + 3 * HOUR);
+    assert.equal(svc.credentialHealthOf(probed), "verified");
+
+    // An UNREADABLE limits row proves nothing: still unverified.
+    const failed = addAccount(r, "codex", "failed");
+    r.store.putAccountLimits(failed.id, { readable: false, unreadableReason: "auth_failed", error: "401" });
+    assert.equal(svc.credentialHealthOf(failed), "unverified");
+  } finally {
+    r.cleanup();
+  }
+});

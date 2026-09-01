@@ -245,6 +245,19 @@ export interface AuditRow {
 export const ACCOUNT_STATUSES = ["ok", "auth_needed", "paused"] as const;
 export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 
+/**
+ * Credential-validation evidence for an account (cohort-0 F2): a credential
+ * FILE existing is not health. Closed vocabulary, derived — never stored:
+ *  - `absent`: no primary credential in the account's vault or home.
+ *  - `unverified`: a credential file exists but no validation evidence was
+ *    ever recorded (typical after an explicit importExisting account.add).
+ *  - `verified`: a completed login/capture or a readable limits probe proved
+ *    the credential once worked (a LATER failure shows as status
+ *    `auth_needed`, which outranks this for rendering).
+ */
+export const CREDENTIAL_HEALTHS = ["absent", "unverified", "verified"] as const;
+export type CredentialHealth = (typeof CREDENTIAL_HEALTHS)[number];
+
 /** Why a limits snapshot is unreadable. Keep this closed so clients never infer from prose. */
 export const ACCOUNT_LIMITS_UNREADABLE_REASONS = [
   "unsupported",
