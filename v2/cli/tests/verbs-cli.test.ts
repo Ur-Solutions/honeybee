@@ -728,7 +728,7 @@ test("verbs.xa: v1 shape is <agent> (not a bee name); refuses pane-less substrat
 });
 
 test("verbs.attach: refuses hsr/cell bees with the v2 guidance; tmux bees get the recorded session (via --print)", async () => {
-  const { dir, cleanup } = makeDaemonDir();
+  const { dir, cleanup } = makeDaemonDir({ bootHangTimeoutMs: 60_000 });
   let daemon: DaemonHandle | null = null;
   try {
     daemon = await startDaemon(dir);

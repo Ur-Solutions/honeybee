@@ -320,7 +320,10 @@ test("cli.4c: per-bee args — `spawn --arg` (repeatable), `bee set-args <bee> -
 test("cli.4d: cells — `spawn --substrate cell --origin`, `cell capture --onto` (landed / refused as results), `cell remove` (refused-dirty exit 2, --force)", async () => {
   const root = mkdtempSync(join(tmpdir(), "hb-v2-cli-cells-"));
   const origin = makeOrigin(root);
-  const { dir, cleanup } = makeDaemonDir({ cells: { root: join(root, "cells") } });
+  const { dir, cleanup } = makeDaemonDir({
+    bootHangTimeoutMs: 60_000,
+    cells: { root: join(root, "cells") },
+  });
   let daemon: DaemonHandle | null = null;
   try {
     daemon = await startDaemon(dir);
@@ -348,7 +351,7 @@ test("cli.4d: cells — `spawn --substrate cell --origin`, `cell capture --onto`
       return v.view?.runtimeState === "idle" && v.bee?.substrate === "cell";
     // Provisioning performs real worktree and runner setup. Keep the wait
     // bounded while allowing for filesystem contention in the full gate.
-    }, "cell bee idle", 30_000);
+    }, "cell bee idle", 60_000);
     assert.ok(/-space-/.test(cwd), `cwd is the space dir: ${cwd}`);
     // list shows the substrate in the human row? (view line carries agent/state; substrate lives on the row json)
     const lj = capture();

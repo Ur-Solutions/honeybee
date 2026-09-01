@@ -97,6 +97,9 @@ function makeCellRig(extra: Parameters<typeof makeDaemonDir>[0] = {}): CellRig {
   const cellsRoot = join(root, "cells");
   mkdirSync(cellsRoot, { recursive: true });
   const { dir, cleanup } = makeDaemonDir({
+    // Provisioning is real filesystem work. Do not let the synthetic test
+    // hang policy kill a healthy boot merely because the release host is busy.
+    bootHangTimeoutMs: 60_000,
     cells: { root: cellsRoot },
     ...extra,
     agents: {
@@ -147,7 +150,7 @@ async function spawnCell(
     return v.view.runtimeState === "idle" ? v : null;
   // Cell startup provisions a real worktree before the runner can become
   // idle; leave enough bounded headroom for a loaded release host.
-  }, `${name} idle`, 30_000);
+  }, `${name} idle`, 60_000);
   return { beeId: spawned.beeId, view };
 }
 
@@ -228,7 +231,7 @@ test("cells.1: spawn {substrate:cell} → row + seed ledger → provisioned on s
     await waitFor(async () => {
       const v = await client.request<ViewResult>("view", { beeId: spawned.beeId });
       return v.view.runtimeState === "idle";
-    }, "cell bee idle", 30_000);
+    }, "cell bee idle", 60_000);
     assert.ok(existsSync(join(spaceDir, ".git")), "space has a .git");
     assert.ok(existsSync(join(spaceDir, "README.md")), "working tree materialized");
     assert.equal(g(spaceDir, ["rev-parse", "HEAD"]), rig.origin.sha, "checked out at the origin sha");
@@ -473,7 +476,6 @@ test("cells.3: daemon SIGKILL → restart re-adopts a cell bee; the next generat
   // kill lands mid-turn — run as a CELL bee (any harness can live in a cell).
   const rig = makeCellRig({
     stubEnv: { STUB_SURVIVE_STDIN_CLOSE: "1", STUB_TURN_MS: "60000" },
-    bootHangTimeoutMs: 8000,
   });
   let daemon: DaemonHandle | null = null;
   const agentPids: number[] = [];
@@ -570,7 +572,7 @@ test("cells.4: spawn param validation (typed invalid_request), explicit sha/warm
     assert.equal(ledger?.sandbox, false);
     // This path performs a real worktree provision plus HSR startup. Keep the
     // assertion bounded, but allow for contention from the full daemon suite.
-    await waitFor(async () => (await client.request<ViewResult>("view", { beeId: spawned.beeId })).view.runtimeState === "idle", "pinned idle", 30_000);
+    await waitFor(async () => (await client.request<ViewResult>("view", { beeId: spawned.beeId })).view.runtimeState === "idle", "pinned idle", 60_000);
     assert.equal(g(v.bee?.cwd as string, ["rev-parse", "HEAD"]), older);
     assert.equal(existsSync(join(v.bee?.cwd as string, "later.txt")), false, "materialized at the pinned sha");
 
