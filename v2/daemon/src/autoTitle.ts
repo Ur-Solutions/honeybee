@@ -129,10 +129,18 @@ export function createAutoTitleDispatcher(deps: AutoTitleDeps): (bees?: BeeRow[]
     }
 
     const records = bees ?? deps.listBees();
+    // Rows read from the store on this very call are current; a caller-
+    // supplied list may be stale, so only those are re-read per bee.
+    const freshRows = bees === undefined;
     let probes = 0;
     for (const candidate of records) {
       if (probes >= AUTO_TITLE_CONTEXT_PROBES_PER_TICK) break;
-      const bee = deps.getBee(candidate.id) ?? candidate;
+      const bee = freshRows ? candidate : (deps.getBee(candidate.id) ?? candidate);
+      // Cheap pre-skip (2026-09-01): the first two autoTitleDecision rules,
+      // applied BEFORE touching the mailbox. Without it every tick read every
+      // bee's mailbox — hundreds of archived/titled bees × 5 ticks/s was the
+      // sustained ~250ms flush stall behind daemon connect timeouts.
+      if (bee.lifecycle !== "active" || bee.title) continue;
       const userMessages = userTaskMessages(deps.listMessages(bee.id));
       const signature = contextSignature(bee, userMessages);
       const bookkeeping = deps.loadState(bee.id);

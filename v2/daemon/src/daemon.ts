@@ -293,6 +293,8 @@ export function beeIdentityEnv(bee: { id: string; name: string; parentId: string
 
 const OP_LOG_TAIL = 40;
 const MIN_TICK_YIELD_MS = 1;
+/** How often the tick runs the (synchronous, roster-wide) auto-title scan. */
+const AUTO_TITLE_SCAN_MS = 1000;
 
 /**
  * Delay from tick completion, not tick start. A repeating interval can remain
@@ -351,6 +353,7 @@ export class HiveDaemon {
   private ticks = 0;
   private tickErrors = 0;
   private lastTickAt: number | null = null;
+  private lastAutoTitleAt = 0;
   private lastBoot: BootReport | null = null;
   private stopping = false;
   private publishedSeq = 0;
@@ -581,15 +584,20 @@ export class HiveDaemon {
       this.accounts?.periodicRefreshTick();
       tAccounts = Date.now();
       this.loginFlows?.tick();
-      void this.autoTitle?.()
-        .then((outcomes) => {
-          for (const outcome of outcomes) {
-            if (outcome.error) this.log(`autoTitle.error bee=${outcome.beeId} ${outcome.error}`);
-          }
-        })
-        .catch((error) => {
-          this.log(`autoTitle.error ${error instanceof Error ? error.message : String(error)}`);
-        });
+      // Auto-title scans the whole bee roster synchronously; once a second is
+      // plenty for a title and keeps that scan off four of every five ticks.
+      if (this.autoTitle && tAccounts - this.lastAutoTitleAt >= AUTO_TITLE_SCAN_MS) {
+        this.lastAutoTitleAt = tAccounts;
+        void this.autoTitle()
+          .then((outcomes) => {
+            for (const outcome of outcomes) {
+              if (outcome.error) this.log(`autoTitle.error bee=${outcome.beeId} ${outcome.error}`);
+            }
+          })
+          .catch((error) => {
+            this.log(`autoTitle.error ${error instanceof Error ? error.message : String(error)}`);
+          });
+      }
     } catch (err) {
       // A tick error is a bug, never a reason to abandon the node: the loops
       // are idempotent over durable state, so the next tick retries.

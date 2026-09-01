@@ -210,3 +210,40 @@ test("dispatcher: disabled naming skips everything", async () => {
   const outcomes = await dispatch();
   assert.deepEqual(outcomes, []);
 });
+
+test("dispatcher: archived and already-titled bees never touch the mailbox", async () => {
+  const rows = [
+    bee({ id: "archived", lifecycle: "archived" }),
+    bee({ id: "titled", title: "Already named" }),
+    bee({ id: "open" }),
+  ];
+  const mailboxReads: string[] = [];
+  const dispatch = createAutoTitleDispatcher({
+    enabled: () => true,
+    naming: () => ({
+      auto: true,
+      backend: "codex-app-server",
+      tool: "codex",
+      model: "gpt-5.6-luna",
+      effort: "medium",
+      generatorCwd: "/tmp",
+    }),
+    listBees: () => rows,
+    listMessages: (id) => {
+      mailboxReads.push(id);
+      return [mail("Please wire up the auto-titler for every harness.", 1), mail("And keep the tests green.", 2)];
+    },
+    getBee: () => {
+      throw new Error("rows from listBees are current; no per-bee re-read expected");
+    },
+    setTitle: () => ({ applied: true }),
+    loadState: () => undefined,
+    saveState: () => undefined,
+    generate: async () => "Wire Up Auto Titler",
+    now: () => NOW,
+    log: () => undefined,
+  });
+  await dispatch();
+  await settle();
+  assert.deepEqual(mailboxReads, ["open"]);
+});
