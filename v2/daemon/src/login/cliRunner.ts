@@ -11,7 +11,7 @@
  */
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { recipeFor, safeAuthorizationUrl, type LoginCliSpec, type LoginFieldDescriptor, type LoginFlowRow } from "../../../core/src/index.ts";
+import { recipeFor, resolveSpawnCommand, safeAuthorizationUrl, type LoginCliSpec, type LoginFieldDescriptor, type LoginFlowRow } from "../../../core/src/index.ts";
 import { primaryCredentialFile, primaryCredentialMtime } from "../activation.ts";
 import { credentialDigest } from "../keychain.ts";
 import { LoginWorker, pipeSpawner, type LoginWorkerEvent, type LoginWorkerStatus, type PtySpawner } from "../loginWorker.ts";
@@ -93,9 +93,13 @@ export class CliRunner implements LoginRunner {
     // A cancel / switch that landed during the awaits wins: never spawn a
     // worker nobody owns.
     if (!host.isCurrent(this) || !host.stillActive()) return host.flow() as LoginFlowRow;
+    // F8 — same one resolution rule as agent spawns: the worker's minimal
+    // env has a minimal PATH, so a bare vendor CLI name must resolve through
+    // core (PATH + fallback dirs) or fail with an honest ENOENT.
+    const { command } = resolveSpawnCommand(launch.command, { env });
     const worker = new LoginWorker({
       spawner,
-      launch: { command: launch.command, args: [...(launch.args ?? [])], cwd: account.homePath, env },
+      launch: { command, args: [...(launch.args ?? [])], cwd: account.homePath, env },
       cues: this.spec.cues,
       now: host.now,
       killGraceMs: host.workerKillGraceMs,
