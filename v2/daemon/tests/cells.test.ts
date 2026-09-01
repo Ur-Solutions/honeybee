@@ -471,11 +471,13 @@ test("cells.2: cell.remove — runtime_refused while live; refused-dirty leaves 
   }
 });
 
-test("cells.3: daemon SIGKILL → restart re-adopts a cell bee; the next generation provisions by replay into the SAME space", async () => {
-  // The WP3 stub (agent `stub`) with survive-stdin-close + a long turn so the
-  // kill lands mid-turn — run as a CELL bee (any harness can live in a cell).
+test("cells.3: daemon SIGKILL → restart re-adopts a live cell bee at full capability: the missed completion folds from the journal and mail reaches the SAME generation", async () => {
+  // The WP3 stub (agent `stub`) with survive-stdin-close + one slow turn so
+  // the kill lands mid-turn — run as a CELL bee (any harness can live in a
+  // cell). The turn finishes around the restart: whichever side of the boot it
+  // lands on, only the successor's journal tail can fold it.
   const rig = makeCellRig({
-    stubEnv: { STUB_SURVIVE_STDIN_CLOSE: "1", STUB_TURN_MS: "60000" },
+    stubEnv: { STUB_SURVIVE_STDIN_CLOSE: "1", STUB_TURN_MS: "5" },
   });
   let daemon: DaemonHandle | null = null;
   const agentPids: number[] = [];
@@ -484,7 +486,7 @@ test("cells.3: daemon SIGKILL → restart re-adopts a cell bee; the next generat
     let client = await daemon.client();
     const { beeId, view } = await spawnCell(client, "survivor", rig.origin.repo, { agent: "stub" });
     const spaceDir = view.bee?.cwd as string;
-    const sent = await client.request<SendRpcResult>("send", { beeId, body: "long task" });
+    const sent = await client.request<SendRpcResult>("send", { beeId, body: "@slow:2500 long task" });
     await waitDelivered(client, beeId, sent.messageId, "delivered to gen 1");
     await waitFor(async () => (await client.request<ViewResult>("view", { beeId })).view.runtimeState === "running", "mid-turn");
     const agentPid = (await client.request<ViewResult>("view", { beeId })).runtime?.pid as number;
@@ -505,16 +507,29 @@ test("cells.3: daemon SIGKILL → restart re-adopts a cell bee; the next generat
     assert.equal(after.bee?.substrate, "cell");
     assert.equal(after.bee?.cwd, spaceDir);
 
-    // Mail rotates the degraded survivor out; gen 2 starts INSIDE the same
-    // cell — provisioning replays from cell.json (no re-clone, no new dir).
+    // Full-capability adoption: the inner HSR driver re-hydrated the cell from
+    // cell.json, so the successor tails the SAME generation's journal. The
+    // completion the dead daemon never saw folds from that journal — the bee
+    // reaches idle with no mail and no rotation. (Before: the successor's
+    // empty cell cache made adoption degrade silently — no tail — and every
+    // cell survivor stayed "running" forever after its turn ended.)
+    await waitFor(
+      async () => (await client.request<ViewResult>("view", { beeId })).view.runtimeState === "idle",
+      "survivor turn folded by the successor",
+      15_000,
+    );
+    assert.equal(pidAlive(agentPid), true, "the survivor keeps running; nothing was rotated");
+
+    // Mail reaches the adopted generation — same process, same cell, and the
+    // ledger is untouched (no re-provisioning happened).
     const ledgerBefore = readFileSync(join(dirname(spaceDir), "box", "cell.json"), "utf8");
     const sent2 = await client.request<SendRpcResult>("send", { beeId, body: "post-restart" });
     await waitDelivered(client, beeId, sent2.messageId, "post-restart delivery");
     const rt2 = (await client.request<ViewResult>("view", { beeId })).runtime;
-    if (typeof rt2?.pid === "number" && rt2.pid > 0) agentPids.push(rt2.pid);
-    assert.equal(rt2?.generation, 2);
-    assert.equal(pidAlive(agentPid), false, "old survivor stopped by exact identity");
-    assert.equal(readFileSync(join(dirname(spaceDir), "box", "cell.json"), "utf8"), ledgerBefore, "replayed provisioning: ledger unchanged");
+    assert.equal(rt2?.generation, 1, "delivered to the adopted generation");
+    assert.equal(rt2?.pid, agentPid, "same process across the restart");
+    assert.equal(pidAlive(agentPid), true);
+    assert.equal(readFileSync(join(dirname(spaceDir), "box", "cell.json"), "utf8"), ledgerBefore, "ledger unchanged");
     assert.equal((await client.request<ViewResult>("view", { beeId })).bee?.cwd, spaceDir, "same space");
     const cmds = await client.request<CommandsResult>("commands", { beeId });
     assert.ok(cmds.commands.every((c) => c.status !== "failed"), "zero failed commands across the restart");

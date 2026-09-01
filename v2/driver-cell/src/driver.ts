@@ -277,6 +277,10 @@ export class CellDriver implements RuntimeDriver {
     return this.inner.sessionLogPath(beeId);
   }
 
+  observationLogPath(beeId: string, generation: number): string {
+    return this.inner.observationLogPath(beeId, generation);
+  }
+
   consumedGeneration(messageId: number): number | undefined {
     return this.inner.consumedGeneration(messageId);
   }
@@ -469,7 +473,13 @@ export class CellDriver implements RuntimeDriver {
   }
 
   private resolveCellSpawn(beeId: string): SpawnSpec {
-    const cell = this.cells.get(beeId);
+    // The ledger (cell.json) is the durable allocation truth; `this.cells` is
+    // only a cache of it. The inner HSR driver resolves through here not just
+    // on start() (cache warm from ensureCell) but on boot re-adoption, when a
+    // successor daemon's cache is empty. Reading the cache alone made every
+    // daemon restart silently degrade every live cell runtime (adapter lost →
+    // no journal tail → the bee stayed "running" after its turn ended).
+    const cell = this.cellOf(beeId);
     if (!cell) throw new Error(`cell driver: bee ${beeId} has no provisioned cell (start() provisions first)`);
     const harness = this.cfg.resolveHarness(beeId);
     const spec = this.cfg.resolveCell(beeId);

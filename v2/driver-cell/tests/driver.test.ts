@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,7 @@ import { reserveCell } from "../src/provision.ts";
 import { probeCow } from "../src/cow.ts";
 import { defaultScratchPaths, type NodeKind } from "../src/sandbox.ts";
 import { commitInCell, makeRig, type CellTestRig } from "./helpers.ts";
+import { pidAlive } from "../../driver-hsr/tests/helpers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const AGENT_PATH = join(here, "..", "..", "driver-hsr", "test-agent", "agent.mjs");
@@ -361,3 +362,81 @@ test("cell-driver.workstation-default: sandbox stays OFF without an override (A4
     rig.cleanup();
   }
 });
+
+test("cell-driver.restart: a successor daemon re-adopts a live cell runtime from the ledger at full capability", async () => {
+  const rig = makeRig();
+  const first = makeDriver(rig);
+  let second: CellDriver | null = null;
+  try {
+    first.start("bee-1", 1);
+    await drainUntil(first, (e) => e.some((x) => x.kind === "booted"));
+    assert.equal(first.deliver("bee-1", 1, 1, "before restart").accepted, true);
+    await drainUntil(first, (e) => e.some((x) => x.kind === "turn_ended"));
+    const checkpoint = checkpointOf(first, "bee-1");
+    const proc = first.procOf("bee-1", 1)!;
+    assert.ok(proc.pid > 0);
+
+    // The crash gap: the runner persists a completion the dying daemon never
+    // folds. The successor must recover it from the journal, not from silence.
+    assert.equal(first.deliver("bee-1", 1, 2, "@slow:80 persisted before crash").accepted, true);
+    await waitForJournal(first.observationLogPath("bee-1", 1), (text) =>
+      text.includes('"turn_ended","messageId":2'),
+    );
+    first.detachAll();
+    assert.ok(pidAlive(proc.pid), "the cell runtime must survive the daemon");
+
+    // A fresh driver has an EMPTY cell cache — only cell.json on disk knows
+    // this bee's allocation. Adoption must hydrate from that ledger; before
+    // the fix it threw "no provisioned cell", lost the adapter, and adopted
+    // degraded (no tail → the bee stayed "running" forever).
+    second = makeDriver(rig);
+    assert.equal(second.adopt("bee-1", 1, proc.pid, proc.pidStartedAt, "running", checkpoint), true);
+    assert.equal(second.isDegraded("bee-1", 1), false, "ledger-backed adoption is never degraded");
+    assert.equal(second.cellOf("bee-1")?.replayed, true, "the cell was re-hydrated from its ledger");
+    assert.equal(second.cellOf("bee-1")?.paths.spaceDir, first.cellOf("bee-1")?.paths.spaceDir);
+
+    const recovered = await drainUntil(second, (e) => e.some((x) => x.kind === "turn_ended"));
+    assert.ok(recovered.some((x) => x.kind === "turn_ended" && x.generation === 1));
+    assert.ok(checkpointOf(second, "bee-1") > checkpoint, "the journal cursor advances past the replayed completion");
+
+    // Full capability: the successor delivers to the SAME process.
+    const deadline = Date.now() + 5000;
+    let accepted = false;
+    while (!accepted && Date.now() < deadline) {
+      second.observe();
+      accepted = second.deliver("bee-1", 1, 3, "after restart").accepted;
+      if (!accepted) await sleep(20);
+    }
+    assert.ok(accepted, "successor daemon must deliver to the adopted cell runtime");
+    await drainUntil(second, (e) => e.some((x) => x.kind === "turn_ended"));
+    assert.equal(second.procOf("bee-1", 1)!.pid, proc.pid);
+
+    second.stop("bee-1", 1, "stopped_by_user");
+    await drainUntil(second, (e) => e.some((x) => x.kind === "exited"));
+  } finally {
+    second?.disposeAll();
+    first.disposeAll();
+    await sleep(10);
+    rig.cleanup();
+  }
+});
+
+function checkpointOf(driver: CellDriver, beeId: string): number {
+  const evidence = driver.observeRecoveryCursors().find((row) => row.beeId === beeId);
+  assert.ok(evidence, `missing recovery cursor for ${beeId}`);
+  return evidence.cursor;
+}
+
+async function waitForJournal(path: string, predicate: (text: string) => boolean): Promise<string> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      const text = readFileSync(path, "utf8");
+      if (predicate(text)) return text;
+    } catch {
+      // The host creates the journal shortly after boot; keep probing.
+    }
+    if (Date.now() > deadline) throw new Error(`journal condition timed out: ${path}`);
+    await sleep(10);
+  }
+}

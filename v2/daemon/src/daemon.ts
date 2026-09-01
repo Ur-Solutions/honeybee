@@ -766,7 +766,10 @@ export class HiveDaemon {
         observationCursor,
         bee.providerSessionId,
       );
-      this.log(`boot.adopt bee=${bee.id} gen=${rt.generation} pid=${rt.pid} ok=${adopted}`);
+      // A degraded adoption keeps the exact pid but has no evidence lane: the
+      // bee can never leave its adopted phase on its own. Say so at boot.
+      const degraded = adopted && driver.isDegraded(bee.id, rt.generation);
+      this.log(`boot.adopt bee=${bee.id} gen=${rt.generation} pid=${rt.pid} ok=${adopted}${degraded ? " degraded=true" : ""}`);
     }
   }
 
