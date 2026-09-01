@@ -16,7 +16,8 @@
  *  - behavior 6 (service mgmt)     → service.ts (wired by the CLI)
  *  - behavior 7 (config)           → config.ts
  */
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { execFile } from "node:child_process";
 import type { InterruptOutcome } from "../../harness/src/driver.ts";
 import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -38,6 +39,7 @@ import {
   isTaskTransitionAction,
   MESSAGE_URGENCIES,
   openCoreStore,
+  resolveExecutable,
   resolveSpawnCommand,
   TASK_TRANSITION_ACTIONS,
   serializePackage,
@@ -134,8 +136,10 @@ import {
   type ConfigPatchResult,
   type DeployInfoResult,
   type ForkResult,
+  type HarnessFact,
   type HealthResult,
   type InterruptResult,
+  type NodeHarnessesResult,
   type ListResult,
   type MutationResult,
   type QuestionAnswerResult,
@@ -950,6 +954,8 @@ export class HiveDaemon {
         return this.rpcAuditTail(params);
       case "deployInfo":
         return this.rpcDeployInfo();
+      case "node.harnesses":
+        return this.rpcNodeHarnesses();
       case "health":
         return this.rpcHealth();
       case "template.list":
@@ -1935,6 +1941,55 @@ export class HiveDaemon {
       socketPath: this.cfg.socketPath,
       storePath: this.cfg.storePath,
     };
+  }
+
+  /**
+   * F8 — honest per-harness capability facts. Present/path/source come from
+   * the SAME core resolver the spawn path uses, against the same env
+   * baseline (process.env + the agent spec's env), so what this verb reports
+   * as runnable is exactly what a spawn would exec. The version probe is a
+   * bounded `--version` of the resolved binary, cached by (path, mtime) —
+   * a failure or timeout is a null version, never an error.
+   */
+  private async rpcNodeHarnesses(): Promise<NodeHarnessesResult> {
+    const harnesses: HarnessFact[] = [];
+    for (const [harness, spec] of Object.entries(this.cfg.agents)) {
+      const env = { ...(process.env as Record<string, string>), ...(spec.env ?? {}) };
+      const resolved = resolveExecutable(spec.command, { env });
+      harnesses.push({
+        harness,
+        command: spec.command,
+        present: resolved !== null,
+        path: resolved?.path ?? null,
+        source: resolved?.source ?? null,
+        version: resolved ? await this.probeHarnessVersion(resolved.path) : null,
+      });
+    }
+    return { harnesses };
+  }
+
+  /** `--version` first lines, cached per (path, mtime) so repeat calls are free. */
+  private readonly harnessVersionCache = new Map<string, string | null>();
+
+  private probeHarnessVersion(path: string): Promise<string | null> {
+    let key: string;
+    try {
+      key = `${path} ${statSync(path).mtimeMs}`;
+    } catch {
+      return Promise.resolve(null);
+    }
+    const hit = this.harnessVersionCache.get(key);
+    if (hit !== undefined) return Promise.resolve(hit);
+    return new Promise((resolvePromise) => {
+      execFile(path, ["--version"], { timeout: 2000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+        const line = error
+          ? null
+          : String(stdout).split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? null;
+        const version = line ? line.slice(0, 120) : null;
+        this.harnessVersionCache.set(key, version);
+        resolvePromise(version);
+      });
+    });
   }
 
   private rpcHealth(): HealthResult {

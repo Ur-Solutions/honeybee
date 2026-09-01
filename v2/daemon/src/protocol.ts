@@ -19,6 +19,7 @@
 import type {
   AuditRow,
   BeeRow,
+  ExecutableResolutionSource,
   LoginFlowRow,
   MirrorAccountLimitsRow,
   MirrorAccountRow,
@@ -55,6 +56,8 @@ export const DAEMON_VERSION = "2.0.0-wp4";
 export const DAEMON_CAPABILITIES = [
   /** Typed, tmux-independent account login flows: account.login.* verbs + the login_flows snapshot table. */
   "account.login.flow.v1",
+  /** Per-harness executable facts (`node.harnesses`), resolved with the same rule the spawn path uses. */
+  "node.harnesses.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -122,6 +125,10 @@ export const RPC_VERBS = [
   "commands",
   "deployInfo",
   "health",
+  // F8 (additive read): per-harness executable facts — present/path/source/
+  // version — resolved with the SAME rule the spawn path uses, so probe
+  // truth equals spawn truth.
+  "node.harnesses",
   // CLI-alignment (additive read): tail of the audit log for `hive v2 events`
   "audit.tail",
   // watch
@@ -747,6 +754,33 @@ export interface DeployInfoResult {
   dataDir: string;
   socketPath: string;
   storePath: string;
+}
+
+/**
+ * `node.harnesses {}` — the node's honest per-harness capability facts:
+ * whether each configured agent's executable is actually runnable BY THIS
+ * DAEMON, where it resolved from, and (when cheaply probeable) its version.
+ * Resolution uses the exact core rule the spawn path uses (F8: probe truth
+ * == spawn truth); a stale bun/mise leftover is therefore visible as
+ * `source:"fallback"` + its real path instead of masquerading as a working
+ * install. `version` is a bounded `--version` of the resolved binary,
+ * cached by (path, mtime); null when absent or the probe fails.
+ */
+export interface NodeHarnessesResult {
+  harnesses: HarnessFact[];
+}
+
+export interface HarnessFact {
+  /** Agent/harness name from the node's `agents` config. */
+  harness: string;
+  /** The configured command, before resolution. */
+  command: string;
+  /** Whether the daemon can resolve a runnable executable right now. */
+  present: boolean;
+  /** Resolved absolute path (the exact path a spawn would exec); null when absent. */
+  path: string | null;
+  source: ExecutableResolutionSource | null;
+  version: string | null;
 }
 
 export interface HealthResult {

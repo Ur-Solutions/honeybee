@@ -47,6 +47,7 @@ const GROUPS: Group[] = [
       ["usage", "[account]", "provider 5h/weekly/fable windows per account (alias: limits)"],
       ["watch", "[--bee id]", "whole-node change stream (snapshot + seq deltas)"],
       ["health", "", "daemon liveness + i1 violations"],
+      ["harnesses", "", "per-harness executable facts (path/source/version) as the daemon resolves them"],
       ["deploy-info", "", "protocol / versions / paths"],
     ],
   },

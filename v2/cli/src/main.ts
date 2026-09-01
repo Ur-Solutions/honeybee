@@ -44,6 +44,7 @@ import {
   type ChildrenResult,
   type ForkResult,
   type HealthResult,
+  type NodeHarnessesResult,
   type InterruptResult,
   type ListResult,
   type MailboxResult,
@@ -1933,6 +1934,18 @@ async function cmdHealth(ctx: CliContext): Promise<number> {
   return 0;
 }
 
+/** F8: the node's per-harness executable facts (same resolver as spawn). */
+async function cmdHarnesses(ctx: CliContext): Promise<number> {
+  const result = await withClient(ctx, (c) => c.request<NodeHarnessesResult>("node.harnesses"));
+  const lines = result.harnesses.map((h) =>
+    h.present
+      ? `${h.harness}: ${h.path} (${h.source}${h.version ? `; ${h.version}` : ""})`
+      : `${h.harness}: not found — command '${h.command}' resolves nowhere on this node (PATH + standard install dirs)`,
+  );
+  emit(ctx, lines, result, false);
+  return 0;
+}
+
 async function cmdWatch(ctx: CliContext, parsed: Parsed): Promise<number> {
   const filterBee = parsed.flags.get("--bee") as string | undefined;
   const client = await RpcClient.connect(ctx.cfg.socketPath);
@@ -3457,6 +3470,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdDeployInfo(ctx);
       case "health":
         return await cmdHealth(ctx);
+      case "harnesses":
+        return await cmdHarnesses(ctx);
       case "watch":
         return await cmdWatch(ctx, parsed);
       case "template":
