@@ -134,7 +134,16 @@ export function seedRateTable(): RateTable {
     // ── Claude Haiku 4.5, $1 / $5 tier ──────────────────────────────────────
     anthropicRule("claude-haiku-4-5", "2025-10-01", 1, 5),
 
-    // ── Claude Fable 5, $10 / $50 tier ──────────────────────────────────────
+    // ── Claude Fable 5 / 5.1, $10 / $50 tier ────────────────────────────────
+    // Fable 5.1 keeps the tier list price but meters cache reads at a flat
+    // $0.25/MTok rather than the 10%-of-input Anthropic default. The `fable`
+    // alias resolves to it in Claude Code ≥ 2.1.257; Fable 5 is still served.
+    {
+      modelPattern: "claude-fable-5-1",
+      provider: "anthropic",
+      note: "Fable 5.1: $10/$50 per MTok; cache reads $0.25/MTok flat.",
+      versions: [{ ...anthropicVersion("2026-06-24", 10, 50), cacheReadPerMTok: 0.25 }],
+    },
     anthropicRule("claude-fable-5", "2026-06-09", 10, 50),
 
     // ── OpenAI/Codex published standard API rates ───────────────────────────

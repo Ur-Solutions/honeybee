@@ -71,6 +71,16 @@ test("seed prices Fable caching and resolves zero-token synthetic rows", () => {
     cacheWrite1hPerMTok: 20,
   });
   assert.equal(ruleFor("<synthetic>").todo, undefined);
+  // Fable 5.1 shares the tier price but meters cache reads at a flat $0.25.
+  const fable51 = ruleFor("claude-fable-5-1").versions[0]!;
+  assert.deepEqual(fable51, {
+    effectiveFrom: "2026-06-24",
+    inputPerMTok: 10,
+    outputPerMTok: 50,
+    cacheReadPerMTok: 0.25,
+    cacheWrite5mPerMTok: 12.5,
+    cacheWrite1hPerMTok: 20,
+  });
 });
 
 test("validateRateTable rejects malformed input", () => {

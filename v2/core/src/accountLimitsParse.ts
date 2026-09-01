@@ -61,7 +61,7 @@ export function parseClaudeUsage(usage: ClaudeUsageResponse, plan?: string | nul
   // Fable included usage rides the limits[] array as a model-scoped weekly
   // entry (the legacy seven_day_<model> fields stay null on Claude 5 plans).
   const fable = usage.limits?.find(
-    (entry) => entry?.kind === "weekly_scoped" && entry.scope?.model?.display_name === "Fable",
+    (entry) => entry?.kind === "weekly_scoped" && /^fable\b/i.test(entry.scope?.model?.display_name ?? ""),
   );
   if (fable && typeof fable.percent === "number") {
     out.fableWeekly = { usedPercent: fable.percent, windowMinutes: CLAUDE_WEEKLY_MINUTES, resetsAt: isoToMs(fable.resets_at) };
