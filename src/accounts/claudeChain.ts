@@ -681,7 +681,7 @@ const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 /** Mint a new token set from a refresh token. ROTATES the chain — persist immediately. */
 export async function refreshClaudeOauthChain(refreshToken: string): Promise<RefreshedClaudeToken | null> {
-  const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
+  const response = await fetch("https://platform.claude.com/v1/oauth/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),

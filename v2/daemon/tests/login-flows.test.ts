@@ -210,11 +210,11 @@ test("flows.claude-oauth: PKCE authorize URL; wrong code re-asks typed; code#sta
     assert.equal(flow.phase, "waiting_input");
     assert.equal(flow.methodId, "claude-oauth");
     assert.deepEqual(flow.inputFields.map((f) => f.id), ["code"]);
-    assert.ok(flow.authorizationUrl?.startsWith("https://claude.ai/oauth/authorize?"));
+    assert.ok(flow.authorizationUrl?.startsWith("https://claude.com/cai/oauth/authorize?"));
     const url = new URL(flow.authorizationUrl as string);
     assert.equal(url.searchParams.get("client_id"), "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
     assert.equal(url.searchParams.get("code_challenge_method"), "S256");
-    assert.equal(url.searchParams.get("redirect_uri"), "https://console.anthropic.com/oauth/code/callback");
+    assert.equal(url.searchParams.get("redirect_uri"), "https://platform.claude.com/oauth/code/callback");
     assert.equal(url.toString(), claudeAuthorizeUrl(exchanges[0]?.codeVerifier ?? "x", url.searchParams.get("state") ?? "") === url.toString() ? url.toString() : url.toString());
 
     // duplicate start rejoins the same flow (no second runner)

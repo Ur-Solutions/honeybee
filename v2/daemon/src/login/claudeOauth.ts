@@ -55,7 +55,9 @@ export class ClaudeOauthRunner implements LoginRunner {
   readonly kind = "claude_oauth" as const;
   private readonly host: LoginRunnerHost;
   private readonly codeVerifier = pkceVerifier();
-  private readonly state = randomBytes(16).toString("base64url");
+  // Claude Code uses a full 256-bit base64url nonce for both PKCE material
+  // and OAuth state. The provider validates this shape after approval.
+  private readonly state = randomBytes(32).toString("base64url");
 
   constructor(host: LoginRunnerHost) {
     this.host = host;

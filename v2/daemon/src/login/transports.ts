@@ -29,10 +29,20 @@ export interface LoginTransports {
 
 // Claude Code's public OAuth client id (the one the CLI itself uses).
 export const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-export const CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
-export const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
-export const CLAUDE_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
-export const CLAUDE_OAUTH_SCOPES = ["org:create_api_key", "user:profile", "user:inference"];
+// Keep this contract aligned with `claude auth login`. Anthropic moved the
+// Claude Code OAuth surface in 2.1.233; the retired claude.ai/console URLs
+// reach the sign-in UI but are rejected after approval as "Invalid format".
+export const CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize";
+export const CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+export const CLAUDE_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
+export const CLAUDE_OAUTH_SCOPES = [
+  "org:create_api_key",
+  "user:profile",
+  "user:inference",
+  "user:sessions:claude_code",
+  "user:mcp_servers",
+  "user:file_upload",
+];
 
 async function checkedJson(response: Response): Promise<unknown> {
   if (!response.ok) throw new Error(`HTTP ${response.status}`);

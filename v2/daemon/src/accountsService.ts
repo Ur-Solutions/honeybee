@@ -66,6 +66,7 @@ import {
   readCursorLiveAuth,
   type CursorAuthReader,
 } from "./cursorAuth.ts";
+import { CLAUDE_OAUTH_CLIENT_ID, CLAUDE_OAUTH_TOKEN_URL } from "./login/transports.ts";
 
 // ---------------------------------------------------------------------------
 // injected transports
@@ -172,12 +173,9 @@ function defaultClaudeUsage(timeoutMs: number): NonNullable<LimitsFetchers["clau
   return (accessToken) => claudeOauthGet(accessToken, "https://api.anthropic.com/api/oauth/usage", timeoutMs) as Promise<ClaudeUsageResponse>;
 }
 
-// Claude Code's public OAuth client id (the same one the CLI itself uses).
-const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-
 function defaultClaudeRefresh(timeoutMs: number): NonNullable<LimitsFetchers["claudeRefresh"]> {
   return async (refreshToken) => {
-    const response = await fetch("https://console.anthropic.com/v1/oauth/token", {
+    const response = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),
