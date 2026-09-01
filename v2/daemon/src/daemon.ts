@@ -38,6 +38,7 @@ import {
   isTaskTransitionAction,
   MESSAGE_URGENCIES,
   openCoreStore,
+  resolveSpawnCommand,
   TASK_TRANSITION_ACTIONS,
   serializePackage,
   type AccountRow,
@@ -661,12 +662,23 @@ export class HiveDaemon {
       this.accounts.activateForSpawn(account, bee);
       accountEnv = { ...this.accounts.homeEnvOf(account), ...this.accounts.credentialEnvOf(account) };
     }
+    const env = { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...accountEnv, ...beeIdentityEnv(bee) };
+    // F8 — one resolution rule: the bare harness command is resolved to an
+    // absolute path at spawn time with the SAME core rule every probe uses
+    // (PATH of the exact spawn env, then the fallback dirs). Nothing found
+    // keeps the bare name — the OS ENOENT stays the honest diagnostic and
+    // the driver's exit detail names the executable.
+    const { command, resolution } = resolveSpawnCommand(spec.command, { env });
+    if (resolution.source !== "configured_path") {
+      this.log(`spawn.resolve bee=${beeId} executable=${resolution.executable} source=${resolution.source}${resolution.path ? ` path=${resolution.path}` : ""}`);
+    }
     return {
       adapter,
-      command: spec.command,
+      command,
       args,
       cwd: bee.cwd,
-      env: { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...accountEnv, ...beeIdentityEnv(bee) },
+      env,
+      commandResolution: resolution,
     };
   }
 
@@ -715,7 +727,13 @@ export class HiveDaemon {
       accountEnv = { ...this.accounts.homeEnvOf(account), ...this.accounts.credentialEnvOf(account) };
     }
     const env = { ...(process.env as Record<string, string>), ...(spec.env ?? {}), ...bee.env, ...accountEnv, ...beeIdentityEnv(bee) };
-    return tmuxSpawnSpec(spec, { agent: bee.agent, cwd: bee.cwd, args: bee.args, env });
+    // Same F8 resolution rule as HSR: the TUI seat must not ENOENT on a CLI
+    // the node's probes can see.
+    const { command, resolution } = resolveSpawnCommand(spec.command, { env });
+    if (resolution.source !== "configured_path") {
+      this.log(`spawn.resolve bee=${beeId} executable=${resolution.executable} source=${resolution.source}${resolution.path ? ` path=${resolution.path}` : ""}`);
+    }
+    return tmuxSpawnSpec({ ...spec, command }, { agent: bee.agent, cwd: bee.cwd, args: bee.args, env });
   }
 
   private adoptSurvivors(store: CoreStore, driver: SubstrateRouter): void {

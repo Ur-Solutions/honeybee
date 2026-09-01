@@ -57,6 +57,7 @@ import type {
   StopCause,
 } from "../../harness/src/driver.ts";
 import type { HarnessAdapter } from "../../adapters/src/index.ts";
+import { executableNotFoundDetail, type SpawnCommandResolution } from "../../core/src/executables.ts";
 import { pidAlive, verifyProcessIdentity } from "./psutil.ts";
 
 /** What `start` needs to know per bee: which agent, how to spawn it. */
@@ -66,6 +67,13 @@ export interface SpawnSpec {
   args: string[];
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * How `command` was resolved (core resolveSpawnCommand — the one rule,
+   * F8). `not_found` means the resolver searched PATH + fallbacks and found
+   * nothing: the spawn proceeds with the bare name (honest ENOENT) and the
+   * exit detail names the missing executable for the operator.
+   */
+  commandResolution?: SpawnCommandResolution;
 }
 
 export interface HsrDriverConfig {
@@ -191,6 +199,8 @@ interface ManagedProcess {
   socketBroken: boolean;
   /** The OS spawn/process error message, when the child emitted `error` (e.g. ENOENT). */
   spawnError: string | null;
+  /** Resolution fact for the spawned command (own spawns only; null on adoption). */
+  commandResolution: SpawnCommandResolution | null;
   /**
    * v9: whether the adapter has parsed at least one signal from this
    * process's actual output. A readyAtSpawn runtime opens its accept point on
@@ -405,6 +415,7 @@ export class HsrDriver implements RuntimeDriver {
       stdoutRest: Buffer.alloc(0),
       exited: false,
       spawnError: null,
+      commandResolution: spec.commandResolution ?? null,
       realEvidence: false,
       hostStyle: true,
       agentPid: null,
@@ -888,6 +899,7 @@ export class HsrDriver implements RuntimeDriver {
             stdoutRest: Buffer.alloc(0),
             exited: false,
             spawnError: null,
+            commandResolution: null,
             realEvidence: false,
             hostStyle: true,
             agentPid: typeof status.agentPid === "number" ? status.agentPid : null,
@@ -934,6 +946,7 @@ export class HsrDriver implements RuntimeDriver {
       stdoutRest: Buffer.alloc(0),
       exited: false,
       spawnError: null,
+      commandResolution: null,
       // Degraded: no event stream, so no evidence can ever be parsed. The
       // store's persisted boot_evidence for the row (from before the daemon
       // restart) governs its exit accounting; this field is driver-local.
@@ -1277,12 +1290,18 @@ export class HsrDriver implements RuntimeDriver {
     // and anything else (non-zero, signal, spawn error) is a crash — death is
     // a fact reported to the parent, never a hypothesis (contract §3.2).
     const cause = p.stopCause ?? (code === 0 ? "clean" : "crashed");
+    // F8: when the spawn config already knew the executable resolved nowhere,
+    // the exit detail names it — this text reaches the operator through the
+    // mirror. The crashed/spawn_failed mechanics themselves are untouched.
+    const notFound = p.spawnError && p.commandResolution?.source === "not_found"
+      ? ` — ${executableNotFoundDetail(p.commandResolution.executable)}`
+      : "";
     this.events.push({
       beeId: p.beeId,
       generation: p.generation,
       kind: "exited",
       exitCause: cause,
-      ...(p.spawnError ? { detail: `spawn error: ${p.spawnError}` } : {}),
+      ...(p.spawnError ? { detail: `spawn error: ${p.spawnError}${notFound}` } : {}),
     });
     // A start deferred behind this death can now actually spawn.
     const pending = this.pendingStarts.get(p.beeId);

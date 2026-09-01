@@ -219,6 +219,33 @@ test("boot crash (exit before ready) and unspawnable binary → exited(crashed),
   }
 });
 
+test("F8: a bare command the resolver found nowhere crashes with a detail naming the executable", async () => {
+  const rig = makeRig();
+  const driver = new HsrDriver({
+    sessionLogDir: join(rig.dir, "logs-f8"),
+    resolve: () => ({
+      adapter: stubAdapter,
+      // Unresolved-but-attempted (core resolveSpawnCommand found nothing):
+      // the bare name spawns, the OS says ENOENT, and the resolution fact
+      // upgrades the detail into an operator-actionable sentence.
+      command: "hb-test-no-such-cli",
+      args: [],
+      commandResolution: { executable: "hb-test-no-such-cli", path: null, source: "not_found" },
+    }),
+  });
+  try {
+    driver.start("bee-f8", 1);
+    const events = await drainUntil(driver, (e) => ofKind(e, "exited").length > 0);
+    const exited = ofKind(events, "exited")[0]!;
+    assert.equal(exited.exitCause, "crashed");
+    assert.match(exited.detail ?? "", /spawn error: .*ENOENT/);
+    assert.match(exited.detail ?? "", /'hb-test-no-such-cli' was not found on this node/);
+  } finally {
+    driver.disposeAll();
+    rig.cleanup();
+  }
+});
+
 test("flag evidence: auth/rate-limit setters and their contrary-evidence clearers", async () => {
   const rig = makeRig();
   try {
