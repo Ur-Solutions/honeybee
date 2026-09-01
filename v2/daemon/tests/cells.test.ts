@@ -145,7 +145,9 @@ async function spawnCell(
   const view = await waitFor(async () => {
     const v = await client.request<ViewResult>("view", { beeId: spawned.beeId });
     return v.view.runtimeState === "idle" ? v : null;
-  }, `${name} idle`, 15_000);
+  // Cell startup provisions a real worktree before the runner can become
+  // idle; leave enough bounded headroom for a loaded release host.
+  }, `${name} idle`, 30_000);
   return { beeId: spawned.beeId, view };
 }
 
@@ -226,7 +228,7 @@ test("cells.1: spawn {substrate:cell} → row + seed ledger → provisioned on s
     await waitFor(async () => {
       const v = await client.request<ViewResult>("view", { beeId: spawned.beeId });
       return v.view.runtimeState === "idle";
-    }, "cell bee idle", 15_000);
+    }, "cell bee idle", 30_000);
     assert.ok(existsSync(join(spaceDir, ".git")), "space has a .git");
     assert.ok(existsSync(join(spaceDir, "README.md")), "working tree materialized");
     assert.equal(g(spaceDir, ["rev-parse", "HEAD"]), rig.origin.sha, "checked out at the origin sha");

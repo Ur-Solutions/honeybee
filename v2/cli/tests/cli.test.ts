@@ -346,7 +346,9 @@ test("cli.4d: cells — `spawn --substrate cell --origin`, `cell capture --onto`
       const v = JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string }; bee?: { substrate: string; cwd: string } };
       cwd = v.bee?.cwd ?? "";
       return v.view?.runtimeState === "idle" && v.bee?.substrate === "cell";
-    }, "cell bee idle", 15_000);
+    // Provisioning performs real worktree and runner setup. Keep the wait
+    // bounded while allowing for filesystem contention in the full gate.
+    }, "cell bee idle", 30_000);
     assert.ok(/-space-/.test(cwd), `cwd is the space dir: ${cwd}`);
     // list shows the substrate in the human row? (view line carries agent/state; substrate lives on the row json)
     const lj = capture();

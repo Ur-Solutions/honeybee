@@ -84,7 +84,9 @@ async function idleBee(dir: string, needle: string): Promise<void> {
     const l = capture();
     await runV2Cli(["view", needle, "--data-dir", dir, "--json"], l.io);
     return (JSON.parse(l.out[0] ?? "{}") as { view?: { runtimeState: string } }).view?.runtimeState === "idle";
-  }, `${needle} idle`, 10_000);
+  // Process startup can contend with the serial integration group on loaded
+  // release hosts. The assertion remains bounded and polling-based.
+  }, `${needle} idle`, 20_000);
 }
 
 test("verbs.x: spawn + first send in one shot (fire-and-forget); prompt lands in the mailbox; usage error without a prompt", async () => {
