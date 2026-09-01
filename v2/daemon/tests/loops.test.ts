@@ -75,7 +75,7 @@ function spawnIdleBee(rig: Rig, id = "bee-1"): void {
   assert.equal(rig.store.currentRuntime(id)?.state, "idle");
 }
 
-test("unit.0: an idle tick uses bounded batch reads, independent of bee count", () => {
+test("unit.0: a tick uses bounded batch reads, independent of bee count, re-read only after a write", () => {
   const rig = makeRig();
   try {
     for (let i = 0; i < 50; i++) {
@@ -97,8 +97,20 @@ test("unit.0: an idle tick uses bounded batch reads, independent of bee count", 
     };
 
     rig.core.step();
-    assert.equal(viewReads, 2, "policy and delivery each take one bee snapshot");
-    assert.equal(mailboxReads, 2, "policy and delivery each take one mailbox snapshot");
+    // A quiet tick changes nothing between the policy and delivery phases, so
+    // the delivery phase reuses the policy snapshot (audit seq unchanged).
+    assert.equal(viewReads, 1, "an idle tick takes one bee snapshot");
+    assert.equal(mailboxReads, 1, "an idle tick takes one mailbox snapshot");
+
+    // A queued command is claimed and executed between the policy and
+    // delivery phases — a store write (audited) after the policy snapshot —
+    // so delivery re-reads exactly once on that tick.
+    rig.store.enqueueCommand("stop", "batch-0", { cause: "stopped_by_system", reason: "test" });
+    viewReads = 0;
+    mailboxReads = 0;
+    rig.core.step();
+    assert.equal(viewReads, 2, "a tick whose command phase wrote re-reads the bee snapshot before delivery");
+    assert.equal(mailboxReads, 2, "a tick whose command phase wrote re-reads the mailbox snapshot before delivery");
   } finally {
     rig.cleanup();
   }

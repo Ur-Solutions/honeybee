@@ -266,18 +266,32 @@ export class DaemonCore {
       this.applySessionIds();
       this.applyObservationCursors();
     });
-    const policySnapshot = this.stepSnapshot();
-    this.bootHangPolicy(policySnapshot.rows);
-    this.scaleToZeroPolicy(policySnapshot.rows, policySnapshot.pendingByBee);
-    this.degradedMailPolicy(policySnapshot.rows, policySnapshot.pendingByBee);
+    let seq = this.store.lastAuditSeq();
+    let snapshot = this.stepSnapshot();
+    this.bootHangPolicy(snapshot.rows);
+    this.scaleToZeroPolicy(snapshot.rows, snapshot.pendingByBee);
+    this.degradedMailPolicy(snapshot.rows, snapshot.pendingByBee);
     this.executeCommands();
-    const deliverySnapshot = this.stepSnapshot();
-    this.deliveryLoop(deliverySnapshot.rows, deliverySnapshot.pendingByBee);
+    ({ snapshot, seq } = this.refreshSnapshot(snapshot, seq));
+    this.deliveryLoop(snapshot.rows, snapshot.pendingByBee);
     this.taskSupplyLoop();
     if (this.policy.i1DeadlineSteps != null && this.onI1Violation != null) {
-      const telemetrySnapshot = this.stepSnapshot();
-      this.i1Telemetry(telemetrySnapshot.rows, telemetrySnapshot.pendingByBee);
+      ({ snapshot, seq } = this.refreshSnapshot(snapshot, seq));
+      this.i1Telemetry(snapshot.rows, snapshot.pendingByBee);
     }
+  }
+
+  /**
+   * Re-read the step snapshot only when the store changed since it was taken.
+   * Every store mutation writes an audit row, so the audit seq is the store's
+   * change version; on a quiet tick this keeps ONE roster materialization per
+   * tick instead of three (2026-09-01: three full listBeeViewRows reads per
+   * 200ms tick were a third of the daemon's CPU on a 268-bee hive).
+   */
+  private refreshSnapshot(current: StepSnapshot, takenAtSeq: number): { snapshot: StepSnapshot; seq: number } {
+    const seq = this.store.lastAuditSeq();
+    if (seq === takenAtSeq) return { snapshot: current, seq };
+    return { snapshot: this.stepSnapshot(), seq };
   }
 
   /**
