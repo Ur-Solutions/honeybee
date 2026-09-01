@@ -44,6 +44,7 @@ import {
   type ChildrenResult,
   type ForkResult,
   type HealthResult,
+  type NodeHarnessesResult,
   type InterruptResult,
   type ListResult,
   type MailboxResult,
@@ -272,6 +273,8 @@ const BOOL_FLAGS = new Set([
   "--yolo",
   "--no-yolo",
   "--no-preamble",
+  // F2: account add — adopting pre-existing harness credentials is explicit.
+  "--import-existing",
 ]);
 
 const KNOWN_FLAGS = new Set([...VALUE_FLAGS, ...BOOL_FLAGS, ...OPTIONAL_VALUE_FLAGS]);
@@ -635,7 +638,7 @@ async function cmdSpawn(ctx: CliContext, parsed: Parsed): Promise<number> {
 
 
 const ACCOUNT_USAGE =
-  "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n]\n" +
+  "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n] [--import-existing]\n" +
   "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100>\n" +
   "       hive account login <selector> [--method <id>] [--remote] [--no-wait] | login-status <selector> | login-cancel <selector>\n" +
   "       hive account capture <selector> | limits [<selector>]\n" +
@@ -768,16 +771,20 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
           ...(parsed.flags.has("--id") ? { id: parsed.flags.get("--id") as string } : {}),
           ...(parsed.flags.has("--home") ? { homePath: resolve(parsed.flags.get("--home") as string) } : {}),
           ...(penaltyFlag !== undefined ? { penalty: Number(penaltyFlag) } : {}),
+          ...(parsed.flags.get("--import-existing") === true ? { importExisting: true } : {}),
           idempotencyKey: key,
         }),
       );
+      const health = r.credentialHealth === "unverified"
+        ? " — adopted existing credentials (unverified until a login/capture/limits probe)"
+        : ` — log in with: hive account login ${r.account.id}`;
       emit(
         ctx,
         [
           confirm(
             "ok",
             "added",
-            `account ${r.account.id} (${r.account.harness}; home ${r.account.homePath}) — log in with: hive account login ${r.account.id}`,
+            `account ${r.account.id} (${r.account.harness}; home ${r.account.homePath})${health}`,
             r.deduped,
           ),
         ],
@@ -1930,6 +1937,18 @@ async function cmdDeployInfo(ctx: CliContext): Promise<number> {
 async function cmdHealth(ctx: CliContext): Promise<number> {
   const result = await withClient(ctx, (c) => c.request<HealthResult>("health"));
   emit(ctx, renderHealth(result), result, false);
+  return 0;
+}
+
+/** F8: the node's per-harness executable facts (same resolver as spawn). */
+async function cmdHarnesses(ctx: CliContext): Promise<number> {
+  const result = await withClient(ctx, (c) => c.request<NodeHarnessesResult>("node.harnesses"));
+  const lines = result.harnesses.map((h) =>
+    h.present
+      ? `${h.harness}: ${h.path} (${h.source}${h.version ? `; ${h.version}` : ""})`
+      : `${h.harness}: not found — command '${h.command}' resolves nowhere on this node (PATH + standard install dirs)`,
+  );
+  emit(ctx, lines, result, false);
   return 0;
 }
 
@@ -3457,6 +3476,8 @@ export async function runV2Cli(argv: string[], io: CliIo = defaultIo): Promise<n
         return await cmdDeployInfo(ctx);
       case "health":
         return await cmdHealth(ctx);
+      case "harnesses":
+        return await cmdHarnesses(ctx);
       case "watch":
         return await cmdWatch(ctx, parsed);
       case "template":

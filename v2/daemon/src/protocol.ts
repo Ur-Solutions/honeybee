@@ -19,6 +19,8 @@
 import type {
   AuditRow,
   BeeRow,
+  CredentialHealth,
+  ExecutableResolutionSource,
   LoginFlowRow,
   MirrorAccountLimitsRow,
   MirrorAccountRow,
@@ -55,6 +57,8 @@ export const DAEMON_VERSION = "2.0.0-wp4";
 export const DAEMON_CAPABILITIES = [
   /** Typed, tmux-independent account login flows: account.login.* verbs + the login_flows snapshot table. */
   "account.login.flow.v1",
+  /** Per-harness executable facts (`node.harnesses`), resolved with the same rule the spawn path uses. */
+  "node.harnesses.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -101,6 +105,13 @@ export const RPC_ERROR_CODES = [
   "login_flow_refused",
   /** v16: the harness has no login recipe or the requested method is not offered (or not remote-capable). */
   "login_method_unsupported",
+  /**
+   * F2: `account.add` without `importExisting:true` found pre-existing
+   * harness credentials at the account's home (or a leftover vault entry) —
+   * a fresh account must start logged out; adopting a machine's existing
+   * login is an explicit choice, never a default.
+   */
+  "account_home_populated",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -122,6 +133,10 @@ export const RPC_VERBS = [
   "commands",
   "deployInfo",
   "health",
+  // F8 (additive read): per-harness executable facts — present/path/source/
+  // version — resolved with the SAME rule the spawn path uses, so probe
+  // truth equals spawn truth.
+  "node.harnesses",
   // CLI-alignment (additive read): tail of the audit log for `hive v2 events`
   "audit.tail",
   // watch
@@ -267,6 +282,8 @@ export interface SpawnResult extends DedupMarkers {
 export interface AccountListResult {
   accounts: MirrorAccountRow[];
   limits: MirrorAccountLimitsRow[];
+  /** F2: derived credential-validation evidence per account id (see CredentialHealth). */
+  credentialHealth: Record<string, CredentialHealth>;
 }
 
 /** `account.get {id}` — id accepts an exact/unique fuzzy selector; `account_not_found` when absent. */
@@ -277,16 +294,30 @@ export interface AccountGetResult {
   bees: string[];
   /** Whether the vault / home hold the harness's primary credential. */
   credentialed: boolean;
+  /** F2: a file existing is not health — the derived validation evidence. */
+  credentialHealth: CredentialHealth;
   /** v16: the account's current login flow (active or its latest outcome), if any. */
   loginFlow: MirrorLoginFlowRow | null;
 }
 
 /**
- * `account.add {harness, label, id?, homePath?, penalty?}` — id defaults to
- * `<harness>-<safe(label)>`, homePath to `<homesDir>/<id>`. Audit account.put.
+ * `account.add {harness, label, id?, homePath?, penalty?, importExisting?}` —
+ * id defaults to `<harness>-<safe(label)>`, homePath to `<homesDir>/<id>`.
+ * Audit account.put.
+ *
+ * F2: a fresh account starts LOGGED OUT (empty vault; credentials arrive
+ * through the typed `account.login.*` flows). When the home (or a leftover
+ * vault entry for the id) already holds the harness's primary credential,
+ * the add is refused with `account_home_populated` unless
+ * `importExisting:true` explicitly opts into adopting those credentials —
+ * which are then reported as `credentialHealth:"unverified"` until a
+ * login/capture/limits probe actually validates them. Import can sign the
+ * machine's regular CLI out of that provider (refresh tokens rotate on use).
  */
 export interface AccountAddResult extends DedupMarkers {
   account: MirrorAccountRow;
+  /** `unverified` after an importExisting adoption; `absent` for a fresh logged-out account. */
+  credentialHealth: CredentialHealth;
 }
 
 /** `account.remove {id}` — id is a selector; `account_referenced` while bees carry it. */
@@ -747,6 +778,33 @@ export interface DeployInfoResult {
   dataDir: string;
   socketPath: string;
   storePath: string;
+}
+
+/**
+ * `node.harnesses {}` — the node's honest per-harness capability facts:
+ * whether each configured agent's executable is actually runnable BY THIS
+ * DAEMON, where it resolved from, and (when cheaply probeable) its version.
+ * Resolution uses the exact core rule the spawn path uses (F8: probe truth
+ * == spawn truth); a stale bun/mise leftover is therefore visible as
+ * `source:"fallback"` + its real path instead of masquerading as a working
+ * install. `version` is a bounded `--version` of the resolved binary,
+ * cached by (path, mtime); null when absent or the probe fails.
+ */
+export interface NodeHarnessesResult {
+  harnesses: HarnessFact[];
+}
+
+export interface HarnessFact {
+  /** Agent/harness name from the node's `agents` config. */
+  harness: string;
+  /** The configured command, before resolution. */
+  command: string;
+  /** Whether the daemon can resolve a runnable executable right now. */
+  present: boolean;
+  /** Resolved absolute path (the exact path a spawn would exec); null when absent. */
+  path: string | null;
+  source: ExecutableResolutionSource | null;
+  version: string | null;
 }
 
 export interface HealthResult {
