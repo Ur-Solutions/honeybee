@@ -2193,7 +2193,7 @@ export class HiveDaemon {
       const verification: AccountAddResult["verification"] = credentialHealth === "absent"
         ? "none"
         : accounts.scheduleVerification([id]).length > 0
-          ? "scheduled"
+          ? accounts.credentialProbeOf(harness)
           : "unsupported";
       this.log(
         `account.add id=${id} harness=${harness} home=${homePath} importExisting=${importExisting} status=${account.status} credentialHealth=${credentialHealth}` +

@@ -421,8 +421,12 @@ test("limits.agy: an imported HOME-scoped token clears auth_needed while provide
     const svc = service(r);
     const tokenFile = ".gemini/antigravity-cli/antigravity-oauth-token";
     const account = addAccount(r, "agy", "personal", { status: "auth_needed", vault: { [tokenFile]: "agy-oauth-token" } });
-    assert.deepEqual(svc.homeEnvOf(account), { HOME: account.homePath });
+    assert.deepEqual(svc.homeEnvOf(account), {
+      HOME: account.homePath,
+      SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1",
+    });
     assert.equal(svc.hasCredentialProbe("agy"), true);
+    assert.equal(svc.credentialProbeOf("agy"), "credential_file");
     assert.equal(svc.credentialed(account), true);
     assert.equal(svc.credentialHealthOf(account), "unverified");
     assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
@@ -437,11 +441,18 @@ test("limits.agy: an imported HOME-scoped token clears auth_needed while provide
     assert.equal(svc.credentialHealthOf(refreshedAccount), "unverified");
     assert.ok(r.log.some((line) => line === `account.auth_ok account=${account.id} by=credential_probe`));
 
+    const present = await svc.verifyCredentials(refreshedAccount);
+    assert.equal(present.outcome, "unverified");
+    assert.equal(present.probe, "credential_file");
+    assert.equal(present.limits?.unreadableReason, "unsupported");
+
     rmSync(join(r.vault, "agy", account.id, tokenFile));
-    const [missing] = await svc.refreshLimits([account.id]);
-    assert.equal(missing?.unreadableReason, "auth_failed");
-    assert.match(missing?.error ?? "", /OAuth token file is missing/);
+    const missing = await svc.verifyCredentials(present.account);
+    assert.equal(missing.outcome, "absent");
+    assert.equal(missing.probe, "credential_file");
+    assert.equal(missing.limits, null);
     assert.equal(svc.credentialed(account), false);
+    assert.equal(missing.account.status, "auth_needed");
     assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
   } finally {
     r.cleanup();
@@ -1243,8 +1254,11 @@ test("verify.v18: the real limits probe settles an import — readable → verif
     assert.deepEqual(await svc.verifyCredentials(stub), { account: stub, outcome: "unverified", probe: "none", limits: null });
     assert.equal(svc.hasCredentialProbe("stub"), false);
     // nothing to verify
-    const bare = r.store.createAccount({ id: "codex-bare", harness: "codex", homePath: join(r.homes, "codex-bare"), label: "bare", status: "auth_needed" });
-    assert.equal((await svc.verifyCredentials(bare)).outcome, "absent");
+    const bare = r.store.createAccount({ id: "codex-bare", harness: "codex", homePath: join(r.homes, "codex-bare"), label: "bare" });
+    const absent = await svc.verifyCredentials(bare);
+    assert.equal(absent.outcome, "absent");
+    assert.equal(absent.account.status, "auth_needed");
+    assert.equal(r.store.getAccount(bare.id)?.status, "auth_needed");
 
     // background scheduling: only probe-capable accounts are queued; the outcome lands on the row
     answer = "ok";

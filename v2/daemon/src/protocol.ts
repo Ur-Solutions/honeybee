@@ -361,9 +361,9 @@ export interface ImportedCredentials {
  * vault. Nothing importable anywhere → `no_credentials_to_import` (the
  * message lists the paths checked) and NO account row. An adopted
  * credential is `unverified`; when the harness has a real probe the daemon
- * schedules one (`verification:"scheduled"`) so the mirror row promptly
- * shows `verified` or `status:"auth_needed"`. Import can sign the machine's
- * regular CLI out of that provider (refresh tokens rotate on use).
+ * schedules one (`verification:"limits"` or `"credential_file"`) so the
+ * mirror row promptly converges. Import can sign the machine's regular CLI
+ * out of that provider (refresh tokens rotate on use).
  */
 export interface AccountAddResult extends DedupMarkers {
   account: MirrorAccountRow;
@@ -372,11 +372,12 @@ export interface AccountAddResult extends DedupMarkers {
   /** v18: provenance of an imported credential; null for a fresh logged-out add. */
   imported: ImportedCredentials | null;
   /**
-   * v18: `scheduled` — the harness's real probe runs in the background lane
-   * and lands on the mirror row; `unsupported` — a credential exists but the
-   * harness has no probe (stays `unverified`); `none` — nothing to verify.
+   * v18: `limits` — an authenticated provider probe is scheduled;
+   * `credential_file` — a required-file check is scheduled; `unsupported` —
+   * a credential exists but the harness has no probe (stays `unverified`);
+   * `none` — nothing to verify.
    */
-  verification: "scheduled" | "unsupported" | "none";
+  verification: "limits" | "credential_file" | "unsupported" | "none";
 }
 
 /** `account.remove {id}` — id is a selector; `account_referenced` while bees carry it. */
@@ -470,20 +471,21 @@ export interface AccountCaptureResult extends DedupMarkers {
 }
 
 /**
- * v18: `account.verify {id, idempotencyKey?}` — run the cheapest REAL
- * validation the harness supports (the limits probe: Claude usage endpoint,
- * `codex app-server`, the secondary providers' windows) and report what it
- * proved. `verified`: the probe read (the limits row is fresh); `auth_needed`:
- * a typed auth failure (status flipped, log in); `unverified`: the harness
- * has no probe (`probe:"none"`) or the probe failed transiently (see
- * `limits.unreadableReason`); `absent`: no credential anywhere to verify.
- * Never spawns a bee; a Codex account's EMPTY home is activated from the
- * vault first (exactly what the first spawn would do).
+ * v18: `account.verify {id, idempotencyKey?}` — run the cheapest validation
+ * the harness supports. `limits` is an authenticated provider read;
+ * `credential_file` checks only that a required credential exists and cannot
+ * prove provider authentication. `verified`: the provider probe read (the
+ * limits row is fresh); `auth_needed`: a typed auth failure (status flipped,
+ * log in); `unverified`: no provider probe exists or it failed transiently
+ * (see `limits.unreadableReason`); `absent`: no credential exists and the
+ * account status converges to `auth_needed`. Never spawns a bee; a Codex
+ * account's EMPTY home is activated from the vault first (exactly what the
+ * first spawn would do).
  */
 export interface AccountVerifyResult extends DedupMarkers {
   account: MirrorAccountRow;
   outcome: "verified" | "auth_needed" | "unverified" | "absent";
-  probe: "limits" | "none";
+  probe: "limits" | "credential_file" | "none";
   /** The limits row after the probe; null when no probe ran. */
   limits: MirrorAccountLimitsRow | null;
 }

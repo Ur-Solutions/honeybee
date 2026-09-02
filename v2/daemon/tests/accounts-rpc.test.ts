@@ -485,7 +485,7 @@ test("rpc.accounts.f2: add refuses pre-existing credentials by default; importEx
     assert.equal(adopted.credentialHealth, "unverified");
     assert.equal(adopted.account.credentialHealth, "unverified", "v18: the mirror row carries the derived health");
     assert.deepEqual(adopted.imported, { source: "home", from: machineHome, files: ["auth.json"] });
-    assert.equal(adopted.verification, "scheduled");
+    assert.equal(adopted.verification, "limits");
     assert.equal(adopted.account.status, "ok", "a credential exists and nothing contradicts it yet");
     assert.equal(readFileSync(join(dir, "vault", "codex", "codex-adopt", "auth.json"), "utf8"), '{"tokens":{"access_token":"stale-april"}}', "the handed-in home is captured into the vault");
     const got = await client.request<AccountGetResult>("account.get", { id: adopted.account.id });
@@ -532,6 +532,22 @@ test("rpc.accounts.f2: add refuses pre-existing credentials by default; importEx
     assert.deepEqual([stubVerify.outcome, stubVerify.probe, stubVerify.limits], ["unverified", "none", null]);
     const bareVerify = await client.request<AccountVerifyResult>("account.verify", { id: fresh.account.id });
     assert.deepEqual([bareVerify.outcome, bareVerify.probe], ["absent", "none"]);
+
+    const agyHome = join(dir, "machine-agy-home");
+    const agyToken = ".gemini/antigravity-cli/antigravity-oauth-token";
+    mkdirSync(join(agyHome, ".gemini", "antigravity-cli"), { recursive: true });
+    writeFileSync(join(agyHome, agyToken), "agy-oauth-token");
+    const agy = await client.request<AccountAddResult>("account.add", {
+      harness: "agy",
+      label: "personal",
+      homePath: agyHome,
+      importExisting: true,
+    });
+    assert.equal(agy.verification, "credential_file");
+    const agyVerify = await client.request<AccountVerifyResult>("account.verify", { id: agy.account.id });
+    assert.equal(agyVerify.probe, "credential_file");
+    assert.equal(agyVerify.outcome, "unverified");
+    assert.equal(agyVerify.limits?.unreadableReason, "unsupported");
 
     // Real validation evidence upgrades honestly: an explicit capture
     // validates the credential and records the login.
@@ -580,7 +596,7 @@ test("rpc.accounts.v18: importExisting imports the MACHINE's vendor home (the fi
     writeFileSync(join(machineHome, ".codex", "config.toml"), 'model = "gpt-5.6"\n');
     const imported = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "work", importExisting: true, idempotencyKey: "import-1" });
     assert.deepEqual(imported.imported, { source: "vendor_home", from: join(machineHome, ".codex"), files: ["auth.json", "config.toml"] });
-    assert.equal(imported.verification, "scheduled");
+    assert.equal(imported.verification, "limits");
     assert.equal(imported.account.status, "ok");
     assert.equal(imported.account.credentialHealth, "unverified");
     assert.equal(readFileSync(join(dir, "vault", "codex", "codex-work", "auth.json"), "utf8"), codexAuth);

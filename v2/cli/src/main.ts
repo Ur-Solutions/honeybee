@@ -779,7 +779,11 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
       );
       const health = r.imported
         ? ` — imported ${r.imported.files.join(", ")} from ${r.imported.source === "external" ? r.imported.from : tildify(r.imported.from)}` +
-          (r.verification === "scheduled" ? "; verifying with the provider (hive account verify " + r.account.id + " to check)" : "; unverified until a login/capture")
+          (r.verification === "limits"
+            ? "; verifying with the provider (hive account verify " + r.account.id + " to check)"
+            : r.verification === "credential_file"
+              ? "; checking the required credential file (hive account verify " + r.account.id + " to check)"
+              : "; unverified until a login/capture")
         : r.credentialHealth === "unverified"
           ? " — existing credentials adopted (unverified until a login/capture/limits probe)"
           : ` — status ${r.account.status}; log in with: hive account login ${r.account.id}`;

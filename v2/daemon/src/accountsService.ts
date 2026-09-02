@@ -163,7 +163,7 @@ export type ImportOutcome =
 export interface VerifyOutcome {
   account: AccountRow;
   outcome: "verified" | "auth_needed" | "unverified" | "absent";
-  probe: "limits" | "none";
+  probe: "limits" | "credential_file" | "none";
   limits: AccountLimitsRow | null;
 }
 
@@ -458,7 +458,13 @@ export class AccountsService {
 
   /** Whether `verifyCredentials` can probe provider authentication or a required credential file. */
   hasCredentialProbe(harness: string): boolean {
-    return PROBE_CAPABLE_HARNESSES.has(harness);
+    return this.credentialProbeOf(harness) !== "none";
+  }
+
+  /** The evidence a harness's credential verification lane can collect. */
+  credentialProbeOf(harness: string): VerifyOutcome["probe"] {
+    if (!PROBE_CAPABLE_HARNESSES.has(harness)) return "none";
+    return harness === "agy" ? "credential_file" : "limits";
   }
 
   // -------------------------------------------------------------------------
@@ -904,8 +910,22 @@ export class AccountsService {
    * unverified until login records fresh evidence.
    */
   async verifyCredentials(account: AccountRow): Promise<VerifyOutcome> {
-    if (!this.credentialed(account)) return { account, outcome: "absent", probe: "none", limits: null };
-    if (!this.hasCredentialProbe(account.harness)) {
+    const probe = this.credentialProbeOf(account.harness);
+    if (!this.credentialed(account)) {
+      const updated = this.store.setAccountStatus(
+        account.id,
+        account.status === "paused" ? "paused" : "auth_needed",
+        "account verify: primary credential is absent",
+      );
+      if (updated.applied) this.log(`account.auth_needed account=${account.id} by=account_verify`);
+      return {
+        account: updated.account,
+        outcome: "absent",
+        probe: probe === "credential_file" ? probe : "none",
+        limits: null,
+      };
+    }
+    if (probe === "none") {
       return { account, outcome: this.credentialHealthOf(account) === "verified" ? "verified" : "unverified", probe: "none", limits: this.store.getAccountLimits(account.id) };
     }
     const [limits] = await this.refreshLimits([account.id]);
@@ -916,7 +936,7 @@ export class AccountsService {
         ? "verified"
         : "unverified";
     this.log(`account.verify account=${account.id} outcome=${outcome} readable=${limits?.readable ?? "-"}${limits && !limits.readable ? ` reason=${limits.unreadableReason}` : ""}`);
-    return { account: after, outcome, probe: "limits", limits: limits ?? null };
+    return { account: after, outcome, probe, limits: limits ?? null };
   }
 
   /**
