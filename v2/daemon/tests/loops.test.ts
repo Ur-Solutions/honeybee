@@ -397,6 +397,48 @@ test("budget.5: immediate-exit runtime → bounded revives with backoff, spawn_f
   }
 });
 
+test("budget.5auth: pre-init agy auth exits consume the budget and suppress churn", () => {
+  const rig = makeRig({ i1DeadlineSteps: 200 });
+  try {
+    rig.driver.authBootFailure = true;
+    rig.store.createBee({ id: "bee-1", name: "bee-1", agent: "agy", substrate: "hsr", cwd: "/tmp" });
+    rig.store.enqueueCommand("spawn", "bee-1");
+    rig.store.send("bee-1", "hello?");
+    stepUntilQuiet(rig, 40);
+
+    assert.equal(rig.driver.starts.length, 3, "only the budget's three generations may start");
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 3, "each pre-real-boot exit counts");
+    assert.deepEqual(
+      rig.store.activeFlags("bee-1").map((flag) => flag.flag).sort(),
+      ["auth_needed", "spawn_failed"],
+    );
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "stopped");
+    assert.equal(rig.store.currentRuntime("bee-1")?.exitCause, "clean");
+    assert.notEqual(rig.store.currentRuntime("bee-1")?.bootEvidence, "real");
+    const resets = rig.store.auditRows().filter(
+      (row) => row.kind === "bee.spawn_failures" && row.payload.spawnFailures === 0,
+    );
+    assert.equal(resets.length, 0, "auth flag evidence must not reset the boot budget");
+
+    const startsAtSuppression = rig.driver.starts.length;
+    rig.clock.now += 10_000;
+    rig.store.send("bee-1", "still there?");
+    for (let i = 0; i < 20; i++) rig.core.step();
+    assert.equal(rig.driver.starts.length, startsAtSuppression, "spawn_failed suppresses further generations");
+
+    rig.store.clearFlag("bee-1", "auth_needed", "operator completed agy login");
+    rig.driver.authBootFailure = false;
+    rig.store.enqueueCommand("revive", "bee-1");
+    for (let i = 0; i < 4; i++) rig.core.step();
+    assert.deepEqual(rig.store.activeFlags("bee-1"), []);
+    assert.equal(rig.store.getBee("bee-1")?.spawnFailures, 0, "operator revive grants a fresh budget");
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.equal(rig.store.currentRuntime("bee-1")?.bootEvidence, "real");
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("budget.5a: prompt-less spawn boot failures still retry to the visible bounded terminal", () => {
   const rig = makeRig({ i1DeadlineSteps: 200 });
   try {

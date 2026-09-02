@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { HsrDriver } from "../src/index.ts";
-import { claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
+import { agyAdapter, claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
 import type { AdapterSignal } from "../../adapters/src/types.ts";
 import {
   AGENT_PATH,
@@ -605,6 +605,43 @@ test("late init must not close an in-flight turn (cell smoke 2026-08-17 phantom 
     assert.equal(seen.filter((k) => k === "turn_ended").length, 1, "exactly one turn_ended");
   } finally {
     driver.stop("li-1", 1, "stopped_by_system");
+  }
+});
+
+test("agy auth before init is flag evidence, not real boot evidence", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-agy-preinit-auth-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "preinit-auth-agy.mjs");
+  writeFileSync(fake, `
+    process.stdout.write(JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: "",
+        status: "ERROR",
+        error: "authentication failed or timed out",
+      },
+    }) + "\\n");
+    setTimeout(() => process.exit(0), 50);
+  `);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({ adapter: agyAdapter, command: process.execPath, args: [fake] }),
+  });
+  try {
+    driver.start("agy-auth", 1);
+    const evidence = await drainEvidenceUntil(
+      driver,
+      (items) => items.some((item) => item.flag === "auth_needed" && item.action === "set"),
+      3000,
+    );
+    const observations = await drainUntil(driver, (items) => ofKind(items, "exited").length > 0, 3000);
+
+    assert.ok(evidence.some((item) => item.flag === "auth_needed" && item.action === "set"));
+    assert.equal(ofKind(observations, "booted").length, 0, "pre-init auth is not readiness proof");
+    assert.equal(ofKind(observations, "turn_ended").length, 0, "a booting runtime has no turn to end");
+    assert.equal(ofKind(observations, "exited")[0]?.exitCause, "clean", "exit code 0 remains a clean exit fact");
+  } finally {
+    driver.disposeAll();
   }
 });
 
