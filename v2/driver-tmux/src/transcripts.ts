@@ -481,12 +481,9 @@ export const agyTranscriptRenderer: TranscriptRenderer = {
       }
       return [];
     }
-    if (row.event === "result") {
-      const result = row.result as { response?: unknown } | undefined;
-      return typeof result?.response === "string" && result.response.trim().length > 0
-        ? [{ role: "assistant", text: result.response }]
-        : [];
-    }
+    // result.response repeats text_delta; a stateless renderer cannot dedupe it.
+    // The stateful agy projector keeps the response as a no-delta fallback.
+    if (row.event === "result") return [];
     return [];
   },
 };

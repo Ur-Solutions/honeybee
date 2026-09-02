@@ -315,9 +315,7 @@ test("agy renderer and projector factory are registered for CLI transcripts", ()
   assert.deepEqual(agyTranscriptRenderer.renderLine(TOOL_TURN_FIXTURE[6]), [
     { role: "assistant", text: "Hi! Ready to build something great today.\n\n`hello-agy`\n" },
   ]);
-  assert.deepEqual(agyTranscriptRenderer.renderLine(TOOL_TURN_FIXTURE[7]), [
-    { role: "assistant", text: "Hi! Ready to build something great today.\n\n`hello-agy`\n" },
-  ]);
+  assert.deepEqual(agyTranscriptRenderer.renderLine(TOOL_TURN_FIXTURE[7]), []);
 
   const projector = createTranscriptProjector("agy");
   assert.equal(projector.harness, "agy");
