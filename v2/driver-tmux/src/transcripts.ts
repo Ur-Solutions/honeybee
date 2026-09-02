@@ -503,7 +503,10 @@ export function renderTranscriptLines(harness: string, lines: readonly string[])
   const projector = createTranscriptProjector(harness);
   const events = lines.flatMap((line) => projector.pushLine(line));
   events.push(...projector.flush());
-  return events.flatMap(turnsFromProjectedEvent);
+  // Rendered turns are the bee's OWN conversation: harness-internal subagent
+  // threads (parentThreadId set) stay out, so `lastAssistantText` is the
+  // bee's closer and never a child's.
+  return events.filter((event) => event.parentThreadId === undefined).flatMap(turnsFromProjectedEvent);
 }
 
 function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTurn[] {
@@ -540,6 +543,8 @@ function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTur
     case "token_usage":
     case "turn_start":
     case "turn_end":
+    case "session_start":
+    case "session_end":
       return [];
   }
 }

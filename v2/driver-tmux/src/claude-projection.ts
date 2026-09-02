@@ -1,9 +1,11 @@
-import type {
-  TranscriptIsoTs,
-  TranscriptProjectedImage,
-  TranscriptProjectedEvent,
-  TranscriptProjector,
-  TranscriptTokenUsage,
+import {
+  ROOT_THREAD_ID,
+  sidechainThreadId,
+  type TranscriptIsoTs,
+  type TranscriptProjectedImage,
+  type TranscriptProjectedEvent,
+  type TranscriptProjector,
+  type TranscriptTokenUsage,
 } from "./transcript-projection.ts";
 
 type JsonObject = Record<string, unknown>;
@@ -34,8 +36,23 @@ type JsonObject = Record<string, unknown>;
  *    exactly like codex deltas (noise is not "unknown" — unknown is reserved
  *    for genuinely unrecognized record types).
  *
- * Stateless per line (claude lines are complete messages); the projector
- * interface stays stateful-shaped for uniformity with codex/grok.
+ * Harness-internal subagents (the `Agent`/`Task` tool, 2026-09-02): the
+ * stream-json log carries every child message inline, tagged with
+ * `parent_tool_use_id` = the parent's spawning `Agent` tool_use id, and
+ * the parent's `system` rows narrate the child's lifecycle:
+ *  - task_started {task_type:"local_agent", task_id, tool_use_id,
+ *    subagent_type, description} → `session_start` on `sidechain:<task_id>`
+ *    (the join tool_use_id → task_id is remembered for the child rows);
+ *  - task_notification {task_id, status} / task_updated {task_id,
+ *    patch.status} for a known agent → one `session_end` (first wins).
+ *  Child user/assistant rows project exactly like root rows but on the
+ *  child's thread with `parentThreadId: "root"`. `task_type:"local_bash"`
+ *  tasks are background shell, not subagents, and stay noise. A child row
+ *  whose spawn record was never seen (truncated log) still threads off its
+ *  raw tool_use id so it never pollutes the root thread.
+ *
+ * Per-line projection is otherwise stateless (claude lines are complete
+ * messages); the only state is the subagent join table above.
  */
 
 function asObject(value: unknown): JsonObject | null {
@@ -152,19 +169,53 @@ function dominantModel(modelUsage: JsonObject | null): string | undefined {
   return best?.model;
 }
 
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "killed", "cancelled", "canceled", "error"]);
+
 export function createClaudeProjector(): TranscriptProjector {
-  return {
-    harness: "claude",
-    pushLine(line: string): TranscriptProjectedEvent[] {
-      let row: JsonObject | null;
-      try {
-        row = asObject(JSON.parse(line));
-      } catch {
-        return [];
-      }
-      if (!row) return [];
-      const type = nonEmptyString(row.type);
-      if (!type || NOISE_TYPES.has(type)) return [];
+  /** Spawning `Agent` tool_use id → harness task/agent id (from task_started). */
+  const agentByToolUse = new Map<string, string>();
+  /** Task ids that are subagents (never background bash), and which already ended. */
+  const agents = new Set<string>();
+  const ended = new Set<string>();
+
+  const subagentLifecycle = (row: JsonObject, ts: TranscriptIsoTs): TranscriptProjectedEvent[] => {
+    const subtype = nonEmptyString(row.subtype);
+    const taskId = nonEmptyString(row.task_id);
+    if (!subtype || !taskId) return [];
+    if (subtype === "task_started") {
+      if (row.task_type !== "local_agent") return [];
+      const toolUseId = nonEmptyString(row.tool_use_id);
+      if (toolUseId) agentByToolUse.set(toolUseId, taskId);
+      agents.add(taskId);
+      const agentType = nonEmptyString(row.subagent_type);
+      const description = nonEmptyString(row.description);
+      return [{
+        kind: "session_start",
+        ts,
+        threadId: sidechainThreadId(taskId),
+        parentThreadId: ROOT_THREAD_ID,
+        ...(agentType ? { agentType } : {}),
+        ...(description ? { description } : {}),
+        ...(toolUseId ? { spawnToolUseId: toolUseId } : {}),
+      }];
+    }
+    if (subtype !== "task_notification" && subtype !== "task_updated") return [];
+    if (!agents.has(taskId) || ended.has(taskId)) return [];
+    const status = subtype === "task_notification"
+      ? nonEmptyString(row.status)
+      : nonEmptyString(asObject(row.patch)?.status);
+    if (!status || !TERMINAL_TASK_STATUSES.has(status)) return [];
+    ended.add(taskId);
+    return [{
+      kind: "session_end",
+      ts,
+      threadId: sidechainThreadId(taskId),
+      parentThreadId: ROOT_THREAD_ID,
+      status,
+    }];
+  };
+
+  const projectLine = (row: JsonObject, type: string): TranscriptProjectedEvent[] => {
       const providerEventId = nonEmptyString(row.uuid);
       const ts = lineTimestamp(row);
 
@@ -331,10 +382,30 @@ export function createClaudeProjector(): TranscriptProjector {
         return events;
       }
 
-      // system init/subtypes are lifecycle + progress chatter, not pane rows.
-      if (type === "system") return [];
+      // system init/subtypes are lifecycle + progress chatter, not pane rows —
+      // except the subagent lifecycle records, which open and close threads.
+      if (type === "system") return subagentLifecycle(row, ts);
 
       return [{ kind: "unknown", ts, nativeType: type }];
+  };
+
+  return {
+    harness: "claude",
+    pushLine(line: string): TranscriptProjectedEvent[] {
+      let row: JsonObject | null;
+      try {
+        row = asObject(JSON.parse(line));
+      } catch {
+        return [];
+      }
+      if (!row) return [];
+      const type = nonEmptyString(row.type);
+      if (!type || NOISE_TYPES.has(type)) return [];
+      const events = projectLine(row, type);
+      const parentToolUseId = nonEmptyString(row.parent_tool_use_id);
+      if (!parentToolUseId || events.length === 0) return events;
+      const threadId = sidechainThreadId(agentByToolUse.get(parentToolUseId) ?? parentToolUseId);
+      return events.map((event) => ({ ...event, threadId, parentThreadId: ROOT_THREAD_ID }));
     },
     flush(): TranscriptProjectedEvent[] {
       return [];

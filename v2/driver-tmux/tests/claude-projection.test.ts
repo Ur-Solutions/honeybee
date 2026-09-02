@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createClaudeProjector } from "../src/claude-projection.ts";
-import { createTranscriptProjector } from "../src/transcripts.ts";
+import { createTranscriptProjector, lastAssistantText, renderTranscriptLines } from "../src/transcripts.ts";
 
 const line = (value: unknown): string => JSON.stringify(value);
 
@@ -210,4 +210,170 @@ test("claude projector: native session-file lines stamp their events; HSR lines 
   assert.equal(result[0]?.ts, "2026-08-24T10:00:02.000Z");
   const bare = p.pushLine(line({ type: "user", message: { role: "user", content: "next" } }));
   assert.deepEqual(bare.map((e) => e.ts), [null, null]);
+});
+
+// ---------------------------------------------------------------------------
+// Harness-internal subagents (Agent/Task tool) — threads off the parent's log
+// ---------------------------------------------------------------------------
+
+/** Shapes lifted from a real HSR session log (bee 64efb07d, 2026-09-02). */
+const spawnCall = line({
+  type: "assistant",
+  uuid: "a-spawn",
+  message: {
+    role: "assistant",
+    content: [{ type: "tool_use", id: "toolu_agent_1", name: "Agent", input: { description: "Review relay diff" } }],
+  },
+});
+const taskStarted = line({
+  type: "system",
+  subtype: "task_started",
+  task_id: "a3a561bafb73ff8cf",
+  tool_use_id: "toolu_agent_1",
+  description: "Review relay Chariot diff",
+  subagent_type: "general-purpose",
+  is_backgrounded: true,
+  spawn_depth: 1,
+  task_type: "local_agent",
+  prompt: "You are an adversarial, read-only code reviewer.",
+});
+const bashTaskStarted = line({
+  type: "system",
+  subtype: "task_started",
+  task_id: "bqjfpo2tr",
+  owned_by_subagent: true,
+  tool_use_id: "toolu_bash_1",
+  description: "Find rental callers",
+  task_type: "local_bash",
+});
+const childPrompt = line({
+  type: "user",
+  uuid: "c-u-1",
+  parent_tool_use_id: "toolu_agent_1",
+  message: { role: "user", content: "You are an adversarial, read-only code reviewer." },
+});
+const childWork = line({
+  type: "assistant",
+  uuid: "c-a-1",
+  parent_tool_use_id: "toolu_agent_1",
+  message: {
+    role: "assistant",
+    id: "msg_child",
+    content: [
+      { type: "text", text: "I'll start by reading the contract docs." },
+      { type: "tool_use", id: "toolu_child_bash", name: "Bash", input: { command: "git diff --stat" } },
+    ],
+    usage: { input_tokens: 2, output_tokens: 5 },
+  },
+});
+const childToolResult = line({
+  type: "user",
+  uuid: "c-u-2",
+  parent_tool_use_id: "toolu_agent_1",
+  message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_child_bash", content: "3 files changed" }] },
+});
+const childProgress = line({
+  type: "system",
+  subtype: "task_progress",
+  task_id: "a3a561bafb73ff8cf",
+  tool_use_id: "toolu_agent_1",
+  description: "Running git diff",
+  usage: { total_tokens: 14836, tool_uses: 1 },
+});
+const rootReply = line({
+  type: "assistant",
+  uuid: "a-root",
+  message: { role: "assistant", content: [{ type: "text", text: "Reviewer launched; reading the wire contract myself." }] },
+});
+const taskNotification = line({
+  type: "system",
+  subtype: "task_notification",
+  task_id: "a3a561bafb73ff8cf",
+  tool_use_id: "toolu_agent_1",
+  status: "completed",
+  output_file: "/private/tmp/claude-501/x/tasks/a3a561bafb73ff8cf.output",
+  summary: "COMPATIBLE for old POS v024 + current backend.",
+});
+const bashNotification = line({
+  type: "system",
+  subtype: "task_notification",
+  task_id: "bqjfpo2tr",
+  tool_use_id: "toolu_bash_1",
+  status: "completed",
+  summary: "Find rental callers",
+});
+const taskUpdated = line({
+  type: "system",
+  subtype: "task_updated",
+  task_id: "a3a561bafb73ff8cf",
+  patch: { status: "completed", end_time: 1788323290986 },
+});
+
+test("claude projector: subagent rows thread off the spawning Agent call with explicit start/end", () => {
+  const p = createClaudeProjector();
+  const events = [
+    spawnCall, taskStarted, bashTaskStarted, childPrompt, childWork, childToolResult, childProgress,
+    rootReply, taskUpdated, taskNotification, bashNotification,
+  ].flatMap((l) => p.pushLine(l));
+  const thread = "sidechain:a3a561bafb73ff8cf";
+  assert.deepEqual(
+    events.map((e) => [e.kind, e.threadId ?? "root", e.parentThreadId ?? "-"]),
+    [
+      ["tool_call", "root", "-"],
+      ["session_start", thread, "root"],
+      ["turn_start", thread, "root"],
+      ["message", thread, "root"],
+      ["message", thread, "root"],
+      ["tool_call", thread, "root"],
+      ["token_usage", thread, "root"],
+      ["tool_result", thread, "root"],
+      ["message", "root", "-"],
+      ["session_end", thread, "root"],
+    ],
+  );
+  const start = events[1] as Extract<typeof events[number], { kind: "session_start" }>;
+  assert.equal(start.agentType, "general-purpose");
+  assert.equal(start.description, "Review relay Chariot diff");
+  assert.equal(start.spawnToolUseId, "toolu_agent_1");
+  const end = events[9] as Extract<typeof events[number], { kind: "session_end" }>;
+  assert.equal(end.status, "completed");
+  // The parent's own Agent call keeps its root identity; the child's Bash
+  // call carries the child's thread so a consumer never pairs across threads.
+  const rootCall = events[0] as Extract<typeof events[number], { kind: "tool_call" }>;
+  assert.equal(rootCall.callId, "toolu_agent_1");
+  const childCall = events[5] as Extract<typeof events[number], { kind: "tool_call" }>;
+  assert.equal(childCall.callId, "toolu_child_bash");
+});
+
+test("claude projector: a child row without its spawn record still stays off the root thread", () => {
+  const p = createClaudeProjector();
+  const events = p.pushLine(childWork);
+  assert.equal(events.length, 3);
+  for (const event of events) {
+    assert.equal(event.threadId, "sidechain:toolu_agent_1");
+    assert.equal(event.parentThreadId, "root");
+  }
+  // A notification for a task that never started as an agent is noise.
+  assert.deepEqual(p.pushLine(taskNotification), []);
+});
+
+test("claude projector: task_notification for background bash is noise; one session_end per agent", () => {
+  const p = createClaudeProjector();
+  p.pushLine(taskStarted);
+  p.pushLine(bashTaskStarted);
+  assert.deepEqual(p.pushLine(bashNotification), []);
+  assert.equal(p.pushLine(taskNotification).length, 1);
+  assert.deepEqual(p.pushLine(taskNotification), []);
+  assert.deepEqual(p.pushLine(taskUpdated), []);
+});
+
+test("renderTranscriptLines keeps subagent threads out of the bee's own turns", () => {
+  const turns = renderTranscriptLines("claude", [
+    spawnCall, taskStarted, childPrompt, childWork, childToolResult, rootReply, taskNotification,
+  ]);
+  assert.deepEqual(turns, [
+    { role: "tool", text: "[tool_use: Agent]" },
+    { role: "assistant", text: "Reviewer launched; reading the wire contract myself." },
+  ]);
+  assert.equal(lastAssistantText(turns), "Reviewer launched; reading the wire contract myself.");
 });

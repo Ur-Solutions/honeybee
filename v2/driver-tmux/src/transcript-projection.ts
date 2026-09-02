@@ -11,6 +11,18 @@
  * Shape is a pure map onto Apiary's AgentEvent (minus id/harness/raw; threadId
  * optional here, root fallback on the Apiary side). Confirmed CL.7920 2026-08-20.
  *
+ * Threads (2026-09-02): a projector that can prove parentage sets BOTH
+ * `threadId` and `parentThreadId` — that pair is the sidechain contract.
+ * `parentThreadId` is always the literal `"root"` today (one nesting level;
+ * deeper harness children flatten onto it). A `threadId` WITHOUT
+ * `parentThreadId` is a provider-native conversation id, not a sidechain, and
+ * consumers keep treating it as the root thread. Harness-internal subagents
+ * (claude `Agent`/`Task`) ride the parent's own session log, so the projector
+ * introduces each one with a `session_start` on its thread (agentType,
+ * description, spawnToolUseId) and closes it with `session_end` (status) when
+ * the harness reports the task done — explicit facts, never inferred from
+ * quiescence.
+ *
  * ts is ISO-8601 or null. Epoch fields on the wire (emittedAtMs, startedAtMs,
  * completedAtMs) convert here. Unknown completed item types become `unknown`
  * with nativeType — never dropped silently, never bee state.
@@ -43,9 +55,30 @@ export type TranscriptProjectedImage = {
   mimeType: string;
 };
 
-type Base = { ts: TranscriptIsoTs; threadId?: string };
+export const ROOT_THREAD_ID = "root";
+export const SIDECHAIN_THREAD_PREFIX = "sidechain:";
+/** Thread id for a harness-internal subagent (its harness-native task/agent id). */
+export function sidechainThreadId(agentId: string): string {
+  return `${SIDECHAIN_THREAD_PREFIX}${agentId}`;
+}
+
+type Base = { ts: TranscriptIsoTs; threadId?: string; parentThreadId?: string };
 
 export type TranscriptProjectedEvent =
+  | (Base & {
+      kind: "session_start";
+      sessionId?: string;
+      cwd?: string;
+      model?: string;
+      cliVersion?: string;
+      /** Harness-defined subagent kind (claude `subagent_type`, e.g. `Explore`). */
+      agentType?: string;
+      /** Human-readable subagent task description from the spawn record. */
+      description?: string;
+      /** The parent-thread tool call (claude `Agent` tool_use id) that spawned this thread. */
+      spawnToolUseId?: string;
+    })
+  | (Base & { kind: "session_end"; status?: string })
   | (Base & { kind: "turn_start"; turnId?: string })
   | (Base & { kind: "turn_end"; turnId?: string; durationMs?: number; finishReason?: string; interrupted?: boolean })
   | (Base & { kind: "interrupt"; reason?: string })
