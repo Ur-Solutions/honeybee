@@ -31,6 +31,38 @@ test("v7.recipes: the Claude recipe's CLI login is the native auth flow", () => 
   assert.deepEqual(recipeFor("claude")?.login, { command: "claude", args: ["auth", "login"] });
 });
 
+test("v7.recipes: the agy recipe conforms to the HOME-based Antigravity OAuth layout and captured login cues", () => {
+  const recipe = recipeFor("agy");
+  assert.ok(recipe);
+  assert.deepEqual(recipe.credentialFiles, [".gemini/antigravity-cli/antigravity-oauth-token"]);
+  assert.deepEqual(recipe.configFiles, [".gemini/antigravity/antigravity_state.pbtxt"]);
+  assert.deepEqual(recipe.extraEnv, { HOME: "{home}" });
+  assert.equal(recipe.vendorHome.dir, ".gemini");
+  assert.deepEqual(recipe.login, { command: "agy", args: [] });
+  assert.equal(recipe.loginFlow.defaultMethodId, "agy-cli");
+  assert.equal(recipe.loginFlow.methods.length, 1);
+  const method = recipe.loginFlow.methods[0]!;
+  assert.deepEqual(
+    { id: method.id, kind: method.kind, remoteCapable: method.remoteCapable, fields: method.fields },
+    { id: "agy-cli", kind: "browser_code", remoteCapable: true, fields: [] },
+  );
+  assert.equal(method.run.mode, "cli");
+  if (method.run.mode !== "cli") return;
+  assert.equal(method.run.cli.tty, true);
+  assert.equal(method.run.cli.landing, "home_mtime");
+  const authOutput = [
+    "Authentication required. Please visit the URL to log in:",
+    "  https://accounts.google.com/o/oauth2/auth?client_id=test",
+    "",
+    "Waiting for authentication (timeout 60s)...",
+    "Or, paste the authorization code here and press Enter:",
+  ].join("\n");
+  const url = new RegExp(method.run.cli.cues.url ?? "", "i").exec(authOutput);
+  assert.equal(url?.[1], "https://accounts.google.com/o/oauth2/auth?client_id=test");
+  assert.ok(method.run.cli.cues.prompts.some((cue) => new RegExp(cue.match, "i").test(authOutput.split("\n").at(-1) ?? "")));
+  assert.ok(method.run.cli.cues.failure?.some((cue) => new RegExp(cue, "i").test('{"error":"authentication failed or timed out"}')));
+});
+
 test("v7.crud: create/get/list (registration order), remove; remove refused while a bee references it; replay", () => {
   const h = harness();
   try {
@@ -328,6 +360,7 @@ test("v7.ids: accountIdFor follows the old registry rule (safeName, lower-case) 
   assert.equal(accountIdFor("kimi", "default"), "kimi-default");
   assert.equal(safeName("..."), "---");
   assert.deepEqual(recipeEnvFor("opencode", "/h"), { XDG_DATA_HOME: "/h/xdg-data" });
+  assert.deepEqual(recipeEnvFor("agy", "/h"), { HOME: "/h" });
   assert.deepEqual(recipeEnvFor("claude", "/h"), {});
 });
 
@@ -444,8 +477,16 @@ test("v18.vendorHome: the machine's real harness home — the home env var when 
   const ocXdg = resolveVendorHome("opencode", { XDG_DATA_HOME: "/data", OPENCODE_CONFIG_DIR: "/cfg/oc" }, home);
   assert.equal(ocXdg?.files[0]?.path, "/data/opencode/auth.json");
   assert.equal(ocXdg?.files[1]?.path, "/cfg/oc/opencode.json");
+  const agy = resolveVendorHome("agy", {}, home);
+  assert.equal(agy?.homeEnv, undefined);
+  assert.equal(agy?.fromEnv, false);
+  assert.equal(agy?.vendorHome, "/Users/op/.gemini");
+  assert.deepEqual(agy?.files, [
+    { rel: ".gemini/antigravity-cli/antigravity-oauth-token", path: "/Users/op/.gemini/antigravity-cli/antigravity-oauth-token", role: "credential" },
+    { rel: ".gemini/antigravity/antigravity_state.pbtxt", path: "/Users/op/.gemini/antigravity/antigravity_state.pbtxt", role: "config" },
+  ]);
   // every recipe declares a vendor home (the import path covers all of them)
-  for (const harness of ["claude", "codex", "opencode", "grok", "kimi", "cursor"]) {
+  for (const harness of ["claude", "codex", "opencode", "grok", "kimi", "agy", "cursor"]) {
     assert.ok(resolveVendorHome(harness, {}, home)?.files[0]?.role === "credential", harness);
   }
   assert.equal(resolveVendorHome("stub", {}, home), null);
