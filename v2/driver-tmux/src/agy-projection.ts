@@ -92,6 +92,7 @@ export function createAgyProjector(): TranscriptProjector {
   let sawAssistantText = false;
   let previousResultUsage: TranscriptTokenUsage | undefined;
   let previousNumTurns: number | undefined;
+  let previousDurationSeconds: number | undefined;
   const assistantFragments = new Map<string, string>();
   const emittedAssistantMessages = new Set<string>();
   const emittedToolCalls = new Set<string>();
@@ -103,6 +104,7 @@ export function createAgyProjector(): TranscriptProjector {
     if (threadId !== undefined && threadId !== next) {
       previousResultUsage = undefined;
       previousNumTurns = undefined;
+      previousDurationSeconds = undefined;
       assistantFragments.clear();
       emittedAssistantMessages.clear();
       emittedToolCalls.clear();
@@ -206,7 +208,6 @@ export function createAgyProjector(): TranscriptProjector {
         ...(turnId ? { providerTurnId: turnId } : {}),
       });
       previousResultUsage = cumulativeUsage;
-      previousNumTurns = numTurns;
     }
 
     const status = nonEmptyString(result.status);
@@ -215,15 +216,32 @@ export function createAgyProjector(): TranscriptProjector {
       events.push({ kind: "interrupt", ts: null, ...thread(), reason });
     }
     const durationSeconds = finiteNumber(result.duration_seconds);
+    let turnDurationSeconds: number | undefined;
+    if (previousNumTurns === undefined && numTurns === 1) {
+      turnDurationSeconds = durationSeconds;
+    } else if (
+      durationSeconds !== undefined
+      && previousDurationSeconds !== undefined
+      && previousNumTurns !== undefined
+      && numTurns !== undefined
+      && numTurns > previousNumTurns
+      && durationSeconds >= previousDurationSeconds
+    ) {
+      turnDurationSeconds = durationSeconds - previousDurationSeconds;
+    }
     events.push({
       kind: "turn_end",
       ts: null,
       ...thread(),
       ...(turnId ? { turnId } : {}),
-      ...(durationSeconds !== undefined ? { durationMs: durationSeconds * 1_000 } : {}),
+      ...(turnDurationSeconds !== undefined
+        ? { durationMs: Math.round(turnDurationSeconds * 1_000_000) / 1_000 }
+        : {}),
       ...(status ? { finishReason: status } : {}),
       ...((status === "CANCELED" || status === "ERROR") ? { interrupted: true } : {}),
     });
+    if (durationSeconds !== undefined) previousDurationSeconds = durationSeconds;
+    if (numTurns !== undefined) previousNumTurns = numTurns;
     assistantFragments.clear();
     sawAssistantText = false;
     return events;

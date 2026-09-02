@@ -336,6 +336,37 @@ test("agy projector: captured cumulative result usage becomes per-turn usage", (
   const ends = events.filter((event) => event.kind === "turn_end");
   assert.equal(ends[0]?.finishReason, "CANCELED");
   assert.equal(ends[0]?.interrupted, true);
+  assert.equal(ends[0]?.durationMs, 4_208.199);
+  assert.equal(ends[1]?.durationMs, 8_741.67);
+});
+
+test("agy projector: resumed cumulative duration waits for a baseline", () => {
+  const events = project([
+    j({ event: "init", conversation_id: SESSION_ID }),
+    j({
+      event: "result",
+      result: {
+        conversation_id: SESSION_ID,
+        status: "SUCCESS",
+        response: "resumed",
+        duration_seconds: 42,
+        num_turns: 3,
+      },
+    }),
+    j({
+      event: "result",
+      result: {
+        conversation_id: SESSION_ID,
+        status: "SUCCESS",
+        response: "next",
+        duration_seconds: 47.25,
+        num_turns: 4,
+      },
+    }),
+  ]);
+  const ends = events.filter((event) => event.kind === "turn_end");
+  assert.equal(ends[0]?.durationMs, undefined);
+  assert.equal(ends[1]?.durationMs, 5_250);
 });
 
 test("agy projector: captured auth error stays visible as an interrupt and terminal result", () => {
