@@ -31,6 +31,14 @@ const TWO_TURN_FIXTURE = [
 const AUTH_ERROR_FIXTURE =
   '{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication failed or timed out","num_turns":0}}';
 
+const SKIP_PERMISSIONS_TOOL_FIXTURE = [
+  `{"event":"init","conversation_id":"${SESSION_ID}","init":{"cwd":"/tmp","tools":["run_command"],"permission_mode":"always-proceed"}}`,
+  `{"event":"step_update","step_update":{"conversation_id":"${SESSION_ID}","step_index":1,"state":"DONE","step_type":"agent_response"}}`,
+  `{"event":"step_update","step_update":{"conversation_id":"${SESSION_ID}","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hello-agy"}}}}`,
+  `{"event":"step_update","step_update":{"conversation_id":"${SESSION_ID}","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hello-agy"},"output":"hello-agy\\n"}}}`,
+  `{"event":"result","result":{"conversation_id":"${SESSION_ID}","status":"SUCCESS","response":"hello-agy\\n","num_turns":1}}`,
+] as const;
+
 test("agy: init is real boot evidence and lands the ready process on idle", () => {
   assert.deepEqual(parseAgyLine(TWO_TURN_FIXTURE[0]), [
     { kind: "booted", sessionId: SESSION_ID },
@@ -48,6 +56,22 @@ test("agy: recorded two-turn stream maps agent responses and results, while user
   assert.deepEqual(parseAgyLine(TWO_TURN_FIXTURE[6]), []);
   assert.deepEqual(parseAgyLine(TWO_TURN_FIXTURE[7]), [{ kind: "turn_started" }]);
   assert.deepEqual(parseAgyLine(TWO_TURN_FIXTURE[8]), [
+    { kind: "flag", flag: "auth_needed", action: "clear", detail: "successful authenticated turn" },
+    { kind: "flag", flag: "resource_blocked", action: "clear", detail: "successful turn served" },
+    { kind: "turn_ended" },
+  ]);
+});
+
+test("agy: recorded skip-permissions stream keeps ACTIVE and DONE tool updates as noise", () => {
+  assert.deepEqual(parseAgyLine(SKIP_PERMISSIONS_TOOL_FIXTURE[0]), [
+    { kind: "booted", sessionId: SESSION_ID },
+    { kind: "flag", flag: "spawn_failed", action: "clear", detail: "runtime booted" },
+    { kind: "turn_ended" },
+  ]);
+  assert.deepEqual(parseAgyLine(SKIP_PERMISSIONS_TOOL_FIXTURE[1]), [{ kind: "turn_started" }]);
+  assert.deepEqual(parseAgyLine(SKIP_PERMISSIONS_TOOL_FIXTURE[2]), []);
+  assert.deepEqual(parseAgyLine(SKIP_PERMISSIONS_TOOL_FIXTURE[3]), []);
+  assert.deepEqual(parseAgyLine(SKIP_PERMISSIONS_TOOL_FIXTURE[4]), [
     { kind: "flag", flag: "auth_needed", action: "clear", detail: "successful authenticated turn" },
     { kind: "flag", flag: "resource_blocked", action: "clear", detail: "successful turn served" },
     { kind: "turn_ended" },
