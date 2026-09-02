@@ -257,7 +257,7 @@ Each live lane is one worker lane at the PR head, resolved through provider disp
 
 **Build.**
 
-- [ ] Add the agy entry to `HARNESS_CATALOG` with the Gemini model list from Appendix A, `--model` flag args, and effort as a reasoning control mapped to `--effort`. Add the agy arm to `harnessPermissionArgs`. Leave `DEFAULT_HARNESS_PRIORITY` unchanged.
+- [ ] Add the agy entry to `HARNESS_CATALOG` with BASE Gemini model ids only (gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash, gemini-3.1-pro), `--model` flag args, and effort as a reasoning control mapped to `--effort`. Never emit an effort-suffixed model id together with `--effort`; agy rejects the conflict (proven live, review doc). Add the agy arm to `harnessPermissionArgs`. Leave `DEFAULT_HARNESS_PRIORITY` unchanged.
 - [ ] Add `agy` to `HSR_CAPABLE_HARNESSES` and `REMOTE_HSR_CAPABLE_HARNESSES` in `packages/core/src/hive.ts`.
 - [ ] Add `agy` to `LOCAL_RUN_HARNESSES`, the onboarding union and `ONBOARDING_HARNESSES` with executable `agy`, version args, install hint, and credential path `.gemini/antigravity-cli/antigravity-oauth-token`, and the doctor label.
 - [ ] Replace the two duplicated harness enums in `agentTools.ts` with one shared list that includes `agy`. This is the subtract-before-add step the duplication invites.
