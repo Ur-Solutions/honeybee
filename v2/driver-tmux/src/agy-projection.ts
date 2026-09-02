@@ -92,6 +92,8 @@ export function createAgyProjector(): TranscriptProjector {
   let sawAssistantText = false;
   let previousResultUsage: TranscriptTokenUsage | undefined;
   let previousNumTurns: number | undefined;
+  const assistantFragments = new Map<string, string>();
+  const emittedAssistantMessages = new Set<string>();
   const emittedToolCalls = new Set<string>();
   const emittedToolResults = new Set<string>();
 
@@ -101,6 +103,8 @@ export function createAgyProjector(): TranscriptProjector {
     if (threadId !== undefined && threadId !== next) {
       previousResultUsage = undefined;
       previousNumTurns = undefined;
+      assistantFragments.clear();
+      emittedAssistantMessages.clear();
       emittedToolCalls.clear();
       emittedToolResults.clear();
     }
@@ -122,17 +126,26 @@ export function createAgyProjector(): TranscriptProjector {
     if (stepType === "user_input") return [];
 
     if (stepType === "agent_response") {
-      const text = nonEmptyString(update.text_delta);
-      if (!text) return [];
-      sawAssistantText = true;
       const stepIndex = finiteNumber(update.step_index);
+      const eventId = `agy:${threadId ?? "unknown"}:${stepIndex ?? "unknown"}`;
+      const delta = typeof update.text_delta === "string" ? update.text_delta : "";
+      if (!emittedAssistantMessages.has(eventId) && delta.length > 0) {
+        assistantFragments.set(eventId, `${assistantFragments.get(eventId) ?? ""}${delta}`);
+      }
+      const state = nonEmptyString(update.state)?.toUpperCase();
+      if (state !== "DONE" || emittedAssistantMessages.has(eventId)) return [];
+      const text = assistantFragments.get(eventId);
+      assistantFragments.delete(eventId);
+      if (!text || text.trim().length === 0) return [];
+      emittedAssistantMessages.add(eventId);
+      sawAssistantText = true;
       return [{
         kind: "message",
         ts: null,
         ...thread(),
         role: "assistant",
         text,
-        ...(stepIndex !== undefined ? { providerEventId: `agy:${threadId ?? "unknown"}:${stepIndex}` } : {}),
+        ...(stepIndex !== undefined ? { providerEventId: eventId } : {}),
       }];
     }
 
@@ -211,6 +224,7 @@ export function createAgyProjector(): TranscriptProjector {
       ...(status ? { finishReason: status } : {}),
       ...((status === "CANCELED" || status === "ERROR") ? { interrupted: true } : {}),
     });
+    assistantFragments.clear();
     sawAssistantText = false;
     return events;
   }

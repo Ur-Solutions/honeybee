@@ -209,6 +209,51 @@ test("agy projector: result response is a fallback and never duplicates text_del
   );
 });
 
+test("agy projector: agent response fragments emit once when the step completes", () => {
+  const projector = createAgyProjector();
+  const active = projector.pushLine(j({
+    event: "step_update",
+    step_update: {
+      conversation_id: SESSION_ID,
+      step_index: 4,
+      state: "ACTIVE",
+      step_type: "agent_response",
+      text_delta: "SECOND",
+    },
+  }));
+  const done = projector.pushLine(j({
+    event: "step_update",
+    step_update: {
+      conversation_id: SESSION_ID,
+      step_index: 4,
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "\n",
+    },
+  }));
+  const duplicateDone = projector.pushLine(j({
+    event: "step_update",
+    step_update: {
+      conversation_id: SESSION_ID,
+      step_index: 4,
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "\n",
+    },
+  }));
+
+  assert.deepEqual(active, []);
+  assert.deepEqual(done, [{
+    kind: "message",
+    ts: null,
+    threadId: SESSION_ID,
+    role: "assistant",
+    text: "SECOND\n",
+    providerEventId: `agy:${SESSION_ID}:4`,
+  }]);
+  assert.deepEqual(duplicateDone, []);
+});
+
 test("agy projector: captured cumulative result usage becomes per-turn usage", () => {
   const events = project([
     j({ event: "init", conversation_id: SESSION_ID }),
