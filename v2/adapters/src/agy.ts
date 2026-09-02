@@ -29,13 +29,7 @@ function resultSignals(resultValue: unknown): AdapterSignal[] {
       : typeof result.response === "string" && result.response.length > 0
         ? result.response
         : "agy result error";
-    const hasConversation = typeof result.conversation_id === "string" && result.conversation_id.length > 0;
-    const signals: AdapterSignal[] = hasConversation
-      ? []
-      : [
-          { kind: "booted" },
-          { kind: "flag", flag: "spawn_failed", action: "clear", detail: "runtime booted" },
-        ];
+    const signals: AdapterSignal[] = [];
     if (isAuthNeededMessage(message)) {
       signals.push({ kind: "flag", flag: "auth_needed", action: "set", detail: message.slice(0, 500) });
     } else if (isResourceBlockedMessage(message)) {
