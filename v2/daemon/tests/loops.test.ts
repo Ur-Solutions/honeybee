@@ -1191,6 +1191,30 @@ test("obs.synthetic-turn_ended: a readyAtSpawn boot-to-ready edge idles the stor
   }
 });
 
+test("obs.synthetic-turn_ended with mail waiting: the boot-to-ready edge is skipped (mail_pending) — no one-step idle under a turn about to start", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    rig.store.enqueueCommand("stop", "bee-1");
+    rig.core.step(); // execute stop
+    rig.core.step(); // drain exited
+    rig.driver.synthBootAlive = true;
+    // revive-on-message: the wake spawns gen 2 with the mail still undelivered.
+    const res = rig.store.send("bee-1", "go");
+    rig.core.step(); // wake claims → gen 2 spawns: booted{synthetic} queued
+    rig.driver.events.push({ beeId: "bee-1", generation: 2, kind: "turn_ended", synthetic: true });
+    rig.core.step(); // drain: running(synthetic); synthetic idle SKIPPED; deliver
+    assert.ok(rig.ops.some((o) => o === "obs.skip bee=bee-1 gen=2 kind=turn_ended reason=mail_pending"), `skip logged; ops tail: ${rig.ops.slice(-6).join(" | ")}`);
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "running", "stays provisionally running until the real result");
+    assert.ok(rig.driver.deliveredIds.includes(res.message.id), "mail delivered into the provisional runtime");
+    rig.driver.events.push({ beeId: "bee-1", generation: 2, kind: "turn_ended" });
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle", "the real result idles it");
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("unit.flag-expiry: a provider-declared reset lifts resource_blocked at the instant — never before, never by silence", () => {
   const rig = makeRig();
   try {

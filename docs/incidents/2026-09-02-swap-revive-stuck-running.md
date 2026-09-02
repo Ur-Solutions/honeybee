@@ -60,7 +60,12 @@ the store.
 - `v2/daemon/src/loops.ts`: a synthetic `turn_ended` moves `running → idle`
   without `recordOutput` (no output fact behind it) and logs as
   `obs.turn_ended … synthetic`. Boot evidence stays `synthetic`, so the
-  spawn-failure budget is unchanged.
+  spawn-failure budget is unchanged. When the bee already has undelivered
+  mail the edge is skipped (`obs.skip … reason=mail_pending`): the delivery
+  loop opens a real turn in that same step, and folding idle first published
+  a one-step "waiting for you" under a turn about to start (caught by the
+  swap/fork/import/rotation RPC tests, which take idle to mean "the turn
+  ran"). Only a revive with nothing to deliver lands idle — the swap shape.
 - Contract docs on `DriverObservation.turn_ended` and `readyAtSpawn` updated.
 
 Tests: two new HSR driver tests (silent revive → idle; delivery-before-status

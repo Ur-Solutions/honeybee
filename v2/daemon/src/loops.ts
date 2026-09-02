@@ -375,6 +375,15 @@ export class DaemonCore {
       this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=booted reason=already_${rt.state}`);
       return;
     }
+    if (obs.kind === "turn_ended" && obs.synthetic === true && this.store.undeliveredMessages(obs.beeId).length > 0) {
+      // The readyAtSpawn boot-to-ready edge with mail already waiting: the
+      // delivery loop opens a real turn this same step (synthetic-boot
+      // `running` is provisional — every urgency is eligible there), so
+      // folding idle here would publish a one-step "waiting for you" under
+      // a turn about to start. Keep `running`; the real result idles it.
+      this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=turn_ended reason=mail_pending`);
+      return;
+    }
     if (rt.state === target) {
       this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind} reason=already_${target}`);
       return;
