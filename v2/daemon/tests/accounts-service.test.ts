@@ -444,7 +444,8 @@ test("limits.agy: an imported HOME-scoped token clears auth_needed while provide
     const present = await svc.verifyCredentials(refreshedAccount);
     assert.equal(present.outcome, "unverified");
     assert.equal(present.probe, "credential_file");
-    assert.equal(present.limits?.unreadableReason, "unsupported");
+    assert.equal(present.limits, null, "a credential-file check does not return provider limits");
+    assert.equal(r.store.getAccountLimits(account.id)?.unreadableReason, "unsupported", "usage keeps the accepted unsupported-limits row");
 
     rmSync(join(r.vault, "agy", account.id, tokenFile));
     const missing = await svc.verifyCredentials(present.account);

@@ -376,6 +376,9 @@ export interface AccountAddResult extends DedupMarkers {
    * `credential_file` — a required-file check is scheduled; `unsupported` —
    * a credential exists but the harness has no probe (stays `unverified`);
    * `none` — nothing to verify.
+   *
+   * This wire enum is additive: later daemon versions may return new kinds.
+   * Consumers must preserve and pass through kinds they do not recognize.
    */
   verification: "limits" | "credential_file" | "unsupported" | "none";
 }
@@ -476,17 +479,19 @@ export interface AccountCaptureResult extends DedupMarkers {
  * `credential_file` checks only that a required credential exists and cannot
  * prove provider authentication. `verified`: the provider probe read (the
  * limits row is fresh); `auth_needed`: a typed auth failure (status flipped,
- * log in); `unverified`: no provider probe exists or it failed transiently
- * (see `limits.unreadableReason`); `absent`: no credential exists and the
- * account status converges to `auth_needed`. Never spawns a bee; a Codex
- * account's EMPTY home is activated from the vault first (exactly what the
- * first spawn would do).
+ * log in); `unverified`: a successful `credential_file` probe found the file
+ * but did not authenticate it, no provider probe exists, or a provider probe
+ * failed transiently (see `limits.unreadableReason`); `absent`: no credential
+ * exists and the account status converges to `auth_needed`. Never spawns a
+ * bee; a Codex account's EMPTY home is activated from the vault first
+ * (exactly what the first spawn would do).
  */
 export interface AccountVerifyResult extends DedupMarkers {
   account: MirrorAccountRow;
   outcome: "verified" | "auth_needed" | "unverified" | "absent";
+  /** Additive wire enum: consumers must preserve and pass through unknown kinds. */
   probe: "limits" | "credential_file" | "none";
-  /** The limits row after the probe; null when no probe ran. */
+  /** Provider limits after a `limits` probe; null for `credential_file` even when that check ran. */
   limits: MirrorAccountLimitsRow | null;
 }
 

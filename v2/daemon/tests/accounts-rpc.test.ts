@@ -547,7 +547,7 @@ test("rpc.accounts.f2: add refuses pre-existing credentials by default; importEx
     const agyVerify = await client.request<AccountVerifyResult>("account.verify", { id: agy.account.id });
     assert.equal(agyVerify.probe, "credential_file");
     assert.equal(agyVerify.outcome, "unverified");
-    assert.equal(agyVerify.limits?.unreadableReason, "unsupported");
+    assert.equal(agyVerify.limits, null);
 
     // Real validation evidence upgrades honestly: an explicit capture
     // validates the credential and records the login.

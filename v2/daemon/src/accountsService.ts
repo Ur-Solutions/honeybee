@@ -936,7 +936,7 @@ export class AccountsService {
         ? "verified"
         : "unverified";
     this.log(`account.verify account=${account.id} outcome=${outcome} readable=${limits?.readable ?? "-"}${limits && !limits.readable ? ` reason=${limits.unreadableReason}` : ""}`);
-    return { account: after, outcome, probe, limits: limits ?? null };
+    return { account: after, outcome, probe, limits: probe === "credential_file" ? null : limits ?? null };
   }
 
   /**
