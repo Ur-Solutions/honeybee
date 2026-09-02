@@ -35,6 +35,40 @@ const here = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(here, "..", "..", "driver-hsr", "test-agent", "fake-login-cli.mjs");
 const SENTINEL_KEY = "sk-SENTINEL-API-KEY-0123456789abcdef";
 const SENTINEL_CODE = "SENTINEL-AUTH-CODE-9f8e7d6c";
+const FAKE_AGY_LOGIN = String.raw`
+const { mkdirSync, writeFileSync } = require("node:fs");
+const { dirname, join } = require("node:path");
+const { createInterface } = require("node:readline");
+const home = process.env.HOME;
+if (!home) process.exit(2);
+console.error("Authentication required. Please visit the URL to log in:");
+console.error("  https://accounts.google.com/o/oauth2/auth?client_id=fake-agy");
+console.error("");
+console.error("Waiting for authentication (timeout 60s)...");
+console.error("Or, paste the authorization code here and press Enter:");
+const fail = () => {
+  console.error("Error: authentication timed out.");
+  console.log(JSON.stringify({ event: "result", result: { status: "ERROR", error: "authentication failed or timed out" } }));
+  process.exit(0);
+};
+if (process.env.FAKE_AGY_FAIL === "1") {
+  setTimeout(fail, 50);
+} else {
+  const input = createInterface({ input: process.stdin, terminal: false });
+  input.once("line", (code) => {
+    if (code.trim() !== process.env.FAKE_AGY_EXPECT) return fail();
+    for (const [file, content] of [
+      [".gemini/antigravity-cli/antigravity-oauth-token", "fake-agy-token"],
+      [".gemini/antigravity/antigravity_state.pbtxt", "fake-agy-state"],
+    ]) {
+      const path = join(home, file);
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      writeFileSync(path, content, { mode: 0o600 });
+    }
+    process.exit(0);
+  });
+}
+`;
 
 interface Rig {
   dir: string;
@@ -133,6 +167,10 @@ function account(r: Rig, harness: string, label: string, status: "ok" | "auth_ne
 
 function fakeCliAgent(harness: string, homeEnv: string, file: string, env: Record<string, string>) {
   return { [harness]: { command: process.execPath, args: [], adapter: harness, login: { command: process.execPath, args: [FAKE_CLI] }, env: { FAKE_LOGIN_HOME_ENV: homeEnv, FAKE_LOGIN_FILE: file, ...env } } };
+}
+
+function fakeAgyAgent(env: Record<string, string>) {
+  return { agy: { command: process.execPath, args: [], adapter: "agy", login: { command: process.execPath, args: ["-e", FAKE_AGY_LOGIN] }, env } };
 }
 
 /** Every persisted/diagnostic surface a secret could leak into. */
@@ -450,6 +488,58 @@ test("flows.cli-prompt: url → prompt (waiting_input) → wrong code re-asks wi
     }, "succeeded", 8000, 25);
     assert.equal(r.store.getAccount(acct.id)?.status, "ok");
     assert.doesNotMatch(leakSurfaces(r), /SENTINEL|wrong/);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("flows.agy-cli: the captured OAuth cues request a code and token landing under the account HOME completes the flow", async () => {
+  const r = rig({ agents: fakeAgyAgent({ FAKE_AGY_EXPECT: SENTINEL_CODE }) });
+  try {
+    const { flows, completed } = services(r);
+    const acct = account(r, "agy", "personal");
+    const { flow } = await flows.start(acct);
+    assert.equal(flow.methodId, "agy-cli");
+    const asking = await waitFor(() => {
+      const current = r.store.getLoginFlow(flow.id) as LoginFlowRow;
+      return current.phase === "waiting_input" && current.authorizationUrl ? current : null;
+    }, "agy authorization code prompt", 5000, 20);
+    assert.equal(asking.authorizationUrl, "https://accounts.google.com/o/oauth2/auth?client_id=fake-agy");
+    assert.deepEqual(asking.inputFields.map((field) => field.id), ["code"]);
+
+    await flows.submit(flow.id, { code: SENTINEL_CODE });
+    await waitFor(() => {
+      flows.tick();
+      return r.store.getLoginFlow(flow.id)?.phase === "succeeded" ? true : null;
+    }, "agy credential landing", 5000, 20);
+    const tokenFile = ".gemini/antigravity-cli/antigravity-oauth-token";
+    const configFile = ".gemini/antigravity/antigravity_state.pbtxt";
+    assert.equal(readFileSync(join(acct.homePath, tokenFile), "utf8"), "fake-agy-token");
+    assert.equal(readFileSync(join(r.vault, "agy", acct.id, tokenFile), "utf8"), "fake-agy-token");
+    assert.equal(readFileSync(join(r.vault, "agy", acct.id, configFile), "utf8"), "fake-agy-state");
+    assert.equal(mode(join(acct.homePath, tokenFile)), 0o600);
+    assert.equal(r.store.getAccount(acct.id)?.status, "ok");
+    assert.deepEqual(completed, [acct.id]);
+    assert.doesNotMatch(leakSurfaces(r), /SENTINEL/);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("flows.agy-cli: a captured auth failure exits zero but still fails the flow", async () => {
+  const r = rig({ agents: fakeAgyAgent({ FAKE_AGY_FAIL: "1" }) });
+  try {
+    const { flows } = services(r);
+    const acct = account(r, "agy", "timeout");
+    const { flow } = await flows.start(acct);
+    const failed = await waitFor(() => {
+      const current = r.store.getLoginFlow(flow.id) as LoginFlowRow;
+      return current.phase === "failed" ? current : null;
+    }, "agy auth failure", 5000, 20);
+    assert.equal(failed.error?.code, "cli_failed");
+    assert.equal(failed.retryable, true);
+    assert.equal(existsSync(join(acct.homePath, ".gemini/antigravity-cli/antigravity-oauth-token")), false);
+    assert.equal(r.store.getAccount(acct.id)?.status, "auth_needed");
   } finally {
     r.cleanup();
   }

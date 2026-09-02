@@ -415,6 +415,33 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
   }
 });
 
+test("limits.agy: the HOME-scoped token is the credential probe while provider limits remain unsupported", async () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const tokenFile = ".gemini/antigravity-cli/antigravity-oauth-token";
+    const account = addAccount(r, "agy", "personal", { vault: { [tokenFile]: "agy-oauth-token" } });
+    assert.deepEqual(svc.homeEnvOf(account), { HOME: account.homePath });
+    assert.equal(svc.hasCredentialProbe("agy"), true);
+    assert.equal(svc.credentialed(account), true);
+
+    const [unsupported] = await svc.refreshLimits([account.id]);
+    assert.equal(unsupported?.readable, false);
+    assert.equal(unsupported?.unreadableReason, "unsupported");
+    assert.equal(unsupported?.error, "agy has no limits source");
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
+
+    rmSync(join(r.vault, "agy", account.id, tokenFile));
+    const [missing] = await svc.refreshLimits([account.id]);
+    assert.equal(missing?.unreadableReason, "auth_failed");
+    assert.match(missing?.error ?? "", /OAuth token file is missing/);
+    assert.equal(svc.credentialed(account), false);
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+  } finally {
+    r.cleanup();
+  }
+});
+
 test("limits.1a: Codex probes are per-home single-flight; transient failure keeps the last good row while auth failure invalidates it", async () => {
   const r = rig();
   try {

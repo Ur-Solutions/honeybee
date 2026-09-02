@@ -167,8 +167,8 @@ export interface VerifyOutcome {
   limits: AccountLimitsRow | null;
 }
 
-/** Harnesses whose limits probe is a real authentication check (fetchByHarness). */
-const PROBE_CAPABLE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "kimi", "cursor", "opencode"]);
+/** Harnesses with either an authenticated limits read or an explicit credential-file probe. */
+const PROBE_CAPABLE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "kimi", "cursor", "opencode", "agy"]);
 
 // ---------------------------------------------------------------------------
 // default transports
@@ -456,7 +456,7 @@ export class AccountsService {
     return this.credentialed(account) ? "ok" : "auth_needed";
   }
 
-  /** Whether `verifyCredentials` has a real probe for the harness (else it can only report `unverified`). */
+  /** Whether `verifyCredentials` can probe provider authentication or a required credential file. */
   hasCredentialProbe(harness: string): boolean {
     return PROBE_CAPABLE_HARNESSES.has(harness);
   }
@@ -761,6 +761,10 @@ export class AccountsService {
       case "cursor":
       case "opencode":
         return this.fetchSecondaryProvider(account);
+      case "agy":
+        return this.credentialed(account)
+          ? { readable: false, unreadableReason: "unsupported", error: "agy has no limits source" }
+          : { readable: false, unreadableReason: "auth_failed", error: "agy OAuth token file is missing from the account home and vault" };
       default:
         return { readable: false, unreadableReason: "unsupported", error: `${account.harness} has no limits source` };
     }
@@ -874,9 +878,9 @@ export class AccountsService {
   }
 
   /**
-   * v18: verify credentials off the caller path (the background limits lane;
-   * `verifyCredentials` is the awaited form). Only probe-capable harnesses
-   * are scheduled; the ids actually queued are returned.
+   * v18: verify credentials off the caller path through the shared background
+   * lane. Provider-backed probes read limits; agy checks its required OAuth
+   * token and leaves limits unsupported. The ids actually queued are returned.
    */
   scheduleVerification(accountIds: readonly string[]): string[] {
     const ids = accountIds.filter((id) => {
@@ -888,10 +892,10 @@ export class AccountsService {
   }
 
   /**
-   * v18: `account.verify` — the cheapest REAL validation the harness has is
-   * its limits probe (an authenticated provider read), so run exactly that
-   * and say what it proved. No new prober: outcome = the account's status
-   * and derived health after `refreshLimits`.
+   * v18: `account.verify` runs the cheapest probe the harness has. A provider
+   * limits read can verify a credential. agy's file probe can prove only that
+   * its required token is present or absent, so a present imported token stays
+   * unverified until login records fresh evidence.
    */
   async verifyCredentials(account: AccountRow): Promise<VerifyOutcome> {
     if (!this.credentialed(account)) return { account, outcome: "absent", probe: "none", limits: null };
