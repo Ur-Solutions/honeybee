@@ -167,7 +167,7 @@ export function createAgyProjector(): TranscriptProjector {
     }
     if (state && TERMINAL_TOOL_STATES.has(state) && !emittedToolResults.has(callId)) {
       emittedToolResults.add(callId);
-      const output = printableOutput(info?.output);
+      const output = printableOutput(info?.output) ?? printableOutput(info?.error);
       return [{
         kind: "tool_result",
         ts: null,

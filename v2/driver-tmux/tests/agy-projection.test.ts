@@ -165,6 +165,38 @@ test("agy projector: captured tool turn maps user, tool pair, reply, usage suffi
   assert.equal(end.turnId, `${SESSION_ID}:1`);
 });
 
+test("agy projector: failed tool without output projects tool_info error", () => {
+  const events = project([
+    j({
+      event: "step_update",
+      step_update: {
+        conversation_id: SESSION_ID,
+        step_index: 8,
+        state: "ACTIVE",
+        step_type: "tool",
+        tool_name: "run_command",
+        tool_info: { name: "run_command", parameters: { CommandLine: "exit 1" } },
+      },
+    }),
+    j({
+      event: "step_update",
+      step_update: {
+        conversation_id: SESSION_ID,
+        step_index: 8,
+        state: "ERROR",
+        step_type: "tool",
+        tool_name: "run_command",
+        tool_info: { name: "run_command", error: "command failed" },
+      },
+    }),
+  ]);
+
+  const result = events[1] as Extract<typeof events[number], { kind: "tool_result" }>;
+  assert.equal(result.kind, "tool_result");
+  assert.equal(result.isError, true);
+  assert.equal(result.output, "command failed");
+});
+
 test("agy projector: result response is a fallback and never duplicates text_delta", () => {
   const withDelta = project([
     j({ event: "init", conversation_id: SESSION_ID }),
