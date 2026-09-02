@@ -116,7 +116,7 @@ test("unit.0: a tick uses bounded batch reads, independent of bee count, re-read
   }
 });
 
-test("unit.1: scale-to-zero — idle past the window stops with stopped_by_system; send revives (Q4 + Q3)", () => {
+test("unit.1: idle-timeout reaper — idle past the window stops with idle_timeout; send revives (Q4 + Q3)", () => {
   const rig = makeRig({ idleWindowSteps: 100 });
   try {
     spawnIdleBee(rig);
@@ -124,13 +124,13 @@ test("unit.1: scale-to-zero — idle past the window stops with stopped_by_syste
     rig.clock.now += 90;
     rig.core.step();
     assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
-    // Past the window: stop enqueued, executed, exit cause stopped_by_system.
+    // Past the window: stop enqueued, executed, exit cause idle_timeout.
     rig.clock.now += 20;
     rig.core.step(); // enqueue + execute stop
     rig.core.step(); // drain exited observation
     const rt = rig.store.currentRuntime("bee-1");
     assert.equal(rt?.state, "stopped");
-    assert.equal(rt?.exitCause, "stopped_by_system");
+    assert.equal(rt?.exitCause, "idle_timeout");
     // Revive-on-message undoes it.
     const res = rig.store.send("bee-1", "wake up");
     assert.ok(res.wakeCommand, "send to a stopped bee must enqueue send_wake");
@@ -156,9 +156,14 @@ test("unit.2: scale-to-zero never stops an idle bee with undelivered mail", () =
     rig.core.step();
     const rt = rig.store.currentRuntime("bee-1");
     assert.equal(rt?.state, "idle", "idle bee with pending mail must not be scale-to-zero'd");
-    // The moment the mail drains, the window applies again.
+    // Once the mail drains AND the harness has answered it with a turn (a
+    // delivery with no turn since is not provably idle), the window applies
+    // again from the new idle edge.
     rig.driver.acceptDeliveries = true;
     rig.core.step(); // deliver
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_started" });
+    rig.driver.events.push({ beeId: "bee-1", generation: 1, kind: "turn_ended" });
+    rig.core.step();
     rig.clock.now += 200;
     rig.core.step();
     rig.core.step();

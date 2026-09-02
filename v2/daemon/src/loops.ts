@@ -16,8 +16,11 @@
  *  3. boot-hang policy: stop runtimes that never produce the bounded boot
  *     readiness handshake. Running turns are unbounded: silence and elapsed
  *     time are not failure evidence.
- *  4. scale-to-zero: stop(stopped_by_system) idle runtimes past the idle
- *     window (Q4 ruling; revive-on-message undoes it)
+ *  4. idle-timeout reaper (scale-to-zero): stop(idle_timeout) a runtime that
+ *     has sat `idle` past its effective timeout with nothing pending — no
+ *     undelivered mail, no open operator question, no condition flag. The
+ *     decision is re-checked right before the kill (the stop command may run
+ *     ticks later); revive-on-message undoes the reap
  *  5. degraded-runtime policy: a re-adopted runtime has no event stream or
  *     stdin (pipes died with the previous daemon process); when mail arrives
  *     for one, stop it so revive-on-message hands the mailbox to a fresh
@@ -64,9 +67,10 @@ export interface DaemonPolicy {
   /** Max commands executed per step (executor loop budget). */
   commandsPerStep: number;
   /**
-   * Scale-to-zero (spec 04 behavior 3): stop(stopped_by_system) an idle
-   * runtime after this window. Omitted/null = disabled (the harness default —
-   * the sim proves the loops; the timer is daemon policy).
+   * Idle-timeout reaper (spec 04 behavior 3, scale-to-zero): stop(idle_timeout)
+   * a runtime idle past this window. Omitted/null = disabled node-wide (the
+   * harness default — the sim proves the loops; the timer is daemon policy).
+   * A bee's own `idleTimeoutMs` overrides it either way (0 = never).
    */
   idleWindowSteps?: number | null;
   /**
@@ -272,7 +276,7 @@ export class DaemonCore {
     let seq = this.store.lastAuditSeq();
     let snapshot = this.stepSnapshot();
     this.bootHangPolicy(snapshot.rows);
-    this.scaleToZeroPolicy(snapshot.rows, snapshot.pendingByBee);
+    this.idleTimeoutPolicy(snapshot.rows, snapshot.pendingByBee);
     this.degradedMailPolicy(snapshot.rows, snapshot.pendingByBee);
     this.executeCommands();
     ({ snapshot, seq } = this.refreshSnapshot(snapshot, seq));
@@ -405,6 +409,7 @@ export class DaemonCore {
         exitCause: obs.exitCause ?? "crashed",
         exitDetail: obs.detail,
       });
+      this.killIssued.delete(`${obs.beeId}#${obs.generation}`);
       this.log(
         `obs.exited bee=${obs.beeId} gen=${obs.generation} cause=${obs.exitCause}${obs.detail ? ` detail=${obs.detail}` : ""}`,
       );
@@ -630,22 +635,79 @@ export class DaemonCore {
   }
 
   // -------------------------------------------------------------------------
-  // scale-to-zero — idle → stop(stopped_by_system) after the idle window
+  // idle-timeout reaper — idle → stop(idle_timeout) after the effective timeout
   // -------------------------------------------------------------------------
 
-  private scaleToZeroPolicy(rows: BeeViewRow[], pendingByBee: Map<string, MessageRow[]>): void {
-    const window = this.policy.idleWindowSteps;
-    if (window == null) return;
+  /** The timeout that applies to this bee: its own override, else the node's. 0/null = never. */
+  private effectiveIdleTimeout(bee: BeeViewRow["bee"]): number | null {
+    const own = bee.idleTimeoutMs;
+    const window = own != null ? own : (this.policy.idleWindowSteps ?? null);
+    return window != null && window > 0 ? window : null;
+  }
+
+  /**
+   * Why an idle runtime must NOT be reaped right now, or null when it may be.
+   * One rule, used both when the policy decides and again inside the stop
+   * command right before the kill: anything that arrived in between (mail,
+   * a question, a flag, a turn) turns the reap into a recorded no-op.
+   */
+  private reapBlocker(
+    beeId: string,
+    rt: { state: RuntimeState; generation: number; updatedAt: number } | null,
+    pendingMail: number,
+    flags: readonly string[],
+    openQuestions: number,
+  ): string | null {
+    if (!rt || rt.state !== "idle") return `state=${rt?.state ?? "none"}`;
+    if (pendingMail > 0) return "pending_mail";
+    if (openQuestions > 0) return "open_question";
+    if (flags.length > 0) return `flag=${flags.join(",")}`;
+    // A delivery after the idle edge with no turn observed since: the harness
+    // has input it has not answered yet. That is not provably idle (the
+    // turn_started may be a tick away); the next running → idle edge
+    // restarts the clock. Strictly after: a turn edge stamped in the same
+    // instant as the delivery it answers (virtual clocks) counts as answered.
+    const delivered = this.store.lastDeliveredAt(beeId, rt.generation);
+    if (delivered != null && delivered > rt.updatedAt) return "delivered_since_idle";
+    return null;
+  }
+
+  /**
+   * Generations whose process has been signaled by an executed stop (any
+   * cause) and whose exit has not been observed yet. The reaper must not
+   * enqueue a second stop for a runtime that is already dying: the exit
+   * observation lands a tick or two after the signal (2026-09-02 log:
+   * policy.idle_stop twice for one generation). In-memory on purpose — after
+   * a daemon restart a re-adopted, still-idle runtime earns at most one
+   * extra signal, which is idempotent.
+   */
+  private readonly killIssued = new Set<string>();
+
+  private idleTimeoutPolicy(rows: BeeViewRow[], pendingByBee: Map<string, MessageRow[]>): void {
     const now = this.now();
-    for (const { bee, runtime: rt } of rows) {
+    // Open questions are read once per step, and only when some runtime is
+    // actually past its timeout — a quiet tick pays nothing extra.
+    let openByBee: Map<string, number> | null = null;
+    for (const { bee, runtime: rt, view } of rows) {
       if (!rt || rt.state !== "idle") continue;
-      if (now - rt.updatedAt <= window) continue;
-      // Pending mail means the delivery loop is about to use this runtime —
-      // stopping it now would only bounce through revive-on-message.
-      if ((pendingByBee.get(bee.id)?.length ?? 0) > 0) continue;
+      const timeout = this.effectiveIdleTimeout(bee);
+      if (timeout == null) continue;
+      // Idle time is measured from the running → idle edge: runtimes.updated_at
+      // moves only on state transitions, so it is exactly "turn ended at".
+      const idleFor = now - rt.updatedAt;
+      if (idleFor <= timeout) continue;
+      if (openByBee == null) {
+        openByBee = new Map();
+        for (const q of this.store.listQuestions({ open: true })) {
+          openByBee.set(q.beeId, (openByBee.get(q.beeId) ?? 0) + 1);
+        }
+      }
+      const blocker = this.reapBlocker(bee.id, rt, pendingByBee.get(bee.id)?.length ?? 0, view.flags, openByBee.get(bee.id) ?? 0);
+      if (blocker != null) continue;
+      if (this.killIssued.has(`${bee.id}#${rt.generation}`)) continue;
       if (this.pendingStopExists(bee.id, rt.generation)) continue;
-      this.store.enqueueCommand("stop", bee.id, { cause: "stopped_by_system", reason: "idle_window" });
-      this.log(`policy.idle_stop bee=${bee.id} gen=${rt.generation} idleFor=${now - rt.updatedAt}`);
+      this.store.enqueueCommand("stop", bee.id, { cause: "idle_timeout", reason: "idle_timeout" });
+      this.log(`policy.idle_stop bee=${bee.id} gen=${rt.generation} idleFor=${idleFor} timeout=${timeout}${bee.idleTimeoutMs != null ? " perBee" : ""}`);
     }
   }
 
@@ -754,10 +816,31 @@ export class DaemonCore {
       case "stop": {
         const gen = cmd.targetGeneration;
         const cause: StopCause =
-          cmd.args.cause === "stopped_by_user" ? "stopped_by_user" : "stopped_by_system";
+          cmd.args.cause === "stopped_by_user"
+            ? "stopped_by_user"
+            : cmd.args.cause === "idle_timeout"
+              ? "idle_timeout"
+              : "stopped_by_system";
         const rt = this.store.currentRuntime(cmd.beeId);
         if (gen == null || !rt || rt.generation !== gen || rt.state === "stopped") return true;
+        if (cause === "idle_timeout") {
+          // Re-decide at the last instant (same single-writer turn as the kill):
+          // mail, a question, a flag, or a new turn since the policy enqueued
+          // this stop makes the reap a recorded no-op — never a bounce.
+          const blocker = this.reapBlocker(
+            cmd.beeId,
+            rt,
+            this.store.undeliveredMessages(cmd.beeId).length,
+            this.store.activeFlags(cmd.beeId).map((f) => f.flag),
+            this.store.listQuestions({ beeId: cmd.beeId, open: true }).length,
+          );
+          if (blocker != null) {
+            this.log(`cmd.stop.skip id=${cmd.id} bee=${cmd.beeId} gen=${gen} cause=idle_timeout reason=${blocker}`);
+            return true;
+          }
+        }
         const { hadProcess } = this.driver.stop(cmd.beeId, gen, cause);
+        if (hadProcess) this.killIssued.add(`${cmd.beeId}#${gen}`);
         if (!hadProcess) {
           // Parenthood certainty: no process exists, so the stop is a fact now.
           this.store.updateRuntimeState(cmd.beeId, gen, "stopped", { exitCause: cause });

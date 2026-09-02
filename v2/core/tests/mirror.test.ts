@@ -210,7 +210,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
         "forkedFrom": null,
         "forkSeed": null,
         "account": null,
-        "handle": "BEE_HANDLE"
+        "handle": "BEE_HANDLE",
+        "idleTimeoutMs": null
       },
       "runtime": {
         "beeId": "BEE_ID",

@@ -131,7 +131,13 @@ export interface NodeConfigFile {
   nodeKind?: NodeKind;
   /** Cell substrate settings (WP5). */
   cells?: CellsConfig;
-  /** Scale-to-zero idle window (behavior 3). Default 60 min; 0/negative disables. */
+  /**
+   * Idle-timeout reaper (behavior 3, scale-to-zero): a runtime idle this
+   * long with nothing pending (no mail, no open question, no flag) is
+   * stopped with exit cause `idle_timeout`; revive-on-message undoes it.
+   * Default 15 min; 0/negative disables node-wide. Per-bee override:
+   * `bee.setIdleTimeout` / `hive bee set-idle-timeout` (0 = never).
+   */
   idleWindowMs?: number;
   /** Hang policy: stop a runtime stuck in `booting` past this. */
   bootHangTimeoutMs?: number;
@@ -237,7 +243,7 @@ export const BUILTIN_AGENTS: Record<string, AgentSpecConfig> = {
 };
 
 export const DEFAULTS = {
-  idleWindowMs: 60 * 60 * 1000, // Q4 ruling: default 60 min
+  idleWindowMs: 15 * 60 * 1000, // idle-timeout reaper: 15 min (2026-09-02; was 60 min — 60+ idle harnesses exhausted 128 GB)
   bootHangTimeoutMs: 3 * 60 * 1000,
   bootAllowanceMs: 60 * 1000,
   turnAllowanceMs: 5 * 60 * 1000,

@@ -72,6 +72,7 @@ import {
   type SendRpcResult,
   type SnapshotResult,
   type SetArgsResult,
+  type SetIdleTimeoutResult,
   type SpawnResult,
   type TagResult,
   type ImportFromFrozenResult,
@@ -148,7 +149,7 @@ import {
   taskLine,
   turnLines,
 } from "./render.ts";
-import { bold, cyan, dim, errorLine, red, staleBanner, tildify, yellow } from "./style.ts";
+import { bold, cyan, dim, errorLine, formatDurationMs, parseDurationMs, red, staleBanner, tildify, yellow } from "./style.ts";
 
 export interface CliIo {
   out(line: string): void;
@@ -1707,7 +1708,8 @@ async function cmdCell(ctx: CliContext, parsed: Parsed): Promise<number> {
 async function cmdBee(ctx: CliContext, parsed: Parsed): Promise<number> {
   const sub = parsed.positional[1];
   const needle = parsed.positional[2];
-  const usage = "usage: hive bee set-args <bee> -- <args…> | bee set-args <bee> --clear | bee args <bee> | bee swap-account <bee> <account>";
+  const usage =
+    "usage: hive bee set-args <bee> -- <args…> | bee set-args <bee> --clear | bee args <bee> | bee swap-account <bee> <account> | bee set-idle-timeout <bee> <15m|never|inherit>";
   switch (sub) {
     case "swap-account": {
       const account = parsed.positional[3];
@@ -1755,6 +1757,30 @@ async function cmdBee(ctx: CliContext, parsed: Parsed): Promise<number> {
               `args for ${beeId}: ${result.bee.args ? JSON.stringify(result.bee.args) : "(none)"} — applies to the next runtime (stop or revive)`,
             ),
           ],
+          result,
+          false,
+        );
+        return 0;
+      });
+    }
+    case "set-idle-timeout":
+    case "idle-timeout": {
+      const value = parsed.positional[3];
+      if (!needle || !value) throw new Error(`${usage}\n(a duration like 15m or 1h, never/0 to keep the bee up, inherit to use the node default)`);
+      const lowered = value.trim().toLowerCase();
+      const idleTimeoutMs = lowered === "inherit" || lowered === "default" || lowered === "null" ? null : parseDurationMs(value);
+      return withClient(ctx, async (c) => {
+        const list = await c.request<ListResult>("list");
+        const beeId = resolveBeeIn(list.views, needle);
+        const result = await c.request<SetIdleTimeoutResult>("bee.setIdleTimeout", {
+          beeId,
+          idleTimeoutMs,
+          idempotencyKey: parsed.flags.get("--idempotency-key") as string | undefined,
+        });
+        const shown = result.bee.idleTimeoutMs == null ? "inherit (node default)" : formatDurationMs(result.bee.idleTimeoutMs);
+        emit(
+          ctx,
+          [confirm(result.applied ? "ok" : "info", result.applied ? "set" : "unchanged", `idle timeout for ${beeId}: ${shown} — applies to the current runtime`)],
           result,
           false,
         );
@@ -3324,7 +3350,13 @@ async function cmdDaemon(ctx: CliContext, parsed: Parsed): Promise<number> {
         const health = await withClient(ctx, (c) => c.request<HealthResult>("health"));
         emit(
           ctx,
-          [confirm("ok", "daemon:", `running (pid ${health.pid}, ${health.ticks} ticks, ${health.i1Violations} i1 violations)`)],
+          [
+            confirm(
+              "ok",
+              "daemon:",
+              `running (pid ${health.pid}, ${health.ticks} ticks, ${health.i1Violations} i1 violations, idle timeout ${health.idleTimeoutMs > 0 ? formatDurationMs(health.idleTimeoutMs) : "never"})`,
+            ),
+          ],
           { running: true, health },
           false,
         );

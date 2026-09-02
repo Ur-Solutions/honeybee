@@ -396,7 +396,7 @@ test("int.4b: runner-persisted completion recovers after SIGKILL and releases id
   }
 });
 
-test("int.5: scale-to-zero with a tiny window → stopped_by_system → revive-on-message", async () => {
+test("int.5: idle-timeout reaper with a tiny window → stopped(idle_timeout) → revive-on-message", async () => {
   const { dir, cleanup } = makeDaemonDir({ idleWindowMs: 250, tickMs: 40 });
   let daemon: DaemonHandle | null = null;
   try {
@@ -408,8 +408,8 @@ test("int.5: scale-to-zero with a tiny window → stopped_by_system → revive-o
       return v.view.runtimeState === "stopped";
     }, "scale-to-zero stop", 10_000);
     const stopped = await client.request<ViewResult>("view", { beeId });
-    assert.equal(stopped.view.exitCause, "stopped_by_system");
-    assert.equal(stopped.view.reachable, true, "a scaled-to-zero bee is still reachable");
+    assert.equal(stopped.view.exitCause, "idle_timeout");
+    assert.equal(stopped.view.reachable, true, "a reaped bee is still reachable");
 
     const sent = await client.request<SendRpcResult>("send", { beeId, body: "revive me" });
     assert.ok(sent.commandId != null, "send to a stopped bee enqueues the wake in the same transaction");

@@ -166,6 +166,7 @@ import {
   type TaskSupplySetResult,
   type TaskTransitionResult,
   type SetArgsResult,
+  type SetIdleTimeoutResult,
   type TagResult,
   type ImportFromFrozenResult,
   type ImportLocalConfigResult,
@@ -926,6 +927,8 @@ export class HiveDaemon {
         );
       case "bee.setArgs":
         return this.withIdempotency(verb, params, () => this.rpcSetArgs(params));
+      case "bee.setIdleTimeout":
+        return this.withIdempotency(verb, params, () => this.rpcSetIdleTimeout(params));
       case "cell.capture":
         return this.withIdempotency(verb, params, () => this.rpcCellCapture(params));
       case "cell.remove":
@@ -1078,6 +1081,25 @@ export class HiveDaemon {
     const res = this.mustStore().updateBeeArgs(beeId, args);
     this.log(`bee.setArgs bee=${beeId} applied=${res.applied} args=${JSON.stringify(args)}`);
     return { bee: res.bee, applied: res.applied };
+  }
+
+  private rpcSetIdleTimeout(params: Record<string, unknown>): SetIdleTimeoutResult {
+    const beeId = this.requireBee(params);
+    if (!("idleTimeoutMs" in params)) throw new RpcError("invalid_request", "bee.setIdleTimeout: idleTimeoutMs is required (null = inherit, 0 = never, >0 ms)");
+    const idleTimeoutMs = this.idleTimeoutParam(params, "bee.setIdleTimeout");
+    const res = this.mustStore().updateBeeIdleTimeout(beeId, idleTimeoutMs);
+    this.log(`bee.setIdleTimeout bee=${beeId} applied=${res.applied} idleTimeoutMs=${idleTimeoutMs}`);
+    return { bee: res.bee, applied: res.applied };
+  }
+
+  /** `idleTimeoutMs`: null/absent = inherit, else a non-negative integer of ms. */
+  private idleTimeoutParam(params: Record<string, unknown>, verb: string): number | null {
+    const v = params.idleTimeoutMs;
+    if (v === undefined || v === null) return null;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+      throw new RpcError("invalid_request", `${verb}: idleTimeoutMs must be null or a non-negative integer (ms)`);
+    }
+    return v;
   }
 
   private requireBee(params: Record<string, unknown>): string {
@@ -1296,6 +1318,7 @@ export class HiveDaemon {
       parentId,
       env: { ...requestedEnv, ...accountEnv },
       ...(account ? { account: account.id } : {}),
+      idleTimeoutMs: this.idleTimeoutParam(params, "spawn"),
     });
     if (cell) {
       reserveCell(this.cfg.cellsRoot, cell.reserve);
@@ -2053,6 +2076,7 @@ export class HiveDaemon {
         active: bees.filter((b) => b.lifecycle === "active").length,
         archived: bees.filter((b) => b.lifecycle === "archived").length,
       },
+      idleTimeoutMs: this.cfg.idleWindowMs > 0 ? this.cfg.idleWindowMs : 0,
     };
   }
 

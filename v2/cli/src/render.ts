@@ -27,6 +27,7 @@ import {
   cyan,
   dim,
   emptyLine,
+  formatDurationMs,
   formatRelativeTime,
   formatTable,
   formatTimeUntil,
@@ -48,10 +49,20 @@ import {
 // bees
 // ---------------------------------------------------------------------------
 
-export function runtimeLabel(v: ViewResult): string {
-  return v.view.runtimeState === "stopped"
-    ? `stopped(${v.view.exitCause})`
-    : (v.view.runtimeState ?? "no-runtime");
+/**
+ * How long the current runtime has been idle (from the running → idle edge,
+ * `runtime.updatedAt`) — what the daemon's idle-timeout reaper measures.
+ */
+export function idleFor(v: ViewResult, now: number = Date.now()): string | null {
+  if (v.view.runtimeState !== "idle" || v.runtime == null) return null;
+  return formatRelativeTime(v.runtime.updatedAt, now);
+}
+
+export function runtimeLabel(v: ViewResult, now: number = Date.now()): string {
+  if (v.view.runtimeState === "stopped") return `stopped(${v.view.exitCause})`;
+  const idle = idleFor(v, now);
+  if (idle != null) return `idle ${idle}`;
+  return v.view.runtimeState ?? "no-runtime";
 }
 
 export function derivedLabel(v: ViewResult): string {
@@ -97,13 +108,20 @@ function extraTokens(v: ViewResult): string {
   return bits.join("  ");
 }
 
-/** Compact runtime for `ls`: the full `stopped(cause)` string stays on `view`. */
-export function listRuntimeLabel(v: ViewResult): string {
+/**
+ * Compact runtime for `ls`: the full `stopped(cause)` string stays on `view`.
+ * Idle bees carry their idle time (`idle 12m`) — the reaper's clock — and a
+ * per-bee `never` marks one the reaper will leave alone.
+ */
+export function listRuntimeLabel(v: ViewResult, now: number = Date.now()): string {
   if (v.view.runtimeState === "stopped") {
     if (v.view.exitCause === "crashed") return "crashed";
     if (v.view.exitCause === "machine_restart") return "restart";
+    if (v.view.exitCause === "idle_timeout") return "idle-timeout";
     return "stopped";
   }
+  const idle = idleFor(v, now);
+  if (idle != null) return v.bee?.idleTimeoutMs === 0 ? `idle ${idle} keep` : `idle ${idle}`;
   return v.view.runtimeState ?? "—";
 }
 
@@ -150,7 +168,7 @@ export function viewLine(v: ViewResult, stale: boolean): string {
   return `${stalePrefix(stale)}${body}`;
 }
 
-export function renderBeeList(views: ViewResult[], stale: boolean, noun = "bees"): string[] {
+export function renderBeeList(views: ViewResult[], stale: boolean, noun = "bees", now: number = Date.now()): string[] {
   if (views.length === 0) return [emptyLine(stale, noun)];
   const working = views.filter((v) => v.view.working).length;
   const waiting = views.filter((v) => v.view.waitingForYou && !v.view.working).length;
@@ -183,7 +201,7 @@ export function renderBeeList(views: ViewResult[], stale: boolean, noun = "bees"
 
   const rows = views.map((v) => {
     const bee = v.bee;
-    const runtime = listRuntimeLabel(v);
+    const runtime = listRuntimeLabel(v, now);
     const derived = derivedLabel(v);
     const row = [
       statusDot(v),
@@ -219,6 +237,7 @@ export function renderBeeView(v: ViewResult, stale: boolean): string[] {
   if (bee.tags.length > 0) details.push(["tags", bee.tags.join(",")]);
   if (bee.parentId) details.push(["parent", bee.parentId]);
   if (bee.lastOutputAt != null) details.push(["last out", `${formatRelativeTime(bee.lastOutputAt)} ago`]);
+  if (bee.idleTimeoutMs != null) details.push(["idle timeout", `${formatDurationMs(bee.idleTimeoutMs)} (per-bee)`]);
   if (bee.providerSessionId) details.push(["session", bee.providerSessionId]);
   if (bee.forkedFrom) details.push(["forked", bee.forkedFrom]);
   for (const [label, value] of details) {
@@ -542,6 +561,10 @@ export function renderHealth(result: HealthResult): string[] {
       dim(`${result.bees.archived} archived`),
     ]),
     joinParts([bold("i1"), `${i1} violations`]),
+    joinParts([
+      bold("idle timeout"),
+      result.idleTimeoutMs > 0 ? `${formatDurationMs(result.idleTimeoutMs)} ${dim("(idle runtimes stop with idle_timeout; send revives)")}` : dim("never (reaper disabled)"),
+    ]),
   ];
 }
 

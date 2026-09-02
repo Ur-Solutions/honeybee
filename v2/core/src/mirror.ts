@@ -99,6 +99,9 @@ export type MirrorDelta = AuditRow;
  * not enqueued because `spawn_failed` is set; no row change).
  * v5 adds `bee.args_set` (bee row: args changed;
  * payload { beeId, args: string[] | null, previous }).
+ * v18 adds `bee.idle_timeout_set` (bee row: idleTimeoutMs changed;
+ * payload { beeId, idleTimeoutMs: number | null, previous }) and the
+ * `idle_timeout` exit cause on runtime rows (the daemon's idle reaper).
  * v6 (pre-flip verbs) adds, all additive:
  *   bee.renamed        → { beeId, name, previous }                     (bee row: name)
  *   bee.titled         → { beeId, title, previous, source }            (bee row: title)
@@ -202,6 +205,8 @@ export const MIRROR_BEE_RECORD_KEYS = [
   "account",
   // v10: additive — the pretty display handle (CL.a3f2 | null pre-backfill).
   "handle",
+  // v18: additive — per-bee idle-timeout override (ms | null = inherit; 0 = never).
+  "idleTimeoutMs",
 ] as const;
 export const MIRROR_RUNTIME_KEYS = [
   "beeId",

@@ -118,7 +118,7 @@ test("args.2: a v4-shaped store (spawn_failures, no args column) migrates additi
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 17);
+      assert.equal(SCHEMA_VERSION, 18);
       const cols = (check.prepare("SELECT name FROM pragma_table_info('bees')").all() as Array<{ name: string }>).map((c) => c.name);
       assert.ok(cols.includes("args"));
       assert.ok(cols.includes("spawn_failures"));

@@ -104,8 +104,54 @@
  *        sign-in (methods, phase, authorization URL / device code, requested
  *        input descriptors, typed error, revision). Carries no secret and no
  *        raw worker output. Additive; migration = CREATE TABLE IF NOT EXISTS.
+ *  v18 — idle-timeout reaper (2026-09-02): adds the `idle_timeout` exit cause
+ *        (the runtimes CHECK gains a value — SQLite cannot ALTER a CHECK, so
+ *        the migration REBUILDS `runtimes` in place with foreign keys off,
+ *        preserving every row and the observation-cursor references) and
+ *        `bees.idle_timeout_ms` (per-bee override: NULL inherit, 0 never,
+ *        >0 ms). Additive column; migration = ALTER TABLE ADD COLUMN ×1.
  */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
+
+/**
+ * The `runtimes` table body, shared by SCHEMA_SQL and the v18 rebuild
+ * migration (the exit_cause CHECK list changed; SQLite cannot alter a CHECK,
+ * so an old store is rebuilt from this exact DDL under a temporary name).
+ */
+export function runtimesTableSql(name: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${name} (
+  bee_id         TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE,
+  generation     INTEGER NOT NULL CHECK (generation >= 1),
+  state          TEXT NOT NULL CHECK (state IN ('booting','running','idle','stopped')),
+  exit_cause     TEXT CHECK (exit_cause IN ('clean','crashed','stopped_by_user','stopped_by_system','machine_restart','idle_timeout')),
+  pid            INTEGER,
+  pid_started_at INTEGER,
+  -- v9: how this runtime left booting (NULL = it has not). 'synthetic' =
+  -- only a driver-minted observation (readyAtSpawn spawn-event booted) —
+  -- provisional: the process has proven nothing; its crashed/clean exit
+  -- counts against the bee's spawn-failure budget like a booting exit.
+  -- 'real' = the adapter parsed actual process output — the contrary
+  -- evidence that resets the budget and clears spawn_failed.
+  boot_evidence  TEXT CHECK (boot_evidence IN ('synthetic','real')),
+  started_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  PRIMARY KEY (bee_id, generation),
+  CHECK ((state = 'stopped') = (exit_cause IS NOT NULL))
+) STRICT;`;
+}
+
+/** Column list of `runtimes`, in DDL order — the rebuild copies exactly these. */
+export const RUNTIMES_COLUMNS = [
+  "bee_id",
+  "generation",
+  "state",
+  "exit_cause",
+  "pid",
+  "pid_started_at",
+  "boot_evidence",
+  "started_at",
+  "updated_at",
+] as const;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -164,30 +210,15 @@ CREATE TABLE IF NOT EXISTS bees (
   -- v10: short human display id (CL.a3f2 — harness prefix + hex), minted by
   -- the owning node at spawn; unique per node (partial index below). The
   -- UUID above stays the canonical id everywhere machines talk.
-  handle           TEXT
+  handle           TEXT,
+  -- v18: per-bee idle-timeout override in ms. NULL = inherit the node's
+  -- idleWindowMs; 0 = never reap; >0 = reap after this long idle.
+  idle_timeout_ms  INTEGER CHECK (idle_timeout_ms IS NULL OR idle_timeout_ms >= 0)
 ) STRICT;
 -- Note: 'deleted' never appears as a stored lifecycle — Q1 says delete removes the
 -- record row immediately, so a missing row IS the deleted state.
 
-CREATE TABLE IF NOT EXISTS runtimes (
-  bee_id         TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE,
-  generation     INTEGER NOT NULL CHECK (generation >= 1),
-  state          TEXT NOT NULL CHECK (state IN ('booting','running','idle','stopped')),
-  exit_cause     TEXT CHECK (exit_cause IN ('clean','crashed','stopped_by_user','stopped_by_system','machine_restart')),
-  pid            INTEGER,
-  pid_started_at INTEGER,
-  -- v9: how this runtime left booting (NULL = it has not). 'synthetic' =
-  -- only a driver-minted observation (readyAtSpawn spawn-event booted) —
-  -- provisional: the process has proven nothing; its crashed/clean exit
-  -- counts against the bee's spawn-failure budget like a booting exit.
-  -- 'real' = the adapter parsed actual process output — the contrary
-  -- evidence that resets the budget and clears spawn_failed.
-  boot_evidence  TEXT CHECK (boot_evidence IN ('synthetic','real')),
-  started_at     INTEGER NOT NULL,
-  updated_at     INTEGER NOT NULL,
-  PRIMARY KEY (bee_id, generation),
-  CHECK ((state = 'stopped') = (exit_cause IS NOT NULL))
-) STRICT;
+${runtimesTableSql("runtimes")}
 
 -- v15: applied cursor into one runner-owned, output-only journal per runtime
 -- generation. This is recovery metadata, not a competing lifecycle state.
@@ -233,6 +264,9 @@ CREATE TABLE IF NOT EXISTS mailbox (
   delivered_generation INTEGER
 ) STRICT;
 CREATE INDEX IF NOT EXISTS mailbox_undelivered ON mailbox(bee_id, id) WHERE delivered_at IS NULL;
+-- v18: the idle reaper's "delivered since the idle edge" read (MAX(delivered_at)
+-- per bee + generation) must not scan the mailbox once per candidate per tick.
+CREATE INDEX IF NOT EXISTS mailbox_delivered ON mailbox(bee_id, delivered_generation, delivered_at);
 
 CREATE TABLE IF NOT EXISTS commands (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -512,7 +546,8 @@ CREATE TABLE IF NOT EXISTS tracks (
 /**
  * Additive columns on `bees` since v2 — name → ADD COLUMN clause (migration =
  * add iff missing). v3: provider_session_id, env, imported_from; v4:
- * spawn_failures; v5: args; v6: parent_id, forked_from, fork_seed; v7: account.
+ * spawn_failures; v5: args; v6: parent_id, forked_from, fork_seed; v7: account;
+ * v10: handle; v18: idle_timeout_ms.
  */
 export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["provider_session_id", "provider_session_id TEXT"],
@@ -525,6 +560,7 @@ export const BEES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: s
   ["fork_seed", "fork_seed TEXT"],
   ["account", "account TEXT"],
   ["handle", "handle TEXT"],
+  ["idle_timeout_ms", "idle_timeout_ms INTEGER CHECK (idle_timeout_ms IS NULL OR idle_timeout_ms >= 0)"],
 ];
 
 /**

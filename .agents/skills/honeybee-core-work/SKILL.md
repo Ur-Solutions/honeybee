@@ -31,7 +31,12 @@ Runtime is `booting -> running <-> idle -> stopped`, with `booting -> stopped` l
 
 - Nothing leaves `stopped`; revive creates generation N+1.
 - Exit causes: `clean`, `crashed`, `stopped_by_user`, `stopped_by_system`,
-  `machine_restart`.
+  `machine_restart`, `idle_timeout`.
+- The daemon's idle-timeout reaper stops a runtime idle past its effective timeout
+  (config `idleWindowMs`, default 15 min; per-bee `idleTimeoutMs`, 0 = never) with
+  `idle_timeout`, only when nothing is pending: no undelivered mail, no open question,
+  no flag, no delivery since the idle edge. It re-checks right before the kill and
+  never stops `running`/`booting`. Revive-on-message undoes it.
 - A restart may reconcile runtimes to `stopped(machine_restart)` but creates no failure.
 - Fence runtime commands by generation; stale intent audits and settles as a no-op.
 

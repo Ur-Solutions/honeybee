@@ -88,7 +88,7 @@ import {
   TASK_SUPPLY_SENDER_NAME,
   TASK_TRANSITIONS,
 } from "./tasks.ts";
-import { BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, RUNTIMES_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION, runtimesTableSql } from "./schema.ts";
 import {
   LOGIN_FLOW_PHASES,
   isTerminalLoginPhase,
@@ -177,6 +177,8 @@ export interface CreateBeeInput {
    * record's creation time. Defaults to the store clock.
    */
   createdAt?: number;
+  /** v18 — per-bee idle-timeout override (ms): null/absent inherit, 0 never, >0 ms. */
+  idleTimeoutMs?: number | null;
 }
 
 /** One authoritative, internally consistent bee/read-model row for list RPCs. */
@@ -449,6 +451,7 @@ function mapBee(r: Row): BeeRow {
     forkSeed: (r.fork_seed as string | null) ?? null,
     account: (r.account as string | null) ?? null,
     handle: (r.handle as string | null) ?? null,
+    idleTimeoutMs: r.idle_timeout_ms == null ? null : Number(r.idle_timeout_ms),
   };
 }
 
@@ -700,6 +703,15 @@ function normalizePenalty(value: unknown, where: string): number {
   return value;
 }
 
+/** v18 — idle-timeout override: null inherit, else a non-negative finite integer of ms. */
+function normalizeIdleTimeoutMs(value: unknown, where: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new CoreError(`${where}: idleTimeoutMs must be null or a non-negative integer (ms), got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 function sameArgs(a: string[] | null, b: string[] | null): boolean {
   if (a === null || b === null) return a === b;
   return a.length === b.length && a.every((v, i) => v === b[i]);
@@ -870,8 +882,14 @@ export class CoreStore {
         this.db.exec("PRAGMA temp_store = MEMORY");
         this.db.exec("PRAGMA cache_size = -8000");
       }
-      this.db.exec("PRAGMA foreign_keys = ON");
+      // Tables first (CREATE IF NOT EXISTS — an old store keeps its rows), then
+      // the v18 runtimes rebuild (the exit_cause CHECK gained `idle_timeout`;
+      // SQLite cannot alter a CHECK) — BEFORE foreign keys are enabled, so
+      // dropping the old table cannot cascade into runtime_observation_cursors
+      // (which references runtimes).
       this.db.exec(SCHEMA_SQL);
+      this.rebuildRuntimesForExitCauses();
+      this.db.exec("PRAGMA foreign_keys = ON");
       this.tx(() => {
         // Version gate + explicit migrations FIRST (before any other write
         // touches possibly-old tables), atomically with the stamp.
@@ -939,6 +957,52 @@ export class CoreStore {
       throw err;
     } finally {
       this.txDepth = 0;
+    }
+  }
+
+  /**
+   * v18 — rebuild `runtimes` when its exit_cause CHECK predates `idle_timeout`.
+   * Runs with foreign keys OFF (the caller enables them right after) so
+   * `DROP TABLE runtimes` is a plain drop, never a cascade into the cursors
+   * table; the rename keeps every other table's `REFERENCES runtimes` valid
+   * because the old name is simply reused. Idempotent: a fresh or already-
+   * rebuilt store has the value in its DDL and is untouched.
+   */
+  private rebuildRuntimesForExitCauses(): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runtimes'")
+      .get() as Row | undefined;
+    if (!row || typeof row.sql !== "string" || row.sql.includes("'idle_timeout'")) return;
+    const present = new Set(
+      (this.db.prepare("SELECT name FROM pragma_table_info('runtimes')").all() as Row[]).map((c) => String(c.name)),
+    );
+    // Only copy columns the old table actually has (a v8 store lacks
+    // boot_evidence; the additive migration below adds nothing then since
+    // the rebuilt DDL already carries it).
+    const cols = RUNTIMES_COLUMNS.filter((c) => present.has(c)).join(", ");
+    const count = (table: string): number =>
+      Number((this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as Row).n);
+    const runtimesBefore = count("runtimes");
+    const cursorsBefore = count("runtime_observation_cursors");
+    // node:sqlite enables foreign keys on open; a DROP with them on would
+    // cascade-delete the cursor rows. Off for the rebuild only (a pragma is
+    // a no-op inside a transaction, so it must precede BEGIN).
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(runtimesTableSql("runtimes_v18"));
+      this.db.exec(`INSERT INTO runtimes_v18(${cols}) SELECT ${cols} FROM runtimes`);
+      this.db.exec("DROP TABLE runtimes");
+      this.db.exec("ALTER TABLE runtimes_v18 RENAME TO runtimes");
+      const broken = this.db.prepare("PRAGMA foreign_key_check(runtime_observation_cursors)").all() as Row[];
+      if (broken.length > 0) throw new CoreError(`runtimes rebuild left ${broken.length} dangling observation-cursor rows`);
+      if (count("runtimes") !== runtimesBefore || count("runtime_observation_cursors") !== cursorsBefore) {
+        throw new CoreError("runtimes rebuild changed the row count — refusing to commit");
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
     }
   }
 
@@ -1126,6 +1190,7 @@ export class CoreStore {
       if (!Number.isFinite(createdAt)) throw new CoreError("createBee: createdAt must be a finite epoch-ms number");
       const args = normalizeBeeArgs(input.args, "createBee");
       requireNonEmpty(input.name, "createBee: name");
+      const idleTimeoutMs = normalizeIdleTimeoutMs(input.idleTimeoutMs, "createBee");
       const account = input.account ?? null;
       if (account !== null) {
         if (typeof account !== "string" || account.length === 0) throw new CoreError("createBee: account must be a non-empty string or null");
@@ -1135,8 +1200,9 @@ export class CoreStore {
       this.db
         .prepare(
           `INSERT INTO bees(id, name, agent, substrate, cwd, title, tags, session_log_path, lifecycle, created_at,
-                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed, account, handle)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            provider_session_id, env, imported_from, args, parent_id, forked_from, fork_seed, account, handle,
+                            idle_timeout_ms)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -1157,6 +1223,7 @@ export class CoreStore {
           input.forkSeed ?? null,
           account,
           handle,
+          idleTimeoutMs,
         );
       const bee = this.mustGetBee(id);
       this.audit("bee.created", id, { bee });
@@ -1754,6 +1821,24 @@ export class CoreStore {
   }
 
   /**
+   * v18 — set a bee's idle-timeout override: null = inherit the node's
+   * `idleWindowMs`, 0 = never reap, >0 = reap after that many ms idle. Read
+   * by the daemon's idle-timeout policy on every tick, so it applies to the
+   * CURRENT runtime at once. An identical value is a silent no-op; a change
+   * is audited as `bee.idle_timeout_set` (bee row: idleTimeoutMs).
+   */
+  updateBeeIdleTimeout(beeId: string, idleTimeoutMs: number | null): { bee: BeeRow; applied: boolean } {
+    const next = normalizeIdleTimeoutMs(idleTimeoutMs, "updateBeeIdleTimeout");
+    return this.tx(() => {
+      const bee = this.mustGetBee(beeId);
+      if (bee.idleTimeoutMs === next) return { bee, applied: false };
+      this.stmt("UPDATE bees SET idle_timeout_ms = ? WHERE id = ?").run(next, beeId);
+      this.audit("bee.idle_timeout_set", beeId, { beeId, idleTimeoutMs: next, previous: bee.idleTimeoutMs });
+      return { bee: this.mustGetBee(beeId), applied: true };
+    });
+  }
+
+  /**
    * v3 (spec 07 §F) — record the harness-native session/thread id a runtime
    * reported on boot. Bee-scoped (the conversation identity outlives any
    * generation); an identical value is a silent no-op, so replays and late
@@ -1991,6 +2076,19 @@ export class CoreStore {
   }
 
   /** All undelivered mail in per-bee FIFO order (daemon tick batch read). */
+  /**
+   * v18 — when this bee's runtime last received a delivery (max delivered_at
+   * for the CURRENT generation), or null. The idle reaper compares it with
+   * the runtime's idle edge: a delivery after the edge with no turn observed
+   * since means the runtime is not provably idle (silence is not evidence).
+   */
+  lastDeliveredAt(beeId: string, generation: number): number | null {
+    const row = this.stmt(
+      "SELECT MAX(delivered_at) AS at FROM mailbox WHERE bee_id = ? AND delivered_generation = ?",
+    ).get(beeId, generation) as Row | undefined;
+    return row?.at == null ? null : Number(row.at);
+  }
+
   listUndeliveredMessages(): MessageRow[] {
     const rows = this.stmt(
       "SELECT * FROM mailbox WHERE delivered_at IS NULL ORDER BY bee_id, id",

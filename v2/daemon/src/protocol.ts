@@ -68,6 +68,11 @@ export const DAEMON_CAPABILITIES = [
    * credentials; the `account.verify` verb runs the harness's real probe.
    */
   "account.credential_health.v1",
+  /**
+   * v18 (2026-09-02): the idle-timeout reaper — `idle_timeout` exit cause,
+   * `bee.setIdleTimeout` (+ `spawn {idleTimeoutMs}`), `health.idleTimeoutMs`.
+   */
+  "bee.idle_timeout.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -183,6 +188,8 @@ export const RPC_VERBS = [
   "import.fromFrozen",
   // schema v5: replace a bee's per-bee spawn args (takes effect on the next runtime)
   "bee.setArgs",
+  // schema v18: per-bee idle-timeout override for the daemon's idle reaper
+  "bee.setIdleTimeout",
   // WP6 §5 cell exit path (spec 05 points 4 + 6): the WP5 driver primitives as verbs
   "cell.capture",
   "cell.remove",
@@ -806,6 +813,18 @@ export interface SetArgsResult extends DedupMarkers {
 }
 
 /**
+ * `bee.setIdleTimeout` (schema v18). Params: `{ beeId, idleTimeoutMs: number | null }`
+ * — null = inherit the node's `idleWindowMs`, 0 = never reap, >0 = reap after
+ * that many ms idle. Read by the reaper every tick, so it applies to the
+ * CURRENT runtime. `spawn` also accepts `idleTimeoutMs?` (the same values).
+ * `applied:false` = the value was already exactly that.
+ */
+export interface SetIdleTimeoutResult extends DedupMarkers {
+  bee: BeeRow;
+  applied: boolean;
+}
+
+/**
  * `send {beeId, body, sender?, urgency?, idempotencyKey?}` — v8 adds
  * `urgency?: 'now'|'next'|'idle'` (spec 01 Q2 amendment; omitted = 'next').
  * Urgency governs when the message becomes eligible for delivery (`now`
@@ -904,6 +923,8 @@ export interface HealthResult {
   lastBoot: BootReport | null;
   i1Violations: number;
   bees: { total: number; active: number; archived: number };
+  /** v18: the node-wide idle-timeout in effect (config `idleWindowMs`); 0 = reaper disabled. */
+  idleTimeoutMs: number;
 }
 
 export interface SnapshotResult {

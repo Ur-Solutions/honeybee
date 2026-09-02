@@ -17,6 +17,10 @@ export const EXIT_CAUSES = [
   "stopped_by_user",
   "stopped_by_system",
   "machine_restart",
+  // v18: the daemon's idle-timeout policy ended the runtime (idle past the
+  // effective timeout with nothing pending). Distinct from stopped_by_system
+  // so operators can tell a reap from a hang-stop; revive-on-send undoes it.
+  "idle_timeout",
 ] as const;
 export type ExitCause = (typeof EXIT_CAUSES)[number];
 
@@ -143,6 +147,13 @@ export interface BeeRow {
    * a pre-v10 store opened read-only (the migration backfills on open).
    */
   handle: string | null;
+  /**
+   * v18 — per-bee idle-timeout override (ms). null = inherit the node's
+   * `idleWindowMs`; 0 = never reap this bee; >0 = reap after this long idle.
+   * Read by the daemon's idle-timeout policy on every tick, so a change
+   * applies to the CURRENT runtime immediately (no revive needed).
+   */
+  idleTimeoutMs: number | null;
 }
 
 /**

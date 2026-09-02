@@ -25,7 +25,11 @@
  */
 
 /** Deliberate stops carry who asked; crashes and clean exits are observed, not requested. */
-export type StopCause = "stopped_by_user" | "stopped_by_system";
+/**
+ * Why the daemon asked for a stop; becomes the exit cause of the exited
+ * observation. `idle_timeout` = the idle reaper (revive-on-message undoes it).
+ */
+export type StopCause = "stopped_by_user" | "stopped_by_system" | "idle_timeout";
 
 export type ObservedExitCause = "clean" | "crashed" | StopCause;
 

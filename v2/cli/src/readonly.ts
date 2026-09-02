@@ -60,6 +60,7 @@ function mapBee(r: Row): BeeRow {
     account: (r.account as string | null | undefined) ?? null,
     // v10 column; same tolerance.
     handle: (r.handle as string | null | undefined) ?? null,
+    idleTimeoutMs: r.idle_timeout_ms == null ? null : Number(r.idle_timeout_ms),
   };
 }
 

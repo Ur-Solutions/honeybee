@@ -244,6 +244,43 @@ export function formatTable(
   return [header, rule, ...body];
 }
 
+/** Compact duration for policy values: 900000 → "15m", 5400000 → "1h30m", 0 → "never". */
+export function formatDurationMs(ms: number | null | undefined): string {
+  if (ms == null) return "—";
+  if (ms <= 0) return "never";
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs > 0 ? `${m}m${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `${h}h${rm}m` : `${h}h`;
+}
+
+/**
+ * Operator duration → ms: "15m", "1h", "90s", "1h30m", "900000" (bare ms),
+ * "0" / "never" / "off" → 0. Throws on anything else.
+ */
+export function parseDurationMs(input: string): number {
+  const text = input.trim().toLowerCase();
+  if (text === "never" || text === "off" || text === "0") return 0;
+  if (/^\d+$/.test(text)) return Number(text);
+  const re = /(\d+(?:\.\d+)?)(ms|s|m|h|d)/gy;
+  const unit: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  let total = 0;
+  let consumed = 0;
+  for (let m = re.exec(text); m != null; m = re.exec(text)) {
+    total += Number(m[1]) * (unit[m[2] as string] as number);
+    consumed = re.lastIndex;
+  }
+  if (consumed !== text.length || text.length === 0) {
+    throw new Error(`invalid duration "${input}" (use e.g. 15m, 1h30m, 90s, or never)`);
+  }
+  return Math.round(total);
+}
+
 export function formatRelativeTime(fromMs: number | undefined | null, now: number = Date.now()): string {
   if (fromMs == null || !Number.isFinite(fromMs)) return "—";
   const delta = Math.max(0, now - fromMs);
