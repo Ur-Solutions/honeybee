@@ -2046,6 +2046,15 @@ hive swap-account CO.a3f codex-backup
 The target must resolve to a single bee. The account must match the bee's
 agent/tool.
 
+Claude bees resume under a NEW session id (`--resume <seed> --fork-session`)
+in the destination account's home. The CLI only resolves that seed inside its
+own config dir, so the swap first carries the conversation over —
+`projects/<cwd-key>/<seed>.jsonl` plus its sibling `<seed>/` dir — from the
+source home into the destination home (never overwriting an existing copy).
+If no transcript exists for the seed the swap is refused with
+`transcript_unavailable` and the bee stays on its current account, instead of
+crash-looping every wake on "No conversation found with session ID".
+
 ### `hive usage` / `hive limits`
 
 Show provider window usage or local usage samples.

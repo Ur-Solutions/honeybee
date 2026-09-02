@@ -28,7 +28,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ImportFromFrozenResult, ListResult, MailboxResult, SendRpcResult, SetArgsResult, SpawnResult, ViewResult } from "../src/protocol.ts";
@@ -73,6 +73,10 @@ test("import.int: frozen import over RPC → revive resumes claude (--resume) an
     fx.writeRecord("kimi.json", claudeHsrRecord(fx.root, { id: "KM.1", name: "kimi-bee", agent: "kimi", runnerPid: NO_SUCH_PID + 3 }));
     const claudeHome = join(fx.root, "homes", "claude-fixture-account");
     const codexHome = join(fx.root, "homes", "codex-fixture-account");
+    // The imported session LIVES in the imported home: claude (and the fake)
+    // resolve `--resume <id>` against `projects/*/<id>.jsonl` in the config dir.
+    mkdirSync(join(claudeHome, "projects", "imported"), { recursive: true });
+    writeFileSync(join(claudeHome, "projects", "imported", `${CLAUDE_HSR_SESSION_ID}.jsonl`), `${JSON.stringify({ type: "init", sessionId: CLAUDE_HSR_SESSION_ID })}\n`);
 
     daemon = await startDaemon(dir);
     const client = await daemon.client();

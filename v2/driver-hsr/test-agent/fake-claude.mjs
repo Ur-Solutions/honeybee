@@ -20,10 +20,19 @@
  * with status "rejected" and an errored result (spec 08 rotation trigger).
  * `@authfail` makes the turn fail with "Not logged in · /login".
  *
+ * Transcript files (only when CLAUDE_CONFIG_DIR is set, like the real CLI's
+ * config dir): the first turn writes `projects/<cwd-key>/<sessionId>.jsonl`
+ * under the config dir, and `--resume <id>` REQUIRES `projects/*\/<id>.jsonl`
+ * there — a missing one fails the first turn the way the real CLI does
+ * (`result error_during_execution`, `errors:["No conversation found with
+ * session ID: …"]`, exit 1). This is the bee.swapAccount regression shape:
+ * a conversation that only exists in the SOURCE account's home.
+ *
  * env FAKE_CLAUDE_ARGV_LOG   append {argv, cwd, env:{CLAUDE_CONFIG_DIR, HIVE_BEE, HIVE_BEE_ID, HIVE_PARENT}, sessionId, resumed, forked} per boot
  * env FAKE_CLAUDE_FAIL_RESUME=1  exit 1 on --resume ("No conversation found") — the failure shape
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
@@ -51,6 +60,30 @@ if (resumed && process.env.FAKE_CLAUDE_FAIL_RESUME === "1") {
   process.stderr.write(`No conversation found with session ID: ${resumed}\n`);
   process.exit(1);
 }
+
+// The config dir's transcript store (real CLI: ~/.claude or CLAUDE_CONFIG_DIR).
+const configDir = process.env.CLAUDE_CONFIG_DIR;
+function projectKey(cwd) {
+  let real = resolve(cwd);
+  try {
+    real = realpathSync(real);
+  } catch {
+    // not created yet — keep the resolved path
+  }
+  return real.normalize("NFC").replace(/[^a-zA-Z0-9]/g, "-");
+}
+function transcriptKnown(id) {
+  const root = join(configDir, "projects");
+  if (!existsSync(root)) return false;
+  return readdirSync(root).some((dir) => existsSync(join(root, dir, `${id}.jsonl`)));
+}
+function recordTranscript(obj) {
+  if (!configDir) return;
+  const dir = join(configDir, "projects", projectKey(process.cwd()));
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(join(dir, `${sessionId}.jsonl`), `${JSON.stringify({ ...obj, sessionId, cwd: process.cwd() })}\n`);
+}
+const resumeMissing = Boolean(resumed && configDir && !transcriptKnown(resumed));
 
 function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -81,10 +114,21 @@ rl.on("line", (raw) => {
   }
   if (!msg || msg.type !== "user") return;
   const text = msg.message?.content?.[0]?.text ?? "";
+  if (resumeMissing) {
+    // Like the real CLI: the resume target is looked up on the first turn;
+    // an unknown id ends the run before any model call (num_turns 0).
+    emit({
+      type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0, duration_ms: 0, stop_reason: null,
+      session_id: sessionId, errors: [`No conversation found with session ID: ${resumed}`],
+    });
+    process.exit(1);
+  }
   if (!initSent) {
     initSent = true;
     emit({ type: "system", subtype: "init", session_id: sessionId, cwd: process.cwd(), model: "fake", claude_code_version: "0.0.0-fake" });
+    recordTranscript({ type: "init", resumed: resumed ?? null, forked });
   }
+  recordTranscript({ type: "user", text });
   const slow = /@slow:(\d+)/.exec(text);
   turnTimer = setTimeout(() => {
     turnTimer = null;

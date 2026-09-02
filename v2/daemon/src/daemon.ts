@@ -16,7 +16,7 @@
  *  - behavior 6 (service mgmt)     → service.ts (wired by the CLI)
  *  - behavior 7 (config)           → config.ts
  */
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import type { InterruptOutcome } from "../../harness/src/driver.ts";
 import { appendFileSync } from "node:fs";
@@ -76,7 +76,7 @@ import {
   type ReserveRequest,
 } from "../../driver-cell/src/index.ts";
 import { SubstrateRouter } from "./substrates.ts";
-import { TmuxDriver } from "../../driver-tmux/src/index.ts";
+import { TmuxDriver, claudeProjectKey } from "../../driver-tmux/src/index.ts";
 import { tmuxSpawnSpec } from "./tmuxHarness.ts";
 import {
   claudeAdapter,
@@ -2409,7 +2409,10 @@ export class HiveDaemon {
     }
     if (target.status === "paused") throw new RpcError("account_paused", `account ${target.id} is paused`);
     const from = bee.account;
-    if (from === target.id) return { beeId: bee.id, from, to: target.id, action: "noop", commandId: null, rekeyed: false };
+    if (from === target.id) return { beeId: bee.id, from, to: target.id, action: "noop", commandId: null, rekeyed: false, transcript: "none" };
+    // Before any state moves: the destination home must hold the conversation
+    // the next generation resumes, or the swap is refused (typed) up front.
+    const transcript = bee.agent === "claude" ? this.carryClaudeTranscript(bee, from, target) : "none";
     const rt = store.currentRuntime(bee.id);
     const live = rt != null && rt.state !== "stopped";
     let rekeyed = false;
@@ -2428,8 +2431,46 @@ export class HiveDaemon {
       }
     });
     const action: SwapAccountResult["action"] = live ? "stop_then_revive" : "rebind_only";
-    this.log(`bee.swapAccount bee=${bee.id} from=${from ?? "-"} to=${target.id} by=${by} action=${action} rekeyed=${rekeyed}${commandId != null ? ` stop=${commandId}` : ""}`);
-    return { beeId: bee.id, from, to: target.id, action, commandId, rekeyed };
+    this.log(`bee.swapAccount bee=${bee.id} from=${from ?? "-"} to=${target.id} by=${by} action=${action} rekeyed=${rekeyed} transcript=${transcript}${commandId != null ? ` stop=${commandId}` : ""}`);
+    return { beeId: bee.id, from, to: target.id, action, commandId, rekeyed, transcript };
+  }
+
+  /**
+   * Claude resolves `--resume <id>` inside its config dir ONLY: a swap that
+   * rekeys the session (`--resume <seed> --fork-session` in the destination
+   * home) fails on its first turn — `result error_during_execution`,
+   * "No conversation found with session ID" — when the transcript lives in
+   * the source home, and every later wake repeats the same crash (field
+   * finding 2026-09-02: three of three cross-account swaps). So the
+   * transcript is carried over first: `projects/<cwd-key>/<seed>.jsonl` plus
+   * its sibling `<seed>/` dir (sub-agent transcripts, tool results), copied
+   * into the same project key under the destination home. Idempotent — an
+   * already-present destination is left alone (never overwritten). The seed
+   * is the bee's current session id, or its pending fork seed when a prior
+   * rekey has not been consumed yet (a stopped bee swapped twice).
+   */
+  private carryClaudeTranscript(bee: BeeRow, from: string | null, target: AccountRow): SwapAccountResult["transcript"] {
+    const seed = bee.providerSessionId ?? bee.forkSeed;
+    if (!seed) return "none";
+    const key = homeEnvFor("claude");
+    const boundHome = key ? bee.env[key] : undefined;
+    const sourceHome = boundHome ?? (from ? this.mustStore().getAccount(from)?.homePath : undefined) ?? join(homedir(), ".claude");
+    const projectKey = claudeProjectKey(bee.cwd);
+    const destDir = join(target.homePath, "projects", projectKey);
+    const destFile = join(destDir, `${seed}.jsonl`);
+    if (existsSync(destFile)) return "present";
+    const source = findClaudeTranscript(sourceHome, projectKey, seed);
+    if (!source) {
+      throw new RpcError(
+        "transcript_unavailable",
+        `bee ${bee.name}: conversation ${seed} was not found under ${sourceHome} (projects/${projectKey}); swapping to ${target.id} would resume nothing`,
+      );
+    }
+    mkdirSync(destDir, { recursive: true });
+    copyFileSync(source.file, destFile);
+    if (source.dir && !existsSync(join(destDir, seed))) cpSync(source.dir, join(destDir, seed), { recursive: true });
+    this.log(`bee.swapAccount.transcript bee=${bee.id} seed=${seed} from=${source.file} to=${destFile}${source.dir ? " +dir" : ""}`);
+    return "copied";
   }
 
   /**
@@ -2611,4 +2652,31 @@ export class HiveDaemon {
     const dir = typeof params.dir === "string" && params.dir.length > 0 ? params.dir : join(homedir(), ".hive");
     return importLocalConfig(store, dir, { scope: this.scopeParam(params) });
   }
+}
+
+/**
+ * Locate a claude transcript in a config dir: the exact project key first,
+ * then any project dir (the key derivation drifted across CLI versions —
+ * realpath vs raw path — and a conversation is only ever one file).
+ */
+function findClaudeTranscript(home: string, projectKey: string, seed: string): { file: string; dir: string | null } | null {
+  const projects = join(home, "projects");
+  const candidates = [join(projects, projectKey)];
+  if (existsSync(projects)) {
+    try {
+      for (const name of readdirSync(projects)) {
+        const dir = join(projects, name);
+        if (dir !== candidates[0]) candidates.push(dir);
+      }
+    } catch {
+      // unreadable projects dir — the exact candidate still gets its chance
+    }
+  }
+  for (const dir of candidates) {
+    const file = join(dir, `${seed}.jsonl`);
+    if (!existsSync(file)) continue;
+    const sibling = join(dir, seed);
+    return { file, dir: existsSync(sibling) ? sibling : null };
+  }
+  return null;
 }

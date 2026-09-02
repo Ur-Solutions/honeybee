@@ -28,7 +28,9 @@ type JsonObject = Record<string, unknown>;
  *    `message.id` and identical usage — the projection carries that id as
  *    `providerTurnId` so consumers deduplicate instead of over-counting.
  *  - result   {subtype, usage, stop_reason, duration_ms} — the turn boundary
- *    close, with turn-scoped usage (`claude -p` runs only).
+ *    close, with turn-scoped usage (`claude -p` runs only). `is_error: true`
+ *    rows also project an `interrupt` carrying the CLI's `errors`/`result`
+ *    text, so a halted turn (failed resume, auth, provider wall) is visible.
  *  - system init carries the session id; every other system subtype plus
  *    rate_limit_event / tool_progress is protocol noise, projected to []
  *    exactly like codex deltas (noise is not "unknown" — unknown is reserved
@@ -54,6 +56,20 @@ function nonEmptyString(value: unknown): string | undefined {
  * events take the line's stamp when it has one.
  */
 const NO_TS: TranscriptIsoTs = null;
+
+/**
+ * The readable reason of an errored `result` row (`is_error: true`): the
+ * CLI's `errors` list (e.g. "No conversation found with session ID: …" on a
+ * failed --resume), else its `result` text, else the subtype.
+ */
+function resultErrorReason(row: JsonObject): string | undefined {
+  if (row.is_error !== true) return undefined;
+  const errors = Array.isArray(row.errors)
+    ? row.errors.filter((e): e is string => typeof e === "string" && e.trim().length > 0)
+    : [];
+  if (errors.length > 0) return errors.join("; ");
+  return nonEmptyString(row.result) ?? nonEmptyString(row.subtype) ?? "claude result error";
+}
 
 function lineTimestamp(row: JsonObject): TranscriptIsoTs {
   const raw = row.timestamp;
@@ -322,6 +338,12 @@ export function createClaudeProjector(): TranscriptProjector {
           typeof row.duration_ms === "number" && Number.isFinite(row.duration_ms)
             ? row.duration_ms
             : undefined;
+        // An errored result is the harness halting the turn — resume/fork of
+        // a conversation the config dir does not hold, auth, provider walls.
+        // Its reason is otherwise dropped (turn_end carries no error), so the
+        // pane showed an empty turn and a crashed bee with no explanation.
+        const halt = resultErrorReason(row);
+        if (halt) events.push({ kind: "interrupt", ts, reason: halt });
         events.push({
           kind: "turn_end",
           ts,

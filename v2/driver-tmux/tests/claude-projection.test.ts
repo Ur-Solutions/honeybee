@@ -211,3 +211,27 @@ test("claude projector: native session-file lines stamp their events; HSR lines 
   const bare = p.pushLine(line({ type: "user", message: { role: "user", content: "next" } }));
   assert.deepEqual(bare.map((e) => e.ts), [null, null]);
 });
+
+test("claude projector: an errored result projects a halt (interrupt) carrying the CLI's errors, then the turn end", () => {
+  const p = createClaudeProjector();
+  // The bee.swapAccount regression shape: a fork of a conversation the config
+  // dir does not hold fails on the first turn with num_turns 0.
+  const events = [
+    ...p.pushLine(line({ type: "user", uuid: "u-1", message: { role: "user", content: "again" } })),
+    ...p.pushLine(line({
+      type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0, duration_ms: 0, stop_reason: null,
+      session_id: "9b33fa02", errors: ["No conversation found with session ID: 0974f5a4"],
+    })),
+    ...p.flush(),
+  ];
+  assert.deepEqual(events.map((e) => e.kind), ["turn_start", "message", "interrupt", "turn_end"]);
+  const halt = events[2] as Extract<typeof events[number], { kind: "interrupt" }>;
+  assert.equal(halt.reason, "No conversation found with session ID: 0974f5a4");
+  // no errors list → the result text; a successful result never projects a halt
+  const p2 = createClaudeProjector();
+  const authFail = p2.pushLine(line({ type: "result", subtype: "error_during_execution", is_error: true, result: "Not logged in · /login" }));
+  assert.deepEqual(authFail.map((e) => e.kind), ["interrupt", "turn_end"]);
+  assert.equal((authFail[0] as Extract<typeof events[number], { kind: "interrupt" }>).reason, "Not logged in · /login");
+  const ok = p2.pushLine(line({ type: "result", subtype: "success", is_error: false, stop_reason: "end_turn" }));
+  assert.deepEqual(ok.map((e) => e.kind), ["turn_end"]);
+});

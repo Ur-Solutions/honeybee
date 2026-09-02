@@ -128,6 +128,13 @@ export const RPC_ERROR_CODES = [
    * logged-out account is never created "by import".
    */
   "no_credentials_to_import",
+  /**
+   * `bee.swapAccount` (claude): the conversation transcript the destination
+   * home must hold for `--resume <seed> --fork-session` was not found in the
+   * source home — refused up front rather than crash-looping every wake on
+   * "No conversation found with session ID".
+   */
+  "transcript_unavailable",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -527,7 +534,12 @@ export interface AccountBackfillResult extends DedupMarkers {
  * (`stop_then_revive`, the stop command id); a stopped bee is just rebound
  * (`rebind_only`; the next wake resumes on the new account). Claude
  * cross-account moves are rekeyed: the conversation resumes under a NEW
- * session id (`--resume <seed> --fork-session`).
+ * session id (`--resume <seed> --fork-session`) — and since the CLI resolves
+ * that seed inside its own config dir, the transcript (`projects/<cwd-key>/
+ * <seed>.jsonl` + its sibling dir) is carried from the source home into the
+ * destination home first (`transcript`: copied / already present / none to
+ * carry). A seed with no transcript anywhere refuses the swap
+ * (`transcript_unavailable`) and leaves the bee untouched.
  */
 export interface SwapAccountResult extends DedupMarkers {
   beeId: string;
@@ -536,6 +548,7 @@ export interface SwapAccountResult extends DedupMarkers {
   action: "stop_then_revive" | "rebind_only" | "noop";
   commandId: number | null;
   rekeyed: boolean;
+  transcript: "copied" | "present" | "none";
 }
 
 // ---------------------------------------------------------------------------

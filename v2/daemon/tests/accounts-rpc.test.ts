@@ -42,6 +42,7 @@ import type {
 import type { MirrorAccountRow } from "../../core/src/index.ts";
 import type { RpcClient } from "../../cli/src/client.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "./helpers.ts";
+import { claudeProjectKey } from "../../driver-tmux/src/index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE = join(here, "..", "..", "driver-hsr", "test-agent", "fake-claude.mjs");
@@ -299,6 +300,13 @@ test("rpc.accounts.2: bee.swapAccount (fake-claude) — same-harness stop → re
     assert.equal(swap.to, "claude-b");
     assert.equal(swap.rekeyed, true);
     assert.ok(swap.commandId);
+    // The CLI resolves the resume seed inside ITS config dir only: the
+    // conversation is carried into home B before generation 2 forks it
+    // (without this, gen 2 dies on "No conversation found with session ID").
+    assert.equal(swap.transcript, "copied");
+    const projectKey = claudeProjectKey(dir);
+    assert.ok(existsSync(join(homeA, "projects", projectKey, `${sid1}.jsonl`)), "fake-claude wrote the source transcript on the first turn");
+    assert.ok(existsSync(join(homeB, "projects", projectKey, `${sid1}.jsonl`)), "the transcript was carried into home B");
     const replay = await client.request<SwapAccountResult>("bee.swapAccount", { beeId: spawned.beeId, account: "claude-b", idempotencyKey: "swap-1" });
     assert.equal(replay.deduped, true);
     // the operator continues the conversation: the message rides the swap and
@@ -333,6 +341,19 @@ test("rpc.accounts.2: bee.swapAccount (fake-claude) — same-harness stop → re
     assert.equal(rebound.bee?.account, "claude-a");
     assert.equal(rebound.bee?.env.CLAUDE_CONFIG_DIR, homeA);
     assert.equal(rebound.view.runtimeState, "stopped");
+    // rebind_only carries the conversation too — the next wake forks it in home A
+    const sid2 = gen2.bee?.providerSessionId as string;
+    assert.equal(back.transcript, "copied");
+    assert.ok(existsSync(join(homeA, "projects", projectKey, `${sid2}.jsonl`)));
+    assert.equal(rebound.bee?.forkSeed, sid2, "rekeyed: the next wake forks sid2");
+    // a seed with no transcript anywhere refuses the swap, typed, and leaves the bee untouched
+    rmSync(join(homeA, "projects", projectKey, `${sid2}.jsonl`));
+    rmSync(join(homeB, "projects", projectKey, `${sid2}.jsonl`));
+    await rejects(() => client.request("bee.swapAccount", { beeId: spawned.beeId, account: "claude-b" }), "transcript_unavailable");
+    const untouched = await client.request<ViewResult>("view", { beeId: spawned.beeId });
+    assert.equal(untouched.bee?.account, "claude-a");
+    assert.equal(untouched.bee?.env.CLAUDE_CONFIG_DIR, homeA);
+    assert.equal(untouched.bee?.forkSeed, sid2, "no rekey, no rebind");
     client.close();
   } finally {
     if (process.env.HB_DEBUG && existsSync(join(dir, "hived.log"))) process.stderr.write(readFileSync(join(dir, "hived.log"), "utf8"));
