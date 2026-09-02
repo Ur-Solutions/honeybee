@@ -41,6 +41,7 @@ const { dirname, join } = require("node:path");
 const { createInterface } = require("node:readline");
 const home = process.env.HOME;
 if (!home) process.exit(2);
+if (process.env.SSH_CONNECTION !== "127.0.0.1 1 127.0.0.1 1") process.exit(3);
 console.error("Authentication required. Please visit the URL to log in:");
 console.error("  https://accounts.google.com/o/oauth2/auth?client_id=fake-agy");
 console.error("");

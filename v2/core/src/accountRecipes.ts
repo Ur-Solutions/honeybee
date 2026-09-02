@@ -408,7 +408,13 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   agy: {
     credentialFiles: [".gemini/antigravity-cli/antigravity-oauth-token"],
     configFiles: [".gemini/antigravity/antigravity_state.pbtxt"],
-    extraEnv: { HOME: "{home}" },
+    // Local agy uses the OS keyring independently of HOME. Its supported SSH
+    // mode bypasses the keyring and persists the OAuth token below HOME, so
+    // every managed login and spawn gets the same file-backed identity.
+    extraEnv: {
+      HOME: "{home}",
+      SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1",
+    },
     vendorHome: {
       dir: ".gemini",
       relocated: {

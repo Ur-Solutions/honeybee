@@ -37,7 +37,10 @@ test("v7.recipes: the agy recipe conforms to the HOME-based Antigravity OAuth la
   assert.ok(recipe);
   assert.deepEqual(recipe.credentialFiles, [".gemini/antigravity-cli/antigravity-oauth-token"]);
   assert.deepEqual(recipe.configFiles, [".gemini/antigravity/antigravity_state.pbtxt"]);
-  assert.deepEqual(recipe.extraEnv, { HOME: "{home}" });
+  assert.deepEqual(recipe.extraEnv, {
+    HOME: "{home}",
+    SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1",
+  });
   assert.equal(recipe.vendorHome.dir, ".gemini");
   assert.deepEqual(recipe.login, { command: "agy", args: [] });
   assert.equal(recipe.loginFlow.defaultMethodId, "agy-cli");
@@ -361,7 +364,10 @@ test("v7.ids: accountIdFor follows the old registry rule (safeName, lower-case) 
   assert.equal(accountIdFor("kimi", "default"), "kimi-default");
   assert.equal(safeName("..."), "---");
   assert.deepEqual(recipeEnvFor("opencode", "/h"), { XDG_DATA_HOME: "/h/xdg-data" });
-  assert.deepEqual(recipeEnvFor("agy", "/h"), { HOME: "/h" });
+  assert.deepEqual(recipeEnvFor("agy", "/h"), {
+    HOME: "/h",
+    SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1",
+  });
   assert.deepEqual(recipeEnvFor("claude", "/h"), {});
 });
 
