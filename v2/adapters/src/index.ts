@@ -3,6 +3,7 @@
  * Spec: docs/design/specs/reset-03-hsr-driver.md. Zero imports from old code.
  */
 export * from "./types.ts";
+export { agyAdapter, agyResumeArgs, encodeAgyMessage, parseAgyLine } from "./agy.ts";
 export { claudeAdapter, claudeResumeArgs, claudeForkArgs, encodeClaudeInterrupt, parseClaudeLine, encodeClaudeMessage } from "./claude.ts";
 export { codexAdapter, codexRateLimitSignals, codexThreadRequest, type CodexAdapterOptions } from "./codex.ts";
 export { grokAdapter, grokAllowPermissionResult, type GrokAdapterOptions, type GrokMcpServerStdio } from "./grok.ts";
@@ -11,6 +12,7 @@ export {
   composeArgv,
   parseArgUnits,
   dedupeUnits,
+  agyArgGrammar,
   claudeArgGrammar,
   codexArgGrammar,
   grokArgGrammar,

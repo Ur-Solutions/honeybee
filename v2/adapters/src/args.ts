@@ -170,6 +170,28 @@ export const claudeArgGrammar: ArgGrammar = {
 };
 
 // ---------------------------------------------------------------------------
+// agy
+// ---------------------------------------------------------------------------
+
+/** `agy` print-mode flags the composer knows. */
+export const agyArgGrammar: ArgGrammar = {
+  valueFlags: new Set([
+    "--model",
+    "--effort",
+    "--conversation",
+    "--print-timeout",
+    "--agent",
+    "--project",
+    "--log-file",
+    "--add-dir",
+    "--mode",
+  ]),
+  booleanFlags: new Set(["--dangerously-skip-permissions"]),
+  keyedFlags: new Set(),
+  aliases: {},
+};
+
+// ---------------------------------------------------------------------------
 // codex
 // ---------------------------------------------------------------------------
 
