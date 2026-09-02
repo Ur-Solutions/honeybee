@@ -646,20 +646,26 @@ export class AccountsService {
       const keepLastGood = previous?.readable === true
         && !fetched.readable
         && (fetched.unreadableReason === "provider_error" || fetched.unreadableReason === "timeout");
+      const credentialProbePassed = account.harness === "agy"
+        && !fetched.readable
+        && fetched.unreadableReason === "unsupported";
       // A transient sampling failure is not evidence that the provider's last
       // readable snapshot became false. Keep its fetchedAt and windows so the
       // mirror and selector honestly expose stale, last-known-good data. Real
       // auth failures still replace the row and drive auth_needed below.
       const row = keepLastGood ? previous! : this.store.putAccountLimits(id, fetched);
       // The probe is the authentication check account health keys on: a REAL
-      // auth failure sets auth_needed; a readable answer is contrary evidence.
+      // auth failure sets auth_needed; a readable answer or agy's successful
+      // token-file probe is contrary evidence. The agy limits row stays
+      // unsupported and its credential health stays unverified.
       if (!fetched.readable && fetched.error && fetched.unreadableReason === "auth_failed") {
         if (this.store.setAccountStatus(id, account.status === "paused" ? "paused" : "auth_needed", `limits probe: ${fetched.error.slice(0, 200)}`).applied) {
           this.log(`account.auth_needed account=${id} by=limits_probe`);
         }
-      } else if (fetched.readable && account.status === "auth_needed") {
-        this.store.setAccountStatus(id, "ok", "limits probe authenticated");
-        this.log(`account.auth_ok account=${id} by=limits_probe`);
+      } else if ((fetched.readable || credentialProbePassed) && account.status === "auth_needed") {
+        const probe = credentialProbePassed ? "credential_probe" : "limits_probe";
+        this.store.setAccountStatus(id, "ok", `${probe} authenticated`);
+        this.log(`account.auth_ok account=${id} by=${probe}`);
       }
       // v18: the probe is validation evidence the MIRROR must see. A status
       // flip above already re-published the row; otherwise (an `ok`

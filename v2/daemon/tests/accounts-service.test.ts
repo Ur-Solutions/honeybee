@@ -415,21 +415,27 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
   }
 });
 
-test("limits.agy: the HOME-scoped token is the credential probe while provider limits remain unsupported", async () => {
+test("limits.agy: an imported HOME-scoped token clears auth_needed while provider limits remain unsupported", async () => {
   const r = rig();
   try {
     const svc = service(r);
     const tokenFile = ".gemini/antigravity-cli/antigravity-oauth-token";
-    const account = addAccount(r, "agy", "personal", { vault: { [tokenFile]: "agy-oauth-token" } });
+    const account = addAccount(r, "agy", "personal", { status: "auth_needed", vault: { [tokenFile]: "agy-oauth-token" } });
     assert.deepEqual(svc.homeEnvOf(account), { HOME: account.homePath });
     assert.equal(svc.hasCredentialProbe("agy"), true);
     assert.equal(svc.credentialed(account), true);
+    assert.equal(svc.credentialHealthOf(account), "unverified");
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
 
     const [unsupported] = await svc.refreshLimits([account.id]);
     assert.equal(unsupported?.readable, false);
     assert.equal(unsupported?.unreadableReason, "unsupported");
     assert.equal(unsupported?.error, "agy has no limits source");
     assert.equal(r.store.getAccount(account.id)?.status, "ok");
+    const refreshedAccount = r.store.getAccount(account.id);
+    assert.ok(refreshedAccount);
+    assert.equal(svc.credentialHealthOf(refreshedAccount), "unverified");
+    assert.ok(r.log.some((line) => line === `account.auth_ok account=${account.id} by=credential_probe`));
 
     rmSync(join(r.vault, "agy", account.id, tokenFile));
     const [missing] = await svc.refreshLimits([account.id]);
