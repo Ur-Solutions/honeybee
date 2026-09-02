@@ -1910,11 +1910,26 @@ the recovery path when provider authentication already completed outside a
 flow (validate the current credential, snapshot it into the vault, mark ok):
 
 ```sh
+hive account add <harness> <label> [--import-existing]
 hive account login <selector> [--method <id>] [--remote] [--no-wait]
 hive account login-status <selector>
 hive account login-cancel <selector>
 hive account capture <selector>
+hive account verify <selector>
 ```
+
+`add` creates a LOGGED-OUT account (`status auth_needed`, `creds=absent`);
+`ok` is never claimed without a credential. `--import-existing` imports the
+machine's existing sign-in instead: the account home or a leftover vault
+entry when populated, else the harness's vendor home (`CODEX_HOME` /
+`CLAUDE_CONFIG_DIR` … when set, else `~/.codex`, `~/.claude`, …; Claude on
+macOS reads the Keychain item) copied into the account's vault. Nothing
+importable anywhere is the typed refusal `no_credentials_to_import` (naming
+every path checked) and no account is created. An imported credential is
+`unverified` until something proves it: the daemon schedules the harness's
+real probe right away, and `verify` runs it on demand (exit 0 only when the
+provider answered an authenticated read; `auth_needed` means log in again).
+`account list` shows the derived `creds=absent|unverified|verified`.
 
 `login` prints the flow (method, sign-in URL, device code, requested fields)
 and, on a TTY, drives it: URLs are for your browser, secrets are typed without
