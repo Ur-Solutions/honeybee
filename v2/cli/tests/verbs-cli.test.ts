@@ -432,6 +432,62 @@ test("verbs.transcript: -f/--follow streams appended lines until SIGINT", async 
   }
 });
 
+test("verbs.transcript: agy follow keeps projector state across appended lines", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-agy-follow-"));
+  try {
+    const logPath = join(dir, "agy.jsonl");
+    writeFileSync(logPath, `${JSON.stringify({ event: "init", conversation_id: "agy-follow-session" })}\n`);
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({
+      id: "agy-follow-1",
+      name: "agy-follow",
+      agent: "agy",
+      substrate: "hsr",
+      cwd: "/tmp",
+      sessionLogPath: logPath,
+    });
+    store.close();
+
+    const follow = capture();
+    assert.equal(
+      await runFollowUntil(
+        ["transcript", "agy-follow", "--follow", "--data-dir", dir],
+        follow,
+        () => appendFileSync(logPath, [
+          JSON.stringify({
+            event: "step_update",
+            step_update: {
+              conversation_id: "agy-follow-session",
+              step_index: 1,
+              state: "DONE",
+              step_type: "agent_response",
+              text_delta: "SECOND",
+            },
+          }),
+          JSON.stringify({
+            event: "result",
+            result: {
+              conversation_id: "agy-follow-session",
+              status: "SUCCESS",
+              response: "SECOND",
+              num_turns: 1,
+            },
+          }),
+        ].join("\n") + "\n"),
+        () => follow.out.includes("[assistant] SECOND"),
+        "agy transcript --follow appended turn",
+      ),
+      0,
+    );
+    assert.deepEqual(
+      follow.out.filter((line) => line === "[assistant] SECOND"),
+      ["[assistant] SECOND"],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("verbs.last: falls back to the latest seal when the log has no assistant text; --seal skips straight there", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
   try {

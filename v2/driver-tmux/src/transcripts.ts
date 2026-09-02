@@ -536,11 +536,29 @@ export function createTranscriptProjector(harness: string): TranscriptProjector 
   }
 }
 
-export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
+export interface TranscriptTurnStream {
+  pushLine(line: string): TranscriptTurn[];
+  flush(): TranscriptTurn[];
+}
+
+/** Stateful raw-line to readable-turn projection for incremental consumers. */
+export function createTranscriptTurnStream(harness: string): TranscriptTurnStream {
   const projector = createTranscriptProjector(harness);
-  const events = lines.flatMap((line) => projector.pushLine(line));
-  events.push(...projector.flush());
-  return events.flatMap(turnsFromProjectedEvent);
+  return {
+    pushLine(line: string): TranscriptTurn[] {
+      return projector.pushLine(line).flatMap(turnsFromProjectedEvent);
+    },
+    flush(): TranscriptTurn[] {
+      return projector.flush().flatMap(turnsFromProjectedEvent);
+    },
+  };
+}
+
+export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
+  const stream = createTranscriptTurnStream(harness);
+  const turns = lines.flatMap((line) => stream.pushLine(line));
+  turns.push(...stream.flush());
+  return turns;
 }
 
 function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTurn[] {

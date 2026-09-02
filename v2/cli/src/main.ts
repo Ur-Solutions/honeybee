@@ -111,6 +111,7 @@ import { realPreflightProbes } from "../../daemon/src/import-probes.ts";
 import { hostname } from "node:os";
 import type { AuditTailResult } from "../../daemon/src/protocol.ts";
 import {
+  createTranscriptTurnStream,
   lastAssistantText,
   renderTranscriptLines,
 } from "../../driver-tmux/src/transcripts.ts";
@@ -2719,11 +2720,6 @@ function sessionLogSize(path: string): number {
   }
 }
 
-function emitFollowLine(ctx: CliContext, harness: string, line: string, raw: boolean): void {
-  if (raw) ctx.io.out(line);
-  else for (const l of turnLines(renderTranscriptLines(harness, [line]))) ctx.io.out(l);
-}
-
 /**
  * Follow a file's appended lines (tail -f): poll, read past the cursor, emit
  * whole lines. The interval stays referenced so a real CLI process does not
@@ -2771,8 +2767,23 @@ async function followFileLines(path: string, fromBytes: number, onLine: (line: s
   });
 }
 
-async function followSessionLog(ctx: CliContext, path: string, harness: string, raw: boolean): Promise<void> {
-  await followFileLines(path, sessionLogSize(path), (line) => emitFollowLine(ctx, harness, line, raw));
+async function followSessionLog(
+  ctx: CliContext,
+  path: string,
+  harness: string,
+  raw: boolean,
+  history: readonly string[],
+): Promise<void> {
+  if (raw) {
+    await followFileLines(path, sessionLogSize(path), (line) => ctx.io.out(line));
+    return;
+  }
+  const stream = createTranscriptTurnStream(harness);
+  for (const line of history) stream.pushLine(line);
+  await followFileLines(path, sessionLogSize(path), (line) => {
+    for (const rendered of turnLines(stream.pushLine(line))) ctx.io.out(rendered);
+  });
+  for (const rendered of turnLines(stream.flush())) ctx.io.out(rendered);
 }
 
 /**
@@ -2804,7 +2815,7 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
     else for (const line of turnLines(shown)) ctx.io.out(line);
   }
   if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw);
+  await followSessionLog(ctx, path, harness, raw, lines);
   return 0;
 }
 
@@ -2833,7 +2844,7 @@ async function cmdTail(ctx: CliContext, parsed: Parsed): Promise<number> {
   if (raw) for (const line of lines.slice(-backlog)) ctx.io.out(line);
   else for (const line of turnLines(renderTranscriptLines(harness, lines)).slice(-backlog)) ctx.io.out(line);
   if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw);
+  await followSessionLog(ctx, path, harness, raw, lines);
   return 0;
 }
 
