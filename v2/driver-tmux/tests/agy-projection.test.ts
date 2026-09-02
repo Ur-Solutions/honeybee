@@ -363,6 +363,40 @@ test("agy projector: captured cumulative result usage becomes per-turn usage", (
   assert.equal(ends[1]?.durationMs, 8_741.67);
 });
 
+test("agy projector: missing usage invalidates the cumulative baseline", () => {
+  const events = project([
+    j({ event: "init", conversation_id: SESSION_ID }),
+    j({
+      event: "result",
+      result: {
+        conversation_id: SESSION_ID,
+        status: "SUCCESS",
+        num_turns: 1,
+        usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+      },
+    }),
+    j({
+      event: "result",
+      result: { conversation_id: SESSION_ID, status: "SUCCESS", num_turns: 2 },
+    }),
+    j({
+      event: "result",
+      result: {
+        conversation_id: SESSION_ID,
+        status: "SUCCESS",
+        num_turns: 3,
+        usage: { input_tokens: 300, output_tokens: 30, total_tokens: 330 },
+      },
+    }),
+  ]);
+
+  const usage = events.filter((event) => event.kind === "token_usage");
+  assert.deepEqual(usage.map((event) => event.usage), [
+    { input: 100, output: 10, total: 110 },
+    { input: 300, output: 30, total: 330 },
+  ]);
+});
+
 test("agy projector: resumed cumulative duration waits for a baseline", () => {
   const events = project([
     j({ event: "init", conversation_id: SESSION_ID }),

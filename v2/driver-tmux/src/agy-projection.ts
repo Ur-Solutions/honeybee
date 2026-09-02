@@ -219,7 +219,6 @@ export function createAgyProjector(): TranscriptProjector {
         scope: "turn",
         ...(turnId ? { providerTurnId: turnId } : {}),
       });
-      previousResultUsage = cumulativeUsage;
     }
 
     const status = nonEmptyString(result.status);
@@ -253,7 +252,8 @@ export function createAgyProjector(): TranscriptProjector {
       ...((status === "CANCELED" || status === "ERROR") ? { interrupted: true } : {}),
     });
     if (durationSeconds !== undefined) previousDurationSeconds = durationSeconds;
-    if (numTurns !== undefined) previousNumTurns = numTurns;
+    previousResultUsage = cumulativeUsage;
+    previousNumTurns = numTurns;
     assistantFragments.clear();
     sawAssistantText = false;
     return events;
