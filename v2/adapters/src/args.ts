@@ -10,7 +10,8 @@
  *
  *   - a valued flag repeated across (or within) layers is de-duplicated: the
  *     LATER occurrence wins and keeps its (later) position; earlier ones are
- *     dropped (`--model opus … --model fable` → one `--model fable`);
+ *     dropped (`--model opus … --model fable` → one `--model fable`), unless
+ *     the grammar marks the flag repeatable;
  *   - a boolean flag is idempotent: the FIRST occurrence is kept, repeats are
  *     dropped (`--dangerously-skip-permissions` twice → once);
  *   - a keyed flag (`codex -c key=value`) de-duplicates per KEY (later wins);
@@ -29,6 +30,8 @@
 export interface ArgGrammar {
   /** Flags that take exactly one value (`--model X`, `--model=X`). */
   valueFlags: ReadonlySet<string>;
+  /** Value-taking flags whose occurrences compose instead of de-duplicating. */
+  repeatableValueFlags?: ReadonlySet<string>;
   /** Flags that take no value. */
   booleanFlags: ReadonlySet<string>;
   /** Flags whose value is `key=value` and that repeat per key (`-c`). */
@@ -41,7 +44,7 @@ export interface ArgGrammar {
 export interface ArgUnit {
   /** The tokens exactly as they will appear in argv. */
   tokens: string[];
-  /** De-dup identity: `flag`, `flag:key`, or null (verbatim — never de-duplicated). */
+  /** De-dup identity: `flag`, `flag:key`, or null (verbatim/repeatable). */
   identity: string | null;
   kind: "value" | "boolean" | "keyed" | "verbatim";
   /** Canonical flag spelling (known units only). */
@@ -67,7 +70,8 @@ export function parseArgUnits(grammar: ArgGrammar, argv: readonly string[]): Arg
     if (eq) {
       const flag = canon(eq.flag);
       if (grammar.valueFlags.has(flag)) {
-        units.push({ tokens: [tok], identity: flag, kind: "value", flag, value: eq.value });
+        const identity = grammar.repeatableValueFlags?.has(flag) === true ? null : flag;
+        units.push({ tokens: [tok], identity, kind: "value", flag, value: eq.value });
         continue;
       }
       if (grammar.keyedFlags.has(flag)) {
@@ -86,7 +90,8 @@ export function parseArgUnits(grammar: ArgGrammar, argv: readonly string[]): Arg
         units.push({ tokens: [tok], identity: null, kind: "verbatim", flag: null, value: null });
         continue;
       }
-      units.push({ tokens: [tok, value], identity: flag, kind: "value", flag, value });
+      const identity = grammar.repeatableValueFlags?.has(flag) === true ? null : flag;
+      units.push({ tokens: [tok, value], identity, kind: "value", flag, value });
       i += 1;
       continue;
     }
@@ -186,6 +191,7 @@ export const agyArgGrammar: ArgGrammar = {
     "--add-dir",
     "--mode",
   ]),
+  repeatableValueFlags: new Set(["--add-dir"]),
   booleanFlags: new Set(["--dangerously-skip-permissions"]),
   keyedFlags: new Set(),
   aliases: {},

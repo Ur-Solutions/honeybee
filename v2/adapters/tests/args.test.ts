@@ -107,3 +107,14 @@ test("args.compose.7: agy valued flags use later-wins composition and permission
     "--conversation", "recorded-session",
   ]);
 });
+
+test("args.compose.8: agy preserves repeatable --add-dir values across layers", () => {
+  assert.deepEqual(composeArgv(agyArgGrammar, [
+    ["--add-dir", "/workspace/shared", "--model", "default"],
+    ["--add-dir=/workspace/project", "--model", "gemini-3.8-flash-low"],
+  ]), [
+    "--add-dir", "/workspace/shared",
+    "--add-dir=/workspace/project",
+    "--model", "gemini-3.8-flash-low",
+  ]);
+});
