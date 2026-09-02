@@ -80,6 +80,8 @@ test("agy: recorded skip-permissions stream keeps ACTIVE and DONE tool updates a
 
 test("agy: auth ERROR result sets auth_needed despite the process exit code being unreliable", () => {
   assert.deepEqual(parseAgyLine(AUTH_ERROR_FIXTURE), [
+    { kind: "booted" },
+    { kind: "flag", flag: "spawn_failed", action: "clear", detail: "runtime booted" },
     {
       kind: "flag",
       flag: "auth_needed",

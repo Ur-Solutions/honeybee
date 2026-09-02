@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore } from "../../core/src/index.ts";
 import { HsrDriver } from "../src/index.ts";
-import { claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
+import { agyAdapter, claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
 import type { AdapterSignal } from "../../adapters/src/types.ts";
 import {
   AGENT_PATH,
@@ -605,6 +605,54 @@ test("late init must not close an in-flight turn (cell smoke 2026-08-17 phantom 
     assert.equal(seen.filter((k) => k === "turn_ended").length, 1, "exactly one turn_ended");
   } finally {
     driver.stop("li-1", 1, "stopped_by_system");
+  }
+});
+
+test("agy auth before init boots once and a late init is lifecycle-neutral", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-agy-auth-init-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "auth-then-init-agy.mjs");
+  writeFileSync(fake, `
+    process.stdout.write(JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: "",
+        status: "ERROR",
+        error: "authentication failed or timed out",
+      },
+    }) + "\\n");
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ event: "init", conversation_id: "late-auth-session" }) + "\\n");
+    }, 250);
+    setInterval(() => {}, 1000);
+  `);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({ adapter: agyAdapter, command: process.execPath, args: [fake] }),
+  });
+  try {
+    driver.start("agy-auth", 1);
+    const evidence = await drainEvidenceUntil(
+      driver,
+      (items) => items.some((item) => item.flag === "auth_needed" && item.action === "set"),
+      3000,
+    );
+    assert.ok(evidence.some((item) => item.flag === "auth_needed" && item.action === "set"));
+
+    const initial = driver.observe();
+    assert.equal(ofKind(initial, "booted").length, 1, "auth result must provide real boot evidence");
+    assert.equal(ofKind(initial, "turn_ended").length, 1, "auth result must settle the booted runtime");
+
+    await sleep(350);
+    const afterLateInit = driver.observe();
+    assert.equal(ofKind(afterLateInit, "booted").length, 0, "late booted is normalized away");
+    assert.equal(ofKind(afterLateInit, "turn_ended").length, 0, "late init companion edge is normalized away");
+    assert.deepEqual(driver.observeSessions(), [
+      { beeId: "agy-auth", generation: 1, sessionId: "late-auth-session" },
+    ]);
+    assert.equal(driver.hasProcess("agy-auth", 1), true);
+  } finally {
+    driver.stop("agy-auth", 1, "stopped_by_system");
   }
 });
 
