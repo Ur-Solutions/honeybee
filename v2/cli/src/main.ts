@@ -114,6 +114,7 @@ import {
   createTranscriptTurnStream,
   lastAssistantText,
   renderTranscriptLines,
+  type TranscriptTurnStream,
 } from "../../driver-tmux/src/transcripts.ts";
 import { sessionNameFor } from "../../driver-tmux/src/driver.ts";
 import {
@@ -2699,9 +2700,11 @@ interface SessionLogSnapshot {
 
 function readSessionLogSnapshot(path: string): SessionLogSnapshot {
   const contents = readFileSync(path);
+  const lastNewline = contents.lastIndexOf(0x0a);
+  const byteOffset = lastNewline < 0 ? 0 : lastNewline + 1;
   return {
-    lines: contents.toString("utf8").split("\n").filter((line) => line.trim().length > 0),
-    byteOffset: contents.length,
+    lines: contents.subarray(0, byteOffset).toString("utf8").split("\n").filter((line) => line.trim().length > 0),
+    byteOffset,
   };
 }
 
@@ -2771,20 +2774,12 @@ async function followFileLines(path: string, fromBytes: number, onLine: (line: s
   });
 }
 
-async function followSessionLog(
+async function followTranscriptStream(
   ctx: CliContext,
   path: string,
-  harness: string,
-  raw: boolean,
-  history: readonly string[],
   fromBytes: number,
+  stream: TranscriptTurnStream,
 ): Promise<void> {
-  if (raw) {
-    await followFileLines(path, fromBytes, (line) => ctx.io.out(line));
-    return;
-  }
-  const stream = createTranscriptTurnStream(harness);
-  for (const line of history) stream.pushLine(line);
   await followFileLines(path, fromBytes, (line) => {
     for (const rendered of turnLines(stream.pushLine(line))) ctx.io.out(rendered);
   });
@@ -2806,6 +2801,7 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
   const path = sessionLogOf(bee, needle);
   const harness = bee?.agent ?? "";
   const raw = parsed.flags.get("--raw") === true;
+  const follow = wantsFollow(parsed);
   const tailN = parsed.flags.has("--tail") ? numFlag(parsed, "--tail", 0) : null;
   const snapshot = readSessionLogSnapshot(path);
   const lines = snapshot.lines;
@@ -2814,14 +2810,17 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
     const shown = tailN != null ? lines.slice(-tailN) : lines;
     if (ctx.json) emit(ctx, [], { path, harness, lines: shown }, stale);
     else for (const line of shown) ctx.io.out(line);
-  } else {
-    const turns = renderTranscriptLines(harness, lines);
-    const shown = tailN != null ? turns.slice(-tailN) : turns;
-    if (ctx.json) emit(ctx, [], { path, harness, turns: shown }, stale);
-    else for (const line of turnLines(shown)) ctx.io.out(line);
+    if (follow) await followFileLines(path, snapshot.byteOffset, (line) => ctx.io.out(line));
+    return 0;
   }
-  if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw, lines, snapshot.byteOffset);
+
+  const stream = createTranscriptTurnStream(harness);
+  const turns = lines.flatMap((line) => stream.pushLine(line));
+  if (!follow) turns.push(...stream.flush());
+  const shown = tailN != null ? turns.slice(-tailN) : turns;
+  if (ctx.json) emit(ctx, [], { path, harness, turns: shown }, stale);
+  else for (const line of turnLines(shown)) ctx.io.out(line);
+  if (follow) await followTranscriptStream(ctx, path, snapshot.byteOffset, stream);
   return 0;
 }
 
@@ -2843,15 +2842,23 @@ async function cmdTail(ctx: CliContext, parsed: Parsed): Promise<number> {
   // made `tail` mean something different per substrate (contract §6 says it
   // must not). Render by default; --raw is the verbatim stream.
   const raw = parsed.flags.get("--raw") === true;
+  const follow = wantsFollow(parsed);
   const backlog = numFlag(parsed, "--tail", 40);
   if (stale) ctx.io.err(staleBanner(ctx.cfg.storePath));
   ctx.io.err(sessionLogBanner(path, harness, false));
   const snapshot = readSessionLogSnapshot(path);
   const lines = snapshot.lines;
-  if (raw) for (const line of lines.slice(-backlog)) ctx.io.out(line);
-  else for (const line of turnLines(renderTranscriptLines(harness, lines)).slice(-backlog)) ctx.io.out(line);
-  if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw, lines, snapshot.byteOffset);
+  if (raw) {
+    for (const line of lines.slice(-backlog)) ctx.io.out(line);
+    if (follow) await followFileLines(path, snapshot.byteOffset, (line) => ctx.io.out(line));
+    return 0;
+  }
+
+  const stream = createTranscriptTurnStream(harness);
+  const turns = lines.flatMap((line) => stream.pushLine(line));
+  if (!follow) turns.push(...stream.flush());
+  for (const line of turnLines(turns).slice(-backlog)) ctx.io.out(line);
+  if (follow) await followTranscriptStream(ctx, path, snapshot.byteOffset, stream);
   return 0;
 }
 
