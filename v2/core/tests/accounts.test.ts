@@ -19,6 +19,7 @@ import {
   parseClaudeCredentials,
   parseClaudeUsage,
   parseCodexRateLimits,
+  openCoreStore,
   recipeFor,
   recipeEnvFor,
   replayAudit,
@@ -496,7 +497,7 @@ test("v18.touchAccount: re-publishes the row (account.put) with an honest `chang
   const h = harness();
   try {
     let t = 1_000_000;
-    const store = h.open({ now: () => t });
+    const store = openCoreStore(h.path, { now: () => t, ephemeral: true });
     const a = store.createAccount({ id: "codex-t", harness: "codex", homePath: "/tmp/homes/codex-t", label: "t" });
     const before = store.lastAuditSeq();
     const frozen = store.touchAccount(a.id, "credential health unverified → verified by limits probe");
