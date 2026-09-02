@@ -2692,9 +2692,21 @@ async function cmdHere(ctx: CliContext, _parsed: Parsed): Promise<number> {
 
 // --- session-log reading (transcript / tail / last) ------------------------
 
+interface SessionLogSnapshot {
+  lines: string[];
+  byteOffset: number;
+}
+
+function readSessionLogSnapshot(path: string): SessionLogSnapshot {
+  const contents = readFileSync(path);
+  return {
+    lines: contents.toString("utf8").split("\n").filter((line) => line.trim().length > 0),
+    byteOffset: contents.length,
+  };
+}
+
 function readSessionLogLines(path: string): string[] {
-  const text = readFileSync(path, "utf8");
-  return text.split("\n").filter((l) => l.trim().length > 0);
+  return readSessionLogSnapshot(path).lines;
 }
 
 /** The bee's session log path, loudly absent when never written. */
@@ -2710,14 +2722,6 @@ function sessionLogOf(bee: ViewResult["bee"], needle: string): string {
 /** `-f/--follow` streams; `--no-follow` wins when both are passed. */
 function wantsFollow(parsed: Parsed): boolean {
   return parsed.flags.get("--follow") === true && parsed.flags.get("--no-follow") !== true;
-}
-
-function sessionLogSize(path: string): number {
-  try {
-    return statSync(path).size;
-  } catch {
-    return 0;
-  }
 }
 
 /**
@@ -2773,14 +2777,15 @@ async function followSessionLog(
   harness: string,
   raw: boolean,
   history: readonly string[],
+  fromBytes: number,
 ): Promise<void> {
   if (raw) {
-    await followFileLines(path, sessionLogSize(path), (line) => ctx.io.out(line));
+    await followFileLines(path, fromBytes, (line) => ctx.io.out(line));
     return;
   }
   const stream = createTranscriptTurnStream(harness);
   for (const line of history) stream.pushLine(line);
-  await followFileLines(path, sessionLogSize(path), (line) => {
+  await followFileLines(path, fromBytes, (line) => {
     for (const rendered of turnLines(stream.pushLine(line))) ctx.io.out(rendered);
   });
   for (const rendered of turnLines(stream.flush())) ctx.io.out(rendered);
@@ -2802,7 +2807,8 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
   const harness = bee?.agent ?? "";
   const raw = parsed.flags.get("--raw") === true;
   const tailN = parsed.flags.has("--tail") ? numFlag(parsed, "--tail", 0) : null;
-  const lines = readSessionLogLines(path);
+  const snapshot = readSessionLogSnapshot(path);
+  const lines = snapshot.lines;
   if (!ctx.json) ctx.io.err(sessionLogBanner(path, harness, stale));
   if (raw) {
     const shown = tailN != null ? lines.slice(-tailN) : lines;
@@ -2815,7 +2821,7 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
     else for (const line of turnLines(shown)) ctx.io.out(line);
   }
   if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw, lines);
+  await followSessionLog(ctx, path, harness, raw, lines, snapshot.byteOffset);
   return 0;
 }
 
@@ -2840,11 +2846,12 @@ async function cmdTail(ctx: CliContext, parsed: Parsed): Promise<number> {
   const backlog = numFlag(parsed, "--tail", 40);
   if (stale) ctx.io.err(staleBanner(ctx.cfg.storePath));
   ctx.io.err(sessionLogBanner(path, harness, false));
-  const lines = readSessionLogLines(path);
+  const snapshot = readSessionLogSnapshot(path);
+  const lines = snapshot.lines;
   if (raw) for (const line of lines.slice(-backlog)) ctx.io.out(line);
   else for (const line of turnLines(renderTranscriptLines(harness, lines)).slice(-backlog)) ctx.io.out(line);
   if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw, lines);
+  await followSessionLog(ctx, path, harness, raw, lines, snapshot.byteOffset);
   return 0;
 }
 

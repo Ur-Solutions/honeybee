@@ -488,6 +488,66 @@ test("verbs.transcript: agy follow keeps projector state across appended lines",
   }
 });
 
+test("verbs.transcript: follow starts at the backlog snapshot boundary", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-follow-boundary-"));
+  try {
+    const logPath = join(dir, "boundary.jsonl");
+    writeFileSync(logPath, `${JSON.stringify({ event: "text", text: "before" })}\n`);
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({
+      id: "follow-boundary-1",
+      name: "follow-boundary",
+      agent: "stub",
+      substrate: "hsr",
+      cwd: "/tmp",
+      sessionLogPath: logPath,
+    });
+    store.close();
+
+    const cap = capture();
+    let appended = false;
+    const io: CliIo = {
+      out(line) {
+        cap.io.out(line);
+        if (!appended && stripAnsi(line) === "[assistant] before") {
+          appended = true;
+          appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "in the gap" })}\n`);
+        }
+      },
+      err: cap.io.err,
+    };
+    const before = new Set(process.listeners("SIGINT"));
+    const done = runV2Cli(["transcript", "follow-boundary", "--follow", "--data-dir", dir], io);
+    await waitFor(
+      () => process.listeners("SIGINT").some((listener) => !before.has(listener)),
+      "snapshot-boundary follow started",
+      5000,
+    );
+    let followError: unknown;
+    try {
+      await waitFor(
+        () => cap.out.includes("[assistant] in the gap"),
+        "line appended at the dump/follow boundary",
+        1500,
+      );
+    } catch (error) {
+      followError = error;
+    } finally {
+      for (const listener of process.listeners("SIGINT").filter((item) => !before.has(item))) {
+        (listener as () => void)();
+      }
+      await done;
+    }
+    if (followError) throw followError;
+    assert.deepEqual(
+      cap.out.filter((line) => line.startsWith("[assistant]")),
+      ["[assistant] before", "[assistant] in the gap"],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("verbs.last: falls back to the latest seal when the log has no assistant text; --seal skips straight there", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
   try {
