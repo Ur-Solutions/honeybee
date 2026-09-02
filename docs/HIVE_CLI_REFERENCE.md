@@ -343,20 +343,38 @@ exhausted.
 
 `auto` is a reserved account query (`--account auto`, or the `<tool>-auto` bee
 spec, on `spawn`/`run`/`x`/`xa`/`open`): hive reads the provider limits of every
-credentialed account for that tool and picks the one with the least
-*pace-adjusted* weekly load. Pace is used% minus elapsed% of the window: an
-account behind pace holds unused quota that expires at its reset, so it is
-preferred even over accounts with nominally lower used% — e.g. 70% used but
-resetting tomorrow beats 40% used with five days to go. Pace's weight fades as
-headroom drops below 25%, so a 98%-used account an hour from reset never wins
-on pace alone. Accounts ≥90% into their 5h window sort behind ones with
-headroom. When the spawned model is Fable, auto also ranks the Fable-scoped
-weekly allowance alongside the general weekly window and pushes accounts at
-≥75% Fable usage behind accounts with scoped headroom, even if the nearly
-empty allowance is behind pace and about to reset. Accounts whose limits
-cannot be read are a last resort (oldest registration wins). The pick is
-printed to stderr, e.g.
-`account auto → claude-thto (weekly 66%, 5h 12%) — least effective weekly load (18% behind pace — surplus expires at reset)`.
+credentialed account for that tool and picks the one with the least effective
+load. The model (revised 2026-09-02 after a burst stacked every Fable spawn on
+one account until its 5h window hit 93%):
+
+- **Weekly load with a capped pace credit.** Pace is used% minus elapsed% of
+  the window; an account behind pace holds quota that expires at its reset, so
+  it earns a credit — but at most 25 points (about three busy bees). 30% used
+  with three hours left still beats 25% with six days to go; 70% used but
+  resetting tomorrow no longer beats 40% with five days to go. Pace's weight
+  fades as headroom drops below 25%, so a 98%-used account an hour from reset
+  never wins on pace alone.
+- **The 5h window is a gradient.** A 5h window ahead of pace (39% used at 20%
+  elapsed) adds its overpace as a penalty; behind pace it adds nothing.
+- **Reserve lines are classes, whatever the clock says.** Accounts at ≥85%
+  weekly (≥75% Fable for a Fable spawn, ≥80% 5h) sort behind every account
+  below the line, even when the window resets in an hour: your other threads on
+  that account need the headroom more than a new bee needs the surplus.
+- **Projection.** Each window is projected an hour ahead: its measured burn
+  velocity (from consecutive limits reads; else the account's busy bees at
+  ~20 5h-points/hour each, or the window's own average rate) plus one new bee's
+  expected burn (5h +20, weekly +4, Fable +7). A spawn projected to push any
+  window over its reserve sorts behind spawns that are not, least overshoot
+  first. Stale snapshots are aged forward by the same velocity first.
+- **Local knowledge.** Live bees add +8 (busy) / +2 (idle); every auto pick
+  debits its account +10 for 15 minutes so same-instant bursts spread; an
+  account the provider just rate-limited (exhaustion evidence) is a down-tier
+  class for the cool-off. Near-ties (within 3 points) rotate.
+- Accounts whose limits cannot be read are a last resort (oldest registration
+  wins).
+
+The pick is printed to stderr, e.g.
+`account auto → claude-thto (weekly 66%, 5h 12% +9/h) — least effective weekly load (18% behind pace — surplus expires at reset); +8 in-flight`.
 
 An account can carry a persistent auto-only penalty in effective-load points:
 `hive account downprio <account> [points]` defaults to +25, while
