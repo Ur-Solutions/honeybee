@@ -28,6 +28,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { openCoreStore, type CoreStore } from "../../core/src/index.ts";
 import { AccountsService, defaultCodexRateLimits } from "../src/accountsService.ts";
+import { activateHomeIfEmpty } from "../src/activation.ts";
 import { loadNodeConfig, type NodeConfigFile, type ResolvedNodeConfig } from "../src/config.ts";
 import { recipeFingerprint } from "../src/activation.ts";
 import { parseCursorAuth } from "../src/cursorAuth.ts";
@@ -990,6 +991,262 @@ test("health.1: credentialHealthOf — absent without a primary credential; a fi
     const failed = addAccount(r, "codex", "failed");
     r.store.putAccountLimits(failed.id, { readable: false, unreadableReason: "auth_failed", error: "401" });
     assert.equal(svc.credentialHealthOf(failed), "unverified");
+  } finally {
+    r.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v18 — honest credentials: import from the machine's vendor home, status
+// that never claims ok without a credential, the real probe as verification
+// ---------------------------------------------------------------------------
+
+const CODEX_AUTH = '{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"i","access_token":"a","refresh_token":"r","account_id":"acc"},"last_refresh":"2026-04-01T00:00:00Z"}';
+
+function fakeMachine(r: Rig): { home: string; env: Record<string, string | undefined> } {
+  const home = join(r.dir, "machine-home");
+  mkdirSync(home, { recursive: true });
+  return { home, env: {} };
+}
+
+function writeAt(path: string, content: string): void {
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, content);
+}
+
+test("import.v18.1: importExisting copies the vendor home's credential (+ config) into the vault — the home env var when set, else the recipe default under $HOME; nothing anywhere is a typed refusal listing every path checked", async () => {
+  const r = rig();
+  try {
+    const svc = service(r, { keychainReader: async () => null, cursorAuthReader: async () => null });
+    const machine = fakeMachine(r);
+    const target = { harness: "codex", id: "codex-w", homePath: join(r.homes, "codex-w") };
+
+    // Nothing anywhere: refusal, and the caller sees exactly what was checked (account home, vault, vendor home).
+    const nothing = await svc.importExistingCredentials(target, { env: machine.env, home: machine.home });
+    assert.equal(nothing.ok, false);
+    assert.deepEqual(nothing.checked, [
+      { path: join(target.homePath, "auth.json"), state: "missing" },
+      { path: join(r.vault, "codex", "codex-w", "auth.json"), state: "missing" },
+      { path: join(machine.home, ".codex", "auth.json"), state: "missing" },
+    ]);
+    assert.equal(existsSync(join(r.vault, "codex", "codex-w")), false, "a refusal writes nothing");
+
+    // The field finding: ~/.codex/auth.json (real shape, stale April session) with CODEX_HOME unset.
+    writeAt(join(machine.home, ".codex", "auth.json"), CODEX_AUTH);
+    writeAt(join(machine.home, ".codex", "config.toml"), 'model = "gpt-5.6"\n');
+    const imported = await svc.importExistingCredentials(target, { env: machine.env, home: machine.home });
+    assert.ok(imported.ok);
+    assert.equal(imported.source, "vendor_home");
+    assert.equal(imported.from, join(machine.home, ".codex"));
+    assert.deepEqual(imported.files, ["auth.json", "config.toml"]);
+    assert.equal(readFileSync(join(r.vault, "codex", "codex-w", "auth.json"), "utf8"), CODEX_AUTH);
+    assert.equal(readFileSync(join(r.vault, "codex", "codex-w", "config.toml"), "utf8"), 'model = "gpt-5.6"\n');
+    assert.equal(existsSync(target.homePath), false, "the account home is never written by an import (activation does that at spawn)");
+    // The row it seeds: a credential exists but nothing validated it → unverified; status ok is honest (contrary evidence flips it).
+    const row = r.store.createAccount({ ...target, label: "w", status: svc.honestStatus(target, "ok") });
+    assert.equal(row.status, "ok");
+    assert.equal(svc.credentialHealthOf(row), "unverified");
+    assert.equal(row.lastLoginAt, null, "an import is not a login");
+
+    // A leftover vault entry is found FIRST on a second import for the same id (no vendor read needed).
+    const again = await svc.importExistingCredentials(target, { env: {}, home: join(r.dir, "nowhere") });
+    assert.ok(again.ok);
+    assert.equal(again.source, "vault");
+
+    // The home env var wins over the default dir; a blank value is unset.
+    const envHome = join(r.dir, "codex-env-home");
+    writeAt(join(envHome, "auth.json"), '{"tokens":{"access_token":"env"}}');
+    const viaEnv = await svc.importExistingCredentials({ harness: "codex", id: "codex-e", homePath: join(r.homes, "codex-e") }, { env: { CODEX_HOME: envHome }, home: machine.home });
+    assert.ok(viaEnv.ok);
+    assert.equal(viaEnv.source, "vendor_home");
+    assert.equal(viaEnv.from, envHome);
+    assert.deepEqual(viaEnv.files, ["auth.json"]);
+    assert.equal(readFileSync(join(r.vault, "codex", "codex-e", "auth.json"), "utf8"), '{"tokens":{"access_token":"env"}}');
+
+    // An unparsable primary is `invalid`, never adopted.
+    const badHome = join(r.dir, "codex-bad");
+    writeAt(join(badHome, "auth.json"), "not json");
+    const bad = await svc.importExistingCredentials({ harness: "codex", id: "codex-bad", homePath: join(r.homes, "codex-bad") }, { env: { CODEX_HOME: badHome }, home: machine.home });
+    assert.equal(bad.ok, false);
+    assert.deepEqual(bad.checked.at(-1), { path: join(badHome, "auth.json"), state: "invalid" });
+
+    // The account's own home (a machine home handed in as homePath) is adopted first and captured into the vault.
+    const handedIn = join(r.dir, "handed-in");
+    writeAt(join(handedIn, "auth.json"), '{"tokens":{"access_token":"home"}}');
+    const fromHome = await svc.importExistingCredentials({ harness: "codex", id: "codex-h", homePath: handedIn }, { env: {}, home: machine.home });
+    assert.ok(fromHome.ok);
+    assert.equal(fromHome.source, "home");
+    assert.deepEqual(fromHome.files, ["auth.json"]);
+    assert.equal(readFileSync(join(r.vault, "codex", "codex-h", "auth.json"), "utf8"), '{"tokens":{"access_token":"home"}}');
+
+    // No recipe: nothing to import (the home is the account).
+    const stub = await svc.importExistingCredentials({ harness: "stub", id: "stub-x", homePath: join(r.homes, "stub-x") }, { env: {}, home: machine.home });
+    assert.equal(stub.ok, false);
+    assert.deepEqual(stub.checked, []);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("import.v18.2: relocated vendor files — Claude's ~/.claude.json + Keychain item (external), opencode's XDG data store — land under the recipe's vault layout", async () => {
+  const r = rig();
+  try {
+    const machine = fakeMachine(r);
+    const keychainReads: string[] = [];
+    const claudeCred = JSON.stringify({ claudeAiOauth: { accessToken: "kc", refreshToken: "rk", expiresAt: r.now() + HOUR } });
+    const svc = service(r, {
+      keychainReader: async (home) => {
+        keychainReads.push(home);
+        return home === join(machine.home, ".claude") ? claudeCred : null;
+      },
+      cursorAuthReader: async () => null,
+    });
+    // macOS shape: no .credentials.json file; ~/.claude.json at $HOME; settings under ~/.claude.
+    writeAt(join(machine.home, ".claude.json"), '{"projects":{}}');
+    writeAt(join(machine.home, ".claude", "settings.json"), '{"model":"opus"}');
+    const claude = await svc.importExistingCredentials({ harness: "claude", id: "claude-m", homePath: join(r.homes, "claude-m") }, { env: {}, home: machine.home });
+    assert.ok(claude.ok);
+    assert.equal(claude.source, "external");
+    assert.equal(claude.from, `keychain:${join(machine.home, ".claude")}`);
+    assert.deepEqual(claude.files, [".credentials.json", ".claude.json", "settings.json"]);
+    assert.deepEqual(keychainReads, [join(machine.home, ".claude")]);
+    assert.equal(readFileSync(join(r.vault, "claude", "claude-m", ".credentials.json"), "utf8"), claudeCred);
+    assert.equal(readFileSync(join(r.vault, "claude", "claude-m", ".claude.json"), "utf8"), '{"projects":{}}');
+    assert.deepEqual(claude.checked.map((c) => c.state), ["missing", "missing", "missing", "present"]);
+    // A Keychain item that is not a credential document is `invalid`, and the import refuses.
+    const svc2 = service(r, { keychainReader: async () => '{"nope":true}', cursorAuthReader: async () => null });
+    const refused = await svc2.importExistingCredentials({ harness: "claude", id: "claude-n", homePath: join(r.homes, "claude-n") }, { env: {}, home: machine.home });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.checked.at(-1)?.state, "invalid");
+    // opencode: XDG_DATA_HOME relocates the auth store; the vault keeps the account-home layout.
+    const xdg = join(r.dir, "xdg-data");
+    writeAt(join(xdg, "opencode", "auth.json"), '{"anthropic":{"type":"api","key":"k"}}');
+    const oc = await svc.importExistingCredentials({ harness: "opencode", id: "opencode-o", homePath: join(r.homes, "opencode-o") }, { env: { XDG_DATA_HOME: xdg }, home: machine.home });
+    assert.ok(oc.ok);
+    assert.equal(oc.source, "vendor_home");
+    assert.deepEqual(oc.files, ["xdg-data/opencode/auth.json"]);
+    assert.equal(readFileSync(join(r.vault, "opencode", "opencode-o", "xdg-data", "opencode", "auth.json"), "utf8"), '{"anthropic":{"type":"api","key":"k"}}');
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("status.v18: honestStatus never returns ok without a credential (auth_needed instead); paused / auth_needed pass through; a recipe-less harness is always credentialed", () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const bare = { harness: "codex", id: "codex-bare", homePath: join(r.homes, "codex-bare") };
+    assert.equal(svc.honestStatus(bare, "ok"), "auth_needed");
+    assert.equal(svc.honestStatus(bare, "paused"), "paused");
+    assert.equal(svc.honestStatus(bare, "auth_needed"), "auth_needed");
+    const filed = addAccount(r, "codex", "filed");
+    assert.equal(svc.honestStatus(filed, "ok"), "ok");
+    assert.equal(svc.honestStatus({ harness: "stub", id: "stub-s", homePath: join(r.homes, "stub-s") }, "ok"), "ok");
+    // the pair every consumer relies on: status ok ⇒ health is never absent
+    const ok = r.store.createAccount({ ...bare, label: "bare", status: svc.honestStatus(bare, "ok") });
+    assert.equal(ok.status, "auth_needed");
+    assert.equal(svc.credentialHealthOf(ok), "absent");
+    assert.equal(svc.mirrorRow(ok).credentialHealth, "absent");
+    // login success (capture / flow) flips it to ok + verified
+    mkdirSync(ok.homePath, { recursive: true });
+    writeFileSync(join(ok.homePath, "auth.json"), '{"tokens":{"access_token":"t"}}');
+    const login = r.store.recordAccountLogin(ok.id).account;
+    assert.equal(login.status, "ok");
+    assert.equal(svc.mirrorRow(login).credentialHealth, "verified");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("verify.v18: the real limits probe settles an import — readable → verified (and the row is re-published for the mirror), auth failure → auth_needed; no probe → unverified; nothing → absent; a Codex probe activates the EMPTY home from the vault first", async () => {
+  const r = rig();
+  try {
+    let answer: "ok" | "auth" = "ok";
+    const probed: string[] = [];
+    const svc = service(r, {
+      fetchers: {
+        codexRateLimits: async (home) => {
+          probed.push(home);
+          if (answer === "auth") return { ok: false, unreadableReason: "auth_failed", error: "401 Unauthorized" };
+          return { ok: true, limits: { primary: { usedPercent: 3, windowDurationMins: 300 }, secondary: { usedPercent: 9, windowDurationMins: 10_080 } } };
+        },
+      },
+      keychainReader: async () => null,
+    });
+    // imported (vault only, empty home), status ok, unverified
+    const imported = addAccount(r, "codex", "imp", { vault: { "auth.json": CODEX_AUTH } });
+    assert.equal(svc.credentialHealthOf(imported), "unverified");
+    const seqBefore = r.store.lastAuditSeq();
+    const ok = await svc.verifyCredentials(imported);
+    assert.equal(ok.outcome, "verified");
+    assert.equal(ok.probe, "limits");
+    assert.equal(ok.limits?.readable, true);
+    assert.equal(ok.account.status, "ok");
+    assert.equal(svc.credentialHealthOf(ok.account), "verified");
+    assert.deepEqual(probed, [imported.homePath], "the probe ran against the account home");
+    assert.equal(readFileSync(join(imported.homePath, "auth.json"), "utf8"), CODEX_AUTH, "the empty home was activated from the vault so codex app-server could see the credential");
+    assert.ok(r.log.some((l) => l.startsWith(`account.activate account=${imported.id}`) && l.endsWith("by=limits_probe")));
+    // the mirror learns: a status-neutral verification still re-publishes the account row
+    const puts = r.store.auditRows(seqBefore).filter((row) => row.kind === "account.put");
+    assert.equal(puts.length, 1);
+    assert.equal(puts[0]?.payload.reason, "credential health unverified → verified by limits probe");
+    assert.ok(r.log.includes(`account.credential_health account=${imported.id} unverified→verified by=limits_probe`));
+    // a second, identical probe changes nothing and re-publishes nothing
+    const seqMid = r.store.lastAuditSeq();
+    assert.equal((await svc.verifyCredentials(ok.account)).outcome, "verified");
+    assert.equal(r.store.auditRows(seqMid).filter((row) => row.kind === "account.put").length, 0);
+
+    // a stale session: the provider refuses → auth_needed with the typed reason on the limits row
+    answer = "auth";
+    const stale = addAccount(r, "codex", "stale", { vault: { "auth.json": CODEX_AUTH } });
+    const bad = await svc.verifyCredentials(stale);
+    assert.equal(bad.outcome, "auth_needed");
+    assert.equal(bad.account.status, "auth_needed");
+    assert.equal(bad.limits?.unreadableReason, "auth_failed");
+    assert.equal(svc.credentialHealthOf(bad.account), "unverified", "a failed probe is no validation evidence");
+
+    // no probe for the harness: honest `unverified`, probe none
+    const stub = r.store.createAccount({ id: "stub-s", harness: "stub", homePath: join(r.homes, "stub-s"), label: "s" });
+    assert.deepEqual(await svc.verifyCredentials(stub), { account: stub, outcome: "unverified", probe: "none", limits: null });
+    assert.equal(svc.hasCredentialProbe("stub"), false);
+    // nothing to verify
+    const bare = r.store.createAccount({ id: "codex-bare", harness: "codex", homePath: join(r.homes, "codex-bare"), label: "bare", status: "auth_needed" });
+    assert.equal((await svc.verifyCredentials(bare)).outcome, "absent");
+
+    // background scheduling: only probe-capable accounts are queued; the outcome lands on the row
+    answer = "ok";
+    const later = addAccount(r, "codex", "later", { vault: { "auth.json": CODEX_AUTH } });
+    assert.deepEqual(svc.scheduleVerification([later.id, stub.id, "nope"]), [later.id]);
+    await waitFor(() => (svc.credentialHealthOf(r.store.getAccount(later.id)!) === "verified" ? true : null), "background verification landed");
+    // a populated home is left alone by the probe's activation rule
+    const populated = addAccount(r, "codex", "pop", { vault: { "auth.json": CODEX_AUTH } });
+    mkdirSync(populated.homePath, { recursive: true });
+    writeFileSync(join(populated.homePath, "auth.json"), '{"tokens":{"access_token":"home-owned"}}');
+    await svc.verifyCredentials(populated);
+    assert.equal(readFileSync(join(populated.homePath, "auth.json"), "utf8"), '{"tokens":{"access_token":"home-owned"}}');
+    assert.equal(activateHomeIfEmpty("codex", populated.homePath, join(r.vault, "codex", populated.id)).reason, "home_populated");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("import.v18.3: the old-registry importer creates a credential-less record as auth_needed, never as a usable-looking ok row", () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const root = join(r.dir, "old-hive");
+    mkdirSync(join(root, "vault", "codex", "codex-creds"), { recursive: true });
+    writeFileSync(join(root, "vault", "codex", "codex-creds", "auth.json"), CODEX_AUTH);
+    writeFileSync(join(root, "vault", "accounts.json"), JSON.stringify([
+      { id: "codex-creds", tool: "codex", label: "creds", addedAt: "2026-06-10T07:21:45.119Z" },
+      { id: "codex-empty", tool: "codex", label: "empty", addedAt: "2026-06-10T07:21:45.119Z" },
+      { id: "codex-parked", tool: "codex", label: "parked", addedAt: "2026-06-10T07:21:45.119Z", pausedAt: "2026-06-11T00:00:00Z" },
+    ]));
+    const report = svc.importRegistry(root);
+    assert.deepEqual(report.entries.map((e) => [e.id, e.status]), [["codex-creds", "ok"], ["codex-empty", "auth_needed"], ["codex-parked", "paused"]]);
+    assert.equal(r.store.getAccount("codex-empty")?.status, "auth_needed");
+    assert.equal(r.store.getAccount("codex-creds")?.status, "ok");
+    assert.equal(svc.credentialHealthOf(r.store.getAccount("codex-empty")!), "absent");
   } finally {
     r.cleanup();
   }

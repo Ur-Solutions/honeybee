@@ -12,7 +12,7 @@
  * Changing anything here is a protocol change (bump PROTOCOL in the daemon).
  * The shape snapshot test (tests/mirror.test.ts) fails on any drift.
  */
-import type { AccountLimitsRow, AccountRow, AuditRow, BeeRow, BeeView, QuestionRow, RuntimeRow, SealRow, TaskRow, TaskSupplyRow, TemplateRow, TrackRow } from "./types.ts";
+import type { AccountLimitsRow, AccountRow, AuditRow, BeeRow, BeeView, CredentialHealth, QuestionRow, RuntimeRow, SealRow, TaskRow, TaskSupplyRow, TemplateRow, TrackRow } from "./types.ts";
 import { LOGIN_FLOW_KEYS, type LoginFlowRow } from "./loginFlow.ts";
 
 /** One bee as apiaryd stores it: B8 view verbatim + record + current runtime. */
@@ -35,8 +35,15 @@ export type MirrorQuestionRow = QuestionRow;
 /** v6: seals mirror as their store rows, verbatim. */
 export type MirrorSealRow = SealRow;
 
-/** v7 (spec 08): accounts mirror as their store rows, verbatim (`hive_accounts`). */
-export type MirrorAccountRow = AccountRow;
+/**
+ * v7 (spec 08): accounts mirror as their store rows (`hive_accounts`) — plus,
+ * v18 (additive, 2026-09-02): `credentialHealth`, the daemon's DERIVED
+ * credential-validation evidence (core `credentialHealthOf` at emit time;
+ * never stored). Snapshot rows and the `account.put` delta payload both carry
+ * it, so a materializer never infers health from a file or from `status`.
+ * A materializer that ignored the key before stays correct.
+ */
+export type MirrorAccountRow = AccountRow & { credentialHealth: CredentialHealth };
 
 /** v7: the latest limits snapshot per account, verbatim (`hive_account_limits` — the account-menu usage hint). */
 export type MirrorAccountLimitsRow = AccountLimitsRow;
@@ -105,8 +112,9 @@ export type MirrorDelta = AuditRow;
  *   seal.created       → { seal: SealRow }                             (seals table: insert)
  * `bee.provider_session` may now also carry `forkSeedConsumed` (bee row: forkSeed → null).
  * v7 (accounts, spec 08) adds, all additive:
- *   account.put          → { account: AccountRow, outcome: "created"|"updated", changed?, previous?, reason? }
- *                                                                        (accounts table: upsert the row verbatim)
+ *   account.put          → { account: MirrorAccountRow, outcome: "created"|"updated", changed?, previous?, reason? }
+ *                                                                        (accounts table: upsert the row verbatim; v18: the
+ *                                                                         daemon adds `credentialHealth` to `account` at emit)
  *   account.removed      → { accountId, harness, removedAt, cursorCleared }  (accounts + account_limits: delete)
  *   account_limits.put   → { limits: AccountLimitsRow }                 (account_limits table: upsert)
  *   selection_cursor.set → { cursor }                                   (internal; no mirror table)
@@ -257,6 +265,8 @@ export const MIRROR_ACCOUNT_KEYS = [
   "exhaustedAt",
   "addedAt",
   "updatedAt",
+  // v18: additive — derived credential-validation evidence (absent | unverified | verified).
+  "credentialHealth",
 ] as const;
 export const MIRROR_ACCOUNT_LIMITS_KEYS = [
   "account",

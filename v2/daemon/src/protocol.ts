@@ -17,6 +17,7 @@
  *     client must refetch the snapshot (fail-closed cursor).
  */
 import type {
+  AccountStatus,
   AuditRow,
   BeeRow,
   CredentialHealth,
@@ -59,6 +60,14 @@ export const DAEMON_CAPABILITIES = [
   "account.login.flow.v1",
   /** Per-harness executable facts (`node.harnesses`), resolved with the same rule the spawn path uses. */
   "node.harnesses.v1",
+  /**
+   * v18 (2026-09-02): honest credentials — mirror account rows (snapshot +
+   * `account.put` deltas) carry the derived `credentialHealth`; `account.add
+   * {importExisting}` imports from the machine's vendor home or refuses with
+   * `no_credentials_to_import`; `status` is never `ok` with `absent`
+   * credentials; the `account.verify` verb runs the harness's real probe.
+   */
+  "account.credential_health.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -112,6 +121,13 @@ export const RPC_ERROR_CODES = [
    * login is an explicit choice, never a default.
    */
   "account_home_populated",
+  /**
+   * v18: `account.add {importExisting:true}` found nothing to adopt — no
+   * primary credential in the account home, the vault entry, or the
+   * machine's vendor home (the message lists every path checked). A
+   * logged-out account is never created "by import".
+   */
+  "no_credentials_to_import",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -196,6 +212,8 @@ export const RPC_VERBS = [
   "account.login.retry",
   "account.login.cancel",
   "account.capture",
+  // v18 (additive): run the harness's real credential probe on demand.
+  "account.verify",
   "account.limits",
   "account.importRegistry",
   "account.backfill",
@@ -300,24 +318,58 @@ export interface AccountGetResult {
   loginFlow: MirrorLoginFlowRow | null;
 }
 
+/** v18: where `account.add {importExisting:true}` took the credential from. */
+export interface ImportedCredentials {
+  /**
+   * `home`: the account's own home already held it (captured into the vault);
+   * `vault`: a leftover vault entry for the id; `vendor_home`: the machine's
+   * real harness home (its home env var, else the recipe default under $HOME);
+   * `external`: the provider's out-of-home store (Claude Keychain, Cursor's
+   * global store) for the vendor home.
+   */
+  source: "home" | "vault" | "vendor_home" | "external";
+  /** The directory / store the files came from. */
+  from: string;
+  /** Recipe-relative files now in the vault. */
+  files: string[];
+}
+
 /**
  * `account.add {harness, label, id?, homePath?, penalty?, importExisting?}` —
  * id defaults to `<harness>-<safe(label)>`, homePath to `<homesDir>/<id>`.
  * Audit account.put.
  *
  * F2: a fresh account starts LOGGED OUT (empty vault; credentials arrive
- * through the typed `account.login.*` flows). When the home (or a leftover
- * vault entry for the id) already holds the harness's primary credential,
- * the add is refused with `account_home_populated` unless
- * `importExisting:true` explicitly opts into adopting those credentials —
- * which are then reported as `credentialHealth:"unverified"` until a
- * login/capture/limits probe actually validates them. Import can sign the
- * machine's regular CLI out of that provider (refresh tokens rotate on use).
+ * through the typed `account.login.*` flows) with `status:"auth_needed"` —
+ * v18: `ok` is never claimed while `credentialHealth` is `absent`. When the
+ * home (or a leftover vault entry for the id) already holds the harness's
+ * primary credential, the add is refused with `account_home_populated`
+ * unless `importExisting:true` explicitly opts into adopting it.
+ *
+ * v18: `importExisting:true` means "import the machine's existing sign-in":
+ * the account home / vault entry when populated, else the harness's
+ * primary credential file(s) copied from the machine's VENDOR home
+ * (`CODEX_HOME` / `CLAUDE_CONFIG_DIR` … when set, else `~/.codex`,
+ * `~/.claude`, …; Claude on macOS: the Keychain item) into the account's
+ * vault. Nothing importable anywhere → `no_credentials_to_import` (the
+ * message lists the paths checked) and NO account row. An adopted
+ * credential is `unverified`; when the harness has a real probe the daemon
+ * schedules one (`verification:"scheduled"`) so the mirror row promptly
+ * shows `verified` or `status:"auth_needed"`. Import can sign the machine's
+ * regular CLI out of that provider (refresh tokens rotate on use).
  */
 export interface AccountAddResult extends DedupMarkers {
   account: MirrorAccountRow;
   /** `unverified` after an importExisting adoption; `absent` for a fresh logged-out account. */
   credentialHealth: CredentialHealth;
+  /** v18: provenance of an imported credential; null for a fresh logged-out add. */
+  imported: ImportedCredentials | null;
+  /**
+   * v18: `scheduled` — the harness's real probe runs in the background lane
+   * and lands on the mirror row; `unsupported` — a credential exists but the
+   * harness has no probe (stays `unverified`); `none` — nothing to verify.
+   */
+  verification: "scheduled" | "unsupported" | "none";
 }
 
 /** `account.remove {id}` — id is a selector; `account_referenced` while bees carry it. */
@@ -410,6 +462,25 @@ export interface AccountCaptureResult extends DedupMarkers {
   at: number;
 }
 
+/**
+ * v18: `account.verify {id, idempotencyKey?}` — run the cheapest REAL
+ * validation the harness supports (the limits probe: Claude usage endpoint,
+ * `codex app-server`, the secondary providers' windows) and report what it
+ * proved. `verified`: the probe read (the limits row is fresh); `auth_needed`:
+ * a typed auth failure (status flipped, log in); `unverified`: the harness
+ * has no probe (`probe:"none"`) or the probe failed transiently (see
+ * `limits.unreadableReason`); `absent`: no credential anywhere to verify.
+ * Never spawns a bee; a Codex account's EMPTY home is activated from the
+ * vault first (exactly what the first spawn would do).
+ */
+export interface AccountVerifyResult extends DedupMarkers {
+  account: MirrorAccountRow;
+  outcome: "verified" | "auth_needed" | "unverified" | "absent";
+  probe: "limits" | "none";
+  /** The limits row after the probe; null when no probe ran. */
+  limits: MirrorAccountLimitsRow | null;
+}
+
 /** `account.limits {id?}` — resolve id as a selector, or refresh all accounts when omitted. */
 export interface AccountLimitsResult extends DedupMarkers {
   limits: MirrorAccountLimitsRow[];
@@ -433,7 +504,8 @@ export interface AccountImportRegistryResult extends DedupMarkers {
     homeExists?: boolean;
     homeHasCredentials?: boolean;
     penalty?: number;
-    status?: "ok" | "paused";
+    /** v18: an old record without any credential imports as `auth_needed`, never a usable-looking `ok`. */
+    status?: AccountStatus;
   }>;
   counts: { import: number; skip: number };
   byHarness: Record<string, { import: number; skip: number }>;
