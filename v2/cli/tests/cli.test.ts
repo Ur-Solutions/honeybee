@@ -259,6 +259,22 @@ test("cli.4c: per-bee args — `spawn --arg` (repeatable), `bee set-args <bee> -
     assert.equal(await runV2Cli(["bee", "args", "argsy", "--data-dir", dir, "--json"], a1.io), 0);
     assert.deepEqual(JSON.parse(a1.out[0] ?? "{}"), { beeId: spawned.beeId, args: ["--model", "fable"] });
 
+    // spawn with `--`: harness flags after the separator stay verbatim.
+    const restSpawn = capture();
+    assert.equal(await runV2Cli([
+      "spawn", "resty", "--agent", "stub", "--cwd", "/tmp", "--data-dir", dir, "--json", "--",
+      "--model", "model-from-rest", "--effort", "high",
+    ], restSpawn.io), 0);
+    const restArgs = capture();
+    assert.equal(await runV2Cli(["bee", "args", "resty", "--data-dir", dir, "--json"], restArgs.io), 0);
+    assert.deepEqual(
+      JSON.parse(restArgs.out[0] ?? "{}"),
+      {
+        beeId: (JSON.parse(restSpawn.out[0] ?? "{}") as { beeId: string }).beeId,
+        args: ["--model", "model-from-rest", "--effort", "high"],
+      },
+    );
+
     // set-args with `--`: everything after is verbatim (even tokens that look like our own flags)
     const set = capture();
     assert.equal(await runV2Cli(["bee", "set-args", "argsy", "--data-dir", dir, "--json", "--", "--model", "opus", "--effort", "high", "--dangerously-skip-permissions"], set.io), 0);

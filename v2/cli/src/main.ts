@@ -590,7 +590,9 @@ async function spawnBee(
       ...(cell ? { cell } : {}),
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
-      ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
+      ...((parsed.args.length > 0 || (parsed.rest?.length ?? 0) > 0)
+        ? { args: [...parsed.args, ...(parsed.rest ?? [])] }
+        : {}),
       ...(Object.keys(env).length > 0 ? { env } : {}),
       ...(parentId ? { parentId } : {}),
       ...(account !== undefined ? { account } : {}),
