@@ -116,6 +116,7 @@ import {
 } from "../../driver-tmux/src/transcripts.ts";
 import { sessionNameFor } from "../../driver-tmux/src/driver.ts";
 import {
+  agyArgGrammar,
   claudeArgGrammar,
   codexArgGrammar,
   composeArgv,
@@ -2047,7 +2048,7 @@ function templateHarnessArgs(template: TemplateRow, agent: string, parsed: Parse
       : template.yolo;
   if (yolo) {
     if (agent === "codex") args.push("--dangerously-bypass-approvals-and-sandbox");
-    else if (agent === "claude") args.push("--dangerously-skip-permissions");
+    else if (agent === "claude" || agent === "agy") args.push("--dangerously-skip-permissions");
     else if (agent === "grok") args.push("--permission-mode", "bypassPermissions");
   }
 
@@ -2951,6 +2952,7 @@ async function cmdEvents(ctx: CliContext, parsed: Parsed): Promise<number> {
 // --- set-model (sugar over bee.setArgs) ------------------------------------
 
 function grammarForAgent(agent: string): ArgGrammar | null {
+  if (agent === "agy") return agyArgGrammar;
   if (agent === "claude") return claudeArgGrammar;
   if (agent === "codex") return codexArgGrammar;
   return null;
