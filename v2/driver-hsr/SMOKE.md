@@ -1,7 +1,7 @@
 # WP3 manual smoke — real harnesses (run before WP4 lands)
 
-CI proves the driver against the stub agent only. This checklist verifies the two real
-adapters against live claude/codex streams once, manually. Budget: one short turn each.
+CI proves the driver against the stub agent only. This checklist verifies the real
+adapters against live harness streams once, manually. Budget: one short turn each.
 
 Setup: none — the runner is checked in. From the repo root:
 
@@ -10,6 +10,7 @@ npm run v2:smoke -- stub     # wiring proof, no tokens (run first)
 npm run v2:smoke -- claude   # real claude from PATH   [--model <m>]
 npm run v2:smoke -- codex    # real codex from PATH    [--model <m>]
 npm run v2:smoke -- grok     # real grok agent stdio   [--model <m>]
+npm run v2:smoke -- agy      # real agy print mode     [--model <m>]
 ```
 
 The runner automates steps 1–5 below and prints a ✓/✗ checklist plus the session-log
@@ -25,7 +26,7 @@ that forced this: grok ignores the tmux paste buffer entirely (now `deliveryMode
 paste during its post-turn redraw. Claude's transcript locator now realpaths the cwd
 (`/var` → `/private/var`), matching where claude actually writes.
 
-## Per harness (claude, then codex, then grok)
+## Per harness (claude, then codex, then grok, then agy)
 
 1. **Spawn** — `start()` a bee running the real CLI with a trivial prompt.
    - [ ] `booted` observation arrives; pid + start-time recorded at spawn
@@ -43,6 +44,19 @@ paste during its post-turn redraw. Claude's transcript locator now realpaths the
    - [ ] adapter emits `auth_needed` evidence; restoring credentials + successful turn
          emits the contrary-evidence clear
 
+## agy print-mode checks
+
+agy 1.1.24 emits an `init` line before accepting input, so delivery during
+boot must return `not_ready`; it is not a synthetic-ready harness. Confirm
+that each `agent_response` step opens a turn and every terminal `result`,
+including `CANCELED`, closes it. Run the authenticated check with
+`--dangerously-skip-permissions` so tool requests do not wait for approval.
+
+For the auth check, use a fresh HOME and inspect both streams. agy prints the
+"Authentication required" stanza on stderr, emits an `ERROR` result containing
+"authentication failed or timed out" on stdout, and may exit 0. The result
+event, not the exit code, must set `auth_needed`.
+
 ## Format-confidence items (from adapter implementation)
 
 Anything the old `src/hsr/adapters/` left ambiguous is listed in the adapter source as
@@ -57,6 +71,7 @@ Result log:
 | 2026-08-17 | claude | trmd | ALL 11 PASS | after readyAtSpawn fix (4a8c6c42); 6 log lines |
 | 2026-08-17 | codex | trmd | ALL 11 PASS | codex-cli app-server; 53 log lines |
 | 2026-08-20 | grok | trmd | ALL 11 PASS | grok 1.0.5 ACP stdio; grok-4.6; 82 log lines; authMethods cached_token+grok.com; loadSession=true; step 6 still manual |
+| | agy | | | pending live smoke after deployment; fixture protocol captured from agy 1.1.24 on 2026-09-02 |
 
 ---
 
