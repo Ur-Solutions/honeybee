@@ -114,6 +114,8 @@ export interface FlagEvidenceLike {
   flag: "auth_needed" | "resource_blocked" | "spawn_failed";
   action: "set" | "clear";
   detail: string;
+  /** Provider-declared instant (epoch ms) the condition lifts, when stated. */
+  resetsAt?: number;
 }
 
 /** Harness session identity, structurally matching HsrDriver's SessionEvidence. */
@@ -266,6 +268,7 @@ export class DaemonCore {
       this.applySessionIds();
       this.applyObservationCursors();
     });
+    this.expireFlags();
     let seq = this.store.lastAuditSeq();
     let snapshot = this.stepSnapshot();
     this.bootHangPolicy(snapshot.rows);
@@ -472,6 +475,22 @@ export class DaemonCore {
   // -------------------------------------------------------------------------
 
   /**
+   * Provider-declared expiry (contract §4.2 provider-boundary flags): a
+   * rate-limit wall carries the instant it lifts. Once the clock passes it,
+   * the block is over by the provider's own statement — clear it, so a bee
+   * that never ran another turn (parked, or stopped by the idle window) does
+   * not read as blocked forever. Silence still clears nothing: a flag with no
+   * declared reset waits for contrary evidence from a served turn.
+   */
+  private expireFlags(): void {
+    for (const row of this.store.expireFlags(this.now())) {
+      this.log(
+        `flag.expire bee=${row.beeId} flag=${row.flag} resetsAt=${new Date(row.resetsAt as number).toISOString()}`,
+      );
+    }
+  }
+
+  /**
    * Contrary-evidence clearing (spec 03, resolving WP2 ambiguity 6): every
    * flag-setter has a clearer in the same adapter, and this policy applies
    * both directions verbatim. Flags are bee-scoped; evidence from a stale
@@ -485,8 +504,10 @@ export class DaemonCore {
         continue;
       }
       if (ev.action === "set") {
-        this.store.setFlag(ev.beeId, ev.flag, ev.detail);
-        this.log(`flag.set bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}`);
+        this.store.setFlag(ev.beeId, ev.flag, ev.detail, { resetsAt: ev.resetsAt ?? null });
+        this.log(
+          `flag.set bee=${ev.beeId} flag=${ev.flag} gen=${ev.generation}${ev.resetsAt != null ? ` resetsAt=${new Date(ev.resetsAt).toISOString()}` : ""}`,
+        );
       } else {
         // Every clean turn re-emits contrary evidence; clearing an unset flag
         // is a store no-op — logging it too was pure noise (soak day-2).

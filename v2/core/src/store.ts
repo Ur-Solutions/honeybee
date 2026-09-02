@@ -88,7 +88,7 @@ import {
   TASK_SUPPLY_SENDER_NAME,
   TASK_TRANSITIONS,
 } from "./tasks.ts";
-import { BEES_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import {
   LOGIN_FLOW_PHASES,
   isTerminalLoginPhase,
@@ -727,7 +727,19 @@ function mapFlag(r: Row): FlagRow {
     detail: r.detail as string,
     setAt: Number(r.set_at),
     clearedAt: r.cleared_at == null ? null : Number(r.cleared_at),
+    resetsAt: r.resets_at == null ? null : Number(r.resets_at),
   };
+}
+
+/**
+ * v17 backfill: the adapters' pre-v17 textual hint (`…, resets <ISO>`) for a
+ * rate-limit wall. Only used once, when the resets_at column is introduced.
+ */
+export function resetsAtFromDetail(detail: string): number | null {
+  const m = /\bresets (\d{4}-\d{2}-\d{2}T[0-9:.]+Z)\b/.exec(detail);
+  if (!m) return null;
+  const ms = Date.parse(m[1]!);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function mapMessage(r: Row): MessageRow {
@@ -983,6 +995,25 @@ export class CoreStore {
       );
       for (const [name, ddl] of RUNTIMES_ADDITIVE_COLUMNS) {
         if (!runtimeCols.has(name)) this.db.exec(`ALTER TABLE runtimes ADD COLUMN ${ddl}`);
+      }
+      // v16 → v17: provider-declared expiry on flags. Open resource_blocked
+      // rows written by an older build already carry the adapter's textual
+      // "resets <ISO>" hint; lift it into the column so a wall recorded before
+      // this build still expires instead of blocking the bee forever.
+      const flagCols = new Set(
+        (this.stmt("SELECT name FROM pragma_table_info('flags')").all() as Row[]).map((c) => String(c.name)),
+      );
+      if (!flagCols.has("resets_at")) {
+        for (const [name, ddl] of FLAGS_ADDITIVE_COLUMNS) {
+          if (!flagCols.has(name)) this.db.exec(`ALTER TABLE flags ADD COLUMN ${ddl}`);
+        }
+        const open = this.stmt(
+          "SELECT id, detail FROM flags WHERE cleared_at IS NULL AND flag = 'resource_blocked'",
+        ).all() as Row[];
+        for (const f of open) {
+          const resetsAt = resetsAtFromDetail(String(f.detail));
+          if (resetsAt != null) this.stmt("UPDATE flags SET resets_at = ? WHERE id = ?").run(resetsAt, Number(f.id));
+        }
       }
       // v11 → v12: typed account-limit failure class. Existing unreadable
       // rows stay null until the next bounded limits sweep refreshes them.
@@ -1797,28 +1828,33 @@ export class CoreStore {
     if (!(FLAGS as readonly string[]).includes(flag)) throw new UnknownFlagError(flag);
   }
 
-  setFlag(beeId: string, flag: string, detail: string): FlagRow {
+  /**
+   * Set (or re-describe) a flag. `resetsAt` is the provider-declared instant
+   * the condition lifts (rate-limit resets); re-setting an open flag replaces
+   * both the detail and the expiry with the newest evidence.
+   */
+  setFlag(beeId: string, flag: string, detail: string, opts: { resetsAt?: number | null } = {}): FlagRow {
     this.assertKnownFlag(flag);
     return this.tx(() => {
       this.mustGetBee(beeId);
-      return this.applySetFlag(beeId, flag, detail);
+      return this.applySetFlag(beeId, flag, detail, opts.resetsAt ?? null);
     });
   }
 
-  private applySetFlag(beeId: string, flag: Flag, detail: string): FlagRow {
+  private applySetFlag(beeId: string, flag: Flag, detail: string, resetsAt: number | null = null): FlagRow {
     const existing = this.db
       .prepare("SELECT * FROM flags WHERE bee_id = ? AND flag = ? AND cleared_at IS NULL")
       .get(beeId, flag) as Row | undefined;
     if (existing) {
-      this.stmt("UPDATE flags SET detail = ? WHERE id = ?").run(detail, Number(existing.id));
-      const row = mapFlag({ ...existing, detail });
+      this.stmt("UPDATE flags SET detail = ?, resets_at = ? WHERE id = ?").run(detail, resetsAt, Number(existing.id));
+      const row = mapFlag({ ...existing, detail, resets_at: resetsAt });
       this.audit("flag.set", beeId, { flag: row });
       return row;
     }
     const at = this.now();
     const res = this.db
-      .prepare("INSERT INTO flags(bee_id, flag, detail, set_at, cleared_at) VALUES(?, ?, ?, ?, NULL)")
-      .run(beeId, flag, detail, at);
+      .prepare("INSERT INTO flags(bee_id, flag, detail, set_at, cleared_at, resets_at) VALUES(?, ?, ?, ?, NULL, ?)")
+      .run(beeId, flag, detail, at, resetsAt);
     const row: FlagRow = {
       id: Number(res.lastInsertRowid),
       beeId,
@@ -1826,6 +1862,7 @@ export class CoreStore {
       detail,
       setAt: at,
       clearedAt: null,
+      resetsAt,
     };
     this.audit("flag.set", beeId, { flag: row });
     return row;
@@ -1862,6 +1899,31 @@ export class CoreStore {
       detail,
     });
     return { applied: true };
+  }
+
+  /**
+   * Enact provider-declared expiry: every open flag whose `resetsAt` has
+   * passed is cleared (audited `flag.cleared`, detail names the instant).
+   * This is not silence-as-evidence — the provider itself stated when its
+   * wall lifts (e.g. rate_limit_event.resetsAt); the store only honours that
+   * statement once the clock reaches it. Flags without a declared reset are
+   * untouched: they wait for contrary evidence from a served turn.
+   */
+  expireFlags(now: number = this.now()): FlagRow[] {
+    return this.tx(() => {
+      const due = (this.db
+        .prepare("SELECT * FROM flags WHERE cleared_at IS NULL AND resets_at IS NOT NULL AND resets_at <= ? ORDER BY id")
+        .all(now) as Row[]).map(mapFlag);
+      for (const row of due) {
+        this.applyClearFlag(
+          row.beeId,
+          row.flag,
+          `provider-declared reset ${new Date(row.resetsAt as number).toISOString()} passed`,
+          { auditNoop: false },
+        );
+      }
+      return due;
+    });
   }
 
   activeFlags(beeId: string): FlagRow[] {

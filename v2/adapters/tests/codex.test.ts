@@ -115,6 +115,7 @@ test("codex: rateLimits reached → resource_blocked set with primary-window res
   if (s.kind === "flag") {
     assert.equal(s.flag, "resource_blocked");
     assert.equal(s.action, "set");
+    assert.equal(s.resetsAt, 1783034400 * 1000, "provider-declared reset rides structurally");
     assert.match(s.detail, /rate_limit_reached/);
     assert.match(s.detail, /resets 2026-/);
   }

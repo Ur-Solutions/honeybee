@@ -52,7 +52,14 @@ export type AdapterSignal =
   /** The RPC request was rejected and may be retried at a later accept point. */
   | { kind: "delivery_refused"; messageId: number }
   /** Condition-flag evidence. The adapter reports; the daemon decides. */
-  | { kind: "flag"; flag: AdapterFlag; action: "set" | "clear"; detail: string }
+  | {
+      kind: "flag";
+      flag: AdapterFlag;
+      action: "set" | "clear";
+      detail: string;
+      /** Provider-declared instant (epoch ms) the condition lifts, when the provider states one. */
+      resetsAt?: number;
+    }
   /**
    * Protocol lines the driver must write back to the runtime's stdin (e.g. the
    * codex JSON-RPC handshake continuation). Derived purely from the input line.
@@ -215,6 +222,13 @@ export function isResourceBlockedMessage(message: string): boolean {
 }
 
 /** Convert a UNIX-seconds epoch to an ISO hint, or undefined if unusable. */
+/** Provider `resetsAt` (unix seconds) → epoch ms, or undefined when absent/invalid. */
+export function epochMsFromSeconds(value: unknown): number | undefined {
+  const seconds = toNumber(value);
+  if (seconds === undefined || seconds <= 0) return undefined;
+  return Math.round(seconds * 1000);
+}
+
 export function isoFromEpochSeconds(value: unknown): string | undefined {
   const seconds = toNumber(value);
   if (seconds === undefined || seconds <= 0) return undefined;

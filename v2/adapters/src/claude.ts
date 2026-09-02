@@ -37,7 +37,7 @@ import {
   type HarnessAdapter,
   type InterruptContext,
 } from "./types.ts";
-import { asObject } from "./types.ts";
+import { asObject, epochMsFromSeconds } from "./types.ts";
 
 /**
  * Map a `rate_limit_event`'s `rate_limit_info` to flag evidence. Verified
@@ -55,11 +55,13 @@ function rateLimitSignals(rateLimitInfo: unknown): AdapterSignal[] {
     return [{ kind: "flag", flag: "resource_blocked", action: "clear", detail: `claude rate limit ${status}` }];
   }
   const reset = isoFromEpochSeconds(info.resetsAt);
+  const resetsAt = epochMsFromSeconds(info.resetsAt);
   return [{
     kind: "flag",
     flag: "resource_blocked",
     action: "set",
     detail: `claude rate limit ${status}${reset ? `, resets ${reset}` : ""}`,
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
   }];
 }
 

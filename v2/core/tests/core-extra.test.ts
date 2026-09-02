@@ -3,6 +3,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import {
   BeeNotFoundError,
   CommandProtocolError,
@@ -11,6 +12,7 @@ import {
   SecondWriterError,
   UnknownFailureCauseError,
   UnknownVerbError,
+  SCHEMA_VERSION,
   openCoreStore,
 } from "../src/index.ts";
 import { bootToRunning, harness, makeBee } from "./helpers.ts";
@@ -425,4 +427,91 @@ test("audit reads are boundable: LIMIT'd ascending rows and a real SQL tail (202
   assert.ok(store.auditRows(mid, 100).every((r) => r.seq > mid));
   assert.ok(store.auditTail(mid, 100).every((r) => r.seq > mid));
   store.close();
+});
+
+test("flags: a provider-declared reset expires resource_blocked at the instant; open-ended flags wait for contrary evidence", () => {
+  const h = harness();
+  const store = h.open();
+  try {
+    const { bee } = makeBee(store);
+    const resetsAt = 1_800_000_000_000;
+    const row = store.setFlag(bee.id, "resource_blocked", "claude rate limit rejected", { resetsAt });
+    assert.equal(row.resetsAt, resetsAt);
+    const { bee: other } = makeBee(store, "other");
+    store.setFlag(other.id, "resource_blocked", "API Error: 529 Overloaded"); // no declared reset
+
+    assert.deepEqual(store.expireFlags(resetsAt - 1), [], "never before the declared instant");
+    assert.equal(store.activeFlags(bee.id).length, 1);
+
+    // Newer evidence replaces the expiry (the provider re-reports the wall).
+    const later = resetsAt + 60_000;
+    assert.equal(store.setFlag(bee.id, "resource_blocked", "claude rate limit rejected (again)", { resetsAt: later }).resetsAt, later);
+    assert.deepEqual(store.expireFlags(resetsAt), [], "the replaced expiry governs");
+
+    const due = store.expireFlags(later);
+    assert.deepEqual(due.map((f) => [f.beeId, f.flag]), [[bee.id, "resource_blocked"]]);
+    assert.deepEqual(store.activeFlags(bee.id), []);
+    assert.equal(store.activeFlags(other.id).length, 1, "no declared reset → only contrary evidence clears");
+    const cleared = store.auditRows().filter((e) => e.kind === "flag.cleared" && e.beeId === bee.id);
+    assert.equal(cleared.length, 1);
+    assert.match(String((cleared[0]!.payload as { detail: string }).detail), /provider-declared reset 2027-01-15T08:01:00\.000Z passed/);
+    assert.deepEqual(store.expireFlags(later + 1), [], "idempotent");
+  } finally {
+    store.close();
+    h.cleanup();
+  }
+});
+
+test("v17.migration: a v16 store gains flags.resets_at and open rate-limit rows are backfilled from the adapter's textual reset hint", () => {
+  const h = harness();
+  try {
+    const db = new DatabaseSync(h.path);
+    db.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+      INSERT INTO meta(key, value) VALUES('schema_version', '16');
+      CREATE TABLE bees (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, agent TEXT NOT NULL, substrate TEXT NOT NULL, cwd TEXT NOT NULL,
+        title TEXT, tags TEXT NOT NULL DEFAULT '[]', session_log_path TEXT,
+        lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active','archived')),
+        created_at INTEGER NOT NULL, archived_at INTEGER, last_output_at INTEGER
+      ) STRICT;
+      INSERT INTO bees(id, name, agent, substrate, cwd, lifecycle, created_at) VALUES('old-1','old','claude','hsr','/tmp','active',5);
+      INSERT INTO bees(id, name, agent, substrate, cwd, lifecycle, created_at) VALUES('old-2','old2','claude','hsr','/tmp','active',5);
+      CREATE TABLE runtimes (
+        bee_id TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE, generation INTEGER NOT NULL CHECK (generation >= 1),
+        state TEXT NOT NULL CHECK (state IN ('booting','running','idle','stopped')),
+        exit_cause TEXT, pid INTEGER, pid_started_at INTEGER, started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (bee_id, generation)
+      ) STRICT;
+      INSERT INTO runtimes(bee_id, generation, state, exit_cause, started_at, updated_at) VALUES('old-1', 1, 'stopped', 'stopped_by_system', 5, 6);
+      INSERT INTO runtimes(bee_id, generation, state, exit_cause, started_at, updated_at) VALUES('old-2', 1, 'stopped', 'stopped_by_system', 5, 6);
+      CREATE TABLE flags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, bee_id TEXT NOT NULL REFERENCES bees(id) ON DELETE CASCADE,
+        flag TEXT NOT NULL CHECK (flag IN ('auth_needed','resource_blocked','spawn_failed','node_unreachable')),
+        detail TEXT NOT NULL, set_at INTEGER NOT NULL, cleared_at INTEGER
+      ) STRICT;
+      INSERT INTO flags(bee_id, flag, detail, set_at) VALUES('old-1','resource_blocked','claude rate limit rejected, resets 2026-09-01T15:10:00.000Z', 7);
+      INSERT INTO flags(bee_id, flag, detail, set_at) VALUES('old-2','resource_blocked','API Error: 529 Overloaded. This is a server-side issue', 7);
+      INSERT INTO flags(bee_id, flag, detail, set_at, cleared_at) VALUES('old-2','resource_blocked','claude rate limit rejected, resets 2026-08-01T00:00:00.000Z', 7, 8);
+    `);
+    db.close();
+    const store = h.open();
+    const declared = Date.parse("2026-09-01T15:10:00.000Z");
+    assert.equal(store.activeFlags("old-1")[0]?.resetsAt, declared, "backfilled from the textual hint");
+    assert.equal(store.activeFlags("old-2")[0]?.resetsAt, null, "no hint → open-ended");
+    assert.deepEqual(store.expireFlags(declared - 1), []);
+    assert.deepEqual(store.expireFlags(declared).map((f) => f.beeId), ["old-1"]);
+    assert.deepEqual(store.activeFlags("old-1"), []);
+    assert.equal(store.activeFlags("old-2").length, 1);
+    store.close();
+    const check = new DatabaseSync(h.path, { readOnly: true });
+    try {
+      const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
+      assert.equal(Number(version.value), SCHEMA_VERSION);
+    } finally {
+      check.close();
+    }
+  } finally {
+    h.cleanup();
+  }
 });

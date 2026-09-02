@@ -71,6 +71,8 @@ test("claude: rejected rate_limit_event → resource_blocked set with reset hint
   );
   assert.match(flag.detail, /rejected/);
   assert.match(flag.detail, /resets 2026-/); // resetsAt is unix seconds → ISO hint
+  // The same instant rides structurally so the daemon can enact the expiry.
+  assert.equal(flag.kind === "flag" ? flag.resetsAt : undefined, 1783034400 * 1000);
 });
 
 test("claude: allowed rate_limit_event → resource_blocked clear (contrary evidence)", () => {

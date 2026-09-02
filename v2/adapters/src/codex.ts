@@ -47,7 +47,7 @@ import {
   type HarnessAdapter,
   type InterruptContext,
 } from "./types.ts";
-import { asObject } from "./types.ts";
+import { asObject, epochMsFromSeconds } from "./types.ts";
 
 const INITIALIZE_ID = 1;
 const THREAD_START_ID = 2;
@@ -97,11 +97,15 @@ export function codexRateLimitSignals(rateLimits: unknown): AdapterSignal[] {
   const reset =
     isoFromEpochSeconds(asObject(snapshot.primary)?.resetsAt) ??
     isoFromEpochSeconds(asObject(snapshot.secondary)?.resetsAt);
+  const resetsAt =
+    epochMsFromSeconds(asObject(snapshot.primary)?.resetsAt) ??
+    epochMsFromSeconds(asObject(snapshot.secondary)?.resetsAt);
   return [{
     kind: "flag",
     flag: "resource_blocked",
     action: "set",
     detail: `codex rate limit reached (${String(reached)})${reset ? `, resets ${reset}` : ""}`,
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
   }];
 }
 

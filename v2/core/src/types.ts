@@ -174,6 +174,8 @@ export interface FlagRow {
   detail: string;
   setAt: number;
   clearedAt: number | null;
+  /** Provider-declared instant (epoch ms) the block lifts; null = open-ended. */
+  resetsAt: number | null;
 }
 
 /**

@@ -1151,3 +1151,45 @@ test("urgency.d6: idle mail DELIVERS to a synthetic-running fresh revive — no 
     rig.cleanup();
   }
 });
+
+test("unit.flag-expiry: a provider-declared reset lifts resource_blocked at the instant — never before, never by silence", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    const blockedView = (): boolean => rig.store.listBeeViewRows().find((r) => r.view.beeId === "bee-1")!.view.blocked;
+    const resetsAt = rig.clock.now + 10_000;
+    rig.driver.evidence.push({
+      beeId: "bee-1",
+      generation: 1,
+      flag: "resource_blocked",
+      action: "set",
+      detail: "claude rate limit rejected, resets soon",
+      resetsAt,
+    });
+    rig.core.step();
+    assert.equal(rig.store.activeFlags("bee-1")[0]?.resetsAt, resetsAt, "the declared instant is durable on the flag row");
+    assert.equal(blockedView(), true);
+    assert.ok(rig.ops.some((o) => o.startsWith("flag.set bee=bee-1 flag=resource_blocked") && o.includes("resetsAt=")));
+
+    rig.clock.now = resetsAt - 1;
+    rig.core.step();
+    assert.equal(rig.store.activeFlags("bee-1").length, 1, "not a millisecond before the provider's instant");
+    assert.equal(blockedView(), true);
+
+    rig.clock.now = resetsAt;
+    rig.core.step();
+    assert.deepEqual(rig.store.activeFlags("bee-1"), [], "cleared at the declared instant, with no turn served");
+    assert.equal(blockedView(), false, "the bee no longer reads as blocked");
+    assert.ok(rig.ops.some((o) => o.startsWith("flag.expire bee=bee-1 flag=resource_blocked resetsAt=")));
+
+    // An open-ended wall (no declared reset) is untouched by any amount of time.
+    rig.driver.evidence.push({ beeId: "bee-1", generation: 1, flag: "resource_blocked", action: "set", detail: "API Error: 529 Overloaded" });
+    rig.core.step();
+    rig.clock.now += 7 * 24 * 3_600_000;
+    rig.core.step();
+    assert.equal(rig.store.activeFlags("bee-1").length, 1, "silence never clears a flag without a declared reset");
+    assert.equal(blockedView(), true);
+  } finally {
+    rig.cleanup();
+  }
+});

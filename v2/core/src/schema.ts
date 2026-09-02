@@ -105,7 +105,7 @@
  *        input descriptors, typed error, revision). Carries no secret and no
  *        raw worker output. Additive; migration = CREATE TABLE IF NOT EXISTS.
  */
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -208,7 +208,10 @@ CREATE TABLE IF NOT EXISTS flags (
   flag       TEXT NOT NULL CHECK (flag IN ('auth_needed','resource_blocked','spawn_failed','node_unreachable')),
   detail     TEXT NOT NULL,
   set_at     INTEGER NOT NULL,
-  cleared_at INTEGER
+  cleared_at INTEGER,
+  -- v17: the provider-declared instant (epoch ms) the block lifts, e.g. a
+  -- rate-limit resetsAt. NULL = open-ended; only contrary evidence clears it.
+  resets_at  INTEGER
 ) STRICT;
 CREATE INDEX IF NOT EXISTS flags_active ON flags(bee_id, flag) WHERE cleared_at IS NULL;
 
@@ -543,6 +546,13 @@ export const MAILBOX_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl
  * Additive columns on `runtimes` since v8 — same add-iff-missing discipline.
  * v9: boot_evidence.
  */
+/**
+ * Additive `flags` columns (v17: resets_at — provider-declared expiry).
+ */
+export const FLAGS_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
+  ["resets_at", "resets_at INTEGER"],
+];
+
 export const RUNTIMES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["boot_evidence", "boot_evidence TEXT CHECK (boot_evidence IN ('synthetic','real'))"],
 ];

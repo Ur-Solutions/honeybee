@@ -107,6 +107,8 @@ export interface FlagEvidence {
   flag: "auth_needed" | "resource_blocked" | "spawn_failed";
   action: "set" | "clear";
   detail: string;
+  /** Provider-declared instant (epoch ms) the condition lifts, when stated. */
+  resetsAt?: number;
 }
 
 /**
@@ -1262,6 +1264,7 @@ export class HsrDriver implements RuntimeDriver {
           flag: signal.flag,
           action: signal.action,
           detail: signal.detail,
+          ...(signal.resetsAt !== undefined ? { resetsAt: signal.resetsAt } : {}),
         });
         return;
       }
