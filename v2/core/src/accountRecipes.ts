@@ -21,6 +21,14 @@ export interface IdentityRecipe {
   /** Explicit extra env for activated spawns. "{home}" expands to the home path. */
   extraEnv?: Record<string, string>;
   /**
+   * Where the MACHINE's own CLI keeps these files (the "vendor home"): the
+   * default dir under $HOME when the harness's home env var
+   * (HARNESS_HOME_ENV) is unset, plus recipe-relative files that live
+   * somewhere else on the machine. `account.add {importExisting:true}` copies
+   * the vendor home's credential into the account's vault from here.
+   */
+  vendorHome: VendorHomeSpec;
+  /**
    * The harness's own login invocation for CLI-driven login methods. Prefer a
    * native login subcommand when the harness exposes one; bare interactive
    * TUIs are reserved for tools whose login still lives in the TUI. Node
@@ -33,6 +41,40 @@ export interface IdentityRecipe {
    * recognizes progress. Data only — the daemon's flow service interprets it.
    */
   loginFlow: LoginRecipe;
+}
+
+/**
+ * The machine-side layout of a recipe's files. Path templates expand
+ * `{HOME}`, `{VENDOR_HOME}`, `{XDG_DATA_HOME}` (default `{HOME}/.local/share`)
+ * and `{XDG_CONFIG_HOME}` (default `{HOME}/.config`).
+ */
+export interface VendorHomeSpec {
+  /** The default vendor home, relative to $HOME (`.codex`, `.claude`, …). */
+  dir: string;
+  /**
+   * Recipe-relative files that do NOT sit at `<vendorHome>/<rel>` on the
+   * machine. `unsetOnly` entries apply only while the home env var is unset
+   * (the CLI folds them into the configured dir otherwise).
+   */
+  relocated?: Record<string, { path: string; unsetOnly?: boolean }>;
+}
+
+/** One machine-side file the import considers, keyed by its recipe-relative name. */
+export interface VendorHomeFile {
+  rel: string;
+  path: string;
+  role: "credential" | "config";
+}
+
+export interface VendorHomeResolution {
+  harness: string;
+  /** The env var that relocates the vendor home (undefined for harnesses without one). */
+  homeEnv: string | undefined;
+  /** Whether `vendorHome` came from that env var (vs the recipe default under $HOME). */
+  fromEnv: boolean;
+  vendorHome: string;
+  /** Every recipe file's machine-side path (credential files first, primary first). */
+  files: VendorHomeFile[];
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +234,10 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
     // macOS the OAuth credential itself is the Keychain item for the home
     // (see daemon keychain.ts); the vault keeps it as .credentials.json.
     credentialFiles: [".credentials.json", ".claude.json", "settings.json"],
+    // Without CLAUDE_CONFIG_DIR the machine keeps `.claude.json` at $HOME
+    // (the rest under ~/.claude); on macOS the credential itself is the
+    // Keychain item for ~/.claude, which the daemon's import reads directly.
+    vendorHome: { dir: ".claude", relocated: { ".claude.json": { path: "{HOME}/.claude.json", unsetOnly: true } } },
     // Claude Code 2.1.x exposes this directly. Starting the auth flow avoids
     // relying on a correctly-timed `/login` keystroke after TUI boot.
     login: { command: "claude", args: ["auth", "login"] },
@@ -216,6 +262,7 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
     // HOME: developer tools inside Codex must see the user's real home.
     activationMirrors: { "auth.json": ".codex/auth.json" },
     configFiles: ["config.toml"],
+    vendorHome: { dir: ".codex" },
     login: { command: "codex", args: ["login"] },
     loginFlow: {
       defaultMethodId: "codex-browser",
@@ -277,6 +324,9 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
     // own opencode.json (OPENCODE_CONFIG_DIR = the account home).
     configFiles: ["opencode.json"],
     extraEnv: { XDG_DATA_HOME: "{home}/xdg-data" },
+    // The machine's opencode keeps its auth store under XDG data, never in
+    // OPENCODE_CONFIG_DIR — the account home's private xdg-data/ mirrors it.
+    vendorHome: { dir: ".config/opencode", relocated: { "xdg-data/opencode/auth.json": { path: "{XDG_DATA_HOME}/opencode/auth.json" } } },
     login: { command: "opencode", args: ["auth", "login"] },
     loginFlow: {
       defaultMethodId: "opencode-api-key",
@@ -296,6 +346,7 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   grok: {
     credentialFiles: ["auth.json"],
     configFiles: ["config.toml"],
+    vendorHome: { dir: ".grok" },
     login: { command: "grok", args: [] },
     loginFlow: {
       defaultMethodId: "grok-cli",
@@ -323,6 +374,7 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   kimi: {
     credentialFiles: ["credentials/kimi-code.json"],
     configFiles: ["config.toml", "tui.toml"],
+    vendorHome: { dir: ".kimi" },
     login: { command: "kimi", args: [] },
     loginFlow: {
       defaultMethodId: "kimi-cli",
@@ -351,6 +403,9 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
     // cursor-agent's credential store is NOT home-relative (machine-global
     // keychain / $XDG_CONFIG_HOME); the vault keeps a canonical auth.json.
     credentialFiles: ["auth.json", "cli-config.json"],
+    // The machine-global credential store (Keychain / global auth.json) is
+    // read by the daemon's Cursor bridge; only cli-config.json is home-relative.
+    vendorHome: { dir: ".cursor" },
     login: { command: "cursor-agent", args: ["login"] },
     loginFlow: {
       defaultMethodId: "cursor-browser",
@@ -418,6 +473,52 @@ export function homeEnvFor(harness: string): string | undefined {
 
 export function recipeFor(harness: string): IdentityRecipe | undefined {
   return ACCOUNT_RECIPES[harness];
+}
+
+/**
+ * The machine's real vendor home for a harness and the machine-side path of
+ * every recipe file: the home env var when set in `env`, else the recipe's
+ * default dir under `home`; relocated files per the recipe. Pure — the
+ * caller decides what exists. null for a harness without a recipe.
+ */
+export function resolveVendorHome(
+  harness: string,
+  env: Readonly<Record<string, string | undefined>>,
+  home: string,
+): VendorHomeResolution | null {
+  const recipe = ACCOUNT_RECIPES[harness];
+  if (!recipe) return null;
+  const homeEnv = HARNESS_HOME_ENV[harness];
+  const fromEnvValue = homeEnv ? env[homeEnv]?.trim() : undefined;
+  const fromEnv = fromEnvValue !== undefined && fromEnvValue.length > 0;
+  const vendorHome = fromEnv ? (fromEnvValue as string) : joinHome(home, recipe.vendorHome.dir);
+  const vars: Record<string, string> = {
+    HOME: home,
+    VENDOR_HOME: vendorHome,
+    XDG_DATA_HOME: env.XDG_DATA_HOME?.trim() || joinHome(home, ".local/share"),
+    XDG_CONFIG_HOME: env.XDG_CONFIG_HOME?.trim() || joinHome(home, ".config"),
+  };
+  const expand = (template: string): string => template.replace(/\{(HOME|VENDOR_HOME|XDG_DATA_HOME|XDG_CONFIG_HOME)\}/g, (_, k: string) => vars[k] as string);
+  const locate = (rel: string): string => {
+    const relocated = recipe.vendorHome.relocated?.[rel];
+    if (relocated && (!relocated.unsetOnly || !fromEnv)) return expand(relocated.path);
+    return joinHome(vendorHome, rel);
+  };
+  return {
+    harness,
+    homeEnv,
+    fromEnv,
+    vendorHome,
+    files: [
+      ...recipe.credentialFiles.map((rel): VendorHomeFile => ({ rel, path: locate(rel), role: "credential" })),
+      ...(recipe.configFiles ?? []).map((rel): VendorHomeFile => ({ rel, path: locate(rel), role: "config" })),
+    ],
+  };
+}
+
+/** `join` without importing node:path into a data module: `<base>/<rel>` with one separator. */
+function joinHome(base: string, rel: string): string {
+  return `${base.replace(/\/+$/, "")}/${rel.replace(/^\/+/, "")}`;
 }
 
 /** The account id for (harness, label): `<harness>-<safe(label)>`, lower-cased — the old registry's rule. */

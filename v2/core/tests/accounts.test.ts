@@ -22,6 +22,7 @@ import {
   recipeFor,
   recipeEnvFor,
   replayAudit,
+  resolveVendorHome,
   safeName,
 } from "../src/index.ts";
 import { harness, makeBee } from "./helpers.ts";
@@ -403,4 +404,78 @@ test("v7.parse.claude-credentials + auth-failure classifier", () => {
   assert.equal(isAuthFailureLimitsError("invalid_grant"), true);
   assert.equal(isAuthFailureLimitsError("HTTP 429 rate limited"), false);
   assert.equal(isAuthFailureLimitsError("fetch failed"), false);
+});
+
+// ---------------------------------------------------------------------------
+// v18 — honest credentials: the vendor-home resolver + the re-publish touch
+// ---------------------------------------------------------------------------
+
+test("v18.vendorHome: the machine's real harness home — the home env var when set, else the recipe default under $HOME; relocated files per recipe; unknown harness = null", () => {
+  const home = "/Users/op";
+  // codex: CODEX_HOME wins; otherwise ~/.codex. config.toml rides along.
+  const codexDefault = resolveVendorHome("codex", {}, home);
+  assert.ok(codexDefault);
+  assert.equal(codexDefault.homeEnv, "CODEX_HOME");
+  assert.equal(codexDefault.fromEnv, false);
+  assert.equal(codexDefault.vendorHome, "/Users/op/.codex");
+  assert.deepEqual(codexDefault.files, [
+    { rel: "auth.json", path: "/Users/op/.codex/auth.json", role: "credential" },
+    { rel: "config.toml", path: "/Users/op/.codex/config.toml", role: "config" },
+  ]);
+  const codexEnv = resolveVendorHome("codex", { CODEX_HOME: "/srv/codex-home/" }, home);
+  assert.equal(codexEnv?.fromEnv, true);
+  assert.equal(codexEnv?.vendorHome, "/srv/codex-home/");
+  assert.equal(codexEnv?.files[0]?.path, "/srv/codex-home/auth.json");
+  assert.equal(resolveVendorHome("codex", { CODEX_HOME: "   " }, home)?.fromEnv, false, "a blank env var is unset");
+  // claude: without CLAUDE_CONFIG_DIR `.claude.json` sits at $HOME; with it, everything is inside.
+  const claudeDefault = resolveVendorHome("claude", {}, home);
+  assert.deepEqual(claudeDefault?.files.map((f) => [f.rel, f.path]), [
+    [".credentials.json", "/Users/op/.claude/.credentials.json"],
+    [".claude.json", "/Users/op/.claude.json"],
+    ["settings.json", "/Users/op/.claude/settings.json"],
+  ]);
+  const claudeEnv = resolveVendorHome("claude", { CLAUDE_CONFIG_DIR: "/Users/op/.claude-2" }, home);
+  assert.deepEqual(claudeEnv?.files.map((f) => f.path), ["/Users/op/.claude-2/.credentials.json", "/Users/op/.claude-2/.claude.json", "/Users/op/.claude-2/settings.json"]);
+  // opencode: the auth store is ALWAYS under XDG data, never in the config dir.
+  const oc = resolveVendorHome("opencode", {}, home);
+  assert.equal(oc?.vendorHome, "/Users/op/.config/opencode");
+  assert.equal(oc?.files[0]?.path, "/Users/op/.local/share/opencode/auth.json");
+  assert.equal(oc?.files[1]?.path, "/Users/op/.config/opencode/opencode.json");
+  const ocXdg = resolveVendorHome("opencode", { XDG_DATA_HOME: "/data", OPENCODE_CONFIG_DIR: "/cfg/oc" }, home);
+  assert.equal(ocXdg?.files[0]?.path, "/data/opencode/auth.json");
+  assert.equal(ocXdg?.files[1]?.path, "/cfg/oc/opencode.json");
+  // every recipe declares a vendor home (the import path covers all of them)
+  for (const harness of ["claude", "codex", "opencode", "grok", "kimi", "cursor"]) {
+    assert.ok(resolveVendorHome(harness, {}, home)?.files[0]?.role === "credential", harness);
+  }
+  assert.equal(resolveVendorHome("stub", {}, home), null);
+});
+
+test("v18.touchAccount: re-publishes the row (account.put) with an honest `changed` — [] under a frozen clock, [updatedAt] once time moved", () => {
+  const h = harness();
+  try {
+    let t = 1_000_000;
+    const store = h.open({ now: () => t });
+    const a = store.createAccount({ id: "codex-t", harness: "codex", homePath: "/tmp/homes/codex-t", label: "t" });
+    const before = store.lastAuditSeq();
+    const frozen = store.touchAccount(a.id, "credential health unverified → verified by limits probe");
+    assert.equal(frozen.account.updatedAt, a.updatedAt);
+    const rows = store.auditRows(before);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.kind, "account.put");
+    assert.deepEqual(Object.keys(rows[0]?.payload ?? {}).sort(), ["account", "changed", "outcome", "previous", "reason"]);
+    assert.deepEqual(rows[0]?.payload.changed, []);
+    assert.equal(rows[0]?.payload.reason, "credential health unverified → verified by limits probe");
+    t += 1000;
+    const moved = store.touchAccount(a.id, "again");
+    assert.equal(moved.account.updatedAt, a.updatedAt + 1000);
+    const last = store.auditRows(before + 1)[0];
+    assert.deepEqual(last?.payload.changed, ["updatedAt"]);
+    assert.deepEqual(last?.payload.previous, { updatedAt: a.updatedAt });
+    // the replayed store agrees with the live one
+    assert.equal(replayAudit(store.auditRows()).accounts.find((row) => row.id === a.id)?.updatedAt, a.updatedAt + 1000);
+    store.close();
+  } finally {
+    h.cleanup();
+  }
 });
