@@ -70,3 +70,15 @@ Three commits, 5 files, about 216 net lines with tests.
 - HB2 finding 1: owner tracing the imported-token status refresh transition; reseal expected.
 - Operator-side: a real login for the `agy-lane` account, then the account-bound spawn lane re-run.
 - Final verdict swarm audit lane at the exact merge-ready heads after HB2 reseals.
+
+## Bot-review triage round (PRs #5 and #6)
+
+Nine automated inline comments, all triaged: seven real, fixed and verified; one real but its suggested fix was falsified live; zero rebutted without evidence.
+
+- Fixed and verified on HB1: follow-mode projector state loss (also repaired pre-existing codex/grok cross-line state loss), repeatable `--add-dir` composition, per-step assistant fragment folding, tool-error output fallback, per-turn duration deltas from cumulative `duration_seconds`.
+- Fixed and verified on HB2: explicit `account.verify` now persists `auth_needed` on missing credentials; probe kinds are truthful (`credential_file` vs `limits` vs `none`); and the keyring finding resolved empirically. agy prefers the OS keychain, and the recipe now sets `SSH_CONNECTION` so agy selects its documented file-storage fallback ("SSH session detected") in every managed home. Verified live end to end.
+- Falsified: the P1 suggestion to emit boot evidence on pre-init auth errors. Implemented, then disproven on a live integration build: an unauthenticated bee reached generation 11 in 75 seconds because synthetic boot evidence reset the spawn-failure budget each cycle, disabling the contract's churn suppressor. Reverted in full; a deterministic regression now pins the three-generation budget settle (`auth_needed` + `spawn_failed`, mail-driven starts suppressed, fresh budget after login + revive). The revert was proven by replaying the reverted hunk against the new test. Final live lane confirms settle at bootFailures=2-3 with no runaway.
+
+## Final verdict
+
+HB1 merge-ready at 6c4d04a3 (PR #5, 17 commits). HB2 merge-ready at 42f449ff (PR #6, 8 commits). One named dropout stands: the real-OAuth login-flow live lane awaits an operator login (test evidence covers it; `SSH_CONNECTION` file-storage landing is probed but not yet proven against Google's real flow).
