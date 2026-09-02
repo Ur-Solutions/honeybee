@@ -78,9 +78,11 @@ test("mirror.1: live rows carry exactly the declared keys — bees (view/bee/run
     assert.deepEqual(keysOf(answered), [...MIRROR_QUESTION_KEYS].sort());
     const seal = store.createSeal(bee.id, { title: "done", body: "all green", refs: ["abc123"] });
     assert.deepEqual(keysOf(seal), [...MIRROR_SEAL_KEYS].sort());
-    // v7: accounts + limits mirror as store rows, verbatim.
+    // v7: accounts + limits mirror as store rows, verbatim — v18: plus the
+    // daemon-derived `credentialHealth` (never a store column).
     const account = store.createAccount({ id: "claude-a", harness: "claude", homePath: "/tmp/h", label: "a" });
-    assert.deepEqual(keysOf(account), [...MIRROR_ACCOUNT_KEYS].sort());
+    assert.deepEqual(keysOf({ ...account, credentialHealth: "absent" }), [...MIRROR_ACCOUNT_KEYS].sort());
+    assert.ok(!("credentialHealth" in account), "credentialHealth is derived at emit, never stored on the row");
     const limits = store.putAccountLimits("claude-a", { readable: true, weekly: { usedPercent: 10 } });
     // v16: login flows mirror as store rows, verbatim; method/field descriptors carry only safe metadata keys.
     const flow = store.createLoginFlow({
@@ -156,7 +158,7 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       tracks: [track],
       questions: [store.getQuestion(question.id)!],
       seals: [seal],
-      accounts: [account],
+      accounts: [{ ...account, credentialHealth: "absent" }],
       accountLimits: [limits],
       tasks: [],
       taskSupply: [],
@@ -317,7 +319,8 @@ test("mirror.2: value-level snapshot — a deterministic store serializes to the
       "lastLoginAt": null,
       "exhaustedAt": null,
       "addedAt": 1017000,
-      "updatedAt": 1017000
+      "updatedAt": 1017000,
+      "credentialHealth": "absent"
     }
   ],
   "accountLimits": [

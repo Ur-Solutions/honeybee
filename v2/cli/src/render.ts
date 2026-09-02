@@ -11,6 +11,7 @@ import type {
   AccountGetResult,
   AccountLimitsResult,
   AccountListResult,
+  AccountVerifyResult,
   CommandsResult,
   HealthResult,
   MailboxResult,
@@ -262,8 +263,19 @@ function colorPct(v: number | null): string {
   return green(label);
 }
 
+/** v18: the derived credential evidence; absent on a stale read-only row (the store cannot derive it). */
+export function colorCredentialHealth(health: AccountListResult["accounts"][number]["credentialHealth"] | undefined): string {
+  if (health === "verified") return green("verified");
+  if (health === "unverified") return yellow("unverified");
+  if (health === "absent") return dim("absent");
+  return dim("?");
+}
+
+/** A stale read-only row lacks the daemon-derived `credentialHealth`. */
+export type AccountLineRow = Omit<AccountListResult["accounts"][number], "credentialHealth"> & { credentialHealth?: AccountListResult["accounts"][number]["credentialHealth"] };
+
 export function accountLine(
-  a: AccountListResult["accounts"][number],
+  a: AccountLineRow,
   limits: AccountListResult["limits"][number] | undefined,
   stale: boolean,
 ): string {
@@ -274,11 +286,11 @@ export function accountLine(
     : "";
   const penalty = a.penalty > 0 ? `  penalty=${a.penalty}` : "";
   const login = a.lastLoginAt ? `  lastLogin=${new Date(a.lastLoginAt).toISOString()}` : "";
-  return `${stalePrefix(stale)}${bold(a.id)}  ${blue(a.harness)}  ${colorAccountStatus(a.status)}  ${dim(tildify(a.homePath))}${penalty}${usage}${login}`;
+  return `${stalePrefix(stale)}${bold(a.id)}  ${blue(a.harness)}  ${colorAccountStatus(a.status)}  ${dim("creds=")}${colorCredentialHealth(a.credentialHealth)}  ${dim(tildify(a.homePath))}${penalty}${usage}${login}`;
 }
 
 export function renderAccountList(
-  accounts: AccountListResult["accounts"],
+  accounts: AccountLineRow[],
   limits: AccountListResult["limits"],
   stale: boolean,
 ): string[] {
@@ -291,9 +303,23 @@ export function renderAccountGet(r: AccountGetResult): string[] {
   const lines = [accountLine(r.account, r.limits ?? undefined, false)];
   const bees = r.bees.length > 0 ? r.bees.join(",") : "-";
   const flow = r.loginFlow ? `  login=${r.loginFlow.phase}${r.loginFlow.methodId ? ` (${r.loginFlow.methodId})` : ""}` : "";
-  const health = r.credentialHealth === "verified" ? green("verified") : r.credentialHealth === "unverified" ? yellow("unverified") : dim("absent");
-  lines.push(`  ${dim("credentials=")}${health}  ${dim("bees=")}${bees}${flow}`);
+  lines.push(`  ${dim("credentials=")}${colorCredentialHealth(r.credentialHealth)}  ${dim("bees=")}${bees}${flow}`);
   return lines;
+}
+
+/** v18: `hive account verify` — what the harness's real probe proved. */
+export function renderAccountVerify(r: AccountVerifyResult): string[] {
+  const why = r.limits && !r.limits.readable ? ` (${r.limits.unreadableReason ?? "?"}: ${r.limits.error ?? "?"})` : "";
+  const detail = r.outcome === "verified"
+    ? "the provider answered an authenticated read"
+    : r.outcome === "auth_needed"
+      ? `the provider refused the credential${why}; log in with: hive account login ${r.account.id}`
+      : r.outcome === "absent"
+        ? `no credential to verify; log in with: hive account login ${r.account.id}`
+        : r.probe === "none"
+          ? `${r.account.harness} has no credential probe; the credential stays unverified until a login or capture`
+          : `the probe did not settle it${why}`;
+  return [`${bold(r.account.id)}  ${colorCredentialHealth(r.account.credentialHealth)}  ${colorAccountStatus(r.account.status)}  ${dim(`probe=${r.probe}`)}  ${detail}`];
 }
 
 /**

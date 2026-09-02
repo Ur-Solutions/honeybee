@@ -286,7 +286,7 @@ export function makeDaemonDir(overrides: DaemonConfigOverrides = {}): { dir: str
   };
 }
 
-export async function startDaemon(dir: string): Promise<DaemonHandle> {
+export async function startDaemon(dir: string, opts: { env?: Record<string, string> } = {}): Promise<DaemonHandle> {
   const socketPath = join(dir, "hived.sock");
   const storePath = join(dir, "core.sqlite3");
   const proc = spawn(process.execPath, [DAEMON_BIN, "--data-dir", dir], {
@@ -299,6 +299,10 @@ export async function startDaemon(dir: string): Promise<DaemonHandle> {
       // Successful test shutdown owns and reaps its disposable runtimes.
       // Production never sets this; restart-survival semantics stay intact.
       HIVE_TEST_REAP_RUNTIMES_ON_SHUTDOWN: "1",
+      // v18: tests that exercise the vendor-home import point HOME / the
+      // harness home env var at a temp dir so the developer's real
+      // ~/.codex, ~/.claude, … are never read.
+      ...(opts.env ?? {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

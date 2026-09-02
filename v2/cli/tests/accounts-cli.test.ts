@@ -37,8 +37,22 @@ test("cli.accounts.1: account verbs over RPC + spawn --account + bee swap-accoun
     // list (human)
     const list = capture();
     assert.equal(await runV2Cli(["account", "list", ...base], list.io), 0);
-    assert.ok(list.out.some((l) => l.includes("stub-one") && l.includes("stub") && l.includes("ok") && l.includes("penalty=5")), list.out.join("\n"));
+    assert.ok(list.out.some((l) => l.includes("stub-one") && l.includes("stub") && l.includes("ok") && l.includes("creds=unverified") && l.includes("penalty=5")), list.out.join("\n"));
     assert.ok(list.out.some((l) => l.includes("stub-two") && l.includes("stub") && l.includes("ok")));
+    // v18: verify says what the probe proved — a recipe-less harness has none (exit 1: not verified)
+    const verify = capture();
+    assert.equal(await runV2Cli(["account", "verify", "stub-two", ...base], verify.io), 1);
+    assert.match(verify.out[0] ?? "", /^stub-two\s+unverified\s+ok\s+probe=none\s+stub has no credential probe/);
+    const verifyJson = capture();
+    assert.equal(await runV2Cli(["account", "verify", "stub-two", ...base, "--json"], verifyJson.io), 1);
+    assert.deepEqual((JSON.parse(verifyJson.out[0] ?? "{}") as { outcome: string; probe: string }).outcome, "unverified");
+    // v18: a fresh codex add is logged OUT — the CLI says so instead of "ok"
+    const fresh = capture();
+    assert.equal(await runV2Cli(["account", "add", "codex", "fresh", ...base], fresh.io), 0);
+    assert.match(fresh.out[0] ?? "", /status auth_needed; log in with: hive account login codex-fresh/);
+    const freshList = capture();
+    assert.equal(await runV2Cli(["account", "list", "--harness", "codex", ...base], freshList.io), 0);
+    assert.ok(freshList.out.some((l) => l.includes("codex-fresh") && l.includes("auth_needed") && l.includes("creds=absent")), freshList.out.join("\n"));
     // pause / unpause / penalty
     const pause = capture();
     assert.equal(await runV2Cli(["account", "pause", "stub-two", ...base], pause.io), 0);
@@ -123,7 +137,8 @@ test("cli.accounts.2: `account list` falls back to the read-only store when the 
     const h = capture();
     assert.equal(await runV2Cli(["account", "list", "--data-dir", dir], h.io), 0);
     assert.ok(h.err[0]?.startsWith("STALE"));
-    assert.match(h.out[0] ?? "", /^stale: claude-a\s+claude\s+ok\s+\/tmp\/h\s+penalty=3\s+weekly=40%\s+5h=5%\s+plan=max$/);
+    // v18: the read-only store cannot derive credentialHealth (daemon-only) — shown as `?`, never guessed.
+    assert.match(h.out[0] ?? "", /^stale: claude-a\s+claude\s+ok\s+creds=\?\s+\/tmp\/h\s+penalty=3\s+weekly=40%\s+5h=5%\s+plan=max$/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -45,14 +45,16 @@ import {
   TASK_TRANSITION_ACTIONS,
   serializePackage,
   type AccountRow,
+  type AuditRow,
   type BeeRow,
   type CommandRow,
   type CoreStore,
+  type MirrorAccountRow,
   type RowSource,
   type Scope,
   type Urgency,
 } from "../../core/src/index.ts";
-import { AccountsService, type LimitsFetchers } from "./accountsService.ts";
+import { AccountsService, type CaptureOutcome, type LimitsFetchers } from "./accountsService.ts";
 import { dirHasCredentials } from "./activation.ts";
 import { LoginFlowService, type LoginTransports } from "./loginFlows.ts";
 import type { PtySpawner } from "./loginWorker.ts";
@@ -128,6 +130,7 @@ import {
   type AccountListResult,
   type AccountRemoveResult,
   type AccountUpdateResult,
+  type AccountVerifyResult,
   type AuditTailResult,
   type SwapAccountResult,
   type CellCaptureMode,
@@ -370,6 +373,8 @@ export class HiveDaemon {
   private readonly deps: HiveDaemonDeps;
   /** v7 rotation bound: one attempt per (bee, generation) exhaustion event. */
   private readonly rotatedGenerations = new Map<string, number>();
+  /** In-flight async idempotent verbs by key: a concurrent duplicate joins the first execution instead of re-running it. */
+  private readonly asyncInFlight = new Map<string, Promise<object>>();
   private naming: ResolvedNamingConfig;
   private autoTitle: ((bees?: BeeRow[]) => Promise<AutoTitleOutcome[]>) | null = null;
   private titleGenerator: TitleGeneratorService | null = null;
@@ -631,7 +636,29 @@ export class HiveDaemon {
     if (latest > this.publishedSeq) this.publishedSeq = latest;
     // maxBatch+1: one extra row is exactly enough to detect a gap without
     // materializing the backlog (the 2026-08-21 flush stall).
-    rpc.flushWatch(latest, (fromSeq) => store.auditRows(fromSeq, this.cfg.watchMaxBatch + 1), this.cfg.watchMaxBatch);
+    rpc.flushWatch(latest, (fromSeq) => this.mirrorAuditRows(store.auditRows(fromSeq, this.cfg.watchMaxBatch + 1)), this.cfg.watchMaxBatch);
+  }
+
+  /**
+   * v18: the watch stream IS the mirror's delta channel, so an `account.put`
+   * payload carries the same derived `credentialHealth` the snapshot row
+   * does — computed here, at emit, from the current vault/home/limits facts
+   * (never stored, never derived by the materializer). Every other row
+   * passes through verbatim.
+   */
+  private mirrorAuditRows(rows: AuditRow[]): AuditRow[] {
+    const accounts = this.accounts;
+    if (!accounts) return rows;
+    return rows.map((row) => {
+      if (row.kind !== "account.put") return row;
+      const account = row.payload.account;
+      if (!account || typeof account !== "object" || Array.isArray(account)) return row;
+      return { ...row, payload: { ...row.payload, account: accounts.mirrorRow(account as AccountRow) } };
+    });
+  }
+
+  private mirrorAccount(account: AccountRow): MirrorAccountRow {
+    return this.mustAccounts().mirrorRow(account);
   }
 
   // -------------------------------------------------------------------------
@@ -835,7 +862,7 @@ export class HiveDaemon {
       case "account.get":
         return this.rpcAccountGet(params);
       case "account.add":
-        return this.withIdempotency(verb, params, () => this.rpcAccountAdd(params));
+        return this.rpcAccountAdd(params);
       case "account.remove":
         return this.rpcAccountRemove(params);
       case "account.pause":
@@ -859,6 +886,8 @@ export class HiveDaemon {
         return this.withIdempotency(verb, params, () => this.rpcAccountLoginCancel(params));
       case "account.capture":
         return this.rpcAccountCapture(params);
+      case "account.verify":
+        return this.rpcAccountVerify(params);
       case "account.limits":
         return this.rpcAccountLimits(params);
       case "account.importRegistry":
@@ -2039,7 +2068,7 @@ export class HiveDaemon {
       tracks: store.listTracks(),
       questions: store.listQuestions(),
       seals: store.listSeals(),
-      accounts: store.listAccounts(),
+      accounts: store.listAccounts().map((account) => this.mirrorAccount(account)),
       accountLimits: store.listAccountLimits(),
       tasks: store.listTasks(),
       taskSupply: store.listTaskSupply(),
@@ -2082,7 +2111,7 @@ export class HiveDaemon {
     const rows = store.listAccounts(harness ? { harness } : {});
     const ids = new Set(rows.map((a) => a.id));
     return {
-      accounts: rows,
+      accounts: rows.map((a) => accounts.mirrorRow(a)),
       limits: store.listAccountLimits().filter((l) => ids.has(l.account)),
       credentialHealth: Object.fromEntries(rows.map((a) => [a.id, accounts.credentialHealthOf(a)])),
     };
@@ -2092,7 +2121,7 @@ export class HiveDaemon {
     const store = this.mustStore();
     const account = this.requireAccount(params);
     return {
-      account,
+      account: this.mirrorAccount(account),
       limits: store.getAccountLimits(account.id),
       bees: store.beesOnAccount(account.id).map((b) => b.id),
       credentialed: this.mustAccounts().credentialed(account),
@@ -2105,10 +2134,10 @@ export class HiveDaemon {
     const account = this.requireAccount(params);
     // v16: a login worker never outlives its account (the store cascades the rows).
     await this.mustLoginFlows().abandonAccount(account.id);
-    return this.withIdempotency("account.remove", params, () => ({ account: this.mustStore().removeAccount(account.id) }) satisfies AccountRemoveResult);
+    return this.withIdempotency("account.remove", params, () => ({ account: this.mirrorAccount(this.mustStore().removeAccount(account.id)) }) satisfies AccountRemoveResult);
   }
 
-  private rpcAccountAdd(params: Record<string, unknown>): AccountAddResult {
+  private rpcAccountAdd(params: Record<string, unknown>): Promise<AccountAddResult> {
     const store = this.mustStore();
     const accounts = this.mustAccounts();
     const harness = this.param(params, "harness");
@@ -2119,38 +2148,79 @@ export class HiveDaemon {
     if (typeof penalty !== "number") throw new RpcError("invalid_request", "account.add: penalty must be a number");
     const importExisting = params.importExisting === undefined ? false : params.importExisting;
     if (typeof importExisting !== "boolean") throw new RpcError("invalid_request", "account.add: importExisting must be a boolean");
-    if (store.getAccount(id)) throw new RpcError("invalid_request", `account already exists: ${id}`);
-    // F2: a fresh account starts LOGGED OUT. Pre-existing credentials at the
-    // home (a machine's live harness home handed in as homePath) or in a
-    // leftover vault entry for this id would be silently adopted by the
-    // credentialed()/activation machinery — that adoption must be an explicit
-    // choice, and even then it is `unverified` until something validates it.
-    const recipe = recipeFor(harness);
-    if (recipe && !importExisting) {
-      const found: string[] = [];
-      if (dirHasCredentials(homePath, recipe)) found.push(`home ${homePath}`);
-      const vaultDir = accounts.vaultDirOf({ harness, id });
-      if (dirHasCredentials(vaultDir, recipe)) found.push(`vault ${vaultDir}`);
-      if (found.length > 0) {
-        throw new RpcError(
-          "account_home_populated",
-          `account.add: existing ${harness} credentials found (${found.join("; ")}); a new account starts logged out — ` +
-            `log in fresh with account.login, or pass importExisting:true to adopt them ` +
-            `(may sign the machine's regular ${harness} CLI out: refresh tokens rotate on use)`,
-        );
+    return this.withAsyncIdempotency("account.add", params, async () => {
+      if (store.getAccount(id)) throw new RpcError("invalid_request", `account already exists: ${id}`);
+      // F2: a fresh account starts LOGGED OUT. Pre-existing credentials at the
+      // home (a machine's live harness home handed in as homePath) or in a
+      // leftover vault entry for this id would be silently adopted by the
+      // credentialed()/activation machinery — that adoption must be an explicit
+      // choice, and even then it is `unverified` until something validates it.
+      const recipe = recipeFor(harness);
+      if (recipe && !importExisting) {
+        const found: string[] = [];
+        if (dirHasCredentials(homePath, recipe)) found.push(`home ${homePath}`);
+        const vaultDir = accounts.vaultDirOf({ harness, id });
+        if (dirHasCredentials(vaultDir, recipe)) found.push(`vault ${vaultDir}`);
+        if (found.length > 0) {
+          throw new RpcError(
+            "account_home_populated",
+            `account.add: existing ${harness} credentials found (${found.join("; ")}); a new account starts logged out — ` +
+              `log in fresh with account.login, or pass importExisting:true to adopt them ` +
+              `(may sign the machine's regular ${harness} CLI out: refresh tokens rotate on use)`,
+          );
+        }
       }
-    }
-    const account = store.createAccount({ id, harness, label, homePath, penalty });
-    const credentialHealth = accounts.credentialHealthOf(account);
-    this.log(`account.add id=${id} harness=${harness} home=${homePath} importExisting=${importExisting} credentialHealth=${credentialHealth}`);
-    return { account, credentialHealth };
+      // v18: "import the existing sign-in" — the machine's real vendor home
+      // counts, and nothing importable is a typed refusal, never a logged-out
+      // row wearing `importExisting`.
+      let imported: AccountAddResult["imported"] = null;
+      if (importExisting) {
+        const outcome = await accounts.importExistingCredentials({ harness, id, homePath });
+        if (store.getAccount(id)) throw new RpcError("invalid_request", `account already exists: ${id}`);
+        if (!outcome.ok) {
+          const checked = outcome.checked.length > 0 ? outcome.checked.map((c) => `${c.path} (${c.state})`).join(", ") : `${harness} has no identity recipe`;
+          throw new RpcError(
+            "no_credentials_to_import",
+            `account.add: no ${harness} credentials to import — checked ${checked}; log in fresh with account.login`,
+          );
+        }
+        imported = { source: outcome.source, from: outcome.from, files: outcome.files };
+      }
+      // v18: never `ok` without a credential.
+      const status = accounts.honestStatus({ harness, id, homePath }, "ok");
+      const account = store.createAccount({ id, harness, label, homePath, penalty, status });
+      const credentialHealth = accounts.credentialHealthOf(account);
+      const verification: AccountAddResult["verification"] = credentialHealth === "absent"
+        ? "none"
+        : accounts.scheduleVerification([id]).length > 0
+          ? "scheduled"
+          : "unsupported";
+      this.log(
+        `account.add id=${id} harness=${harness} home=${homePath} importExisting=${importExisting} status=${account.status} credentialHealth=${credentialHealth}` +
+          `${imported ? ` imported=${imported.source}:${imported.from} files=${imported.files.join(",")}` : ""} verification=${verification}`,
+      );
+      return { account: accounts.mirrorRow(account), credentialHealth, imported, verification } satisfies AccountAddResult;
+    });
+  }
+
+  /** v18: `account.verify {id}` — the harness's real probe, awaited; the mirror row follows through the audit stream. */
+  private rpcAccountVerify(params: Record<string, unknown>): Promise<AccountVerifyResult> {
+    const account = this.requireAccount(params);
+    return this.withAsyncIdempotency("account.verify", params, async () => {
+      const accounts = this.mustAccounts();
+      const res = await accounts.verifyCredentials(account);
+      return { account: accounts.mirrorRow(res.account), outcome: res.outcome, probe: res.probe, limits: res.limits } satisfies AccountVerifyResult;
+    });
   }
 
   private rpcAccountStatus(params: Record<string, unknown>, status: "paused" | "ok"): AccountUpdateResult {
     const account = this.requireAccount(params);
-    const res = this.mustStore().setAccountStatus(account.id, status, status === "paused" ? "operator pause" : "operator unpause");
-    this.log(`account.${status === "paused" ? "pause" : "unpause"} id=${account.id} applied=${res.applied}`);
-    return { account: res.account, applied: res.applied };
+    const accounts = this.mustAccounts();
+    // v18: unpausing a logged-out account lands on auth_needed, not ok.
+    const honest = accounts.honestStatus(account, status);
+    const res = this.mustStore().setAccountStatus(account.id, honest, status === "paused" ? "operator pause" : "operator unpause");
+    this.log(`account.${status === "paused" ? "pause" : "unpause"} id=${account.id} status=${honest} applied=${res.applied}`);
+    return { account: accounts.mirrorRow(res.account), applied: res.applied };
   }
 
   private rpcAccountSetPenalty(params: Record<string, unknown>): AccountUpdateResult {
@@ -2161,7 +2231,7 @@ export class HiveDaemon {
     }
     const res = this.mustStore().setAccountPenalty(account.id, penalty);
     this.log(`account.setPenalty id=${account.id} penalty=${penalty} applied=${res.applied}`);
-    return { account: res.account, applied: res.applied };
+    return { account: this.mirrorAccount(res.account), applied: res.applied };
   }
 
   private mustLoginFlows(): LoginFlowService {
@@ -2184,10 +2254,21 @@ export class HiveDaemon {
         this.log(`rpc.dedup verb=${verb} key=${key}`);
         return { ...(hit.result as T), deduped: true as const };
       }
+      const inFlight = this.asyncInFlight.get(key);
+      if (inFlight) {
+        this.log(`rpc.dedup verb=${verb} key=${key} joined=in_flight`);
+        return { ...((await inFlight) as T), deduped: true as const };
+      }
     }
-    const result = await fn();
-    if (key != null) store.recordRpcResult(key, verb, null, result);
-    return result;
+    const pending = fn();
+    if (key != null) this.asyncInFlight.set(key, pending);
+    try {
+      const result = await pending;
+      if (key != null) store.recordRpcResult(key, verb, null, result);
+      return result;
+    } finally {
+      if (key != null && this.asyncInFlight.get(key) === pending) this.asyncInFlight.delete(key);
+    }
   }
 
   private flowIdParam(params: Record<string, unknown>): string {
@@ -2272,14 +2353,14 @@ export class HiveDaemon {
       const hit = store.lookupRpcResult(key);
       if (hit) return { ...(hit.result as AccountCaptureResult), deduped: true };
     }
-    let captured: AccountCaptureResult;
+    let captured: CaptureOutcome;
     try {
       captured = await this.mustAccounts().captureAccount(account);
     } catch (err) {
       throw new RpcError("invalid_request", err instanceof Error ? err.message : String(err));
     }
     this.clearAccountAuthNeeded(account.id, `credentials captured for account ${account.id}`, "capture");
-    const result = captured;
+    const result: AccountCaptureResult = { ...captured, account: this.mirrorAccount(captured.account) };
     if (key != null) store.recordRpcResult(key, "account.capture", null, result);
     return result;
   }

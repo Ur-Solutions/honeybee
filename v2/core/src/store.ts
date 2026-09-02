@@ -2911,6 +2911,26 @@ export class CoreStore {
     });
   }
 
+  /**
+   * v18 — re-publish an account row whose DERIVED facts changed without a
+   * stored field changing (a limits probe just verified an imported
+   * credential): bump updated_at and audit `account.put {changed:
+   * ["updatedAt"], reason}` so the mirror's `credentialHealth` is re-derived
+   * at emit. The stored row is otherwise untouched.
+   */
+  touchAccount(id: string, reason: string): { account: AccountRow } {
+    return this.tx(() => {
+      const before = this.mustGetAccount(id);
+      const at = this.now();
+      this.stmt("UPDATE accounts SET updated_at = ? WHERE id = ?").run(at, id);
+      const account = this.mustGetAccount(id);
+      // Always re-publish (that is the point); only claim a field changed when it did.
+      const changed = at === before.updatedAt ? [] : ["updatedAt"];
+      this.audit("account.put", null, { account, outcome: "updated", changed, previous: Object.fromEntries(changed.map((k) => [k, before.updatedAt])), reason });
+      return { account };
+    });
+  }
+
   /** v7 — rate-limit exhaustion evidence on the account (rotation cool-off). null clears. */
   recordAccountExhaustion(id: string, at: number | null): { account: AccountRow; applied: boolean } {
     return this.tx(() => this.applyAccountUpdate(id, { exhaustedAt: at }, at === null ? "provider served a turn" : "rate limit evidence"));

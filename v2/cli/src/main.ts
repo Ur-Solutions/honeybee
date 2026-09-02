@@ -40,6 +40,7 @@ import {
   type LoginFlowRow,
   type AccountRemoveResult,
   type AccountUpdateResult,
+  type AccountVerifyResult,
   type SwapAccountResult,
   type ChildrenResult,
   type ForkResult,
@@ -129,6 +130,7 @@ import {
   registryLine,
   renderLoginFlow,
   renderAccountGet,
+  renderAccountVerify,
   renderAccountLimits,
   renderAccountList,
   renderBeeList,
@@ -146,7 +148,7 @@ import {
   taskLine,
   turnLines,
 } from "./render.ts";
-import { bold, cyan, dim, errorLine, red, staleBanner, yellow } from "./style.ts";
+import { bold, cyan, dim, errorLine, red, staleBanner, tildify, yellow } from "./style.ts";
 
 export interface CliIo {
   out(line: string): void;
@@ -641,7 +643,7 @@ const ACCOUNT_USAGE =
   "usage: hive account list [--harness h] | get <selector> | add <harness> <label> [--id id] [--home dir] [--penalty n] [--import-existing]\n" +
   "       hive account remove|pause|unpause <selector> | penalty <selector> <0-100>\n" +
   "       hive account login <selector> [--method <id>] [--remote] [--no-wait] | login-status <selector> | login-cancel <selector>\n" +
-  "       hive account capture <selector> | limits [<selector>]\n" +
+  "       hive account capture <selector> | verify <selector> | limits [<selector>]\n" +
   "       hive account import [--root ~/.hive] [--dry-run] | backfill [--dry-run]";
 
 const ACCOUNT_LIMITS_RPC_TIMEOUT_MS = 120_000;
@@ -775,9 +777,12 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
           idempotencyKey: key,
         }),
       );
-      const health = r.credentialHealth === "unverified"
-        ? " — adopted existing credentials (unverified until a login/capture/limits probe)"
-        : ` — log in with: hive account login ${r.account.id}`;
+      const health = r.imported
+        ? ` — imported ${r.imported.files.join(", ")} from ${r.imported.source === "external" ? r.imported.from : tildify(r.imported.from)}` +
+          (r.verification === "scheduled" ? "; verifying with the provider (hive account verify " + r.account.id + " to check)" : "; unverified until a login/capture")
+        : r.credentialHealth === "unverified"
+          ? " — existing credentials adopted (unverified until a login/capture/limits probe)"
+          : ` — status ${r.account.status}; log in with: hive account login ${r.account.id}`;
       emit(
         ctx,
         [
@@ -879,6 +884,13 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
         false,
       );
       return 0;
+    }
+    case "verify": {
+      const id = parsed.positional[2];
+      if (!id) throw new Error(ACCOUNT_USAGE);
+      const r = await withClient(ctx, (c) => c.request<AccountVerifyResult>("account.verify", { id, idempotencyKey: key }, ACCOUNT_LIMITS_RPC_TIMEOUT_MS));
+      emit(ctx, renderAccountVerify(r), r, false);
+      return r.outcome === "verified" ? 0 : 1;
     }
     case "limits": {
       const id = parsed.positional[2];

@@ -21,7 +21,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcError, type ListResult, type MailboxResult, type SendRpcResult, type SnapshotResult, type SpawnResult, type ViewResult, type WatchFrame } from "../src/protocol.ts";
@@ -35,8 +36,10 @@ import type {
   AccountLoginStartResult,
   AccountRemoveResult,
   AccountUpdateResult,
+  AccountVerifyResult,
   SwapAccountResult,
 } from "../src/protocol.ts";
+import type { MirrorAccountRow } from "../../core/src/index.ts";
 import type { RpcClient } from "../../cli/src/client.ts";
 import { makeDaemonDir, startDaemon, waitFor, type DaemonHandle } from "./helpers.ts";
 
@@ -427,11 +430,13 @@ test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) 
   }
 });
 
-test("rpc.accounts.f2: add refuses pre-existing credentials by default; importExisting adopts as unverified; health is validation evidence, never file-existence", async () => {
-  const { dir, cleanup } = makeDaemonDir();
+test("rpc.accounts.f2: add refuses pre-existing credentials by default; importExisting adopts as unverified; health is validation evidence, never file-existence; a fresh add is auth_needed, never ok", async () => {
+  // v18: the daemon's Codex probe must never reach a real `codex`; point it
+  // at nothing so the scheduled verification fails typed (provider_error).
+  const { dir, cleanup } = makeDaemonDir({ agents: { codex: { command: join("/nonexistent", "hive-test-codex") } } });
   let daemon: DaemonHandle | null = null;
   try {
-    daemon = await startDaemon(dir);
+    daemon = await startDaemon(dir, { env: { HOME: join(dir, "machine-home") } });
     const client = await daemon.client();
 
     // The F2 shape: a machine home that already holds harness credentials
@@ -457,26 +462,141 @@ test("rpc.accounts.f2: add refuses pre-existing credentials by default; importEx
       importExisting: true,
     });
     assert.equal(adopted.credentialHealth, "unverified");
+    assert.equal(adopted.account.credentialHealth, "unverified", "v18: the mirror row carries the derived health");
+    assert.deepEqual(adopted.imported, { source: "home", from: machineHome, files: ["auth.json"] });
+    assert.equal(adopted.verification, "scheduled");
+    assert.equal(adopted.account.status, "ok", "a credential exists and nothing contradicts it yet");
+    assert.equal(readFileSync(join(dir, "vault", "codex", "codex-adopt", "auth.json"), "utf8"), '{"tokens":{"access_token":"stale-april"}}', "the handed-in home is captured into the vault");
     const got = await client.request<AccountGetResult>("account.get", { id: adopted.account.id });
     assert.equal(got.credentialed, true);
     assert.equal(got.credentialHealth, "unverified", "a credential FILE existing is not health");
 
-    // A default fresh add: empty home, empty vault, health absent.
+    // A default fresh add: empty home, empty vault, health absent — and v18:
+    // status auth_needed (never ok without a credential), nothing to verify.
     const fresh = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "fresh" });
     assert.equal(fresh.credentialHealth, "absent");
+    assert.equal(fresh.account.status, "auth_needed");
+    assert.equal(fresh.imported, null);
+    assert.equal(fresh.verification, "none");
     const list = await client.request<AccountListResult>("account.list", { harness: "codex" });
     assert.equal(list.credentialHealth[adopted.account.id], "unverified");
     assert.equal(list.credentialHealth[fresh.account.id], "absent");
+    assert.deepEqual(list.accounts.map((a) => [a.id, a.status, a.credentialHealth]).sort(), [["codex-adopt", "ok", "unverified"], ["codex-fresh", "auth_needed", "absent"]]);
+    // pause/unpause keeps the truth: a logged-out account unpauses to auth_needed, not ok
+    await client.request("account.pause", { id: fresh.account.id });
+    const unpaused = await client.request<AccountUpdateResult>("account.unpause", { id: fresh.account.id });
+    assert.equal(unpaused.account.status, "auth_needed");
+    assert.equal(unpaused.account.credentialHealth, "absent");
+
+    // The scheduled verification cannot reach a provider here: it settles as a
+    // typed transient failure — status stays ok, health stays unverified.
+    const settled = await waitFor(async () => {
+      const g = await client.request<AccountGetResult>("account.get", { id: adopted.account.id });
+      return g.limits ? g : null;
+    }, "background verification settled", 12_000);
+    assert.equal(settled.limits?.readable, false);
+    assert.equal(settled.limits?.unreadableReason, "provider_error");
+    assert.equal(settled.account.status, "ok");
+    assert.equal(settled.credentialHealth, "unverified");
+    // on demand: account.verify says exactly what the probe proved (idempotent by key)
+    const verify = await client.request<AccountVerifyResult>("account.verify", { id: adopted.account.id, idempotencyKey: "verify-1" });
+    assert.equal(verify.outcome, "unverified");
+    assert.equal(verify.probe, "limits");
+    assert.equal(verify.limits?.unreadableReason, "provider_error");
+    assert.equal(verify.account.credentialHealth, "unverified");
+    assert.equal((await client.request<AccountVerifyResult>("account.verify", { id: adopted.account.id, idempotencyKey: "verify-1" })).deduped, true);
+    const stubAdd = await client.request<AccountAddResult>("account.add", { harness: "stub", label: "s" });
+    assert.equal(stubAdd.verification, "unsupported", "a recipe-less harness has a credential by definition but no probe");
+    const stubVerify = await client.request<AccountVerifyResult>("account.verify", { id: stubAdd.account.id });
+    assert.deepEqual([stubVerify.outcome, stubVerify.probe, stubVerify.limits], ["unverified", "none", null]);
+    const bareVerify = await client.request<AccountVerifyResult>("account.verify", { id: fresh.account.id });
+    assert.deepEqual([bareVerify.outcome, bareVerify.probe], ["absent", "none"]);
 
     // Real validation evidence upgrades honestly: an explicit capture
     // validates the credential and records the login.
     const captured = await client.request<AccountCaptureResult>("account.capture", { id: adopted.account.id });
     assert.ok(captured.account.lastLoginAt != null);
+    assert.equal(captured.account.credentialHealth, "verified");
     const verified = await client.request<AccountGetResult>("account.get", { id: adopted.account.id });
     assert.equal(verified.credentialHealth, "verified");
     client.close();
   } finally {
     if (daemon) await daemon.stop();
     cleanup();
+  }
+});
+
+test("rpc.accounts.v18: importExisting imports the MACHINE's vendor home (the field finding); nothing importable is `no_credentials_to_import` naming the paths; snapshot + watch deltas carry credentialHealth; login success flips status", async () => {
+  const machineHome = join(mkdtempSync(join(tmpdir(), "hb-v2-machine-")), "home");
+  const { dir, cleanup } = makeDaemonDir({ agents: { codex: { command: join("/nonexistent", "hive-test-codex") } } });
+  let daemon: DaemonHandle | null = null;
+  try {
+    mkdirSync(machineHome, { recursive: true });
+    // The daemon's idea of $HOME is the fake machine home: ~/.codex lives there, never in the developer's real home.
+    daemon = await startDaemon(dir, { env: { HOME: machineHome } });
+    const client = await daemon.client();
+    const watch = await daemon.client();
+    const frames: WatchFrame[] = [];
+    watch.onEvent = (f: WatchFrame) => frames.push(f);
+    await watch.request("watch");
+
+    // Nothing anywhere → typed refusal, no row, and the message names what was checked.
+    try {
+      await client.request("account.add", { harness: "codex", label: "nothing", importExisting: true });
+      assert.fail("expected no_credentials_to_import");
+    } catch (err) {
+      assert.ok(err instanceof RpcError);
+      assert.equal(err.code, "no_credentials_to_import");
+      assert.ok(err.message.includes(`${join(machineHome, ".codex", "auth.json")} (missing)`), err.message);
+      assert.ok(err.message.includes(`${join(dir, "vault", "codex", "codex-nothing", "auth.json")} (missing)`), err.message);
+    }
+    assert.equal((await client.request<AccountListResult>("account.list")).accounts.length, 0, "a refusal creates no logged-out account");
+
+    // The field finding: ~/.codex/auth.json (real shape; a stale April session), CODEX_HOME unset.
+    const codexAuth = '{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"i","access_token":"a","refresh_token":"r","account_id":"acc"},"last_refresh":"2026-04-01T00:00:00Z"}';
+    mkdirSync(join(machineHome, ".codex"), { recursive: true });
+    writeFileSync(join(machineHome, ".codex", "auth.json"), codexAuth);
+    writeFileSync(join(machineHome, ".codex", "config.toml"), 'model = "gpt-5.6"\n');
+    const imported = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "work", importExisting: true, idempotencyKey: "import-1" });
+    assert.deepEqual(imported.imported, { source: "vendor_home", from: join(machineHome, ".codex"), files: ["auth.json", "config.toml"] });
+    assert.equal(imported.verification, "scheduled");
+    assert.equal(imported.account.status, "ok");
+    assert.equal(imported.account.credentialHealth, "unverified");
+    assert.equal(readFileSync(join(dir, "vault", "codex", "codex-work", "auth.json"), "utf8"), codexAuth);
+    assert.equal(readFileSync(join(machineHome, ".codex", "auth.json"), "utf8"), codexAuth, "the vendor home is read, never modified");
+    // replay-safe: the same key answers with the recorded result, no second import
+    const replay = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "work", importExisting: true, idempotencyKey: "import-1" });
+    assert.equal(replay.deduped, true);
+    assert.equal(replay.account.id, "codex-work");
+    await rejects(() => client.request("account.add", { harness: "codex", label: "work", importExisting: true }), "invalid_request");
+    // the spawn path now sees a credentialed account (the field failure was `No codex account has credentials`)
+    const get = await client.request<AccountGetResult>("account.get", { id: "codex-work" });
+    assert.equal(get.credentialed, true);
+    const fresh = await client.request<AccountAddResult>("account.add", { harness: "codex", label: "fresh" });
+    assert.equal(fresh.account.status, "auth_needed");
+
+    // MIRROR CONTRACT: snapshot rows AND account.put deltas carry the derived health.
+    const snap = await client.request<{ accounts: MirrorAccountRow[] }>("snapshot");
+    assert.deepEqual(snap.accounts.map((a) => [a.id, a.status, a.credentialHealth]).sort(), [["codex-fresh", "auth_needed", "absent"], ["codex-work", "ok", "unverified"]]);
+    const putsFor = (id: string): MirrorAccountRow[] =>
+      frames.flatMap((f) => (f.type === "delta" ? f.events : [])).filter((e) => e.kind === "account.put" && (e.payload.account as MirrorAccountRow).id === id).map((e) => e.payload.account as MirrorAccountRow);
+    await waitFor(() => (putsFor("codex-fresh").length > 0 && putsFor("codex-work").length > 0 ? true : null), "account.put deltas");
+    assert.equal(putsFor("codex-work")[0]?.credentialHealth, "unverified");
+    assert.equal(putsFor("codex-fresh")[0]?.credentialHealth, "absent");
+    assert.equal(putsFor("codex-fresh")[0]?.status, "auth_needed");
+
+    // Login success (the capture path records the login exactly like a finished flow): status ok, health verified — in the result AND the delta.
+    mkdirSync(join(dir, "homes", "codex-fresh"), { recursive: true });
+    writeFileSync(join(dir, "homes", "codex-fresh", "auth.json"), '{"tokens":{"access_token":"fresh-login"}}');
+    const captured = await client.request<AccountCaptureResult>("account.capture", { id: "codex-fresh" });
+    assert.equal(captured.account.status, "ok");
+    assert.equal(captured.account.credentialHealth, "verified");
+    await waitFor(() => (putsFor("codex-fresh").some((row) => row.credentialHealth === "verified" && row.status === "ok") ? true : null), "verified account.put delta");
+    watch.close();
+    client.close();
+  } finally {
+    if (daemon) await daemon.stop();
+    cleanup();
+    rmSync(dirname(machineHome), { recursive: true, force: true });
   }
 });

@@ -14,7 +14,8 @@
  */
 import { spawn as spawnChild } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { withFileLock } from "../../../src/lock.ts";
 import {
   accountCommitments,
@@ -27,6 +28,7 @@ import {
   parseCodexRateLimits,
   recipeEnvFor,
   recipeFor,
+  resolveVendorHome,
   rotateNearTie,
   selectLeastLoadedAccount,
   windowRolledOver,
@@ -35,11 +37,13 @@ import {
   type AccountLimitsRow,
   type AccountLimitsUnreadableReason,
   type AccountRow,
+  type AccountStatus,
   type AutoAccountCandidate,
   type ClaudeUsageResponse,
   type CodexLiveRateLimits,
   type CoreStore,
   type CredentialHealth,
+  type MirrorAccountRow,
   type PutAccountLimitsInput,
   type WindowUsage,
 } from "../../core/src/index.ts";
@@ -145,6 +149,26 @@ export interface CaptureOutcome {
   source: "external" | "home";
   at: number;
 }
+
+/** One location `importExistingCredentials` looked at, and what it found. */
+export interface ImportCheck {
+  path: string;
+  state: "present" | "missing" | "invalid";
+}
+
+export type ImportOutcome =
+  | { ok: true; source: "home" | "vault" | "vendor_home" | "external"; from: string; files: string[]; checked: ImportCheck[] }
+  | { ok: false; checked: ImportCheck[] };
+
+export interface VerifyOutcome {
+  account: AccountRow;
+  outcome: "verified" | "auth_needed" | "unverified" | "absent";
+  probe: "limits" | "none";
+  limits: AccountLimitsRow | null;
+}
+
+/** Harnesses whose limits probe is a real authentication check (fetchByHarness). */
+const PROBE_CAPABLE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "kimi", "cursor", "opencode"]);
 
 // ---------------------------------------------------------------------------
 // default transports
@@ -393,7 +417,7 @@ export class AccountsService {
    * home is the account (singleton harnesses without a recipe are always
    * candidates).
    */
-  credentialed(account: AccountRow): boolean {
+  credentialed(account: Pick<AccountRow, "harness" | "id" | "homePath">): boolean {
     const recipe = recipeFor(account.harness);
     if (!recipe) return true;
     return dirHasCredentials(this.vaultDirOf(account), recipe) || dirHasCredentials(account.homePath, recipe);
@@ -413,6 +437,28 @@ export class AccountsService {
     if (account.lastLoginAt != null) return "verified";
     if (this.store.getAccountLimits(account.id)?.readable === true) return "verified";
     return "unverified";
+  }
+
+  /** The mirror shape of an account row: the store row plus the derived health (never stored). */
+  mirrorRow(account: AccountRow): MirrorAccountRow {
+    return { ...account, credentialHealth: this.credentialHealthOf(account) };
+  }
+
+  /**
+   * v18 status honesty: `ok` may only be claimed for an account that HAS a
+   * credential — with none anywhere the truthful status is `auth_needed`
+   * (the closed vocabulary's "log in" state). `paused` / `auth_needed`
+   * requests pass through. Harnesses without a recipe (the home is the
+   * account) are always credentialed.
+   */
+  honestStatus(account: Pick<AccountRow, "harness" | "id" | "homePath">, requested: AccountStatus): AccountStatus {
+    if (requested !== "ok") return requested;
+    return this.credentialed(account) ? "ok" : "auth_needed";
+  }
+
+  /** Whether `verifyCredentials` has a real probe for the harness (else it can only report `unverified`). */
+  hasCredentialProbe(harness: string): boolean {
+    return PROBE_CAPABLE_HARNESSES.has(harness);
   }
 
   // -------------------------------------------------------------------------
@@ -593,6 +639,7 @@ export class AccountsService {
     for (const id of ids) {
       const account = this.store.getAccount(id);
       if (!account) continue;
+      const healthBefore = this.credentialHealthOf(account);
       const fetched = await this.fetchOne(account);
       if (!this.store.getAccount(id)) continue; // removed mid-fetch
       const previous = this.store.getAccountLimits(id);
@@ -613,6 +660,18 @@ export class AccountsService {
       } else if (fetched.readable && account.status === "auth_needed") {
         this.store.setAccountStatus(id, "ok", "limits probe authenticated");
         this.log(`account.auth_ok account=${id} by=limits_probe`);
+      }
+      // v18: the probe is validation evidence the MIRROR must see. A status
+      // flip above already re-published the row; otherwise (an `ok`
+      // unverified import that just proved itself) re-publish it explicitly
+      // so `credentialHealth` is re-derived at emit — no stored health field.
+      const after = this.store.getAccount(id);
+      if (after) {
+        const healthAfter = this.credentialHealthOf(after);
+        if (healthAfter !== healthBefore && after.updatedAt === account.updatedAt && after.status === account.status) {
+          this.store.touchAccount(id, `credential health ${healthBefore} → ${healthAfter} by limits probe`);
+          this.log(`account.credential_health account=${id} ${healthBefore}→${healthAfter} by=limits_probe`);
+        }
       }
       if (keepLastGood) {
         this.log(`account.limits.transient_failure account=${id} reason=${fetched.unreadableReason} kept_fetched_at=${row.fetchedAt} error=${JSON.stringify(fetched.error ?? null)}`);
@@ -687,6 +746,12 @@ export class AccountsService {
         return parseClaudeUsage(usage, credential.subscriptionType ?? null);
       }
       case "codex": {
+        // `codex app-server` reads CODEX_HOME only: an imported credential
+        // still sits in the vault until the first spawn activates the home.
+        // Activate the EMPTY home now (the identical rule the spawn path
+        // applies; a populated home is untouched) so the probe sees it.
+        const activated = activateHomeIfEmpty(account.harness, account.homePath, this.vaultDirOf(account), { yolo: true });
+        if (activated.activated) this.log(`account.activate account=${account.id} home=${account.homePath} copied=${activated.copied.join(",")} by=limits_probe`);
         const result = await this.fetchers.codexRateLimits(account.homePath);
         if (!result.ok) return { readable: false, unreadableReason: result.unreadableReason, error: result.error };
         return parseCodexRateLimits(result.limits);
@@ -806,6 +871,128 @@ export class AccountsService {
     } finally {
       if (this.claudeRefreshes.get(account.id) === pending) this.claudeRefreshes.delete(account.id);
     }
+  }
+
+  /**
+   * v18: verify credentials off the caller path (the background limits lane;
+   * `verifyCredentials` is the awaited form). Only probe-capable harnesses
+   * are scheduled; the ids actually queued are returned.
+   */
+  scheduleVerification(accountIds: readonly string[]): string[] {
+    const ids = accountIds.filter((id) => {
+      const account = this.store.getAccount(id);
+      return account !== null && this.hasCredentialProbe(account.harness);
+    });
+    if (ids.length > 0) this.enqueueLimitsRefresh(ids);
+    return ids;
+  }
+
+  /**
+   * v18: `account.verify` — the cheapest REAL validation the harness has is
+   * its limits probe (an authenticated provider read), so run exactly that
+   * and say what it proved. No new prober: outcome = the account's status
+   * and derived health after `refreshLimits`.
+   */
+  async verifyCredentials(account: AccountRow): Promise<VerifyOutcome> {
+    if (!this.credentialed(account)) return { account, outcome: "absent", probe: "none", limits: null };
+    if (!this.hasCredentialProbe(account.harness)) {
+      return { account, outcome: this.credentialHealthOf(account) === "verified" ? "verified" : "unverified", probe: "none", limits: this.store.getAccountLimits(account.id) };
+    }
+    const [limits] = await this.refreshLimits([account.id]);
+    const after = this.store.getAccount(account.id) ?? account;
+    const outcome: VerifyOutcome["outcome"] = after.status === "auth_needed"
+      ? "auth_needed"
+      : this.credentialHealthOf(after) === "verified"
+        ? "verified"
+        : "unverified";
+    this.log(`account.verify account=${account.id} outcome=${outcome} readable=${limits?.readable ?? "-"}${limits && !limits.readable ? ` reason=${limits.unreadableReason}` : ""}`);
+    return { account: after, outcome, probe: "limits", limits: limits ?? null };
+  }
+
+  /**
+   * v18: `account.add {importExisting:true}` — adopt the machine's existing
+   * sign-in for a NEW account (called before the row exists). In order:
+   * the account's own home (captured into the vault), a leftover vault
+   * entry, then the machine's VENDOR home (the harness's home env var when
+   * set in `env`, else the recipe default under `home`; Claude's Keychain
+   * item / Cursor's global store as the external primary). The primary must
+   * parse as a credential; supporting/config files come along when present.
+   * Nothing valid anywhere → `ok:false` with every path checked. Never
+   * writes the account home; never records a login (health stays
+   * `unverified` until a probe/login proves it).
+   */
+  async importExistingCredentials(
+    account: Pick<AccountRow, "harness" | "id" | "homePath">,
+    opts: { env?: Readonly<Record<string, string | undefined>>; home?: string } = {},
+  ): Promise<ImportOutcome> {
+    const recipe = recipeFor(account.harness);
+    const checked: ImportCheck[] = [];
+    if (!recipe) return { ok: false, checked };
+    const primaryFile = primaryCredentialFile(recipe);
+    const vaultDir = this.vaultDirOf(account);
+    const check = (path: string, raw: string | null): ImportCheck["state"] =>
+      raw === null ? "missing" : this.validPrimaryCredential(account.harness, primaryFile, raw) ? "present" : "invalid";
+
+    // 1. The account's own home (a machine home handed in as homePath).
+    const homePrimary = join(account.homePath, primaryFile);
+    const homeRaw = readIfFile(homePrimary);
+    const homeState = check(homePrimary, homeRaw);
+    checked.push({ path: homePrimary, state: homeState });
+    if (homeState === "present") {
+      const files = captureHomeToVault(account.harness, account.homePath, vaultDir);
+      return { ok: true, source: "home", from: account.homePath, files, checked };
+    }
+    // 2. A leftover vault entry for the id.
+    const vaultPrimary = join(vaultDir, primaryFile);
+    const vaultRaw = readIfFile(vaultPrimary);
+    const vaultState = check(vaultPrimary, vaultRaw);
+    checked.push({ path: vaultPrimary, state: vaultState });
+    if (vaultState === "present") {
+      const files = recipeFilesPresent(vaultDir, recipe);
+      return { ok: true, source: "vault", from: vaultDir, files, checked };
+    }
+    // 3. The machine's vendor home.
+    const vendor = resolveVendorHome(account.harness, opts.env ?? process.env, opts.home ?? homedir());
+    if (!vendor) return { ok: false, checked };
+    const contents = new Map<string, string>();
+    for (const file of vendor.files) {
+      const raw = readIfFile(file.path);
+      if (file.role === "credential" && file.rel === primaryFile) checked.push({ path: file.path, state: check(file.path, raw) });
+      if (raw !== null) contents.set(file.rel, raw);
+    }
+    let source: "vendor_home" | "external" = "vendor_home";
+    let from = vendor.vendorHome;
+    if (!this.validPrimaryCredential(account.harness, primaryFile, contents.get(primaryFile) ?? null)) {
+      contents.delete(primaryFile);
+      // The provider's out-of-home store for the VENDOR home.
+      const external = account.harness === "claude"
+        ? await this.keychainReader(vendor.vendorHome).catch(() => null)
+        : account.harness === "cursor"
+          ? (await this.cursorAuthReader().catch(() => null))?.raw ?? null
+          : null;
+      if (account.harness === "claude" || account.harness === "cursor") {
+        const store = account.harness === "claude" ? `keychain:${vendor.vendorHome}` : "cursor:global-store";
+        const state = check(store, external);
+        checked.push({ path: store, state });
+        if (state === "present") {
+          contents.set(primaryFile, external as string);
+          source = "external";
+          from = store;
+        }
+      }
+    }
+    if (!contents.has(primaryFile)) return { ok: false, checked };
+    mkdirSync(vaultDir, { recursive: true, mode: 0o700 });
+    const files: string[] = [];
+    for (const file of vendor.files) {
+      const raw = contents.get(file.rel);
+      if (raw === undefined) continue;
+      const dst = join(vaultDir, file.rel);
+      mkdirSync(dirname(dst), { recursive: true, mode: 0o700 });
+      atomicWriteFileSync(dst, raw);
+      files.push(file.rel);
+    }
+    return { ok: true, source, from, files, checked };
   }
 
   private enqueueLimitsRefresh(accountIds: readonly string[]): void {
@@ -1003,17 +1190,21 @@ export class AccountsService {
       const homePath = join(homesDir, id);
       const vault = vaultDirFor(join(root, "vault"), harness, id);
       const recipe = recipeFor(harness);
+      const vaultHasCredentials = recipe ? dirHasCredentials(vault, recipe) : existsSync(vault);
+      const homeHasCredentials = recipe ? dirHasCredentials(homePath, recipe) : existsSync(homePath);
       const entry: RegistryImportEntry = {
         id,
         harness,
         action: "import",
         homePath,
         vaultDir: vault,
-        vaultHasCredentials: recipe ? dirHasCredentials(vault, recipe) : existsSync(vault),
+        vaultHasCredentials,
         homeExists: existsSync(homePath),
-        homeHasCredentials: recipe ? dirHasCredentials(homePath, recipe) : existsSync(homePath),
+        homeHasCredentials,
         penalty: typeof r.autoPickPenalty === "number" && Number.isFinite(r.autoPickPenalty) && r.autoPickPenalty > 0 && r.autoPickPenalty <= 100 ? r.autoPickPenalty : 0,
-        status: typeof r.pausedAt === "string" ? "paused" : "ok",
+        // v18: an old record without any credential is imported logged OUT
+        // (auth_needed), never as a usable-looking `ok` row.
+        status: typeof r.pausedAt === "string" ? "paused" : vaultHasCredentials || homeHasCredentials ? "ok" : "auth_needed",
         addedAt: typeof r.addedAt === "string" && Number.isFinite(Date.parse(r.addedAt)) ? Date.parse(r.addedAt) : null,
       };
       if (this.store.getAccount(id)) {
@@ -1084,7 +1275,7 @@ export interface RegistryImportEntry {
   homeExists?: boolean;
   homeHasCredentials?: boolean;
   penalty?: number;
-  status?: "ok" | "paused";
+  status?: AccountStatus;
   addedAt?: number | null;
 }
 
@@ -1103,6 +1294,11 @@ export interface BackfillReport {
   dryRun: boolean;
   bound: Array<{ beeId: string; account: string; home: string }>;
   unmatched: Array<{ beeId: string; home: string }>;
+}
+
+/** The recipe files (credential + config) that exist in a dir, relative. */
+function recipeFilesPresent(dir: string, recipe: NonNullable<ReturnType<typeof recipeFor>>): string[] {
+  return [...recipe.credentialFiles, ...(recipe.configFiles ?? [])].filter((rel) => readIfFile(join(dir, rel)) !== null);
 }
 
 function readIfFile(path: string): string | null {
