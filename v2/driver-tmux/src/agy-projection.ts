@@ -9,6 +9,10 @@ import type {
 } from "./transcript-projection.ts";
 
 type JsonObject = Record<string, unknown>;
+interface AssistantFragment {
+  text: string;
+  providerEventId?: string;
+}
 
 const TERMINAL_TOOL_STATES = new Set(["DONE", "ERROR", "FAILED", "CANCELED"]);
 const ERROR_TOOL_STATES = new Set(["ERROR", "FAILED", "CANCELED"]);
@@ -93,7 +97,7 @@ export function createAgyProjector(): TranscriptProjector {
   let previousResultUsage: TranscriptTokenUsage | undefined;
   let previousNumTurns: number | undefined;
   let previousDurationSeconds: number | undefined;
-  const assistantFragments = new Map<string, string>();
+  const assistantFragments = new Map<string, AssistantFragment>();
   const emittedAssistantMessages = new Set<string>();
   const emittedToolCalls = new Set<string>();
   const emittedToolResults = new Set<string>();
@@ -122,6 +126,17 @@ export function createAgyProjector(): TranscriptProjector {
     return `agy:${threadId ?? "unknown"}:${stepIndex ?? "unknown"}`;
   }
 
+  function assistantMessage(fragment: AssistantFragment): TranscriptProjectedEvent {
+    return {
+      kind: "message",
+      ts: null,
+      ...thread(),
+      role: "assistant",
+      text: fragment.text,
+      ...(fragment.providerEventId ? { providerEventId: fragment.providerEventId } : {}),
+    };
+  }
+
   function projectStep(update: JsonObject): TranscriptProjectedEvent[] {
     rememberThread(update.conversation_id);
     const stepType = nonEmptyString(update.step_type);
@@ -132,23 +147,20 @@ export function createAgyProjector(): TranscriptProjector {
       const eventId = `agy:${threadId ?? "unknown"}:${stepIndex ?? "unknown"}`;
       const delta = typeof update.text_delta === "string" ? update.text_delta : "";
       if (!emittedAssistantMessages.has(eventId) && delta.length > 0) {
-        assistantFragments.set(eventId, `${assistantFragments.get(eventId) ?? ""}${delta}`);
+        const held = assistantFragments.get(eventId);
+        assistantFragments.set(eventId, {
+          text: `${held?.text ?? ""}${delta}`,
+          ...(stepIndex !== undefined ? { providerEventId: eventId } : {}),
+        });
       }
       const state = nonEmptyString(update.state)?.toUpperCase();
       if (state !== "DONE" || emittedAssistantMessages.has(eventId)) return [];
-      const text = assistantFragments.get(eventId);
+      const fragment = assistantFragments.get(eventId);
       assistantFragments.delete(eventId);
-      if (!text || text.trim().length === 0) return [];
+      if (!fragment || fragment.text.trim().length === 0) return [];
       emittedAssistantMessages.add(eventId);
       sawAssistantText = true;
-      return [{
-        kind: "message",
-        ts: null,
-        ...thread(),
-        role: "assistant",
-        text,
-        ...(stepIndex !== undefined ? { providerEventId: eventId } : {}),
-      }];
+      return [assistantMessage(fragment)];
     }
 
     if (stepType !== "tool") return [];
@@ -286,7 +298,15 @@ export function createAgyProjector(): TranscriptProjector {
       return [{ kind: "unknown", ts: null, ...thread(), nativeType: event }];
     },
     flush(): TranscriptProjectedEvent[] {
-      return [];
+      const events: TranscriptProjectedEvent[] = [];
+      for (const [eventId, fragment] of assistantFragments) {
+        if (fragment.text.trim().length === 0) continue;
+        emittedAssistantMessages.add(eventId);
+        events.push(assistantMessage(fragment));
+      }
+      assistantFragments.clear();
+      if (events.length > 0) sawAssistantText = true;
+      return events;
     },
   };
 }

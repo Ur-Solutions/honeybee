@@ -286,6 +286,29 @@ test("agy projector: agent response fragments emit once when the step completes"
   assert.deepEqual(duplicateDone, []);
 });
 
+test("agy projector: flush emits an in-progress assistant response once", () => {
+  const projector = createAgyProjector();
+  assert.deepEqual(projector.pushLine(j({
+    event: "step_update",
+    step_update: {
+      conversation_id: SESSION_ID,
+      step_index: 5,
+      state: "ACTIVE",
+      step_type: "agent_response",
+      text_delta: "reply before crash",
+    },
+  })), []);
+  assert.deepEqual(projector.flush(), [{
+    kind: "message",
+    ts: null,
+    threadId: SESSION_ID,
+    role: "assistant",
+    text: "reply before crash",
+    providerEventId: `agy:${SESSION_ID}:5`,
+  }]);
+  assert.deepEqual(projector.flush(), []);
+});
+
 test("agy projector: captured cumulative result usage becomes per-turn usage", () => {
   const events = project([
     j({ event: "init", conversation_id: SESSION_ID }),
