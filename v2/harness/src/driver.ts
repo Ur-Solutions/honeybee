@@ -36,7 +36,9 @@ export interface DriverObservation {
    * booted       — boot finished; the runtime is live and working its initial turn
    *                (carries pid + pidStartedAt for boot re-adoption, B7).
    * turn_started — an idle runtime accepted input and began a turn.
-   * turn_ended   — the turn finished; the runtime is idle (produced output).
+   * turn_ended   — the turn finished; the runtime is idle (produced output —
+   *                unless `synthetic`: the readyAtSpawn boot-to-ready edge,
+   *                which is a phase fact with no output behind it).
    * exited       — the process is gone, with its exit cause.
    */
   kind: "booted" | "turn_started" | "turn_ended" | "exited";

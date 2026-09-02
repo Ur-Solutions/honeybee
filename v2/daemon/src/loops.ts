@@ -431,10 +431,12 @@ export class DaemonCore {
         target,
         // The output/turn-completion fact and running→idle phase are one core
         // transaction. A crash can replay the journal line, but can never
-        // persist idle without its corresponding last-output fact.
-        obs.kind === "turn_ended" ? { recordOutput: true } : {},
+        // persist idle without its corresponding last-output fact. A SYNTHETIC
+        // turn_ended (the readyAtSpawn boot-to-ready edge) is a phase fact
+        // only: the agent produced nothing, so lastOutputAt must not move.
+        obs.kind === "turn_ended" && obs.synthetic !== true ? { recordOutput: true } : {},
       );
-      this.log(`obs.${obs.kind} bee=${obs.beeId} gen=${obs.generation}`);
+      this.log(`obs.${obs.kind} bee=${obs.beeId} gen=${obs.generation}${obs.synthetic ? " synthetic" : ""}`);
     }
   }
 

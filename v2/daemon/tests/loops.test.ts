@@ -1152,6 +1152,45 @@ test("urgency.d6: idle mail DELIVERS to a synthetic-running fresh revive — no 
   }
 });
 
+test("obs.synthetic-turn_ended: a readyAtSpawn boot-to-ready edge idles the store without an output fact; evidence stays synthetic (2026-09-02 swap-revive stall)", () => {
+  const rig = makeRig();
+  try {
+    spawnIdleBee(rig);
+    const outputBefore = rig.store.getBee("bee-1")?.lastOutputAt ?? null;
+    // Revive with an empty mailbox (the swap_account shape): the HsrDriver
+    // mints booted{synthetic} then turn_ended{synthetic} for a claude that
+    // sits silently at its prompt.
+    rig.store.enqueueCommand("stop", "bee-1");
+    rig.core.step(); // execute stop
+    rig.core.step(); // drain exited
+    rig.driver.synthBootAlive = true;
+    rig.store.enqueueCommand("revive", "bee-1");
+    rig.core.step(); // gen 2 spawns: booted{synthetic} queued
+    rig.driver.events.push({ beeId: "bee-1", generation: 2, kind: "turn_ended", synthetic: true });
+    rig.core.step(); // drain booted → running(synthetic) → idle
+    const rt = rig.store.currentRuntime("bee-1");
+    assert.equal(rt?.generation, 2);
+    assert.equal(rt?.state, "idle", `store idles on the synthetic edge; ops tail: ${rig.ops.slice(-6).join(" | ")}`);
+    assert.equal(rt?.bootEvidence, "synthetic", "a phase fact is not boot evidence");
+    assert.equal(rig.store.getBee("bee-1")?.lastOutputAt ?? null, outputBefore, "no output fact: the agent produced nothing");
+    assert.ok(rig.ops.some((o) => o === "obs.turn_ended bee=bee-1 gen=2 synthetic"), "the fold names the synthetic edge");
+    const view = rig.store.listBeeViewRows().find((r) => r.view.beeId === "bee-1")!.view;
+    assert.equal(view.working, false, "never 'working' with nothing in flight");
+    // A real turn on top still records output as before.
+    rig.clock.now += 1000;
+    rig.store.send("bee-1", "go");
+    rig.core.step(); // deliver → turn_started (synthetic, driver-opened)
+    rig.driver.events.push({ beeId: "bee-1", generation: 2, kind: "turn_started", synthetic: true });
+    rig.core.step();
+    rig.driver.events.push({ beeId: "bee-1", generation: 2, kind: "turn_ended" });
+    rig.core.step();
+    assert.equal(rig.store.currentRuntime("bee-1")?.state, "idle");
+    assert.ok((rig.store.getBee("bee-1")?.lastOutputAt ?? 0) > (outputBefore ?? 0), "the real turn_ended records output");
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test("unit.flag-expiry: a provider-declared reset lifts resource_blocked at the instant — never before, never by silence", () => {
   const rig = makeRig();
   try {

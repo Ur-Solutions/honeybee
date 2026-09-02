@@ -16,6 +16,7 @@ import { openCoreStore } from "../../core/src/index.ts";
 import { HsrDriver } from "../src/index.ts";
 import { claudeAdapter, stubAdapter } from "../../adapters/src/index.ts";
 import type { AdapterSignal } from "../../adapters/src/types.ts";
+import type { DriverObservation } from "../../harness/src/driver.ts";
 import {
   AGENT_PATH,
   drainEvidenceUntil,
@@ -438,6 +439,156 @@ test("readyAtSpawn: silent-until-input runtime (claude stream-json) is deliverab
   }
 });
 
+/** A claude-shaped agent that emits NOTHING until its first stdin line. */
+function writeSilentClaude(path: string): void {
+  writeFileSync(path, `
+    process.stdin.setEncoding("utf8");
+    let buf = "";
+    process.stdin.on("data", (c) => {
+      buf += c;
+      let i;
+      while ((i = buf.indexOf("\\n")) >= 0) {
+        buf = buf.slice(i + 1);
+        process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: "late-sess" }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ok" }) + "\\n");
+      }
+    });
+  `);
+}
+
+test("readyAtSpawn with NOTHING to deliver: the synthetic booted is paired with a synthetic turn_ended — never a `running` no output will close (2026-09-02 swap-revive stall)", async (t) => {
+  // bee.swapAccount stops and revives an IDLE bee with an empty mailbox. The
+  // driver's phase is idle (accept point open) but the store only saw
+  // booted → running, and claude emits no line until stdin arrives — so the
+  // bee showed "working" for hours (CL.60c9, CL.e72f). The boot-to-ready edge
+  // must reach the store too: synthetic (no boot evidence, no output fact).
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-ras-idle-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "silent-claude.mjs");
+  writeSilentClaude(fake);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({ adapter: claudeAdapter, command: process.execPath, args: [fake] }),
+  });
+  try {
+    driver.start("ras-idle", 1);
+    const events = await drainUntil(driver, (e) => ofKind(e, "turn_ended").length > 0, 3000);
+    const booted = ofKind(events, "booted");
+    const ended = ofKind(events, "turn_ended");
+    assert.equal(booted.length, 1, "exactly the synthetic booted");
+    assert.equal(booted[0]!.synthetic, true);
+    assert.equal(ended.length, 1, "exactly one boot-to-ready turn_ended");
+    assert.equal(ended[0]!.synthetic, true, "the boot-to-ready edge is driver-minted: never output evidence");
+    assert.ok(events.indexOf(booted[0]!) < events.indexOf(ended[0]!), "booted precedes its turn_ended");
+    assert.equal(ofKind(events, "turn_started").length, 0, "nothing was injected: no turn opened");
+    // A later delivery opens and closes a REAL turn on top of that idle.
+    assert.equal(driver.deliver("ras-idle", 1, 1, "hello").accepted, true);
+    const turn = await drainUntil(driver, (e) => ofKind(e, "turn_ended").length > 0, 3000);
+    assert.equal(ofKind(turn, "turn_started")[0]!.synthetic, true, "deliver-opened turn_started is synthetic");
+    assert.notEqual(ofKind(turn, "turn_ended")[0]!.synthetic, true, "the parsed result is the real turn_ended");
+  } finally {
+    driver.stop("ras-idle", 1, "stopped_by_system");
+    driver.disposeAll();
+  }
+});
+
+test("readyAtSpawn status poll (deterministic, no spawn): synthetic booted pairs with a synthetic turn_ended only while the driver's phase is idle", (t) => {
+  // Drives the host status-poll edge directly: the runner-host status file is
+  // the OS-confirmed-agent fact. Idle phase (nothing injected) → booted +
+  // turn_ended, both synthetic, in that order, once. Running phase (a delivery
+  // already opened the turn) → booted only. No process is spawned, so this
+  // holds under any machine load.
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-ras-poll-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => { throw new Error("this poll-edge test does not spawn"); },
+  });
+  const pump = (driver as unknown as { pumpHost(p: unknown): void }).pumpHost.bind(driver);
+  const proc = (beeId: string, phase: "idle" | "running") => {
+    const statusPath = join(dir, `${beeId}.status.json`);
+    writeFileSync(statusPath, JSON.stringify({ hostPid: process.pid, beeId, generation: 1, at: Date.now(), agentPid: 4242 }));
+    return {
+      beeId,
+      generation: 1,
+      pid: process.pid, // alive: the poll must not fold an exit
+      pidStartedAt: 0,
+      child: null,
+      adapter: claudeAdapter,
+      degraded: false,
+      phase,
+      sessionId: null,
+      turnId: null,
+      pendingDeliveries: new Set<number>(),
+      confirmedDeliveries: new Set<number>(),
+      stopCause: null,
+      killTimer: null,
+      stdoutRest: Buffer.alloc(0),
+      exited: false,
+      spawnError: null,
+      commandResolution: null,
+      realEvidence: false,
+      hostStyle: true,
+      agentPid: null,
+      socket: null,
+      socketRetry: null,
+      socketPath: join(dir, `${beeId}.sock`),
+      statusPath,
+      observationPath: join(dir, `${beeId}.absent.jsonl`), // no journal yet: tail is a no-op
+      logOffset: 0,
+      initialObservationCursor: 0,
+      pendingObservationCursor: null,
+      legacySharedObservation: false,
+      outboundPending: [],
+      pendingWrites: [],
+      socketBroken: false,
+    };
+  };
+  try {
+    const idle = proc("poll-idle", "idle");
+    pump(idle);
+    const kinds = (events: DriverObservation[]) => events.map((e) => `${e.kind}${e.synthetic ? "*" : ""}`);
+    assert.deepEqual(kinds(driver.observe()), ["booted*", "turn_ended*"], "idle phase: the boot-to-ready edge follows the synthetic booted");
+    assert.equal(idle.phase, "idle", "the driver's own phase is untouched");
+    pump(idle);
+    assert.deepEqual(kinds(driver.observe()), [], "the agent pid is learned once: no second edge");
+
+    const running = proc("poll-running", "running");
+    pump(running);
+    assert.deepEqual(kinds(driver.observe()), ["booted*"], "running phase (delivery opened the turn): no synthetic turn_ended under an open turn");
+  } finally {
+    driver.disposeAll();
+  }
+});
+
+test("readyAtSpawn with a delivery BEFORE the OS confirms the agent: no synthetic turn_ended — the real result closes the open turn", async (t) => {
+  // Delivery at spawn opens the turn driver-side (phase running) before the
+  // status poll mints the synthetic booted. A synthetic turn_ended there
+  // would idle the store under a turn that is actually in flight (the
+  // 2026-08-19 'needs your reply while working' class) — so it is suppressed.
+  const dir = mkdtempSync(join(tmpdir(), "hive-drv-ras-race-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fake = join(dir, "silent-claude.mjs");
+  writeSilentClaude(fake);
+  const driver = new HsrDriver({
+    sessionLogDir: join(dir, "logs"),
+    resolve: () => ({ adapter: claudeAdapter, command: process.execPath, args: [fake] }),
+  });
+  try {
+    driver.start("ras-race", 1);
+    assert.equal(driver.deliver("ras-race", 1, 1, "hello").accepted, true, "accept point is open at spawn");
+    const events = await drainUntil(driver, (e) => ofKind(e, "turn_ended").length > 0, 3000);
+    assert.equal(ofKind(events, "booted")[0]!.synthetic, true, "spawn-event booted is synthetic");
+    const ended = ofKind(events, "turn_ended");
+    assert.equal(ended.length, 1, "one turn_ended: the parsed result");
+    assert.notEqual(ended[0]!.synthetic, true, "no synthetic turn_ended under an open turn");
+    assert.equal(ofKind(events, "turn_started").length, 1, "the deliver-opened turn");
+  } finally {
+    driver.stop("ras-race", 1, "stopped_by_system");
+    driver.disposeAll();
+  }
+});
+
 test("readyAtSpawn: a spawn that fails outright (missing cwd / binary) is exited(crashed) with NO synthetic booted", async (t) => {
   // The spawn-loop hazard: before, the synthetic booted was pushed
   // synchronously, so a claude bee with a missing cwd looked like
@@ -724,11 +875,13 @@ test("self-woken turn: unprompted assistant output on an IDLE runtime opens a tu
   });
   try {
     driver.start("sw-1", 1);
-    // readyAtSpawn boot emits NO turn events (init/result while phase idle
-    // are normalized away) — the first turn_ended IS the self-woken turn's.
-    const events = await drainUntil(driver, (e) => ofKind(e, "turn_ended").length >= 1, 4000);
+    // readyAtSpawn boot emits NO REAL turn events (init/result while phase
+    // idle are normalized away; the boot-to-ready turn_ended is synthetic) —
+    // the first real turn_ended IS the self-woken turn's.
+    const real = (events: DriverObservation[]) => events.filter((e) => e.synthetic !== true);
+    const events = await drainUntil(driver, (e) => ofKind(real(e), "turn_ended").length >= 1, 4000);
     assert.equal(ofKind(events, "turn_started").length, 1, "one opening edge (driver dedupes the second assistant line)");
-    assert.equal(ofKind(events, "turn_ended").length, 1, "result closes the self-woken turn");
+    assert.equal(ofKind(real(events), "turn_ended").length, 1, "result closes the self-woken turn");
   } finally {
     driver.stop("sw-1", 1, "stopped_by_system");
     driver.disposeAll();
