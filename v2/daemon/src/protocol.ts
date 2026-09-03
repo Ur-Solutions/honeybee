@@ -45,6 +45,9 @@ import type {
   TrackPackage,
 } from "../../core/src/index.ts";
 import type { BootReport } from "./loops.ts";
+import type { EphemeralCredentialFile } from "./accountsService.ts";
+
+export type { EphemeralCredential, EphemeralCredentialFile } from "./accountsService.ts";
 
 export const PROTOCOL = "v2/1";
 export const DAEMON_VERSION = "2.0.0-wp4";
@@ -68,6 +71,13 @@ export const DAEMON_CAPABILITIES = [
    * credentials; the `account.verify` verb runs the harness's real probe.
    */
   "account.credential_health.v1",
+  /**
+   * v19 (2026-09-03, RN7a): the credential-lease mint — `account.lease`
+   * returns the refresh-blanked ephemeral credential for one account (the
+   * remote-nodes lease plane's mint side; see credential-leases.md), with
+   * typed `lease_unsupported` / `lease_unavailable` refusals.
+   */
+  "account.lease.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -135,6 +145,19 @@ export const RPC_ERROR_CODES = [
    * "No conversation found with session ID".
    */
   "transcript_unavailable",
+  /**
+   * v19 (`account.lease`): the harness/account SHAPE cannot hold a lease —
+   * no lease strategy (cursor, unmodeled harnesses), an OAuth-only kimi
+   * account, an opencode account without a coding-plan provider entry.
+   * Durable until the account itself changes.
+   */
+  "lease_unsupported",
+  /**
+   * v19 (`account.lease`): leasable in principle but not right now — no/
+   * stale credential, the account's refresher is mid-rotation, a codex token
+   * rotation failed or left under 15 minutes of TTL. Retryable.
+   */
+  "lease_unavailable",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -224,6 +247,9 @@ export const RPC_VERBS = [
   "account.limits",
   "account.importRegistry",
   "account.backfill",
+  // v19 (RN7a, additive): mint the refresh-blanked credential lease for one
+  // account (the remote-nodes lease plane; capability account.lease.v1).
+  "account.lease",
   "bee.swapAccount",
   // Auto-titler node config (additive): `config.get` is a read; `config.patch`
   // writes `naming` in the node's config.json.
@@ -532,6 +558,28 @@ export interface AccountBackfillResult extends DedupMarkers {
   dryRun: boolean;
   bound: Array<{ beeId: string; account: string; home: string }>;
   unmatched: Array<{ beeId: string; home: string }>;
+}
+
+/**
+ * v19: `account.lease {account, harness?}` — mint the refresh-blanked
+ * ephemeral credential for ONE account (the remote-nodes lease plane's mint;
+ * credential-leases.md, a port of v1 remoteCreds.ts's mint side). `account`
+ * is a selector; `harness`, when given, must equal the account's harness
+ * (`harness_mismatch`). Paused accounts refuse (`account_paused`); shape and
+ * timing refusals are `lease_unsupported` / `lease_unavailable`.
+ *
+ * SENSITIVE: `files`/`env` carry secret bytes and this result is the ONLY
+ * place they appear — the verb takes no idempotency key, records nothing,
+ * and neither the daemon log nor the audit stream ever carries the material.
+ * `kindNote` and `expiresAt` (unix SECONDS) are secret-free.
+ */
+export interface AccountLeaseResult {
+  account: string;
+  harness: string;
+  files: EphemeralCredentialFile[];
+  env?: Record<string, string>;
+  kindNote: string;
+  expiresAt?: number;
 }
 
 /**

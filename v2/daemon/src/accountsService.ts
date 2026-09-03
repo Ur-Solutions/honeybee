@@ -12,10 +12,11 @@
  * Everything that talks to a provider or a keychain is injected; the defaults
  * are the real transports. Tests inject fakes.
  */
-import { spawn as spawnChild } from "node:child_process";
+import { execFile, spawn as spawnChild } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { withFileLock } from "../../../src/lock.ts";
 import {
   accountCommitments,
@@ -109,6 +110,13 @@ export interface AccountsServiceOptions {
   fetchers?: LimitsFetchers;
   /** Injectable HTTP boundary for Grok, Kimi, Cursor, and OpenCode limits. */
   providerHttp?: Partial<ProviderLimitsHttp>;
+  /**
+   * v19 (account.lease): injectable stale-codex-token rotation — a no-op codex
+   * turn against the account home (CODEX_HOME); codex rotates auth.json in
+   * place at turn start when the access token is near expiry. Tests inject a
+   * fake so no real codex runs. Default: the real `codex exec` runner.
+   */
+  codexLeaseRefresh?: (homePath: string) => Promise<void>;
 }
 
 type ClaudeCredential = {
@@ -171,6 +179,132 @@ export interface VerifyOutcome {
 const PROBE_CAPABLE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "kimi", "cursor", "opencode", "agy"]);
 
 // ---------------------------------------------------------------------------
+// v19: account.lease — the credential-lease mint (RN7a; a port of v1
+// src/hsr/remoteCreds.ts's MINT side per credential-leases.md)
+// ---------------------------------------------------------------------------
+
+/** One credential file to write into a satellite's isolated home. */
+export interface EphemeralCredentialFile {
+  /** Path RELATIVE to the harness home (e.g. "auth.json", ".credentials.json"). */
+  homeRelPath: string;
+  /** File bytes, base64-encoded. Opaque — NEVER decode into a log/error/audit row. */
+  contentB64: string;
+  /** POSIX mode for the written file (0600). */
+  mode: number;
+}
+
+/**
+ * The short-lived, refresh-blanked material a satellite receives for ONE
+ * account. `files` land in the isolated home; `env` merges into the spawn env;
+ * `kindNote` is a secret-free one-liner; `expiresAt` (unix SECONDS) is the
+ * NON-SECRET expiry of the shipped material when known, which the RN7b lease
+ * service uses to renew before a satellite bee's token dies.
+ */
+export interface EphemeralCredential {
+  files: EphemeralCredentialFile[];
+  env?: Record<string, string>;
+  kindNote: string;
+  expiresAt?: number;
+}
+
+/**
+ * Typed lease refusal (rpc.ts maps it onto the closed error list):
+ *  - `lease_unsupported`: the harness/account SHAPE cannot lease (no strategy,
+ *    OAuth-only kimi, no coding-plan opencode provider). Durable until the
+ *    account changes.
+ *  - `lease_unavailable`: leasable in principle but not RIGHT NOW (no/stale
+ *    credential, refresher mid-rotation, refresh failed). Retryable.
+ */
+export class LeaseRefusal extends Error {
+  readonly code: "lease_unsupported" | "lease_unavailable";
+
+  constructor(code: "lease_unsupported" | "lease_unavailable", message: string) {
+    super(message);
+    this.name = "LeaseRefusal";
+    this.code = code;
+  }
+}
+
+// Never ship a codex access token with less than this TTL remaining: below it
+// the token could die on the satellite before the RN7b rotation re-delivers.
+export const CODEX_MIN_SHIP_TTL_MS = 15 * 60_000;
+
+// The same floor for claude: a lease under 15 minutes of access-token TTL is
+// refreshed through the daemon's own OAuth refresher before shipping, never
+// re-shipped dying.
+export const CLAUDE_MIN_SHIP_TTL_MS = 15 * 60_000;
+
+// OAuth refresh-token field names blanked before a credential file is shipped:
+// codex/grok/kimi use `refresh_token`, opencode's oauth entries use `refresh`,
+// claude's .credentials.json uses `refreshToken`. Refresh tokens are
+// single-use and rotating — the vault must stay their sole holder, so no two
+// fleet bees ever present the same one (and a leaked lease cannot take over
+// the account's refresh chain).
+const REFRESH_TOKEN_KEYS: ReadonlySet<string> = new Set(["refresh_token", "refresh", "refreshToken"]);
+
+/**
+ * Deep-clone a parsed credential JSON with EVERY OAuth refresh-token field
+ * blanked to "" (field kept — codex serde hard-fails when it is deleted).
+ * Blanks only string values under the exact key names; access tokens, api
+ * keys, and expiries are preserved untouched. Opaque — callers never log it.
+ */
+function blankRefreshTokens(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => blankRefreshTokens(item));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = REFRESH_TOKEN_KEYS.has(key) && typeof inner === "string" ? "" : blankRefreshTokens(inner);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** JWT `exp` claim (unix SECONDS), decoded not verified (a local freshness fact). */
+function expFromJwt(token: string): number | undefined {
+  const segment = token.split(".")[1];
+  if (!segment) return undefined;
+  try {
+    const claims = JSON.parse(Buffer.from(segment, "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof claims.exp === "number" && Number.isFinite(claims.exp) ? claims.exp : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The opencode coding-plan providers a lease may carry (the same closed list the limits probe reads). */
+const OPENCODE_LEASE_PROVIDERS = ["minimax-coding-plan", "zai-coding-plan"] as const;
+
+/**
+ * Default stale-codex rotation: a minimal read-only `codex exec` turn against
+ * the home, serialized under the SAME per-home boot lock runner-host and the
+ * limits probe take, so the rotation never races a booting codex in this home.
+ */
+function defaultCodexLeaseRefresh(command: string): (homePath: string) => Promise<void> {
+  return async (homePath) => {
+    try {
+      await withFileLock(
+        join(homePath, CODEX_BOOT_LOCK_FILENAME),
+        async () => {
+          // codex refreshes auth.json in place at turn start when the token is
+          // near expiry; the output is discarded. cwd is a throwaway temp dir.
+          await execFileP(command, ["exec", "--skip-git-repo-check", "-s", "read-only", "ok"], {
+            cwd: tmpdir(),
+            env: { ...process.env, CODEX_HOME: homePath },
+            timeout: 120_000,
+            maxBuffer: 1 << 20,
+          });
+        },
+        { timeoutMs: 10_000, staleMs: CODEX_BOOT_LOCK_STALE_MS, pollMs: 25 },
+      );
+    } catch {
+      // Secret-free: never surface codex stderr (could echo token-adjacent bytes).
+      throw new LeaseRefusal("lease_unavailable", "could not run codex to rotate the stale access token (is codex installed and this account logged in?)");
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // default transports
 // ---------------------------------------------------------------------------
 
@@ -217,6 +351,8 @@ function defaultClaudeRefresh(timeoutMs: number): NonNullable<LimitsFetchers["cl
     };
   };
 }
+
+const execFileP = promisify(execFile);
 
 const CODEX_BOOT_LOCK_FILENAME = ".hive-app-server-boot.lock";
 const CODEX_BOOT_LOCK_STALE_MS = 2 * 60_000;
@@ -362,6 +498,9 @@ export class AccountsService {
   private readonly claudeRefreshes = new Map<string, Promise<ClaudeRefreshOutcome>>();
   /** Grok/Kimi refresh tokens also rotate; share the whole provider read. */
   private readonly secondaryProviderFetches = new Map<string, Promise<PutAccountLimitsInput>>();
+  /** v19: at most one lease mint per account; concurrent callers join it. */
+  private readonly leaseMints = new Map<string, Promise<EphemeralCredential>>();
+  private readonly codexLeaseRefresh: (homePath: string) => Promise<void>;
 
   constructor(opts: AccountsServiceOptions) {
     this.store = opts.store;
@@ -380,6 +519,7 @@ export class AccountsService {
       ...defaultProviderLimitsHttp(this.cfg.accounts.limitsFetchTimeoutMs),
       ...opts.providerHttp,
     };
+    this.codexLeaseRefresh = opts.codexLeaseRefresh ?? defaultCodexLeaseRefresh(this.cfg.agents.codex?.command ?? "codex");
   }
 
   // -------------------------------------------------------------------------
@@ -839,9 +979,11 @@ export class AccountsService {
   /**
    * Rotate one expired Claude chain exactly once and persist the new chain to
    * the account's only home, Keychain item, and vault backup. A live runtime
-   * owns its own refresh and is never raced by the daemon.
+   * owns its own refresh and is never raced by the daemon. `minTtlMs` is the
+   * freshness floor the caller needs (the lease mint's ship floor); the
+   * default 0 keeps the limits path's "expired means expired" behavior.
    */
-  private async refreshClaudeCredential(account: AccountRow): Promise<ClaudeRefreshOutcome> {
+  private async refreshClaudeCredential(account: AccountRow, minTtlMs = 0): Promise<ClaudeRefreshOutcome> {
     const joined = this.claudeRefreshes.get(account.id);
     if (joined) return joined;
     const pending = (async (): Promise<ClaudeRefreshOutcome> => {
@@ -849,7 +991,7 @@ export class AccountsService {
       // Re-read inside the single-flight boundary: another limits caller or
       // harness may have advanced the chain after the first read.
       const credential = await this.freshestClaudeCredential(account);
-      if (credential && credential.expiresAt > this.now()) return { kind: "ok", credential };
+      if (credential && credential.expiresAt - this.now() > minTtlMs) return { kind: "ok", credential };
       if (!credential?.refreshToken) return { kind: "no_refresh_token" };
       const refreshed = await this.fetchers.claudeRefresh(credential.refreshToken);
       if (!refreshed) return { kind: "refresh_failed" };
@@ -937,6 +1079,307 @@ export class AccountsService {
         : "unverified";
     this.log(`account.verify account=${account.id} outcome=${outcome} readable=${limits?.readable ?? "-"}${limits && !limits.readable ? ` reason=${limits.unreadableReason}` : ""}`);
     return { account: after, outcome, probe, limits: probe === "credential_file" ? null : limits ?? null };
+  }
+
+  // -------------------------------------------------------------------------
+  // v19: account.lease — the credential-lease mint (RN7a)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Whether the account's local refresher is mid-rotation RIGHT NOW: the
+   * claude OAuth single-flight, a secondary-provider read (grok/kimi rotate
+   * their refresh tokens inside that read), or a codex app-server probe
+   * against the account's home (codex may rotate auth.json in place at turn
+   * start). A lease minted while the chain is rotating could ship a token the
+   * rotation is about to replace — the mint refuses instead (retryable).
+   */
+  refreshBusy(account: Pick<AccountRow, "id" | "homePath">): boolean {
+    return this.claudeRefreshes.has(account.id) || this.secondaryProviderFetches.has(account.id) || this.codexFetches.has(account.homePath);
+  }
+
+  /**
+   * Mint the SHORT-LIVED, refresh-blanked credential lease for `account`
+   * (spec: credential-leases.md; validated by docs/RN7A_EXPERIMENTS.md).
+   * Never returns more than this single account's primary credential, always
+   * with every OAuth refresh-token field blanked — the vault/home chain stays
+   * the sole holder of the real refresh tokens. Single-flight per account
+   * (concurrent callers join); refused while the account's refresher is
+   * mid-rotation. SENSITIVE: the return value is the ONLY place secret bytes
+   * appear — callers must never log, audit, or persist it.
+   */
+  async mintLease(account: AccountRow): Promise<EphemeralCredential> {
+    const joined = this.leaseMints.get(account.id);
+    if (joined) return joined;
+    const pending = this.mintLeaseFresh(account);
+    this.leaseMints.set(account.id, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.leaseMints.get(account.id) === pending) this.leaseMints.delete(account.id);
+    }
+  }
+
+  private async mintLeaseFresh(account: AccountRow): Promise<EphemeralCredential> {
+    if (this.refreshBusy(account)) {
+      throw new LeaseRefusal("lease_unavailable", `account ${account.id}'s credential refresher is mid-rotation; retry shortly`);
+    }
+    const lease = await this.mintLeaseByHarness(account);
+    // Secret-free by construction: counts, note, and expiry only.
+    this.log(
+      `account.lease account=${account.id} harness=${account.harness} files=${lease.files.length}` +
+        ` env=${Object.keys(lease.env ?? {}).length} exp=${lease.expiresAt !== undefined ? new Date(lease.expiresAt * 1000).toISOString() : "-"}`,
+    );
+    return lease;
+  }
+
+  private mintLeaseByHarness(account: AccountRow): Promise<EphemeralCredential> {
+    switch (account.harness) {
+      case "claude":
+        return this.mintClaudeLease(account);
+      case "codex":
+        return this.mintCodexLease(account);
+      case "grok":
+        return Promise.resolve(this.mintGrokLease(account));
+      case "kimi":
+        return Promise.resolve(this.mintKimiLease(account));
+      case "opencode":
+        return Promise.resolve(this.mintOpenCodeLease(account));
+      default:
+        // cursor's machine-global keychain slot (and every unmodeled harness)
+        // has no defensible lease artifact — a durable, typed refusal.
+        throw new LeaseRefusal(
+          "lease_unsupported",
+          `harness "${account.harness}" has no credential-lease strategy (supported: claude, codex, grok, kimi, opencode)`,
+        );
+    }
+  }
+
+  /**
+   * claude: ship `.credentials.json` with `claudeAiOauth.refreshToken` blanked
+   * and the CURRENT access token preserved. Experiment 2 (RN7A_EXPERIMENTS.md)
+   * confirmed the harness runs cleanly to real token expiry with a blanked
+   * refresh token and fails typed at a server 401 — the daemon's own OAuth
+   * refresh (refreshClaudeCredential, single-flight, live-runtime-guarded)
+   * freshens a chain at/near expiry BEFORE the lease is cut; a token under
+   * CLAUDE_MIN_SHIP_TTL_MS is never shipped dying.
+   */
+  private async mintClaudeLease(account: AccountRow): Promise<EphemeralCredential> {
+    let credential = await this.freshestClaudeCredential(account);
+    if (!credential) {
+      throw new LeaseRefusal("lease_unavailable", `no claude OAuth credential for ${account.id}; log in: hive v2 account login ${account.id}`);
+    }
+    if (credential.expiresAt - this.now() <= CLAUDE_MIN_SHIP_TTL_MS) {
+      const refreshed = await this.refreshClaudeCredential(account, CLAUDE_MIN_SHIP_TTL_MS);
+      if (refreshed.kind === "ok") credential = refreshed.credential;
+      else if (refreshed.kind === "live_runtime") {
+        throw new LeaseRefusal("lease_unavailable", `claude OAuth token for ${account.id} is at/near expiry and the running Claude owns refresh; retry shortly`);
+      } else if (refreshed.kind === "no_refresh_token") {
+        throw new LeaseRefusal("lease_unavailable", `claude OAuth token for ${account.id} is at/near expiry with no refresh chain; log in: hive v2 account login ${account.id}`);
+      } else {
+        throw new LeaseRefusal("lease_unavailable", `claude OAuth refresh failed for ${account.id}; log in: hive v2 account login ${account.id}`);
+      }
+    }
+    // A joined in-flight refresh (from the limits path, floor 0) may have
+    // answered with a token that satisfies "not expired" but not the ship
+    // floor — re-check the token actually being shipped.
+    if (credential.expiresAt - this.now() <= CLAUDE_MIN_SHIP_TTL_MS) {
+      throw new LeaseRefusal("lease_unavailable", `claude OAuth refresh for ${account.id} did not produce a token above the 15-minute ship floor; retry shortly`);
+    }
+    const body = `${JSON.stringify(blankRefreshTokens(credential.document))}\n`;
+    const expSeconds = Math.floor(credential.expiresAt / 1000);
+    return {
+      files: [{ homeRelPath: ".credentials.json", contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+      expiresAt: expSeconds,
+      kindNote: `claude: shipped .credentials.json with OAuth refresh token blanked, exp ${new Date(expSeconds * 1000).toISOString()}; scrub ANTHROPIC_API_KEY on subscription spawns`,
+    };
+  }
+
+  /**
+   * codex: ship an auth.json carrying a FRESH access token with the refresh
+   * token BLANKED (`refresh_token: ""`, field kept — codex serde requires it
+   * present). Re-validated on codex-cli 0.152.0 (Experiment 1). A near-expiry
+   * vault/home token triggers the central rotation first: codex itself rotates
+   * auth.json in place on a no-op turn in the account's home (never a
+   * re-implemented OAuth endpoint), then the home is captured back to the
+   * vault. Never ships a token with under CODEX_MIN_SHIP_TTL_MS remaining.
+   */
+  private async mintCodexLease(account: AccountRow): Promise<EphemeralCredential> {
+    let current = this.freshestCodexAuth(account);
+    if (!current) {
+      throw new LeaseRefusal("lease_unavailable", `no codex auth.json with a decodable access token for ${account.id}; log in: hive v2 account login ${account.id}`);
+    }
+    if (current.expSeconds * 1000 - this.now() <= CODEX_MIN_SHIP_TTL_MS) {
+      if (this.hasLiveRuntime(account.id)) {
+        throw new LeaseRefusal("lease_unavailable", `codex access token for ${account.id} is near expiry and a live runtime owns the home; retry after its rotation lands`);
+      }
+      // An imported credential may still sit vault-only; the rotation turn
+      // reads CODEX_HOME, so activate the EMPTY home first (a populated home
+      // is untouched — the identical rule the spawn path applies).
+      const activated = activateHomeIfEmpty(account.harness, account.homePath, this.vaultDirOf(account), { yolo: true });
+      if (activated.activated) this.log(`account.activate account=${account.id} home=${account.homePath} copied=${activated.copied.join(",")} by=lease`);
+      await this.codexLeaseRefresh(account.homePath);
+      // The rotation turn is long (up to 120 s): a runtime may have started on
+      // this account meanwhile and now owns the home — re-check before
+      // touching it again (the harvest) or shipping what the rotation wrote.
+      if (this.hasLiveRuntime(account.id)) {
+        throw new LeaseRefusal("lease_unavailable", `a runtime started on ${account.id} during the token rotation and owns the home; retry after its rotation lands`);
+      }
+      // Harvest the rotated chain home → vault so the vault stays current.
+      captureHomeToVault(account.harness, account.homePath, this.vaultDirOf(account));
+      current = this.freshestCodexAuth(account);
+      if (!current || current.expSeconds * 1000 - this.now() <= CODEX_MIN_SHIP_TTL_MS) {
+        throw new LeaseRefusal("lease_unavailable", `codex token rotation for ${account.id} did not produce a fresh access token; not shipping a stale token`);
+      }
+      this.log(`account.lease.codex_rotated account=${account.id} exp=${new Date(current.expSeconds * 1000).toISOString()}`);
+    }
+    // Deep blank covers every refresh key ANYWHERE in the file (not only
+    // tokens.refresh_token); the explicit spread then guarantees the field is
+    // PRESENT as "" — codex serde hard-fails when it is missing entirely.
+    const blankedDoc = blankRefreshTokens(current.parsed) as Record<string, unknown>;
+    // A subscription lease must never carry a billable developer API key: the
+    // registry scrubs OPENAI_API_KEY from spawn env, and the file must not
+    // smuggle one back in. An API-key-mode account keeps it — that billing is
+    // the account's intent.
+    const apiKeyMode = typeof blankedDoc.auth_mode === "string" && /^api[-_]?key$/i.test(blankedDoc.auth_mode);
+    const blanked = {
+      ...blankedDoc,
+      ...(!apiKeyMode && "OPENAI_API_KEY" in blankedDoc ? { OPENAI_API_KEY: null } : {}),
+      tokens: { ...(blankedDoc.tokens as Record<string, unknown>), refresh_token: "" },
+    };
+    const body = `${JSON.stringify(blanked, null, 2)}\n`;
+    return {
+      files: [{ homeRelPath: "auth.json", contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+      expiresAt: current.expSeconds,
+      kindNote: `codex: shipped access-token-only auth.json (refresh_token blanked), exp ${new Date(current.expSeconds * 1000).toISOString()}`,
+    };
+  }
+
+  /**
+   * The freshest codex auth.json between the account's HOME (the live chain —
+   * codex rotates in place there) and the vault snapshot, by access-token
+   * `exp`. Null when neither holds a decodable access token.
+   */
+  private freshestCodexAuth(account: AccountRow): { parsed: Record<string, unknown>; expSeconds: number } | null {
+    let best: { parsed: Record<string, unknown>; expSeconds: number } | null = null;
+    for (const path of [join(account.homePath, "auth.json"), join(this.vaultDirOf(account), "auth.json")]) {
+      const raw = readIfFile(path);
+      if (raw === null) continue;
+      let parsed: Record<string, unknown>;
+      try {
+        const value = JSON.parse(raw) as unknown;
+        if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+        parsed = value as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const tokens = parsed.tokens && typeof parsed.tokens === "object" && !Array.isArray(parsed.tokens)
+        ? (parsed.tokens as Record<string, unknown>)
+        : undefined;
+      const accessToken = tokens && typeof tokens.access_token === "string" ? tokens.access_token : undefined;
+      const expSeconds = accessToken ? expFromJwt(accessToken) : undefined;
+      if (expSeconds === undefined) continue;
+      if (!best || expSeconds > best.expSeconds) best = { parsed, expSeconds };
+    }
+    return best;
+  }
+
+  /**
+   * grok: ship auth.json (keyed by issuer::client; each entry may carry an
+   * OAuth `refresh_token` grok uses to self-refresh) with every refresh token
+   * blanked; the cached `key`/`expires_at` are preserved. The spawn side must
+   * scrub XAI_API_KEY / GROK_CODE_XAI_API_KEY for subscription bees so the
+   * delivered cached OAuth token — not developer API billing — is used.
+   */
+  private mintGrokLease(account: AccountRow): EphemeralCredential {
+    const parsed = this.leasePrimaryJson(account, "auth.json");
+    // Non-secret expiry: the soonest-dying entry bounds the whole lease —
+    // that is when RN7b must have re-delivered. Live files carry ISO strings;
+    // accept epoch numbers (ms or seconds) defensively.
+    let expiresAt: number | undefined;
+    for (const entry of Object.values(parsed as Record<string, unknown>)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const raw = (entry as Record<string, unknown>).expires_at;
+      const ms = typeof raw === "string" ? Date.parse(raw) : typeof raw === "number" ? (raw > 1e11 ? raw : raw * 1000) : Number.NaN;
+      if (!Number.isFinite(ms)) continue;
+      const seconds = Math.floor(ms / 1000);
+      if (expiresAt === undefined || seconds < expiresAt) expiresAt = seconds;
+    }
+    const body = `${JSON.stringify(blankRefreshTokens(parsed), null, 2)}\n`;
+    return {
+      files: [{ homeRelPath: "auth.json", contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+      kindNote: "grok: shipped auth.json with OAuth refresh token(s) blanked; scrub XAI_API_KEY and GROK_CODE_XAI_API_KEY on subscription spawns",
+    };
+  }
+
+  /**
+   * kimi: API-key lease per the design ruling — kimi's OAuth access tokens
+   * live ~15 minutes and its refresh token rotates on every grant, so an
+   * OAuth-only account cannot hold a lease across a satellite turn. A
+   * credential carrying an `api_key` ships (refresh blanked); an OAuth-only
+   * credential is a durable typed refusal.
+   */
+  private mintKimiLease(account: AccountRow): EphemeralCredential {
+    const parsed = this.leasePrimaryJson(account, "credentials/kimi-code.json");
+    const apiKey = (parsed as Record<string, unknown>).api_key;
+    if (typeof apiKey !== "string" || apiKey.length === 0) {
+      throw new LeaseRefusal(
+        "lease_unsupported",
+        `kimi account ${account.id} is OAuth-only (15-minute rotating tokens cannot survive a lease); log in with a Moonshot API key to lease it`,
+      );
+    }
+    const body = `${JSON.stringify(blankRefreshTokens(parsed), null, 2)}\n`;
+    return {
+      files: [{ homeRelPath: "credentials/kimi-code.json", contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+      kindNote: "kimi: shipped credentials/kimi-code.json as an API-key lease (OAuth refresh token blanked)",
+    };
+  }
+
+  /**
+   * opencode: auth.json multiplexes EVERY provider login in one object keyed
+   * by providerID. Ship ONLY the account's single coding-plan entry (the same
+   * closed provider list the limits probe reads), refresh blanked, every
+   * other provider's credential dropped. Never ships the multi-provider file.
+   */
+  private mintOpenCodeLease(account: AccountRow): EphemeralCredential {
+    const rel = join("xdg-data", "opencode", "auth.json");
+    const parsed = this.leasePrimaryJson(account, rel);
+    const providers = parsed as Record<string, unknown>;
+    const provider = OPENCODE_LEASE_PROVIDERS.find((id) => Object.prototype.hasOwnProperty.call(providers, id));
+    if (!provider) {
+      throw new LeaseRefusal(
+        "lease_unsupported",
+        `opencode account ${account.id} has no leasable coding-plan provider entry (${OPENCODE_LEASE_PROVIDERS.join(", ")})`,
+      );
+    }
+    const dropped = Object.keys(providers).length - 1;
+    const filtered = { [provider]: blankRefreshTokens(providers[provider]) };
+    const body = `${JSON.stringify(filtered, null, 2)}\n`;
+    return {
+      files: [{ homeRelPath: rel, contentB64: Buffer.from(body, "utf8").toString("base64"), mode: 0o600 }],
+      kindNote: `opencode: shipped single-provider (${provider}) auth.json (refresh blanked; ${dropped} other provider entr${dropped === 1 ? "y" : "ies"} dropped)`,
+    };
+  }
+
+  /**
+   * The account's primary credential file for a lease, HOME first (the live
+   * chain) then the vault snapshot, parsed as a JSON object. Typed refusals:
+   * missing anywhere → `lease_unavailable`; unparseable → `lease_unavailable`
+   * with a re-login hint. Never reads any other account's files.
+   */
+  private leasePrimaryJson(account: AccountRow, rel: string): unknown {
+    for (const path of [join(account.homePath, rel), join(this.vaultDirOf(account), rel)]) {
+      const raw = readIfFile(path);
+      if (raw === null) continue;
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      } catch {
+        // fall through to the typed refusal below
+      }
+      throw new LeaseRefusal("lease_unavailable", `${account.harness} credential ${rel} for ${account.id} is not a JSON object; re-login: hive v2 account login ${account.id}`);
+    }
+    throw new LeaseRefusal("lease_unavailable", `no ${rel} found for ${account.id}; log in: hive v2 account login ${account.id}`);
   }
 
   /**
