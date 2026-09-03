@@ -6,8 +6,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { TmuxDriver } from "../src/driver.ts";
 import { TmuxServer } from "../src/tmux.ts";
-import { drainUntil, kinds, makeRig, sleep } from "./helpers.ts";
+import { drainUntil, kinds, makeRig, sleep, waitForStubReady } from "./helpers.ts";
 import { pidAlive } from "../../driver-hsr/src/psutil.ts";
 
 test("tmux.roundtrip: spawn on the private socket, deliver, observe a full turn, clean @exit", async () => {
@@ -37,6 +40,76 @@ test("tmux.roundtrip: spawn on the private socket, deliver, observe a full turn,
     const exit = await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "exited"));
     assert.equal(exit.find((x) => x.kind === "exited")?.exitCause, "clean");
     assert.equal(rig.driver.hasProcess("bee-1", 1), false);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("tmux.agy-hooks: installs agy hooks and mirrors SQLite without lifecycle parsing", async () => {
+  const rig = makeRig({ sessionLogDir: true, deliveryGraceMs: 4_000 });
+  try {
+    const beeId = "agy-bee";
+    rig.configure(beeId, "agy-hooks");
+    rig.driver.start(beeId, 1);
+    await waitForStubReady(rig, beeId);
+    await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "booted"));
+
+    const hookWorkspace = join(rig.dir, "events", "agy-hooks", "agy-bee-g1");
+    assert.deepEqual(readdirSync(hookWorkspace), [".agents"]);
+    assert.deepEqual(readdirSync(join(hookWorkspace, ".agents")), ["hooks.json"]);
+    const hooksJson = join(hookWorkspace, ".agents", "hooks.json");
+    const hooks = readFileSync(hooksJson, "utf8");
+    assert.match(hooks, /turn_started/);
+    assert.match(hooks, /turn_ended/);
+
+    assert.equal(rig.driver.deliver(beeId, 1, 1, "agy mirror").accepted, true);
+    const turn = await drainUntil(
+      rig.driver,
+      (e) => e.some((x) => x.kind === "turn_started") && e.some((x) => x.kind === "turn_ended"),
+    );
+    assert.deepEqual(kinds(turn), ["turn_started", "turn_ended"]);
+    assert.deepEqual(rig.driver.observeDeliveryNotes(), []);
+
+    const logPath = rig.driver.sessionLogPath(beeId);
+    assert.ok(logPath);
+    let log = "";
+    for (let i = 0; i < 100; i += 1) {
+      rig.driver.observe();
+      if (existsSync(logPath)) {
+        log = readFileSync(logPath, "utf8");
+        if (log.includes("echo:agy mirror")) break;
+      }
+      await sleep(10);
+    }
+    assert.match(log, /"event":"user"/);
+    assert.match(log, /echo:agy mirror/);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("tmux.agy-sqlite: SQLite locators are rejected as lifecycle observers", () => {
+  const rig = makeRig();
+  try {
+    const driver = new TmuxDriver({
+      socketPath: rig.socketPath,
+      eventsDir: join(rig.dir, "bad-events"),
+      resolve: () => ({
+        command: "this-command-must-not-run",
+        args: [],
+        cwd: rig.dir,
+        observation: {
+          transcript: {
+            locator: { dir: rig.dir, match: /\.db$/, format: "agy-sqlite" },
+            parser: "grok",
+          },
+        },
+      }),
+      allowKillServer: true,
+    });
+    driver.start("bad-agy", 1);
+    assert.deepEqual(driver.observe(), [{ beeId: "bad-agy", generation: 1, kind: "exited", exitCause: "crashed" }]);
+    assert.equal(driver.hasProcess("bad-agy", 1), false);
   } finally {
     rig.cleanup();
   }

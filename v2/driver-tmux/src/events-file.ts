@@ -17,7 +17,7 @@
  *        the turn open; attention surfacing is a store/UI concern)
  *  - codex notify payloads (the argument codex passes its notify program):
  *      {"type":"agent-turn-complete", ...}         → turn_ended
- *  - the generic v2 shape, for stubs and future harnesses:
+ *  - the generic v2 shape, for stubs and harness-installed hooks such as agy:
  *      {"event":"turn_started"|"turn_ended"|"output"}
  */
 import type { TranscriptEvent } from "./transcripts.ts";

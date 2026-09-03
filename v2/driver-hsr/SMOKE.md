@@ -114,6 +114,17 @@ the live TUI.
   `config.toml` points `notify` at a helper that appends codex's
   `agent-turn-complete` payload to the events file. Only end-of-turn evidence
   exists, so the driver's pending-confirm synthesis supplies `turn_started`.
+- **agy tmux observation** — the daemon uses driver-installed generic v2 events
+  from agy command hooks as lifecycle truth. The driver creates a per-bee,
+  per-generation added workspace under its runtime files and passes it with
+  `--add-dir`; agy sees that path as a workspace. Live probes on 2026-09-03
+  showed agy loads hooks from `<added-workspace>/.agents/hooks.json`, while
+  root-level `hooks.json` did not load. Keep that added workspace empty except
+  `.agents/hooks.json`; it must not contain source, tokens, or helper scripts.
+  `history.jsonl` is prompt history only, and the Antigravity SQLite DB is used
+  only to render `hive transcript`, never for turn or idle detection. If hooks
+  cannot run, agy must still pass A3 through pane fallback; transcript-only is
+  not a real agy lifecycle style.
 - The contrary-evidence flag-clear path is NOT covered here: the tmux driver
   has no evidence channel (flags are an adapter-stream concern, HSR smoke
   step 6) — nothing to test on this surface.

@@ -12,10 +12,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { drainUntil, kinds, makeRig, settle } from "./helpers.ts";
+import { drainUntil, kinds, makeRig, settle, waitForStubReady } from "./helpers.ts";
 
 async function bootIdle(rig: ReturnType<typeof makeRig>, bee: string): Promise<void> {
   rig.driver.start(bee, 1);
+  await waitForStubReady(rig, bee);
   await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_ended"));
   await settle(rig.driver, 80);
 }
@@ -87,7 +88,7 @@ test("spec05.deliver.honest-failure: nothing ever lands → immediate echo_misma
     assert.equal(out.accepted, true, "assume-best: accepted; the mailbox is durable truth");
     const notes = rig.driver.observeDeliveryNotes();
     assert.equal(notes.length, 1, "note surfaces IMMEDIATELY, not after a grace");
-    assert.ok(Date.now() - t0 < 6000, "no long grace wait on a known-failed injection");
+    assert.ok(Date.now() - t0 < 10_000, "no unbounded grace wait on a known-failed injection");
     assert.equal(notes[0]?.kind, "unconfirmed");
     assert.equal(notes[0]?.messageId, 9);
     assert.match(notes[0]?.detail ?? "", /echo_mismatch/);

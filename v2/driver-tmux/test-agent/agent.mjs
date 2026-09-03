@@ -12,11 +12,17 @@
  *               $HIVE_EVENTS_FILE (agent-turn-complete) + a codex-format
  *               transcript (its task_complete is the explicit end)
  *   transcript  transcript file ONLY (the A3 equal-treatment case)
+ *   agy-hooks   agy-shaped generic HIVE_EVENTS_FILE lifecycle events plus a
+ *               SQLite transcript mirror; PreInvocation/PostInvocation may
+ *               repeat within one turn, Stop ends it.
+ *   agy-pane-fallback
+ *               agy-shaped SQLite transcript mirror plus pane fallback only;
+ *               no lifecycle is parsed from the DB.
  *   silent      no files at all — pane output only (source (c) fallback)
  *
  * Transcript format — env TMUX_STUB_TRANSCRIPT: claude | codex | grok
- * (default: claude for hooks style, codex for notify style, grok for
- * transcript style — mirroring the harnesses those styles model).
+ * (default: claude for hooks style, codex for notify style, agy-sqlite for
+ * agy styles, grok otherwise — mirroring the harnesses those styles model).
  *
  * Other env: TMUX_STUB_TRANSCRIPT_DIR (where transcripts go),
  * TMUX_STUB_TURN_MS (default 40), TMUX_STUB_IGNORE_SIGTERM=1,
@@ -49,9 +55,11 @@
  * the completion evidence; idle: ignored (never exits).
  */
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
+const require = createRequire(import.meta.url);
 const env = process.env;
 const style = env.TMUX_STUB_STYLE || "transcript";
 const turnMs = Number(env.TMUX_STUB_TURN_MS || "40");
@@ -59,13 +67,58 @@ const sessionId = `stub-${process.pid}`;
 const eventsFile = env.HIVE_EVENTS_FILE || "";
 const transcriptDir = env.TMUX_STUB_TRANSCRIPT_DIR || "";
 const format =
-  env.TMUX_STUB_TRANSCRIPT || (style === "hooks" ? "claude" : style === "notify" ? "codex" : "grok");
+  env.TMUX_STUB_TRANSCRIPT
+  || (style === "hooks"
+    ? "claude"
+    : style === "notify"
+      ? "codex"
+      : style === "agy-hooks" || style === "agy-pane-fallback"
+        ? "agy-sqlite"
+        : "grok");
 
 if (env.TMUX_STUB_IGNORE_SIGTERM === "1") {
   process.on("SIGTERM", () => console.log("ignoring SIGTERM"));
 }
 
 let transcriptPath = null;
+let agyDb = null;
+let agyStepIdx = 0;
+
+function varint(value) {
+  const bytes = [];
+  let next = value;
+  do {
+    let byte = next & 0x7f;
+    next = Math.floor(next / 128);
+    if (next > 0) byte |= 0x80;
+    bytes.push(byte);
+  } while (next > 0);
+  return Buffer.from(bytes);
+}
+
+function messageField(field, payload) {
+  return Buffer.concat([varint((field * 8) + 2), varint(payload.length), payload]);
+}
+
+function stringField(field, text) {
+  return messageField(field, Buffer.from(text, "utf8"));
+}
+
+function agyUserPayload(text) {
+  return messageField(19, Buffer.concat([stringField(2, text), messageField(3, stringField(1, text))]));
+}
+
+function agyAssistantPayload(text) {
+  return messageField(20, Buffer.concat([stringField(1, text), stringField(8, text)]));
+}
+
+function agyStep(stepType, status, payload) {
+  if (agyDb == null) return;
+  agyDb.prepare("insert into steps (idx, step_type, status, step_payload) values (?, ?, ?, ?)")
+    .run(agyStepIdx, stepType, status, payload);
+  agyStepIdx += 1;
+}
+
 function initTranscript() {
   if (style === "silent" || !transcriptDir) return;
   mkdirSync(transcriptDir, { recursive: true });
@@ -78,6 +131,42 @@ function initTranscript() {
       transcriptPath,
       `${JSON.stringify({ timestamp: new Date().toISOString(), type: "session_meta", payload: { id: sessionId, cwd: process.cwd() } })}\n`,
     );
+  } else if (format === "agy-sqlite") {
+    transcriptPath = join(transcriptDir, `${sessionId}.db`);
+    const { DatabaseSync } = require("node:sqlite");
+    agyDb = new DatabaseSync(transcriptPath);
+    agyDb.exec(`
+      create table trajectory_meta (
+        trajectory_id text,
+        cascade_id text,
+        trajectory_type integer,
+        source integer,
+        primary key (trajectory_id)
+      );
+      create table steps (
+        idx integer,
+        step_type integer not null default 0,
+        status integer not null default 0,
+        has_subtrajectory numeric not null default false,
+        metadata blob,
+        error_details blob,
+        permissions blob,
+        task_details blob,
+        render_info blob,
+        step_payload blob,
+        step_format integer not null default 0,
+        primary key (idx)
+      );
+      create table trajectory_metadata_blob (
+        id text default "main",
+        data blob,
+        primary key (id)
+      );
+    `);
+    agyDb.prepare("insert into trajectory_meta (trajectory_id, cascade_id, trajectory_type, source) values (?, ?, ?, ?)")
+      .run(`trajectory-${sessionId}`, sessionId, 4, 17);
+    agyDb.prepare("insert into trajectory_metadata_blob (id, data) values (?, ?)")
+      .run("main", Buffer.from(`file://${process.cwd()}`, "utf8"));
   } else {
     const dir = join(transcriptDir, sessionId);
     mkdirSync(dir, { recursive: true });
@@ -97,9 +186,17 @@ function hookEvent(obj) {
   appendFileSync(eventsFile, `${JSON.stringify(obj)}\n`);
 }
 
+function agyInvocationEvents() {
+  if (style !== "agy-hooks") return;
+  hookEvent({ event: "turn_started" });
+  hookEvent({ event: "output" });
+}
+
 function userRow(body) {
   const ts = new Date().toISOString();
-  if (format === "claude") {
+  if (format === "agy-sqlite") {
+    agyStep(14, 3, agyUserPayload(body));
+  } else if (format === "claude") {
     transcript({ type: "user", timestamp: ts, sessionId, message: { role: "user", content: body } });
   } else if (format === "codex") {
     transcript({ timestamp: ts, type: "turn_context", payload: { model: "stub" } });
@@ -116,7 +213,9 @@ function userRow(body) {
 
 function assistantRow(text) {
   const ts = new Date().toISOString();
-  if (format === "claude") {
+  if (format === "agy-sqlite") {
+    agyStep(15, 3, agyAssistantPayload(text));
+  } else if (format === "claude") {
     transcript({
       type: "assistant",
       timestamp: ts,
@@ -133,6 +232,8 @@ function assistantRow(text) {
 function completion() {
   if (style === "hooks") {
     hookEvent({ hook_event_name: "Stop", session_id: sessionId });
+  } else if (style === "agy-hooks") {
+    hookEvent({ event: "turn_ended" });
   } else if (style === "notify") {
     hookEvent({ type: "agent-turn-complete", "turn-id": sessionId, "last-assistant-message": "done" });
   } else if (format === "codex") {
@@ -166,12 +267,14 @@ function workNext() {
   busy = true;
   userRow(body);
   if (style === "hooks") hookEvent({ hook_event_name: "UserPromptSubmit", session_id: sessionId });
+  agyInvocationEvents();
   if (body.includes("@hang")) return; // never completes until Ctrl-C
   turnTimer = setTimeout(() => {
     turnTimer = null;
     if (body.includes("@crash")) process.exit(9);
     console.log(`echo:${body}`);
     assistantRow(`echo:${body}`);
+    agyInvocationEvents();
     completion();
     busy = false;
     if (env.TMUX_STUB_SWALLOW_PASTE_AFTER_TURN === "1") swallowNextPaste = true;
@@ -185,6 +288,9 @@ function workNext() {
 
 initTranscript();
 console.log(`stub ready (${style}/${format})`);
+process.on("exit", () => {
+  if (agyDb != null) agyDb.close();
+});
 
 const dropPaste = env.TMUX_STUB_DROP_PASTE === "1";
 const eatFirst = Number(env.TMUX_STUB_EAT_FIRST || "0");

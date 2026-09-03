@@ -45,3 +45,31 @@ test("tmux.claude/codex: paste delivery; skip-permissions default; homes from en
   assert.equal(codex.transcript?.parser, "codex");
   assert.equal(codex.transcript?.locator.dir, join("/homes/codex-x", "sessions"));
 });
+
+test("tmux.agy: paste delivery, hooks lifecycle, HOME-scoped sqlite mirror, unattended default, HSR plumbing off", () => {
+  assert.equal(tmuxDeliveryMode("agy"), "paste");
+  assert.deepEqual(tmuxArgsFor("agy", ["--model", "gemini-3.8-flash", "--effort", "high"]), [
+    "--dangerously-skip-permissions", "--model", "gemini-3.8-flash", "--effort", "high",
+  ]);
+  assert.deepEqual(tmuxArgsFor("agy", ["--dangerously-skip-permissions"]), ["--dangerously-skip-permissions"]);
+  const spec = tmuxSpawnSpec(BUILTIN_AGENTS.agy!, {
+    agent: "agy",
+    cwd: "/Users/trmd/work/agy-project",
+    args: ["--model", "gemini-3.8-flash"],
+    env: { HOME: "/homes/agy-x", SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1" },
+  });
+  assert.equal(spec.command, "agy");
+  assert.equal(spec.deliveryMode, "paste");
+  assert.ok(!spec.args.includes("--print="));
+  assert.ok(!spec.args.includes("--input-format"));
+  assert.ok(!spec.args.includes("--output-format"));
+  assert.equal(spec.observation.hooks?.kind, "agy");
+  assert.equal(spec.observation.explicitTurnEnd, true);
+  assert.equal(spec.observation.transcript, undefined);
+  const mirror = spec.observation.transcriptMirror;
+  assert.equal(mirror?.locator.dir, join("/homes/agy-x", ".gemini", "antigravity-cli", "conversations"));
+  assert.equal(String(mirror?.locator.match), String(/\.db$/));
+  assert.equal(mirror?.locator.format, "agy-sqlite");
+  assert.ok(mirror?.locator.containsAny?.includes("/Users/trmd/work/agy-project"));
+  assert.ok(mirror?.locator.containsAny?.includes("file:///Users/trmd/work/agy-project"));
+});
