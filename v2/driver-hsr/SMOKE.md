@@ -121,6 +121,18 @@ the live TUI.
   showed agy loads hooks from `<added-workspace>/.agents/hooks.json`, while
   root-level `hooks.json` did not load. Keep that added workspace empty except
   `.agents/hooks.json`; it must not contain source, tokens, or helper scripts.
+  Before launching the TUI, the driver adds both the bee cwd and the hook
+  workspace to agy's `$HOME/.gemini/antigravity-cli/settings.json`
+  `trustedWorkspaces` array. The merge only appends missing entries and
+  preserves other settings. This is required because
+  `--dangerously-skip-permissions` does not bypass agy's workspace trust
+  dialog; an untrusted workspace can swallow pasted mail before any hook event
+  or transcript exists. agy tmux also has a bounded boot-readiness probe: the
+  driver waits up to 45s for the `? for shortcuts` input prompt before
+  reporting booted/idle. If a trust dialog is observed despite the pre-seed
+  (`Do you trust the contents of this project?` / `Yes, I trust this folder`),
+  the driver sends Enter once; an unanswered dialog or missing prompt is a
+  boot failure, not idle.
   `history.jsonl` is prompt history only, and the Antigravity SQLite DB is used
   only to render `hive transcript`, never for turn or idle detection. If hooks
   cannot run, agy must still pass A3 through pane fallback; transcript-only is

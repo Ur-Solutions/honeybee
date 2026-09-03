@@ -6,9 +6,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { TmuxDriver } from "../src/driver.ts";
+import { canonicalCwd } from "../src/transcripts.ts";
 import { TmuxServer } from "../src/tmux.ts";
 import { drainUntil, kinds, makeRig, sleep, waitForStubReady } from "./helpers.ts";
 import { pidAlive } from "../../driver-hsr/src/psutil.ts";
@@ -49,7 +50,22 @@ test("tmux.agy-hooks: installs agy hooks and mirrors SQLite without lifecycle pa
   const rig = makeRig({ sessionLogDir: true, deliveryGraceMs: 4_000 });
   try {
     const beeId = "agy-bee";
-    rig.configure(beeId, "agy-hooks");
+    const agyHome = join(rig.dir, "agy-home");
+    const settingsDir = join(agyHome, ".gemini", "antigravity-cli");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(
+      join(settingsDir, "settings.json"),
+      `${JSON.stringify(
+        {
+          enableTelemetry: false,
+          model: "Gemini 3.8 Flash (High)",
+          trustedWorkspaces: ["/already-trusted"],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    rig.configure(beeId, "agy-hooks", { HOME: agyHome });
     rig.driver.start(beeId, 1);
     await waitForStubReady(rig, beeId);
     await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "booted"));
@@ -61,6 +77,17 @@ test("tmux.agy-hooks: installs agy hooks and mirrors SQLite without lifecycle pa
     const hooks = readFileSync(hooksJson, "utf8");
     assert.match(hooks, /turn_started/);
     assert.match(hooks, /turn_ended/);
+
+    const settings = JSON.parse(readFileSync(join(settingsDir, "settings.json"), "utf8")) as {
+      enableTelemetry: boolean;
+      model: string;
+      trustedWorkspaces: string[];
+    };
+    assert.equal(settings.enableTelemetry, false);
+    assert.equal(settings.model, "Gemini 3.8 Flash (High)");
+    for (const expected of ["/already-trusted", rig.dir, canonicalCwd(rig.dir), hookWorkspace, canonicalCwd(hookWorkspace)]) {
+      assert.ok(settings.trustedWorkspaces.includes(expected), `trustedWorkspaces missing ${expected}`);
+    }
 
     assert.equal(rig.driver.deliver(beeId, 1, 1, "agy mirror").accepted, true);
     const turn = await drainUntil(
@@ -83,6 +110,92 @@ test("tmux.agy-hooks: installs agy hooks and mirrors SQLite without lifecycle pa
     }
     assert.match(log, /"event":"user"/);
     assert.match(log, /echo:agy mirror/);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("tmux.agy-trust: malformed trustedWorkspaces refuses boot before a modal-blocked TUI can idle", () => {
+  const rig = makeRig();
+  try {
+    const beeId = "bad-trust";
+    const agyHome = join(rig.dir, "bad-agy-home");
+    const settingsDir = join(agyHome, ".gemini", "antigravity-cli");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, "settings.json"), '{"trustedWorkspaces":{}}\n');
+    rig.configure(beeId, "agy-hooks", { HOME: agyHome });
+
+    rig.driver.start(beeId, 1);
+
+    assert.deepEqual(rig.driver.observe(), [{ beeId, generation: 1, kind: "exited", exitCause: "crashed" }]);
+    assert.equal(rig.driver.hasProcess(beeId, 1), false);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("tmux.agy-boot-ready: booted/idle waits for the agy input prompt", () => {
+  const rig = makeRig();
+  try {
+    const beeId = "agy-ready";
+    const driver = new TmuxDriver({
+      socketPath: rig.socketPath,
+      eventsDir: join(rig.dir, "ready-events"),
+      resolve: () => ({
+        command: process.execPath,
+        args: [
+          "-e",
+          "setTimeout(() => { console.log('agy banner'); console.log('? for shortcuts Gemini 3.8 Flash · high'); }, 450); process.stdin.resume();",
+          "--",
+        ],
+        cwd: rig.dir,
+        env: { HOME: join(rig.dir, "ready-home") },
+        observation: { hooks: { kind: "agy" }, bootReady: { kind: "agy-tui", timeoutMs: 5_000 } },
+      }),
+      allowKillServer: true,
+    });
+
+    const started = Date.now();
+    driver.start(beeId, 1);
+
+    assert.ok(Date.now() - started >= 300, "booted/idle was emitted before the agy prompt appeared");
+    assert.deepEqual(kinds(driver.observe()), ["booted", "turn_ended"]);
+    driver.disposeAll();
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test("tmux.agy-boot-ready: unanswered workspace trust dialog is a boot failure, not idle", () => {
+  const rig = makeRig();
+  try {
+    const beeId = "agy-trust-dialog";
+    const driver = new TmuxDriver({
+      socketPath: rig.socketPath,
+      eventsDir: join(rig.dir, "dialog-events"),
+      resolve: () => ({
+        command: "/bin/sh",
+        args: [
+          "-c",
+          "printf '%s\\n%s\\n' 'Do you trust the contents of this project?' 'Yes, I trust this folder'; sleep 60",
+          "agy-trust-dialog",
+        ],
+        cwd: rig.dir,
+        env: { HOME: join(rig.dir, "dialog-home") },
+        observation: { hooks: { kind: "agy" }, bootReady: { kind: "agy-tui", timeoutMs: 1_000 } },
+      }),
+      allowKillServer: true,
+    });
+
+    driver.start(beeId, 1);
+
+    const events = driver.observe();
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.kind, "exited");
+    assert.equal(events[0]?.exitCause, "crashed");
+    assert.match(events[0]?.detail ?? "", /workspace trust dialog/);
+    assert.equal(driver.hasProcess(beeId, 1), false);
+    driver.disposeAll();
   } finally {
     rig.cleanup();
   }

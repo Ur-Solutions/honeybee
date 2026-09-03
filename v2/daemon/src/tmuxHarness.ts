@@ -62,8 +62,15 @@ export function tmuxObservationFor(bee: TmuxBee): ObservationSpec {
         // The tmux driver injects agy lifecycle hooks by adding a per-bee,
         // driver-owned workspace via `--add-dir`. agy requires the hook config
         // at `<added-workspace>/.agents/hooks.json`; that workspace contains no
-        // source tree, tokens, or helper scripts. SQLite is a render-only mirror.
+        // source tree, tokens, or helper scripts. Before launch the driver
+        // also pre-seeds agy's trustedWorkspaces for both the bee cwd and that
+        // hook workspace because `--dangerously-skip-permissions` does not
+        // bypass agy's workspace trust dialog. The driver waits for agy's
+        // `? for shortcuts` input prompt before reporting booted/idle, so
+        // first-turn mail cannot be pasted into a boot modal or cold input
+        // loop. SQLite is a render-only mirror.
         hooks: { kind: "agy" },
+        bootReady: { kind: "agy-tui" },
         explicitTurnEnd: true,
         transcriptMirror: {
           locator: {

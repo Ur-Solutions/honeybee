@@ -64,6 +64,7 @@ test("tmux.agy: paste delivery, hooks lifecycle, HOME-scoped sqlite mirror, unat
   assert.ok(!spec.args.includes("--input-format"));
   assert.ok(!spec.args.includes("--output-format"));
   assert.equal(spec.observation.hooks?.kind, "agy");
+  assert.equal(spec.observation.bootReady?.kind, "agy-tui");
   assert.equal(spec.observation.explicitTurnEnd, true);
   assert.equal(spec.observation.transcript, undefined);
   const mirror = spec.observation.transcriptMirror;

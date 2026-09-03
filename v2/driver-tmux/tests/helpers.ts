@@ -97,6 +97,9 @@ export function makeRig(opts: { sessionLogDir?: boolean; deliveryGraceMs?: numbe
   const transcriptDirOf = (beeId: string): string => join(dir, "tx", beeId);
   const resolve = (beeId: string): TmuxSpawnSpec => {
     const cfg = styles.get(beeId) ?? { style: "transcript" as StubStyle, env: {} };
+    const styleHome: Record<string, string> = cfg.style.startsWith("agy-")
+      ? { HOME: join(dir, "homes", beeId) }
+      : {};
     return {
       command: process.execPath,
       args: [AGENT_PATH],
@@ -105,6 +108,7 @@ export function makeRig(opts: { sessionLogDir?: boolean; deliveryGraceMs?: numbe
         TMUX_STUB_STYLE: cfg.style,
         TMUX_STUB_TRANSCRIPT_DIR: transcriptDirOf(beeId),
         TMUX_STUB_TURN_MS: "20",
+        ...styleHome,
         ...cfg.env,
       },
       ...(cfg.deliveryMode ? { deliveryMode: cfg.deliveryMode } : {}),
@@ -178,7 +182,7 @@ export async function settle(driver: TmuxDriver, ms: number): Promise<DriverObse
 export async function waitForStubReady(rig: TmuxRig, beeId: string, generation = 1): Promise<void> {
   const server = new TmuxServer({ socketPath: rig.socketPath });
   const pane = exactPaneTarget(sessionNameFor(beeId, generation));
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
     const res = server.try(["capture-pane", "-p", "-t", pane]);
     if (res.status === 0 && res.stdout.includes("stub ready")) return;

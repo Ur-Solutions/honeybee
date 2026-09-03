@@ -36,8 +36,8 @@
  *    session by verified pid and re-attaches observers at EOF — the runtime
  *    stays fully deliverable (tmux runtimes are never "degraded").
  */
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import type {
   DeliverOutcome,
@@ -53,6 +53,7 @@ import { AgySqliteTail } from "./agy-sqlite-tail.ts";
 import { JsonlTail } from "./tail.ts";
 import { parseEventsFileLine } from "./events-file.ts";
 import {
+  canonicalCwd,
   findTranscript,
   TRANSCRIPT_PARSERS,
   type TranscriptEvent,
@@ -70,6 +71,8 @@ export interface ObservationSpec {
   transcriptMirror?: { locator: TranscriptLocator };
   /** Driver-installed hook roots for harnesses whose lifecycle comes from HIVE_EVENTS_FILE. */
   hooks?: { kind: "agy" };
+  /** Bounded TUI boot readiness checks for harnesses where prompt readiness is not immediate. */
+  bootReady?: { kind: "agy-tui"; timeoutMs?: number };
   /** Suppress quiescence end detection when hooks/notify provide explicit end events. */
   explicitTurnEnd?: boolean;
   /** Source (c): pane-content change detection. Only for file-less harnesses. */
@@ -187,6 +190,13 @@ const TYPE_CHUNK_GAP_MS = 50;
 const ECHO_TAIL_CHARS = 24;
 const ECHO_VERIFY_TIMEOUT_MS = 2_000;
 const ECHO_VERIFY_POLL_MS = 100;
+const AGY_BOOT_READY_TIMEOUT_MS = 45_000;
+const AGY_BOOT_READY_POLL_MS = 100;
+const AGY_BOOT_TRUST_PROMPTS = [
+  "Do you trust the contents of this project?",
+  "Yes, I trust this folder",
+] as const;
+const AGY_BOOT_READY_PROMPTS = ["? for shortcuts"] as const;
 
 /** Synchronous sleep — the driver is fully synchronous (spawnSync tmux). */
 function sleepSync(ms: number): void {
@@ -232,6 +242,64 @@ function safePathSegment(value: string): string {
 function agyEventHookCommand(event: "turn_started" | "turn_ended" | "output"): string {
   const payload = JSON.stringify({ event });
   return `if [ -n "$HIVE_EVENTS_FILE" ]; then printf '%s\\n' '${payload}' >> "$HIVE_EVENTS_FILE"; fi; printf '{}\\n'`;
+}
+
+function jsonObject(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function agyTrustPaths(path: string): string[] {
+  const out: string[] = [];
+  for (const candidate of [path, canonicalCwd(path)]) {
+    if (candidate.length > 0 && !out.includes(candidate)) out.push(candidate);
+  }
+  return out;
+}
+
+function atomicWriteFileSync(path: string, content: string, mode = 0o600): void {
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, content, { mode });
+  renameSync(tmp, path);
+}
+
+function seedAgyTrustedWorkspaces(home: string, workspaces: readonly string[]): void {
+  const settingsPath = join(home, ".gemini", "antigravity-cli", "settings.json");
+  let settings: Record<string, unknown> = {};
+  let existing = "";
+  if (existsSync(settingsPath)) {
+    existing = readFileSync(settingsPath, "utf8");
+    if (existing.trim().length > 0) {
+      const parsed = jsonObject(JSON.parse(existing));
+      if (parsed == null) throw new Error(`tmux driver: agy settings must be a JSON object (${settingsPath})`);
+      settings = parsed;
+    }
+  }
+
+  const rawTrusted = settings.trustedWorkspaces;
+  let trusted: string[];
+  if (rawTrusted === undefined) {
+    trusted = [];
+  } else if (Array.isArray(rawTrusted) && rawTrusted.every((entry) => typeof entry === "string")) {
+    trusted = [...rawTrusted];
+  } else {
+    throw new Error(`tmux driver: agy settings trustedWorkspaces must be a string array (${settingsPath})`);
+  }
+
+  let changed = false;
+  for (const workspace of workspaces) {
+    for (const trustedPath of agyTrustPaths(workspace)) {
+      if (trusted.includes(trustedPath)) continue;
+      trusted.push(trustedPath);
+      changed = true;
+    }
+  }
+  if (!changed && rawTrusted !== undefined) return;
+
+  settings.trustedWorkspaces = trusted;
+  const next = `${JSON.stringify(settings, null, 2)}\n`;
+  if (next === existing) return;
+  mkdirSync(dirname(settingsPath), { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(settingsPath, next);
 }
 
 export class TmuxDriver implements RuntimeDriver {
@@ -333,6 +401,19 @@ export class TmuxDriver implements RuntimeDriver {
       // through the daemon's spawn-retry path exactly like HSR.
       this.tryKillSession(sessionName);
       this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
+    try {
+      this.waitForBootReady(spec.observation, sessionName, pid);
+    } catch (err) {
+      this.tryKillSession(sessionName);
+      this.events.push({
+        beeId,
+        generation,
+        kind: "exited",
+        exitCause: "crashed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
       return;
     }
     let runtime: TmuxRuntime;
@@ -647,6 +728,9 @@ export class TmuxDriver implements RuntimeDriver {
     this.validateObservation(spec.observation);
     if (spec.observation.hooks?.kind !== "agy") return spec.args;
     const root = this.installAgyHooks(beeId, generation);
+    const home = spec.env?.HOME ?? process.env.HOME;
+    if (home == null || home.length === 0) throw new Error("tmux driver: agy HOME is required for workspace trust seeding");
+    seedAgyTrustedWorkspaces(home, [spec.cwd, root]);
     return [...spec.args, "--add-dir", root];
   }
 
@@ -692,6 +776,37 @@ export class TmuxDriver implements RuntimeDriver {
       )}\n`,
     );
     return root;
+  }
+
+  private waitForBootReady(obs: ObservationSpec, sessionName: string, pid: number): void {
+    if (obs.bootReady?.kind !== "agy-tui") return;
+    const timeoutMs = obs.bootReady.timeoutMs ?? AGY_BOOT_READY_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+    const target = exactPaneTarget(sessionName);
+    let trustSubmitted = false;
+    let sawTrustDialog = false;
+    for (;;) {
+      if (!pidAlive(pid)) throw new Error("tmux driver: agy TUI exited before its input prompt appeared");
+      const captured = this.server.try(["capture-pane", "-p", "-t", target]);
+      if (captured.status !== 0) throw new Error("tmux driver: agy TUI pane disappeared before boot readiness");
+      const text = captured.stdout;
+      const trustDialog = AGY_BOOT_TRUST_PROMPTS.some((prompt) => text.includes(prompt));
+      if (trustDialog) {
+        sawTrustDialog = true;
+        if (!trustSubmitted) {
+          trustSubmitted = true;
+          this.server.try(["send-keys", "-t", target, "Enter"]);
+        }
+      }
+      if (AGY_BOOT_READY_PROMPTS.some((prompt) => text.includes(prompt))) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `tmux driver: agy TUI did not reach its input prompt within ${timeoutMs}ms` +
+            (sawTrustDialog ? " after a workspace trust dialog was observed" : ""),
+        );
+      }
+      sleepSync(AGY_BOOT_READY_POLL_MS);
+    }
   }
 
   // --- delivery ground truth (invariant gate) ------------------------------
