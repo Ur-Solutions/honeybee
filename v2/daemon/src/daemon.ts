@@ -118,6 +118,7 @@ import {
   SPAWN_SUBSTRATES,
   type AccountAddResult,
   type AccountBackfillResult,
+  type AccountLeaseResult,
   type AccountCaptureResult,
   type AccountLoginCancelResult,
   type AccountLoginGetResult,
@@ -900,6 +901,11 @@ export class HiveDaemon {
         return this.withIdempotency(verb, params, () => this.rpcAccountImportRegistry(params));
       case "account.backfill":
         return this.withIdempotency(verb, params, () => this.rpcAccountBackfill(params));
+      // SENSITIVE — deliberately NO idempotency wrapper: recording the result
+      // would persist secret bytes in the store. The result is the only place
+      // the lease material appears.
+      case "account.lease":
+        return this.rpcAccountLease(params);
       case "send":
         return this.withIdempotency(verb, params, () => this.rpcSend(params));
       case "mail.cancel": {
@@ -2389,6 +2395,29 @@ export class HiveDaemon {
 
   private rpcAccountBackfill(params: Record<string, unknown>): AccountBackfillResult {
     return this.mustAccounts().backfillBeeAccounts({ dryRun: params.dryRun === true });
+  }
+
+  /**
+   * v19: `account.lease {account, harness?}` — the credential-lease mint
+   * (RN7a). SENSITIVE: the result carries secret bytes and is the ONLY place
+   * they appear — no idempotency record, no audit row, no log line with
+   * material; AccountsService.mintLease logs a secret-free summary only.
+   */
+  private async rpcAccountLease(params: Record<string, unknown>): Promise<AccountLeaseResult> {
+    const account = this.requireAccount(params, "account");
+    if (params.harness !== undefined && params.harness !== null) {
+      const harness = this.param(params, "harness");
+      if (harness !== account.harness) {
+        throw new RpcError("harness_mismatch", `account ${account.id} is a ${account.harness} account, not ${harness}`);
+      }
+    }
+    // A paused account is the operator saying "place no new work on this";
+    // leasing it to a satellite is exactly that.
+    if (account.status === "paused") {
+      throw new RpcError("account_paused", `account ${account.id} is paused; unpause it before leasing`);
+    }
+    const lease = await this.mustAccounts().mintLease(account);
+    return { account: account.id, harness: account.harness, ...lease };
   }
 
   /**
