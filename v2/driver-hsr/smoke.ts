@@ -5,6 +5,7 @@
  *   npm run v2:smoke -- claude [--model m]   # real claude CLI from PATH
  *   npm run v2:smoke -- codex  [--model m]   # real codex app-server from PATH
  *   npm run v2:smoke -- grok   [--model m]   # real grok agent stdio from PATH
+ *   npm run v2:smoke -- agy    [--model m]   # real agy print mode from PATH
  *
  * Spawns ONE real bee (plus one short-lived boot-delivery bee), runs two short
  * turns, stops it, and prints a ✓/✗ checklist. Delivery uses daemon semantics:
@@ -17,7 +18,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HsrDriver, type SpawnSpec } from "./src/index.ts";
-import { claudeAdapter, codexAdapter, grokAdapter, grokSpawnPlan, stubAdapter } from "../adapters/src/index.ts";
+import { agyAdapter, claudeAdapter, codexAdapter, grokAdapter, grokSpawnPlan, stubAdapter } from "../adapters/src/index.ts";
 import type { DeliverOutcome, DriverObservation } from "../harness/src/driver.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -25,8 +26,8 @@ const harness = process.argv[2];
 const modelFlag = process.argv.indexOf("--model");
 const model = modelFlag > 0 ? process.argv[modelFlag + 1] : undefined;
 
-if (!harness || !["stub", "claude", "codex", "grok"].includes(harness)) {
-  console.error("usage: npm run v2:smoke -- <stub|claude|codex|grok> [--model <m>]");
+if (!harness || !["stub", "agy", "claude", "codex", "grok"].includes(harness)) {
+  console.error("usage: npm run v2:smoke -- <stub|agy|claude|codex|grok> [--model <m>]");
   process.exit(2);
 }
 
@@ -36,6 +37,21 @@ const cwd = mkdtempSync(join(tmpdir(), "hive-smoke-cwd-"));
 
 function specFor(): SpawnSpec {
   switch (harness) {
+    case "agy":
+      return {
+        adapter: agyAdapter,
+        command: "agy",
+        args: [
+          "--print=",
+          "--input-format", "stream-json",
+          "--output-format", "stream-json",
+          "--dangerously-skip-permissions",
+          "--print-timeout", "12h",
+          ...(model ? ["--model", model] : []),
+        ],
+        cwd,
+        env: { ...(process.env as Record<string, string>), AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
+      };
     case "claude":
       return {
         adapter: claudeAdapter,

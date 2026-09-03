@@ -54,6 +54,7 @@ export function defaultWritablePaths(home: string = homedir()): string[] {
     join(home, ".claude"),
     join(home, ".claude.json"),
     join(home, ".codex"),
+    join(home, ".gemini"),
     join(home, ".grok"),
     join(home, ".config"),
     join(home, ".cache"),

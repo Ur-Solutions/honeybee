@@ -79,6 +79,8 @@ import { SubstrateRouter } from "./substrates.ts";
 import { TmuxDriver, claudeProjectKey } from "../../driver-tmux/src/index.ts";
 import { tmuxSpawnSpec } from "./tmuxHarness.ts";
 import {
+  agyAdapter,
+  agyArgGrammar,
   claudeAdapter,
   claudeArgGrammar,
   codexAdapter,
@@ -189,7 +191,7 @@ import {
   type ViewResult,
 } from "./protocol.ts";
 
-const ADAPTER_NAMES = ["claude", "codex", "grok", "stub"] as const;
+const ADAPTER_NAMES = ["agy", "claude", "codex", "grok", "stub"] as const;
 
 /**
  * Adapter for a bee. `providerSessionId` (bee row, spec 07 §F) selects the
@@ -210,6 +212,8 @@ function adapterFor(
   grokMcpServers: readonly GrokMcpServerStdio[] = [],
 ): HarnessAdapter | null {
   switch (name) {
+    case "agy":
+      return agyAdapter;
     case "claude":
       return claudeAdapter;
     case "codex":
@@ -235,6 +239,8 @@ function adapterFor(
 const NO_GRAMMAR: ArgGrammar = { valueFlags: new Set(), booleanFlags: new Set(), keyedFlags: new Set(), aliases: {} };
 function grammarFor(adapterName: string): ArgGrammar {
   switch (adapterName) {
+    case "agy":
+      return agyArgGrammar;
     case "claude":
       return claudeArgGrammar;
     case "codex":

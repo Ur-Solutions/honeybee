@@ -138,7 +138,7 @@ export function helpText(version = "v2"): string {
   ${dim("(`hive v2 …` still works — it is the same CLI.)")}`;
 
   const bees = `${bold(yellow("Bees:"))}
-  ${blue("claude")}, ${blue("codex")}, ${blue("grok")}, stub — or any agent the node has configured
+  ${blue("agy")}, ${blue("claude")}, ${blue("codex")}, ${blue("grok")}, stub — or any agent the node has configured
   ${dim("resolve a bee by handle (CL.a3f2), unique name, or uuid prefix (3+ chars)")}
   ${dim("urgency: now = interrupt then deliver; next = next accept point (default); idle = after the turn")}`;
 

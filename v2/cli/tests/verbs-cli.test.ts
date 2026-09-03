@@ -432,6 +432,252 @@ test("verbs.transcript: -f/--follow streams appended lines until SIGINT", async 
   }
 });
 
+test("verbs.transcript: agy follow keeps projector state across appended lines", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-agy-follow-"));
+  try {
+    const logPath = join(dir, "agy.jsonl");
+    writeFileSync(logPath, `${JSON.stringify({ event: "init", conversation_id: "agy-follow-session" })}\n`);
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({
+      id: "agy-follow-1",
+      name: "agy-follow",
+      agent: "agy",
+      substrate: "hsr",
+      cwd: "/tmp",
+      sessionLogPath: logPath,
+    });
+    store.close();
+
+    const follow = capture();
+    assert.equal(
+      await runFollowUntil(
+        ["transcript", "agy-follow", "--follow", "--data-dir", dir],
+        follow,
+        () => appendFileSync(logPath, [
+          JSON.stringify({
+            event: "step_update",
+            step_update: {
+              conversation_id: "agy-follow-session",
+              step_index: 1,
+              state: "DONE",
+              step_type: "agent_response",
+              text_delta: "SECOND",
+            },
+          }),
+          JSON.stringify({
+            event: "result",
+            result: {
+              conversation_id: "agy-follow-session",
+              status: "SUCCESS",
+              response: "SECOND",
+              num_turns: 1,
+            },
+          }),
+        ].join("\n") + "\n"),
+        () => follow.out.includes("[assistant] SECOND"),
+        "agy transcript --follow appended turn",
+      ),
+      0,
+    );
+    assert.deepEqual(
+      follow.out.filter((line) => line === "[assistant] SECOND"),
+      ["[assistant] SECOND"],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verbs.transcript: follow completes a torn agy record with one projector", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-agy-torn-follow-"));
+  try {
+    const logPath = join(dir, "agy.jsonl");
+    const init = JSON.stringify({ event: "init", conversation_id: "agy-torn-session" });
+    const active = JSON.stringify({
+      event: "step_update",
+      step_update: {
+        conversation_id: "agy-torn-session",
+        step_index: 1,
+        state: "ACTIVE",
+        step_type: "agent_response",
+        text_delta: "HEL",
+      },
+    });
+    const done = JSON.stringify({
+      event: "step_update",
+      step_update: {
+        conversation_id: "agy-torn-session",
+        step_index: 1,
+        state: "DONE",
+        step_type: "agent_response",
+        text_delta: "LO",
+      },
+    });
+    const result = JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: "agy-torn-session",
+        status: "SUCCESS",
+        response: "HELLO",
+        num_turns: 1,
+      },
+    });
+    const splitAt = Math.floor(done.length / 2);
+    writeFileSync(logPath, `${init}\n${active}\n${done.slice(0, splitAt)}`);
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({
+      id: "agy-torn-follow-1",
+      name: "agy-torn-follow",
+      agent: "agy",
+      substrate: "hsr",
+      cwd: "/tmp",
+      sessionLogPath: logPath,
+    });
+    store.close();
+
+    const follow = capture();
+    const before = new Set(process.listeners("SIGINT"));
+    const running = runV2Cli(["transcript", "agy-torn-follow", "--follow", "--data-dir", dir], follow.io);
+    await waitFor(
+      () => process.listeners("SIGINT").some((listener) => !before.has(listener)),
+      "torn-record follow started",
+      5000,
+    );
+    appendFileSync(logPath, `${done.slice(splitAt)}\n${result}\n`);
+    let followError: unknown;
+    try {
+      await waitFor(
+        () => follow.out.includes("[assistant] HELLO"),
+        "torn agy response completed",
+        1500,
+      );
+    } catch (error) {
+      followError = error;
+    } finally {
+      for (const listener of process.listeners("SIGINT").filter((item) => !before.has(item))) {
+        (listener as () => void)();
+      }
+      await running;
+    }
+    if (followError) throw followError;
+    assert.deepEqual(
+      follow.out.filter((line) => line.startsWith("[assistant]")),
+      ["[assistant] HELLO"],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verbs.transcript: follow flushes one live agy fragment once on SIGINT", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-agy-live-follow-"));
+  try {
+    const logPath = join(dir, "agy.jsonl");
+    writeFileSync(logPath, [
+      JSON.stringify({ event: "init", conversation_id: "agy-live-session" }),
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          conversation_id: "agy-live-session",
+          step_index: 1,
+          state: "ACTIVE",
+          step_type: "agent_response",
+          text_delta: "reply in progress",
+        },
+      }),
+    ].join("\n") + "\n");
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({
+      id: "agy-live-follow-1",
+      name: "agy-live-follow",
+      agent: "agy",
+      substrate: "hsr",
+      cwd: "/tmp",
+      sessionLogPath: logPath,
+    });
+    store.close();
+
+    const follow = capture();
+    const before = new Set(process.listeners("SIGINT"));
+    const running = runV2Cli(["transcript", "agy-live-follow", "--follow", "--data-dir", dir], follow.io);
+    await waitFor(
+      () => process.listeners("SIGINT").some((listener) => !before.has(listener)),
+      "live-fragment follow started",
+      5000,
+    );
+    for (const listener of process.listeners("SIGINT").filter((item) => !before.has(item))) {
+      (listener as () => void)();
+    }
+    await running;
+    assert.deepEqual(
+      follow.out.filter((line) => line.startsWith("[assistant]")),
+      ["[assistant] reply in progress"],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("verbs.transcript: follow starts at the backlog snapshot boundary", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-follow-boundary-"));
+  try {
+    const logPath = join(dir, "boundary.jsonl");
+    writeFileSync(logPath, `${JSON.stringify({ event: "text", text: "before" })}\n`);
+    const store = openCoreStore(join(dir, "core.sqlite3"));
+    store.createBee({
+      id: "follow-boundary-1",
+      name: "follow-boundary",
+      agent: "stub",
+      substrate: "hsr",
+      cwd: "/tmp",
+      sessionLogPath: logPath,
+    });
+    store.close();
+
+    const cap = capture();
+    let appended = false;
+    const io: CliIo = {
+      out(line) {
+        cap.io.out(line);
+        if (!appended && stripAnsi(line) === "[assistant] before") {
+          appended = true;
+          appendFileSync(logPath, `${JSON.stringify({ event: "text", text: "in the gap" })}\n`);
+        }
+      },
+      err: cap.io.err,
+    };
+    const before = new Set(process.listeners("SIGINT"));
+    const done = runV2Cli(["transcript", "follow-boundary", "--follow", "--data-dir", dir], io);
+    await waitFor(
+      () => process.listeners("SIGINT").some((listener) => !before.has(listener)),
+      "snapshot-boundary follow started",
+      5000,
+    );
+    let followError: unknown;
+    try {
+      await waitFor(
+        () => cap.out.includes("[assistant] in the gap"),
+        "line appended at the dump/follow boundary",
+        1500,
+      );
+    } catch (error) {
+      followError = error;
+    } finally {
+      for (const listener of process.listeners("SIGINT").filter((item) => !before.has(item))) {
+        (listener as () => void)();
+      }
+      await done;
+    }
+    if (followError) throw followError;
+    assert.deepEqual(
+      cap.out.filter((line) => line.startsWith("[assistant]")),
+      ["[assistant] before", "[assistant] in the gap"],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("verbs.last: falls back to the latest seal when the log has no assistant text; --seal skips straight there", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hb-v2-verbs-"));
   try {

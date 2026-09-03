@@ -66,6 +66,8 @@ export class FakeDriver implements RuntimeDriver {
    * immediate-exit stub / missing-cwd shape). Wins over autoBoot.
    */
   bootCrash = false;
+  /** agy auth failure before init: flag evidence, then a clean booting exit. */
+  authBootFailure = false;
   /**
    * v9 — the readyAtSpawn instant-death shape (the 2026-08-18 soak loop): a
    * claude-like harness spawns fine (the driver mints a SYNTHETIC booted from
@@ -113,6 +115,18 @@ export class FakeDriver implements RuntimeDriver {
     if (this.bootCrash) {
       this.procs.delete(beeId);
       this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
+    if (this.authBootFailure) {
+      this.evidence.push({
+        beeId,
+        generation,
+        flag: "auth_needed",
+        action: "set",
+        detail: "authentication failed or timed out",
+      });
+      this.procs.delete(beeId);
+      this.events.push({ beeId, generation, kind: "exited", exitCause: "clean" });
       return;
     }
     if (this.synthBootAlive) {

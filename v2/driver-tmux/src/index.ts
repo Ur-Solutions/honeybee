@@ -23,6 +23,7 @@ export {
   grokTranscriptRenderer,
   lastAssistantText,
   createTranscriptProjector,
+  createTranscriptTurnStream,
   renderTranscriptLines,
   stubTranscriptRenderer,
   TRANSCRIPT_PARSERS,
@@ -31,6 +32,7 @@ export {
   type TranscriptLocator,
   type TranscriptParser,
   type TranscriptRenderer,
+  type TranscriptTurnStream,
   type TranscriptTurn,
   type TranscriptTurnRole,
 } from "./transcripts.ts";

@@ -9,6 +9,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ConfigError,
+  BUILTIN_AGENTS,
   DEFAULTS,
   NAMING_DEFAULTS,
   defaultDataDir,
@@ -38,6 +39,19 @@ test("config.1: absent file resolves to pure defaults (the file may be absent)",
     assert.ok(cfg.agents.claude, "builtin agent table present");
     assert.ok(cfg.agents.codex);
     assert.ok(cfg.agents.grok);
+    assert.deepEqual(cfg.agents.agy, BUILTIN_AGENTS.agy);
+    assert.deepEqual(cfg.agents.agy, {
+      command: "agy",
+      args: [
+        "--print=",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--dangerously-skip-permissions",
+        "--print-timeout", "12h",
+      ],
+      adapter: "agy",
+      env: { AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
+    });
   });
 });
 
