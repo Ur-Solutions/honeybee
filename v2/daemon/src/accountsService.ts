@@ -163,12 +163,12 @@ export type ImportOutcome =
 export interface VerifyOutcome {
   account: AccountRow;
   outcome: "verified" | "auth_needed" | "unverified" | "absent";
-  probe: "limits" | "none";
+  probe: "limits" | "credential_file" | "none";
   limits: AccountLimitsRow | null;
 }
 
-/** Harnesses whose limits probe is a real authentication check (fetchByHarness). */
-const PROBE_CAPABLE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "kimi", "cursor", "opencode"]);
+/** Harnesses with either an authenticated limits read or an explicit credential-file probe. */
+const PROBE_CAPABLE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "grok", "kimi", "cursor", "opencode", "agy"]);
 
 // ---------------------------------------------------------------------------
 // default transports
@@ -456,9 +456,15 @@ export class AccountsService {
     return this.credentialed(account) ? "ok" : "auth_needed";
   }
 
-  /** Whether `verifyCredentials` has a real probe for the harness (else it can only report `unverified`). */
+  /** Whether `verifyCredentials` can probe provider authentication or a required credential file. */
   hasCredentialProbe(harness: string): boolean {
-    return PROBE_CAPABLE_HARNESSES.has(harness);
+    return this.credentialProbeOf(harness) !== "none";
+  }
+
+  /** The evidence a harness's credential verification lane can collect. */
+  credentialProbeOf(harness: string): VerifyOutcome["probe"] {
+    if (!PROBE_CAPABLE_HARNESSES.has(harness)) return "none";
+    return harness === "agy" ? "credential_file" : "limits";
   }
 
   // -------------------------------------------------------------------------
@@ -646,20 +652,26 @@ export class AccountsService {
       const keepLastGood = previous?.readable === true
         && !fetched.readable
         && (fetched.unreadableReason === "provider_error" || fetched.unreadableReason === "timeout");
+      const credentialProbePassed = account.harness === "agy"
+        && !fetched.readable
+        && fetched.unreadableReason === "unsupported";
       // A transient sampling failure is not evidence that the provider's last
       // readable snapshot became false. Keep its fetchedAt and windows so the
       // mirror and selector honestly expose stale, last-known-good data. Real
       // auth failures still replace the row and drive auth_needed below.
       const row = keepLastGood ? previous! : this.store.putAccountLimits(id, fetched);
       // The probe is the authentication check account health keys on: a REAL
-      // auth failure sets auth_needed; a readable answer is contrary evidence.
+      // auth failure sets auth_needed; a readable answer or agy's successful
+      // token-file probe is contrary evidence. The agy limits row stays
+      // unsupported and its credential health stays unverified.
       if (!fetched.readable && fetched.error && fetched.unreadableReason === "auth_failed") {
         if (this.store.setAccountStatus(id, account.status === "paused" ? "paused" : "auth_needed", `limits probe: ${fetched.error.slice(0, 200)}`).applied) {
           this.log(`account.auth_needed account=${id} by=limits_probe`);
         }
-      } else if (fetched.readable && account.status === "auth_needed") {
-        this.store.setAccountStatus(id, "ok", "limits probe authenticated");
-        this.log(`account.auth_ok account=${id} by=limits_probe`);
+      } else if ((fetched.readable || credentialProbePassed) && account.status === "auth_needed") {
+        const probe = credentialProbePassed ? "credential_probe" : "limits_probe";
+        this.store.setAccountStatus(id, "ok", `${probe} authenticated`);
+        this.log(`account.auth_ok account=${id} by=${probe}`);
       }
       // v18: the probe is validation evidence the MIRROR must see. A status
       // flip above already re-published the row; otherwise (an `ok`
@@ -761,6 +773,10 @@ export class AccountsService {
       case "cursor":
       case "opencode":
         return this.fetchSecondaryProvider(account);
+      case "agy":
+        return this.credentialed(account)
+          ? { readable: false, unreadableReason: "unsupported", error: "agy has no limits source" }
+          : { readable: false, unreadableReason: "auth_failed", error: "agy OAuth token file is missing from the account home and vault" };
       default:
         return { readable: false, unreadableReason: "unsupported", error: `${account.harness} has no limits source` };
     }
@@ -874,9 +890,9 @@ export class AccountsService {
   }
 
   /**
-   * v18: verify credentials off the caller path (the background limits lane;
-   * `verifyCredentials` is the awaited form). Only probe-capable harnesses
-   * are scheduled; the ids actually queued are returned.
+   * v18: verify credentials off the caller path through the shared background
+   * lane. Provider-backed probes read limits; agy checks its required OAuth
+   * token and leaves limits unsupported. The ids actually queued are returned.
    */
   scheduleVerification(accountIds: readonly string[]): string[] {
     const ids = accountIds.filter((id) => {
@@ -888,14 +904,28 @@ export class AccountsService {
   }
 
   /**
-   * v18: `account.verify` — the cheapest REAL validation the harness has is
-   * its limits probe (an authenticated provider read), so run exactly that
-   * and say what it proved. No new prober: outcome = the account's status
-   * and derived health after `refreshLimits`.
+   * v18: `account.verify` runs the cheapest probe the harness has. A provider
+   * limits read can verify a credential. agy's file probe can prove only that
+   * its required token is present or absent, so a present imported token stays
+   * unverified until login records fresh evidence.
    */
   async verifyCredentials(account: AccountRow): Promise<VerifyOutcome> {
-    if (!this.credentialed(account)) return { account, outcome: "absent", probe: "none", limits: null };
-    if (!this.hasCredentialProbe(account.harness)) {
+    const probe = this.credentialProbeOf(account.harness);
+    if (!this.credentialed(account)) {
+      const updated = this.store.setAccountStatus(
+        account.id,
+        account.status === "paused" ? "paused" : "auth_needed",
+        "account verify: primary credential is absent",
+      );
+      if (updated.applied) this.log(`account.auth_needed account=${account.id} by=account_verify`);
+      return {
+        account: updated.account,
+        outcome: "absent",
+        probe: probe === "credential_file" ? probe : "none",
+        limits: null,
+      };
+    }
+    if (probe === "none") {
       return { account, outcome: this.credentialHealthOf(account) === "verified" ? "verified" : "unverified", probe: "none", limits: this.store.getAccountLimits(account.id) };
     }
     const [limits] = await this.refreshLimits([account.id]);
@@ -906,7 +936,7 @@ export class AccountsService {
         ? "verified"
         : "unverified";
     this.log(`account.verify account=${account.id} outcome=${outcome} readable=${limits?.readable ?? "-"}${limits && !limits.readable ? ` reason=${limits.unreadableReason}` : ""}`);
-    return { account: after, outcome, probe: "limits", limits: limits ?? null };
+    return { account: after, outcome, probe, limits: probe === "credential_file" ? null : limits ?? null };
   }
 
   /**

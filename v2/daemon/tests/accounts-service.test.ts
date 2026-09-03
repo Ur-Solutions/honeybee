@@ -415,6 +415,51 @@ test("limits.1: fetch writes the table (claude via the home token + injected usa
   }
 });
 
+test("limits.agy: an imported HOME-scoped token clears auth_needed while provider limits remain unsupported", async () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const tokenFile = ".gemini/antigravity-cli/antigravity-oauth-token";
+    const account = addAccount(r, "agy", "personal", { status: "auth_needed", vault: { [tokenFile]: "agy-oauth-token" } });
+    assert.deepEqual(svc.homeEnvOf(account), {
+      HOME: account.homePath,
+      SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1",
+    });
+    assert.equal(svc.hasCredentialProbe("agy"), true);
+    assert.equal(svc.credentialProbeOf("agy"), "credential_file");
+    assert.equal(svc.credentialed(account), true);
+    assert.equal(svc.credentialHealthOf(account), "unverified");
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+
+    const [unsupported] = await svc.refreshLimits([account.id]);
+    assert.equal(unsupported?.readable, false);
+    assert.equal(unsupported?.unreadableReason, "unsupported");
+    assert.equal(unsupported?.error, "agy has no limits source");
+    assert.equal(r.store.getAccount(account.id)?.status, "ok");
+    const refreshedAccount = r.store.getAccount(account.id);
+    assert.ok(refreshedAccount);
+    assert.equal(svc.credentialHealthOf(refreshedAccount), "unverified");
+    assert.ok(r.log.some((line) => line === `account.auth_ok account=${account.id} by=credential_probe`));
+
+    const present = await svc.verifyCredentials(refreshedAccount);
+    assert.equal(present.outcome, "unverified");
+    assert.equal(present.probe, "credential_file");
+    assert.equal(present.limits, null, "a credential-file check does not return provider limits");
+    assert.equal(r.store.getAccountLimits(account.id)?.unreadableReason, "unsupported", "usage keeps the accepted unsupported-limits row");
+
+    rmSync(join(r.vault, "agy", account.id, tokenFile));
+    const missing = await svc.verifyCredentials(present.account);
+    assert.equal(missing.outcome, "absent");
+    assert.equal(missing.probe, "credential_file");
+    assert.equal(missing.limits, null);
+    assert.equal(svc.credentialed(account), false);
+    assert.equal(missing.account.status, "auth_needed");
+    assert.equal(r.store.getAccount(account.id)?.status, "auth_needed");
+  } finally {
+    r.cleanup();
+  }
+});
+
 test("limits.1a: Codex probes are per-home single-flight; transient failure keeps the last good row while auth failure invalidates it", async () => {
   const r = rig();
   try {
@@ -1210,8 +1255,11 @@ test("verify.v18: the real limits probe settles an import — readable → verif
     assert.deepEqual(await svc.verifyCredentials(stub), { account: stub, outcome: "unverified", probe: "none", limits: null });
     assert.equal(svc.hasCredentialProbe("stub"), false);
     // nothing to verify
-    const bare = r.store.createAccount({ id: "codex-bare", harness: "codex", homePath: join(r.homes, "codex-bare"), label: "bare", status: "auth_needed" });
-    assert.equal((await svc.verifyCredentials(bare)).outcome, "absent");
+    const bare = r.store.createAccount({ id: "codex-bare", harness: "codex", homePath: join(r.homes, "codex-bare"), label: "bare" });
+    const absent = await svc.verifyCredentials(bare);
+    assert.equal(absent.outcome, "absent");
+    assert.equal(absent.account.status, "auth_needed");
+    assert.equal(r.store.getAccount(bare.id)?.status, "auth_needed");
 
     // background scheduling: only probe-capable accounts are queued; the outcome lands on the row
     answer = "ok";
