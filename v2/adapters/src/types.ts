@@ -191,6 +191,8 @@ export function parseJsonLine(line: string): Record<string, unknown> | undefined
  */
 export function isAuthNeededMessage(message: string): boolean {
   const m = message.toLowerCase();
+  if (m.includes("authentication required")) return true;
+  if (m.includes("authentication failed or timed out")) return true;
   if (m.includes("not logged in")) return true;
   if (m.includes("please log out and sign in again")) return true;
   if (m.includes("please sign out and sign in again")) return true;

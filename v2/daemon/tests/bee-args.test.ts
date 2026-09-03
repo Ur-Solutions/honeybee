@@ -88,6 +88,26 @@ test("args.daemon.2c: composeSpawn injects live gateways into Grok session setup
   assert.deepEqual(setup.params.mcpServers, mcpServers);
 });
 
+test("args.daemon.2d: composeSpawn agy keeps model and effort on argv, de-duplicates yolo, and resumes by conversation", () => {
+  const spec = { ...BUILTIN_AGENTS.agy!, defaultArgs: ["--model", "default", "--dangerously-skip-permissions"] };
+  const r = composeSpawn(spec, "agy", bee({
+    args: ["--model", "gemini-3.8-flash-low", "--effort", "high", "--conversation", "stale"],
+    providerSessionId: "conversation-1",
+  }));
+  assert.deepEqual(r.args, [
+    "--print=",
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+    "--dangerously-skip-permissions",
+    "--print-timeout", "12h",
+    "--model", "gemini-3.8-flash-low",
+    "--effort", "high",
+    "--conversation", "conversation-1",
+  ]);
+  assert.equal(r.model, undefined);
+  assert.equal(r.adapter?.harness, "agy");
+});
+
 test("args.daemon.3: composeSpawn stub/unknown — verbatim concatenation, no de-dup, no resume; unknown adapter → null", () => {
   const spec = { command: "node", args: ["agent.mjs", "--x"], defaultArgs: ["--x"] };
   const r = composeSpawn(spec, "stub", bee({ args: ["--x", "--y"], providerSessionId: "ignored" }));

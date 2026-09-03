@@ -111,11 +111,14 @@ import { realPreflightProbes } from "../../daemon/src/import-probes.ts";
 import { hostname } from "node:os";
 import type { AuditTailResult } from "../../daemon/src/protocol.ts";
 import {
+  createTranscriptTurnStream,
   lastAssistantText,
   renderTranscriptLines,
+  type TranscriptTurnStream,
 } from "../../driver-tmux/src/transcripts.ts";
 import { sessionNameFor } from "../../driver-tmux/src/driver.ts";
 import {
+  agyArgGrammar,
   claudeArgGrammar,
   codexArgGrammar,
   composeArgv,
@@ -589,7 +592,9 @@ async function spawnBee(
       ...(cell ? { cell } : {}),
       title: parsed.flags.get("--title") as string | undefined,
       tags: parsed.tags,
-      ...(parsed.args.length > 0 ? { args: parsed.args } : {}),
+      ...((parsed.args.length > 0 || (parsed.rest?.length ?? 0) > 0)
+        ? { args: [...parsed.args, ...(parsed.rest ?? [])] }
+        : {}),
       ...(Object.keys(env).length > 0 ? { env } : {}),
       ...(parentId ? { parentId } : {}),
       ...(account !== undefined ? { account } : {}),
@@ -779,7 +784,11 @@ async function cmdAccount(ctx: CliContext, parsed: Parsed): Promise<number> {
       );
       const health = r.imported
         ? ` — imported ${r.imported.files.join(", ")} from ${r.imported.source === "external" ? r.imported.from : tildify(r.imported.from)}` +
-          (r.verification === "scheduled" ? "; verifying with the provider (hive account verify " + r.account.id + " to check)" : "; unverified until a login/capture")
+          (r.verification === "limits"
+            ? "; verifying with the provider (hive account verify " + r.account.id + " to check)"
+            : r.verification === "credential_file"
+              ? "; checking the required credential file (hive account verify " + r.account.id + " to check)"
+              : "; unverified until a login/capture")
         : r.credentialHealth === "unverified"
           ? " — existing credentials adopted (unverified until a login/capture/limits probe)"
           : ` — status ${r.account.status}; log in with: hive account login ${r.account.id}`;
@@ -2047,7 +2056,7 @@ function templateHarnessArgs(template: TemplateRow, agent: string, parsed: Parse
       : template.yolo;
   if (yolo) {
     if (agent === "codex") args.push("--dangerously-bypass-approvals-and-sandbox");
-    else if (agent === "claude") args.push("--dangerously-skip-permissions");
+    else if (agent === "claude" || agent === "agy") args.push("--dangerously-skip-permissions");
     else if (agent === "grok") args.push("--permission-mode", "bypassPermissions");
   }
 
@@ -2688,9 +2697,23 @@ async function cmdHere(ctx: CliContext, _parsed: Parsed): Promise<number> {
 
 // --- session-log reading (transcript / tail / last) ------------------------
 
+interface SessionLogSnapshot {
+  lines: string[];
+  byteOffset: number;
+}
+
+function readSessionLogSnapshot(path: string): SessionLogSnapshot {
+  const contents = readFileSync(path);
+  const lastNewline = contents.lastIndexOf(0x0a);
+  const byteOffset = lastNewline < 0 ? 0 : lastNewline + 1;
+  return {
+    lines: contents.subarray(0, byteOffset).toString("utf8").split("\n").filter((line) => line.trim().length > 0),
+    byteOffset,
+  };
+}
+
 function readSessionLogLines(path: string): string[] {
-  const text = readFileSync(path, "utf8");
-  return text.split("\n").filter((l) => l.trim().length > 0);
+  return readSessionLogSnapshot(path).lines;
 }
 
 /** The bee's session log path, loudly absent when never written. */
@@ -2706,19 +2729,6 @@ function sessionLogOf(bee: ViewResult["bee"], needle: string): string {
 /** `-f/--follow` streams; `--no-follow` wins when both are passed. */
 function wantsFollow(parsed: Parsed): boolean {
   return parsed.flags.get("--follow") === true && parsed.flags.get("--no-follow") !== true;
-}
-
-function sessionLogSize(path: string): number {
-  try {
-    return statSync(path).size;
-  } catch {
-    return 0;
-  }
-}
-
-function emitFollowLine(ctx: CliContext, harness: string, line: string, raw: boolean): void {
-  if (raw) ctx.io.out(line);
-  else for (const l of turnLines(renderTranscriptLines(harness, [line]))) ctx.io.out(l);
 }
 
 /**
@@ -2768,8 +2778,16 @@ async function followFileLines(path: string, fromBytes: number, onLine: (line: s
   });
 }
 
-async function followSessionLog(ctx: CliContext, path: string, harness: string, raw: boolean): Promise<void> {
-  await followFileLines(path, sessionLogSize(path), (line) => emitFollowLine(ctx, harness, line, raw));
+async function followTranscriptStream(
+  ctx: CliContext,
+  path: string,
+  fromBytes: number,
+  stream: TranscriptTurnStream,
+): Promise<void> {
+  await followFileLines(path, fromBytes, (line) => {
+    for (const rendered of turnLines(stream.pushLine(line))) ctx.io.out(rendered);
+  });
+  for (const rendered of turnLines(stream.flush())) ctx.io.out(rendered);
 }
 
 /**
@@ -2787,21 +2805,26 @@ async function cmdTranscript(ctx: CliContext, parsed: Parsed): Promise<number> {
   const path = sessionLogOf(bee, needle);
   const harness = bee?.agent ?? "";
   const raw = parsed.flags.get("--raw") === true;
+  const follow = wantsFollow(parsed);
   const tailN = parsed.flags.has("--tail") ? numFlag(parsed, "--tail", 0) : null;
-  const lines = readSessionLogLines(path);
+  const snapshot = readSessionLogSnapshot(path);
+  const lines = snapshot.lines;
   if (!ctx.json) ctx.io.err(sessionLogBanner(path, harness, stale));
   if (raw) {
     const shown = tailN != null ? lines.slice(-tailN) : lines;
     if (ctx.json) emit(ctx, [], { path, harness, lines: shown }, stale);
     else for (const line of shown) ctx.io.out(line);
-  } else {
-    const turns = renderTranscriptLines(harness, lines);
-    const shown = tailN != null ? turns.slice(-tailN) : turns;
-    if (ctx.json) emit(ctx, [], { path, harness, turns: shown }, stale);
-    else for (const line of turnLines(shown)) ctx.io.out(line);
+    if (follow) await followFileLines(path, snapshot.byteOffset, (line) => ctx.io.out(line));
+    return 0;
   }
-  if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw);
+
+  const stream = createTranscriptTurnStream(harness);
+  const turns = lines.flatMap((line) => stream.pushLine(line));
+  if (!follow) turns.push(...stream.flush());
+  const shown = tailN != null ? turns.slice(-tailN) : turns;
+  if (ctx.json) emit(ctx, [], { path, harness, turns: shown }, stale);
+  else for (const line of turnLines(shown)) ctx.io.out(line);
+  if (follow) await followTranscriptStream(ctx, path, snapshot.byteOffset, stream);
   return 0;
 }
 
@@ -2823,14 +2846,23 @@ async function cmdTail(ctx: CliContext, parsed: Parsed): Promise<number> {
   // made `tail` mean something different per substrate (contract §6 says it
   // must not). Render by default; --raw is the verbatim stream.
   const raw = parsed.flags.get("--raw") === true;
+  const follow = wantsFollow(parsed);
   const backlog = numFlag(parsed, "--tail", 40);
   if (stale) ctx.io.err(staleBanner(ctx.cfg.storePath));
   ctx.io.err(sessionLogBanner(path, harness, false));
-  const lines = readSessionLogLines(path);
-  if (raw) for (const line of lines.slice(-backlog)) ctx.io.out(line);
-  else for (const line of turnLines(renderTranscriptLines(harness, lines)).slice(-backlog)) ctx.io.out(line);
-  if (!wantsFollow(parsed)) return 0;
-  await followSessionLog(ctx, path, harness, raw);
+  const snapshot = readSessionLogSnapshot(path);
+  const lines = snapshot.lines;
+  if (raw) {
+    for (const line of lines.slice(-backlog)) ctx.io.out(line);
+    if (follow) await followFileLines(path, snapshot.byteOffset, (line) => ctx.io.out(line));
+    return 0;
+  }
+
+  const stream = createTranscriptTurnStream(harness);
+  const turns = lines.flatMap((line) => stream.pushLine(line));
+  if (!follow) turns.push(...stream.flush());
+  for (const line of turnLines(turns).slice(-backlog)) ctx.io.out(line);
+  if (follow) await followTranscriptStream(ctx, path, snapshot.byteOffset, stream);
   return 0;
 }
 
@@ -2951,6 +2983,7 @@ async function cmdEvents(ctx: CliContext, parsed: Parsed): Promise<number> {
 // --- set-model (sugar over bee.setArgs) ------------------------------------
 
 function grammarForAgent(agent: string): ArgGrammar | null {
+  if (agent === "agy") return agyArgGrammar;
   if (agent === "claude") return claudeArgGrammar;
   if (agent === "codex") return codexArgGrammar;
   return null;

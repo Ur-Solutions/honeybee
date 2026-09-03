@@ -45,6 +45,9 @@ import type {
   TrackPackage,
 } from "../../core/src/index.ts";
 import type { BootReport } from "./loops.ts";
+import type { EphemeralCredentialFile } from "./accountsService.ts";
+
+export type { EphemeralCredential, EphemeralCredentialFile } from "./accountsService.ts";
 
 export const PROTOCOL = "v2/1";
 export const DAEMON_VERSION = "2.0.0-wp4";
@@ -68,6 +71,13 @@ export const DAEMON_CAPABILITIES = [
    * credentials; the `account.verify` verb runs the harness's real probe.
    */
   "account.credential_health.v1",
+  /**
+   * v19 (2026-09-03, RN7a): the credential-lease mint — `account.lease`
+   * returns the refresh-blanked ephemeral credential for one account (the
+   * remote-nodes lease plane's mint side; see credential-leases.md), with
+   * typed `lease_unsupported` / `lease_unavailable` refusals.
+   */
+  "account.lease.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -135,6 +145,19 @@ export const RPC_ERROR_CODES = [
    * "No conversation found with session ID".
    */
   "transcript_unavailable",
+  /**
+   * v19 (`account.lease`): the harness/account SHAPE cannot hold a lease —
+   * no lease strategy (cursor, unmodeled harnesses), an OAuth-only kimi
+   * account, an opencode account without a coding-plan provider entry.
+   * Durable until the account itself changes.
+   */
+  "lease_unsupported",
+  /**
+   * v19 (`account.lease`): leasable in principle but not right now — no/
+   * stale credential, the account's refresher is mid-rotation, a codex token
+   * rotation failed or left under 15 minutes of TTL. Retryable.
+   */
+  "lease_unavailable",
 ] as const;
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -224,6 +247,9 @@ export const RPC_VERBS = [
   "account.limits",
   "account.importRegistry",
   "account.backfill",
+  // v19 (RN7a, additive): mint the refresh-blanked credential lease for one
+  // account (the remote-nodes lease plane; capability account.lease.v1).
+  "account.lease",
   "bee.swapAccount",
   // Auto-titler node config (additive): `config.get` is a read; `config.patch`
   // writes `naming` in the node's config.json.
@@ -361,9 +387,9 @@ export interface ImportedCredentials {
  * vault. Nothing importable anywhere → `no_credentials_to_import` (the
  * message lists the paths checked) and NO account row. An adopted
  * credential is `unverified`; when the harness has a real probe the daemon
- * schedules one (`verification:"scheduled"`) so the mirror row promptly
- * shows `verified` or `status:"auth_needed"`. Import can sign the machine's
- * regular CLI out of that provider (refresh tokens rotate on use).
+ * schedules one (`verification:"limits"` or `"credential_file"`) so the
+ * mirror row promptly converges. Import can sign the machine's regular CLI
+ * out of that provider (refresh tokens rotate on use).
  */
 export interface AccountAddResult extends DedupMarkers {
   account: MirrorAccountRow;
@@ -372,11 +398,15 @@ export interface AccountAddResult extends DedupMarkers {
   /** v18: provenance of an imported credential; null for a fresh logged-out add. */
   imported: ImportedCredentials | null;
   /**
-   * v18: `scheduled` — the harness's real probe runs in the background lane
-   * and lands on the mirror row; `unsupported` — a credential exists but the
-   * harness has no probe (stays `unverified`); `none` — nothing to verify.
+   * v18: `limits` — an authenticated provider probe is scheduled;
+   * `credential_file` — a required-file check is scheduled; `unsupported` —
+   * a credential exists but the harness has no probe (stays `unverified`);
+   * `none` — nothing to verify.
+   *
+   * This wire enum is additive: later daemon versions may return new kinds.
+   * Consumers must preserve and pass through kinds they do not recognize.
    */
-  verification: "scheduled" | "unsupported" | "none";
+  verification: "limits" | "credential_file" | "unsupported" | "none";
 }
 
 /** `account.remove {id}` — id is a selector; `account_referenced` while bees carry it. */
@@ -470,21 +500,24 @@ export interface AccountCaptureResult extends DedupMarkers {
 }
 
 /**
- * v18: `account.verify {id, idempotencyKey?}` — run the cheapest REAL
- * validation the harness supports (the limits probe: Claude usage endpoint,
- * `codex app-server`, the secondary providers' windows) and report what it
- * proved. `verified`: the probe read (the limits row is fresh); `auth_needed`:
- * a typed auth failure (status flipped, log in); `unverified`: the harness
- * has no probe (`probe:"none"`) or the probe failed transiently (see
- * `limits.unreadableReason`); `absent`: no credential anywhere to verify.
- * Never spawns a bee; a Codex account's EMPTY home is activated from the
- * vault first (exactly what the first spawn would do).
+ * v18: `account.verify {id, idempotencyKey?}` — run the cheapest validation
+ * the harness supports. `limits` is an authenticated provider read;
+ * `credential_file` checks only that a required credential exists and cannot
+ * prove provider authentication. `verified`: the provider probe read (the
+ * limits row is fresh); `auth_needed`: a typed auth failure (status flipped,
+ * log in); `unverified`: a successful `credential_file` probe found the file
+ * but did not authenticate it, no provider probe exists, or a provider probe
+ * failed transiently (see `limits.unreadableReason`); `absent`: no credential
+ * exists and the account status converges to `auth_needed`. Never spawns a
+ * bee; a Codex account's EMPTY home is activated from the vault first
+ * (exactly what the first spawn would do).
  */
 export interface AccountVerifyResult extends DedupMarkers {
   account: MirrorAccountRow;
   outcome: "verified" | "auth_needed" | "unverified" | "absent";
-  probe: "limits" | "none";
-  /** The limits row after the probe; null when no probe ran. */
+  /** Additive wire enum: consumers must preserve and pass through unknown kinds. */
+  probe: "limits" | "credential_file" | "none";
+  /** Provider limits after a `limits` probe; null for `credential_file` even when that check ran. */
   limits: MirrorAccountLimitsRow | null;
 }
 
@@ -525,6 +558,28 @@ export interface AccountBackfillResult extends DedupMarkers {
   dryRun: boolean;
   bound: Array<{ beeId: string; account: string; home: string }>;
   unmatched: Array<{ beeId: string; home: string }>;
+}
+
+/**
+ * v19: `account.lease {account, harness?}` — mint the refresh-blanked
+ * ephemeral credential for ONE account (the remote-nodes lease plane's mint;
+ * credential-leases.md, a port of v1 remoteCreds.ts's mint side). `account`
+ * is a selector; `harness`, when given, must equal the account's harness
+ * (`harness_mismatch`). Paused accounts refuse (`account_paused`); shape and
+ * timing refusals are `lease_unsupported` / `lease_unavailable`.
+ *
+ * SENSITIVE: `files`/`env` carry secret bytes and this result is the ONLY
+ * place they appear — the verb takes no idempotency key, records nothing,
+ * and neither the daemon log nor the audit stream ever carries the material.
+ * `kindNote` and `expiresAt` (unix SECONDS) are secret-free.
+ */
+export interface AccountLeaseResult {
+  account: string;
+  harness: string;
+  files: EphemeralCredentialFile[];
+  env?: Record<string, string>;
+  kindNote: string;
+  expiresAt?: number;
 }
 
 /**

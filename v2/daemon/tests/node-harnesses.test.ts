@@ -27,6 +27,19 @@ test("rpc.node.harnesses: present/path/source/version are resolver truth; a miss
     const { harnesses } = await client.request<NodeHarnessesResult>("node.harnesses");
     const byName = new Map(harnesses.map((h) => [h.harness, h]));
 
+    const agy = byName.get("agy");
+    assert.ok(agy, "the built-in agy harness must be reported");
+    assert.equal(agy.command, "agy");
+    if (agy.present) {
+      assert.ok(agy.path?.endsWith("/agy"), `resolved agy path, got ${agy.path}`);
+      assert.ok(agy.source === "PATH" || agy.source === "fallback");
+    } else {
+      assert.deepEqual(
+        { path: agy.path, source: agy.source, version: agy.version },
+        { path: null, source: null, version: null },
+      );
+    }
+
     // The helper's stub agent is configured with an absolute path: reported
     // verbatim as configured_path — never rewritten.
     const stub = byName.get("stub");

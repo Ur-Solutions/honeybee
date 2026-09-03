@@ -227,6 +227,12 @@ const GENERIC_PROMPTS: LoginCliCue[] = [
 ];
 const GENERIC_USER_CODE = "\\b(?:code|enter)[^\\n]{0,40}?\\b([A-Z0-9]{4,6}-[A-Z0-9]{4,6})\\b";
 const GENERIC_FAILURE = ["\\b(login|authentication|authorization) (failed|error|denied)\\b", "\\binvalid (code|token|api key)\\b"];
+const AGY_AUTH_URL = `(?:Authentication required\\. Please visit the URL to log in:\\s*)?${GENERIC_URL}`;
+const AGY_CODE_PROMPT: LoginCliCue = {
+  match: "(?:Or,\\s*)?paste the authorization code here and press Enter:\\s*$",
+  field: LOGIN_FIELD_CODE,
+};
+const AGY_FAILURE = ["\\bauthentication (?:failed or )?timed out\\b"];
 
 export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
   claude: {
@@ -392,6 +398,47 @@ export const ACCOUNT_RECIPES: Readonly<Record<string, IdentityRecipe>> = {
               tty: true,
               env: { BROWSER: "true" },
               cues: { url: GENERIC_URL, userCode: GENERIC_USER_CODE, prompts: GENERIC_PROMPTS, failure: GENERIC_FAILURE },
+              landing: "home_mtime",
+            },
+          },
+        },
+      ],
+    },
+  },
+  agy: {
+    credentialFiles: [".gemini/antigravity-cli/antigravity-oauth-token"],
+    configFiles: [".gemini/antigravity/antigravity_state.pbtxt"],
+    // Local agy uses the OS keyring independently of HOME. Its supported SSH
+    // mode bypasses the keyring and persists the OAuth token below HOME, so
+    // every managed login and spawn gets the same file-backed identity.
+    extraEnv: {
+      HOME: "{home}",
+      SSH_CONNECTION: "127.0.0.1 1 127.0.0.1 1",
+    },
+    vendorHome: {
+      dir: ".gemini",
+      relocated: {
+        ".gemini/antigravity-cli/antigravity-oauth-token": { path: "{HOME}/.gemini/antigravity-cli/antigravity-oauth-token" },
+        ".gemini/antigravity/antigravity_state.pbtxt": { path: "{HOME}/.gemini/antigravity/antigravity_state.pbtxt" },
+      },
+    },
+    login: { command: "agy", args: [] },
+    loginFlow: {
+      defaultMethodId: "agy-cli",
+      methods: [
+        {
+          id: "agy-cli",
+          kind: "browser_code",
+          label: "Sign in with agy",
+          description: "Approve access in your browser, then paste the authorization code.",
+          remoteCapable: true,
+          fields: [],
+          run: {
+            mode: "cli",
+            cli: {
+              tty: true,
+              env: { BROWSER: "true" },
+              cues: { url: AGY_AUTH_URL, prompts: [AGY_CODE_PROMPT], failure: AGY_FAILURE },
               landing: "home_mtime",
             },
           },

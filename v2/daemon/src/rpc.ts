@@ -23,6 +23,7 @@ import {
   TemplateNotFoundError,
   TrackNotFoundError,
 } from "../../core/src/index.ts";
+import { LeaseRefusal } from "./accountsService.ts";
 import { LoginFlowRefusal } from "./loginFlows.ts";
 import {
   DAEMON_CAPABILITIES,
@@ -67,6 +68,7 @@ interface Connection extends RpcConn {
 export function toRpcError(err: unknown): { code: RpcErrorCode; message: string } {
   if (err instanceof RpcError) return { code: err.code, message: err.message };
   if (err instanceof LoginFlowRefusal) return { code: err.code, message: err.message };
+  if (err instanceof LeaseRefusal) return { code: err.code, message: err.message };
   if (err instanceof BeeNotFoundError) return { code: "bee_not_found", message: err.message };
   if (err instanceof TemplateNotFoundError) return { code: "template_not_found", message: err.message };
   if (err instanceof TrackNotFoundError) return { code: "track_not_found", message: err.message };

@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { claudeArgGrammar, codexArgGrammar, grokArgGrammar, grokSpawnPlan, composeArgv, parseArgUnits, codexSpawnPlan } from "../src/index.ts";
+import { agyArgGrammar, claudeArgGrammar, codexArgGrammar, grokArgGrammar, grokSpawnPlan, composeArgv, parseArgUnits, codexSpawnPlan } from "../src/index.ts";
 
 const CLAUDE_BASE = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
 
@@ -78,4 +78,43 @@ test("args.compose.6: grokSpawnPlan lifts --model/--effort in front of stdio", (
   const plan = grokSpawnPlan(composed);
   assert.deepEqual(plan.argv, ["--no-auto-update", "agent", "--no-leader", "--always-approve", "--model", "grok-4.6", "--effort", "high", "stdio"]);
   assert.equal(plan.model, "grok-4.6");
+});
+
+test("args.compose.7: agy valued flags use later-wins composition and permission bypass is idempotent", () => {
+  const valueFlags = [
+    "--model",
+    "--effort",
+    "--conversation",
+    "--print-timeout",
+    "--agent",
+    "--project",
+    "--log-file",
+    "--add-dir",
+    "--mode",
+  ];
+  assert.deepEqual([...agyArgGrammar.valueFlags], valueFlags);
+  const argv = composeArgv(agyArgGrammar, [
+    ["--print=", "--dangerously-skip-permissions", "--model", "default", "--print-timeout", "12h"],
+    ["--dangerously-skip-permissions", "--model=gemini-3.8-flash-low", "--effort", "high"],
+    ["--conversation", "recorded-session"],
+  ]);
+  assert.deepEqual(argv, [
+    "--print=",
+    "--dangerously-skip-permissions",
+    "--print-timeout", "12h",
+    "--model=gemini-3.8-flash-low",
+    "--effort", "high",
+    "--conversation", "recorded-session",
+  ]);
+});
+
+test("args.compose.8: agy preserves repeatable --add-dir values across layers", () => {
+  assert.deepEqual(composeArgv(agyArgGrammar, [
+    ["--add-dir", "/workspace/shared", "--model", "default"],
+    ["--add-dir=/workspace/project", "--model", "gemini-3.8-flash-low"],
+  ]), [
+    "--add-dir", "/workspace/shared",
+    "--add-dir=/workspace/project",
+    "--model", "gemini-3.8-flash-low",
+  ]);
 });

@@ -39,6 +39,7 @@
  */
 import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
+import { createAgyProjector } from "./agy-projection.ts";
 import { createClaudeProjector } from "./claude-projection.ts";
 import { createCodexProjector } from "./codex-projection.ts";
 import { createGrokProjector, isGrokCompactionSummary } from "./grok-projection.ts";
@@ -454,7 +455,41 @@ export const stubTranscriptRenderer: TranscriptRenderer = {
   },
 };
 
+/** agy — HSR print-mode user, step_update, and result envelopes. */
+export const agyTranscriptRenderer: TranscriptRenderer = {
+  harness: "agy",
+  renderLine(line: string): TranscriptTurn[] {
+    const row = jsonLine(line);
+    if (!row || typeof row.event !== "string") return [];
+    if (row.event === "user") {
+      const message = row.message as { content?: unknown } | undefined;
+      return turnsFromBlocks("user", message?.content);
+    }
+    if (row.event === "step_update") {
+      const update = row.step_update as Record<string, unknown> | undefined;
+      if (!update) return [];
+      if (update.step_type === "agent_response" && typeof update.text_delta === "string") {
+        return update.text_delta.trim().length > 0
+          ? [{ role: "assistant", text: update.text_delta }]
+          : [];
+      }
+      if (update.step_type !== "tool") return [];
+      const name = typeof update.tool_name === "string" ? update.tool_name : "tool";
+      if (update.state === "ACTIVE") return [{ role: "tool", text: `[tool_use: ${name}]` }];
+      if (["DONE", "ERROR", "FAILED", "CANCELED"].includes(String(update.state))) {
+        return [{ role: "tool", text: "[tool_result]" }];
+      }
+      return [];
+    }
+    // result.response repeats text_delta; a stateless renderer cannot dedupe it.
+    // The stateful agy projector keeps the response as a no-delta fallback.
+    if (row.event === "result") return [];
+    return [];
+  },
+};
+
 export const TRANSCRIPT_RENDERERS: Record<string, TranscriptRenderer> = {
+  agy: agyTranscriptRenderer,
   claude: claudeTranscriptRenderer,
   codex: codexTranscriptRenderer,
   grok: grokTranscriptRenderer,
@@ -486,6 +521,8 @@ function projectorFromRenderer(renderer: TranscriptRenderer): TranscriptProjecto
 /** The single harness registry for pane and CLI transcript projection. */
 export function createTranscriptProjector(harness: string): TranscriptProjector {
   switch (harness) {
+    case "agy":
+      return createAgyProjector();
     case "codex":
       return createCodexProjector();
     case "grok":
@@ -499,11 +536,29 @@ export function createTranscriptProjector(harness: string): TranscriptProjector 
   }
 }
 
-export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
+export interface TranscriptTurnStream {
+  pushLine(line: string): TranscriptTurn[];
+  flush(): TranscriptTurn[];
+}
+
+/** Stateful raw-line to readable-turn projection for incremental consumers. */
+export function createTranscriptTurnStream(harness: string): TranscriptTurnStream {
   const projector = createTranscriptProjector(harness);
-  const events = lines.flatMap((line) => projector.pushLine(line));
-  events.push(...projector.flush());
-  return events.flatMap(turnsFromProjectedEvent);
+  return {
+    pushLine(line: string): TranscriptTurn[] {
+      return projector.pushLine(line).flatMap(turnsFromProjectedEvent);
+    },
+    flush(): TranscriptTurn[] {
+      return projector.flush().flatMap(turnsFromProjectedEvent);
+    },
+  };
+}
+
+export function renderTranscriptLines(harness: string, lines: readonly string[]): TranscriptTurn[] {
+  const stream = createTranscriptTurnStream(harness);
+  const turns = lines.flatMap((line) => stream.pushLine(line));
+  turns.push(...stream.flush());
+  return turns;
 }
 
 function turnsFromProjectedEvent(event: TranscriptProjectedEvent): TranscriptTurn[] {

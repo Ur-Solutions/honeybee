@@ -22,7 +22,7 @@ export interface AgentSpecConfig {
    * valued flag overrides an earlier one, boolean flags are idempotent).
    */
   defaultArgs?: string[];
-  /** Adapter name: claude | codex | grok | stub. Defaults to the agent key itself. */
+  /** Adapter name: agy | claude | codex | grok | stub. Defaults to the agent key itself. */
   adapter?: string;
   env?: Record<string, string>;
   /**
@@ -219,6 +219,18 @@ export class ConfigError extends Error {
 
 /** Built-in agent table; a config `agents` entry with the same key overrides it wholesale. */
 export const BUILTIN_AGENTS: Record<string, AgentSpecConfig> = {
+  agy: {
+    command: "agy",
+    args: [
+      "--print=",
+      "--input-format", "stream-json",
+      "--output-format", "stream-json",
+      "--dangerously-skip-permissions",
+      "--print-timeout", "12h",
+    ],
+    adapter: "agy",
+    env: { AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
+  },
   claude: {
     command: "claude",
     args: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],

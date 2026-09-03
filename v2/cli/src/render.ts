@@ -318,7 +318,9 @@ export function renderAccountVerify(r: AccountVerifyResult): string[] {
         ? `no credential to verify; log in with: hive account login ${r.account.id}`
         : r.probe === "none"
           ? `${r.account.harness} has no credential probe; the credential stays unverified until a login or capture`
-          : `the probe did not settle it${why}`;
+          : r.probe === "credential_file"
+            ? `the required credential file is present; provider authentication remains unverified${why}`
+            : `the probe did not settle it${why}`;
   return [`${bold(r.account.id)}  ${colorCredentialHealth(r.account.credentialHealth)}  ${colorAccountStatus(r.account.status)}  ${dim(`probe=${r.probe}`)}  ${detail}`];
 }
 
