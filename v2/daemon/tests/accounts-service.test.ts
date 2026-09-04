@@ -678,9 +678,16 @@ test("limits.1b: expired Claude chains refresh once, persist home + keychain + v
     });
     const liveRow = (await liveSvc.refreshLimits([live.id]))[0]!;
     assert.equal(racedRefreshes, 0, "the daemon never races a live Claude runtime's rotating refresh token");
-    assert.equal(liveRow.unreadableReason, "auth_expired");
+    assert.equal(liveRow.unreadableReason, "refresh_deferred", "a stand-down is not an auth failure");
     assert.match(liveRow.error ?? "", /running Claude owns refresh/);
     assert.equal(r.store.getAccount(live.id)?.status, "ok");
+    // A stand-down cannot erase last-known-good usage either: with a readable
+    // row in place, the deferred fetch keeps it (same rule as transient errors).
+    r.store.putAccountLimits(live.id, { readable: true, plan: "max", weekly: { usedPercent: 33 } });
+    const kept = (await liveSvc.refreshLimits([live.id]))[0]!;
+    assert.equal(kept.readable, true);
+    assert.equal(kept.weeklyPct, 33);
+    assert.ok(r.log.some((line) => line.includes(`account.limits.transient_failure account=${live.id} reason=refresh_deferred`)));
 
     const rejected = addAccount(r, "claude", "rejected", {
       vault: { ".credentials.json": JSON.stringify({ claudeAiOauth: { accessToken: "bad-access", refreshToken: "bad-refresh", expiresAt: r.now() - 1 } }) },
@@ -810,7 +817,7 @@ test("limits.1d: the daemon never races a live Grok runtime's rotating refresh t
     const svc = service(r, { providerHttp: { postForm: async () => { refreshCalls += 1; return {}; } } });
     const row = (await svc.refreshLimits([account.id]))[0]!;
     assert.equal(refreshCalls, 0);
-    assert.equal(row.unreadableReason, "auth_expired");
+    assert.equal(row.unreadableReason, "refresh_deferred");
     assert.match(row.error ?? "", /running Grok owns refresh/);
     assert.equal(r.store.getAccount(account.id)?.status, "ok");
   } finally {

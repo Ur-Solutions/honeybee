@@ -819,14 +819,17 @@ export class AccountsService {
       const previous = this.store.getAccountLimits(id);
       const keepLastGood = previous?.readable === true
         && !fetched.readable
-        && (fetched.unreadableReason === "provider_error" || fetched.unreadableReason === "timeout");
+        && (fetched.unreadableReason === "provider_error" || fetched.unreadableReason === "timeout"
+          || fetched.unreadableReason === "refresh_deferred");
       const credentialProbePassed = account.harness === "agy"
         && !fetched.readable
         && fetched.unreadableReason === "unsupported";
       // A transient sampling failure is not evidence that the provider's last
-      // readable snapshot became false. Keep its fetchedAt and windows so the
-      // mirror and selector honestly expose stale, last-known-good data. Real
-      // auth failures still replace the row and drive auth_needed below.
+      // readable snapshot became false, and neither is a refresh stood down to
+      // a live runtime that owns the rotating chain. Keep its fetchedAt and
+      // windows so the mirror and selector honestly expose stale,
+      // last-known-good data. Real auth failures still replace the row and
+      // drive auth_needed below.
       if (!keepLastGood && previous?.readable === true && fetched.readable) {
         this.velocities.set(id, this.measureVelocities(previous, fetched));
       }
@@ -940,7 +943,7 @@ export class AccountsService {
           const refreshed = await this.refreshClaudeCredential(account);
           if (refreshed.kind === "ok") credential = refreshed.credential;
           else if (refreshed.kind === "live_runtime") {
-            return { readable: false, unreadableReason: "auth_expired", error: "OAuth token expired; the running Claude owns refresh for this account" };
+            return { readable: false, unreadableReason: "refresh_deferred", error: "OAuth token expired; the running Claude owns refresh for this account" };
           } else if (refreshed.kind === "no_refresh_token") {
             return { readable: false, unreadableReason: "auth_expired", error: "OAuth token expired and has no refresh token; log in: hive v2 account login " + account.id };
           } else {

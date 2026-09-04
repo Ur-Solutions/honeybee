@@ -88,7 +88,7 @@ import {
   TASK_SUPPLY_SENDER_NAME,
   TASK_TRANSITIONS,
 } from "./tasks.ts";
-import { BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { ACCOUNT_LIMITS_TABLE_SQL, BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import {
   LOGIN_FLOW_PHASES,
   isTerminalLoginPhase,
@@ -1029,6 +1029,25 @@ export class CoreStore {
       // extra buckets; the standard routing windows remain untouched.
       if (!accountLimitCols.has("display_windows")) {
         this.db.exec("ALTER TABLE account_limits ADD COLUMN display_windows TEXT NOT NULL DEFAULT '[]'");
+      }
+      // v17 → v18: the unreadable_reason CHECK gains 'refresh_deferred'.
+      // SQLite cannot widen a CHECK in place, so rebuild the table and carry
+      // the rows across by name (an ALTER-migrated store appends columns in
+      // a different order than a fresh one).
+      const limitsDdl = this.stmt(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'account_limits'",
+      ).get() as Row | undefined;
+      if (limitsDdl !== undefined && !String(limitsDdl.sql).includes("refresh_deferred")) {
+        const carried = [
+          "account", "fetched_at", "readable", "unreadable_reason", "error", "plan",
+          "five_hour_pct", "five_hour_resets_at", "five_hour_minutes",
+          "weekly_pct", "weekly_resets_at", "weekly_minutes",
+          "fable_weekly_pct", "fable_resets_at", "fable_minutes", "display_windows",
+        ].join(", ");
+        this.db.exec("ALTER TABLE account_limits RENAME TO account_limits_v17");
+        this.db.exec(ACCOUNT_LIMITS_TABLE_SQL);
+        this.db.exec(`INSERT INTO account_limits(${carried}) SELECT ${carried} FROM account_limits_v17`);
+        this.db.exec("DROP TABLE account_limits_v17");
       }
       // v9 → v10: mint display handles for existing bees. An imported bee
       // whose old id already IS a pretty handle (CL.7920-style) keeps it —
