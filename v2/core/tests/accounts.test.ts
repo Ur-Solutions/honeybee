@@ -279,7 +279,7 @@ test("v7.migration: a v6 store opens as v7 — bees.account added, accounts/acco
     try {
       const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
       assert.equal(Number(version.value), SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 17);
+      assert.equal(SCHEMA_VERSION, 18);
       const cols = (check.prepare("SELECT name FROM pragma_table_info('bees')").all() as Array<{ name: string }>).map((c) => c.name);
       assert.ok(cols.includes("account"));
       const tables = (check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name);
@@ -338,6 +338,13 @@ test("v12+v13 migration: account_limits gains typed failures and display windows
       error: "expired",
     });
     assert.equal(refreshed.unreadableReason, "auth_expired");
+    // v18: the rebuilt CHECK accepts the refresh_deferred class on a migrated store
+    const deferred = store.putAccountLimits("claude-old", {
+      readable: false,
+      unreadableReason: "refresh_deferred",
+      error: "stood down to the live runtime",
+    });
+    assert.equal(deferred.unreadableReason, "refresh_deferred");
     store.close();
     const check = new DatabaseSync(h.path, { readOnly: true });
     try {

@@ -260,13 +260,19 @@ export type AccountStatus = (typeof ACCOUNT_STATUSES)[number];
 export const CREDENTIAL_HEALTHS = ["absent", "unverified", "verified"] as const;
 export type CredentialHealth = (typeof CREDENTIAL_HEALTHS)[number];
 
-/** Why a limits snapshot is unreadable. Keep this closed so clients never infer from prose. */
+/**
+ * Why a limits snapshot is unreadable. Keep this closed so clients never infer
+ * from prose. `refresh_deferred` means the stored token is past expiry but a
+ * live runtime owns the rotating refresh chain (HIVE-2), so the daemon stood
+ * down; no sign-in is needed and clients must not render it as an auth failure.
+ */
 export const ACCOUNT_LIMITS_UNREADABLE_REASONS = [
   "unsupported",
   "auth_expired",
   "auth_failed",
   "provider_error",
   "timeout",
+  "refresh_deferred",
 ] as const;
 export type AccountLimitsUnreadableReason = (typeof ACCOUNT_LIMITS_UNREADABLE_REASONS)[number];
 

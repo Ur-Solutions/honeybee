@@ -104,8 +104,42 @@
  *        sign-in (methods, phase, authorization URL / device code, requested
  *        input descriptors, typed error, revision). Carries no secret and no
  *        raw worker output. Additive; migration = CREATE TABLE IF NOT EXISTS.
+ *  v17 — provider-declared rate-limit expiry: adds `flags.resets_at` so an
+ *        open resource_blocked wall expires when the provider said it would.
+ *        Additive; migration = ALTER TABLE ADD COLUMN + backfill from detail.
+ *  v18 — `refresh_deferred` limits class: widens the
+ *        `account_limits.unreadable_reason` CHECK so a refresh stood down to
+ *        a live runtime (which owns the rotating OAuth chain, HIVE-2) is
+ *        typed distinctly from a real auth failure. SQLite cannot alter a
+ *        CHECK, so the migration drops and recreates the table — it is a
+ *        snapshot cache repopulated by the next limits sweep.
  */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
+
+/**
+ * v18: shared between SCHEMA_SQL and the v18 migration's table rebuild so a
+ * migrated store and a fresh store cannot drift.
+ */
+export const ACCOUNT_LIMITS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS account_limits (
+  account              TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  fetched_at           INTEGER NOT NULL,
+  readable             INTEGER NOT NULL CHECK (readable IN (0,1)),
+  unreadable_reason    TEXT CHECK (unreadable_reason IS NULL OR unreadable_reason IN ('unsupported','auth_expired','auth_failed','provider_error','timeout','refresh_deferred')),
+  error                TEXT,
+  plan                 TEXT,
+  five_hour_pct        REAL,
+  five_hour_resets_at  INTEGER,
+  five_hour_minutes    INTEGER,
+  weekly_pct           REAL,
+  weekly_resets_at     INTEGER,
+  weekly_minutes       INTEGER,
+  fable_weekly_pct     REAL,
+  fable_resets_at      INTEGER,
+  fable_minutes        INTEGER,
+  display_windows      TEXT NOT NULL DEFAULT '[]'
+) STRICT;
+`;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -329,25 +363,7 @@ CREATE INDEX IF NOT EXISTS accounts_harness ON accounts(harness, added_at, id);
 -- *_minutes the window length when known (pace needs it). readable = the
 -- fetch answered (0 = the fetch failed; error says why; the selector ranks
 -- unreadable accounts last).
-CREATE TABLE IF NOT EXISTS account_limits (
-  account              TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-  fetched_at           INTEGER NOT NULL,
-  readable             INTEGER NOT NULL CHECK (readable IN (0,1)),
-  unreadable_reason    TEXT CHECK (unreadable_reason IS NULL OR unreadable_reason IN ('unsupported','auth_expired','auth_failed','provider_error','timeout')),
-  error                TEXT,
-  plan                 TEXT,
-  five_hour_pct        REAL,
-  five_hour_resets_at  INTEGER,
-  five_hour_minutes    INTEGER,
-  weekly_pct           REAL,
-  weekly_resets_at     INTEGER,
-  weekly_minutes       INTEGER,
-  fable_weekly_pct     REAL,
-  fable_resets_at      INTEGER,
-  fable_minutes        INTEGER,
-  display_windows      TEXT NOT NULL DEFAULT '[]'
-) STRICT;
-
+${ACCOUNT_LIMITS_TABLE_SQL}
 -- v7: durable selector cursors. The bare harness key is auto's near-tie
 -- rotation; rr:<harness> is the explicit registration-order selector.
 CREATE TABLE IF NOT EXISTS selection_cursors (

@@ -129,7 +129,7 @@ async function grokAccessToken(options: ProviderLimitsOptions): Promise<string |
   const expiresAt = typeof credential.entry.expires_at === "string" ? Date.parse(credential.entry.expires_at) : 0;
   if (current && Number.isFinite(expiresAt) && expiresAt > options.now + 30_000) return current;
   if (!options.allowCredentialRefresh) {
-    return unreadable("auth_expired", "Grok OAuth token expired; the running Grok owns refresh for this account");
+    return unreadable("refresh_deferred", "Grok OAuth token expired; the running Grok owns refresh for this account");
   }
   const refreshToken = credential.entry.refresh_token;
   const clientId = credential.entry.oidc_client_id;
@@ -237,7 +237,7 @@ async function kimiAccessToken(options: ProviderLimitsOptions): Promise<string |
   const expiresAtMs = (numberField(credential.expires_at) ?? 0) * 1000;
   if (access && expiresAtMs > options.now + 30_000) return access;
   if (!options.allowCredentialRefresh) {
-    return unreadable("auth_expired", "Kimi OAuth token expired; the running Kimi owns refresh for this account");
+    return unreadable("refresh_deferred", "Kimi OAuth token expired; the running Kimi owns refresh for this account");
   }
   const refreshToken = credential.refresh_token;
   if (typeof refreshToken !== "string" || !refreshToken) {
