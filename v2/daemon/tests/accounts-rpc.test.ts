@@ -449,8 +449,8 @@ test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) 
   });
   let daemon: DaemonHandle | null = null;
   try {
-    seedVault(dir, "claude", "claude-a", ".credentials.json");
-    seedVault(dir, "claude", "claude-b", ".credentials.json");
+    seedVault(dir, "claude", "claude-a", ".credentials.json", '{"claudeAiOauth":{"accessToken":"a","expiresAt":1}}');
+    seedVault(dir, "claude", "claude-b", ".credentials.json", '{"claudeAiOauth":{"accessToken":"b","expiresAt":1}}');
     daemon = await startDaemon(dir);
     const client = await daemon.client();
     await client.request("account.add", { harness: "claude", label: "a", importExisting: true });
@@ -643,7 +643,9 @@ test("rpc.accounts.v18: importExisting imports the MACHINE's vendor home (the fi
   try {
     mkdirSync(machineHome, { recursive: true });
     // The daemon's idea of $HOME is the fake machine home: ~/.codex lives there, never in the developer's real home.
-    daemon = await startDaemon(dir, { env: { HOME: machineHome } });
+    daemon = await startDaemon(dir, {
+      env: { HOME: machineHome, CODEX_HOME: join(machineHome, ".codex") },
+    });
     const client = await daemon.client();
     const watch = await daemon.client();
     const frames: WatchFrame[] = [];

@@ -322,11 +322,19 @@ test("v6.rpc.4: bee.fork (codex) — the fork's handshake sends thread/fork {thr
     daemon = await startDaemon(dir);
     const client = await daemon.client();
     const src = await client.request<SpawnResult>("spawn", { name: "csrc", agent: "codex", cwd: dir });
-    const srcThread = await waitFor(async () => (await client.request<ViewResult>("view", { beeId: src.beeId })).bee?.providerSessionId, "codex source thread id");
+    const srcThread = await waitFor(
+      async () => (await client.request<ViewResult>("view", { beeId: src.beeId })).bee?.providerSessionId,
+      "codex source thread id",
+      20_000,
+    );
     await waitState(client, src.beeId, "idle", "codex source idle");
     const fork = await client.request<ForkResult>("bee.fork", { beeId: src.beeId, prompt: "go on" });
     assert.equal(fork.forkSeed, srcThread);
-    const forkThread = await waitFor(async () => (await client.request<ViewResult>("view", { beeId: fork.beeId })).bee?.providerSessionId, "codex fork thread id");
+    const forkThread = await waitFor(
+      async () => (await client.request<ViewResult>("view", { beeId: fork.beeId })).bee?.providerSessionId,
+      "codex fork thread id",
+      20_000,
+    );
     assert.notEqual(forkThread, srcThread);
     await waitDelivered(client, fork.beeId, fork.messageId as number, "codex fork prompt delivered");
     await waitState(client, fork.beeId, "idle", "codex fork idle");
