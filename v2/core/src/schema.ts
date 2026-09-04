@@ -104,8 +104,13 @@
  *        sign-in (methods, phase, authorization URL / device code, requested
  *        input descriptors, typed error, revision). Carries no secret and no
  *        raw worker output. Additive; migration = CREATE TABLE IF NOT EXISTS.
+ *  v17 — provider-declared flag expiry: adds `flags.resets_at` and backfills
+ *        parseable reset instants from existing resource-blocked details.
+ *  v18 — bounded mailbox history: adds `mail_history_enqueues`, its projection
+ *        cursor, and partial audit indexes for bounded lifecycle/deletion
+ *        folding. Additive; migration creates and backfills the projection.
  */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -552,6 +557,47 @@ export const MAILBOX_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl
 export const FLAGS_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["resets_at", "resets_at INTEGER"],
 ];
+
+/**
+ * v18 mail-history indexes. They are ensured after additive migrations because
+ * paging selects `mail.enqueued` and lifecycle folds need direct point seeks.
+ */
+export const MAIL_HISTORY_INDEX_SQL = `
+CREATE INDEX IF NOT EXISTS audit_mail_enqueued_seq
+  ON audit(seq DESC) WHERE kind = 'mail.enqueued';
+CREATE INDEX IF NOT EXISTS audit_mail_delivered_message_seq
+  ON audit(CAST(json_extract(payload, '$.messageId') AS INTEGER), seq DESC)
+  WHERE kind = 'mail.delivered';
+CREATE INDEX IF NOT EXISTS audit_mail_expedited_message_seq
+  ON audit(CAST(json_extract(payload, '$.messageId') AS INTEGER), seq DESC)
+  WHERE kind = 'mail.expedited';
+CREATE INDEX IF NOT EXISTS audit_mail_canceled_message_seq
+  ON audit(CAST(json_extract(payload, '$.messageId') AS INTEGER), seq DESC)
+  WHERE kind = 'mail.canceled';
+CREATE INDEX IF NOT EXISTS audit_bee_deleted_bee_seq
+  ON audit(bee_id, seq DESC)
+  WHERE kind = 'bee.deleted';
+`;
+
+/**
+ * Bounded send-time projection for history pages. It deliberately has no bee
+ * foreign key: deletion removes the live mailbox but not accepted-send history.
+ */
+export const MAIL_HISTORY_PROJECTION_SQL = `
+CREATE TABLE IF NOT EXISTS mail_history_enqueues (
+  seq              INTEGER PRIMARY KEY,
+  message_id       INTEGER NOT NULL UNIQUE,
+  bee_id            TEXT NOT NULL,
+  origin            TEXT NOT NULL CHECK (origin IN ('mail.send','spawn.prompt','legacy.unknown')),
+  sender            BLOB NOT NULL,
+  sender_truncated  INTEGER NOT NULL CHECK (sender_truncated IN (0, 1)),
+  body              BLOB NOT NULL,
+  body_truncated    INTEGER NOT NULL CHECK (body_truncated IN (0, 1)),
+  priority          INTEGER NOT NULL,
+  urgency           TEXT NOT NULL CHECK (urgency IN ('now','next','idle')),
+  enqueued_at       INTEGER NOT NULL
+) STRICT;
+`;
 
 export const RUNTIMES_ADDITIVE_COLUMNS: ReadonlyArray<readonly [name: string, ddl: string]> = [
   ["boot_evidence", "boot_evidence TEXT CHECK (boot_evidence IN ('synthetic','real'))"],

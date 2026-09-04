@@ -23,6 +23,12 @@ import type {
   CredentialHealth,
   ExecutableResolutionSource,
   LoginFlowRow,
+  MailCancellationReason,
+  MailHistoryMessage as CoreMailHistoryMessage,
+  MailHistoryParams as CoreMailHistoryParams,
+  MailHistoryResult as CoreMailHistoryResult,
+  MailPendingParams as CoreMailPendingParams,
+  MailPendingResult as CoreMailPendingResult,
   MirrorAccountLimitsRow,
   MirrorAccountRow,
   MirrorLoginFlowRow,
@@ -43,6 +49,7 @@ import type {
   RuntimeRow,
   TemplatePackage,
   TrackPackage,
+  Urgency,
 } from "../../core/src/index.ts";
 import type { BootReport } from "./loops.ts";
 import type { EphemeralCredentialFile } from "./accountsService.ts";
@@ -78,6 +85,10 @@ export const DAEMON_CAPABILITIES = [
    * typed `lease_unsupported` / `lease_unavailable` refusals.
    */
   "account.lease.v1",
+  /** Bounded, backward-pageable node-wide mailbox history reconstructed from typed audit events. */
+  "mail.history.v1",
+  /** Bounded undelivered-only mailbox previews for frequent live indicators. */
+  "mail.pending.v1",
 ] as const;
 export type DaemonCapability = (typeof DAEMON_CAPABILITIES)[number];
 
@@ -176,6 +187,8 @@ export const RPC_VERBS = [
   "view",
   "list",
   "mailbox",
+  "mail.history",
+  "mail.pending",
   "commands",
   "deployInfo",
   "health",
@@ -892,6 +905,51 @@ export interface ListResult {
 export interface MailboxResult {
   messages: MessageRow[];
 }
+
+/** A mailbox mutation is routed by bee as well as node-local message id. */
+export interface MailCancelParams {
+  /** Required by current clients; optional only for rolling compatibility with pre-owner clients. */
+  beeId?: string;
+  messageId: number;
+  idempotencyKey?: string;
+}
+
+export interface MailExpediteParams extends MailCancelParams {
+  urgency: Urgency;
+}
+
+export interface MailCancelResult extends DedupMarkers {
+  canceled: true;
+}
+
+export interface MailExpediteResult extends DedupMarkers {
+  applied: true;
+}
+
+/** `mail.history` request params. See the core contract for cursor and bound semantics. */
+export type MailHistoryParams = CoreMailHistoryParams;
+
+export type MailHistoryLifecycle =
+  | { state: "queued" }
+  | { state: "delivered"; deliveredAt: number; deliveredGeneration: number }
+  | { state: "canceled"; canceledAt: number; reason?: MailCancellationReason };
+
+/** New preview metadata is optional at the rolling-compatible v1 client boundary. */
+export interface MailHistoryMessage
+  extends Omit<CoreMailHistoryMessage, "senderTruncated" | "bodyTruncated" | "lifecycle"> {
+  senderTruncated?: boolean;
+  bodyTruncated?: boolean;
+  lifecycle: MailHistoryLifecycle;
+}
+
+/** `total` is retained only as an optional legacy type; the bounded server omits it. */
+export interface MailHistoryResult extends Omit<CoreMailHistoryResult, "messages"> {
+  messages: MailHistoryMessage[];
+  total?: number;
+}
+
+export type MailPendingParams = CoreMailPendingParams & { beeId: string };
+export type MailPendingResult = CoreMailPendingResult;
 
 export interface CommandsResult {
   commands: CommandRow[];
