@@ -157,7 +157,7 @@ test("urgency.5: v8 migration — a v7 store opens as v8: mailbox.urgency added,
   try {
     const version = check.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
     assert.equal(Number(version.value), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 18);
+    assert.equal(SCHEMA_VERSION, 19);
     const cols = (check.prepare("SELECT name FROM pragma_table_info('mailbox')").all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes("urgency"));
     assert.ok(cols.includes("priority"));
@@ -174,13 +174,13 @@ test("mail.cancel: undelivered removed + audited; delivered refused; absent refu
     const { bee } = makeBee(store);
     bootToRunning(store, bee.id, 4, 4);
     const queued = store.send(bee.id, "cancel me", { urgency: "idle" });
-    assert.deepEqual(store.cancelMessage(queued.message.id), { canceled: true });
+    assert.deepEqual(store.cancelMessage(bee.id, queued.message.id), { canceled: true });
     assert.equal(store.getMessage(queued.message.id), null);
     assert.ok(store.auditRows().some((r) => r.kind === "mail.canceled"));
     const delivered = store.send(bee.id, "already gone");
     store.markDelivered(delivered.message.id, store.currentRuntime(bee.id)!.generation);
-    assert.deepEqual(store.cancelMessage(delivered.message.id), { canceled: false, reason: "delivered" });
-    assert.deepEqual(store.cancelMessage(99999), { canceled: false, reason: "not_found" });
+    assert.deepEqual(store.cancelMessage(bee.id, delivered.message.id), { canceled: false, reason: "delivered" });
+    assert.deepEqual(store.cancelMessage(bee.id, 99999), { canceled: false, reason: "not_found" });
   }
 });
 
@@ -192,11 +192,11 @@ test("mail.expedite: undelivered urgency changes + audited; delivered refused; u
     const { bee } = makeBee(store);
     bootToRunning(store, bee.id, 4, 4);
     const queued = store.send(bee.id, "later", { urgency: "idle" });
-    assert.deepEqual(store.expediteMessage(queued.message.id, "now"), { applied: true });
+    assert.deepEqual(store.expediteMessage(bee.id, queued.message.id, "now"), { applied: true });
     assert.equal(store.getMessage(queued.message.id)?.urgency, "now");
     assert.ok(store.auditRows().some((r) => r.kind === "mail.expedited"));
-    assert.throws(() => store.expediteMessage(queued.message.id, "whenever" as never));
+    assert.throws(() => store.expediteMessage(bee.id, queued.message.id, "whenever" as never));
     store.markDelivered(queued.message.id, store.currentRuntime(bee.id)!.generation);
-    assert.deepEqual(store.expediteMessage(queued.message.id, "next"), { applied: false, reason: "delivered" });
+    assert.deepEqual(store.expediteMessage(bee.id, queued.message.id, "next"), { applied: false, reason: "delivered" });
   }
 });

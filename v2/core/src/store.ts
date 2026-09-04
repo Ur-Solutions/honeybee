@@ -10,6 +10,7 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { TextDecoder } from "node:util";
 import {
   BeeNotFoundError,
   CommandProtocolError,
@@ -21,6 +22,15 @@ import {
   RUNTIME_VERBS,
   SecondWriterError,
   MESSAGE_URGENCIES,
+  MAIL_HISTORY_BODY_PREVIEW_BYTES,
+  MAIL_HISTORY_DEFAULT_LIMIT,
+  MAIL_HISTORY_MAX_LIMIT,
+  MAIL_HISTORY_PAGE_BODY_BUDGET_BYTES,
+  MAIL_HISTORY_PAGE_JSON_BUDGET_BYTES,
+  MAIL_HISTORY_SENDER_PREVIEW_BYTES,
+  MAIL_CANCELLATION_REASONS,
+  MAIL_ORIGINS,
+  MAX_BEE_ID_BYTES,
   UnknownFailureCauseError,
   UnknownFlagError,
   UnknownUrgencyError,
@@ -40,6 +50,14 @@ import {
   type Flag,
   type FlagRow,
   type MessageRow,
+  type MailCancellationReason,
+  type MailHistoryMessage,
+  type MailHistoryParams,
+  type MailHistoryResult,
+  type MailOrigin,
+  type MailPendingMessage,
+  type MailPendingParams,
+  type MailPendingResult,
   NAMING_USAGE_STATUSES,
   type NamingUsageRow,
   type NamingUsageStatus,
@@ -88,7 +106,7 @@ import {
   TASK_SUPPLY_SENDER_NAME,
   TASK_TRANSITIONS,
 } from "./tasks.ts";
-import { ACCOUNT_LIMITS_TABLE_SQL, BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
+import { ACCOUNT_LIMITS_TABLE_SQL, BEES_ADDITIVE_COLUMNS, FLAGS_ADDITIVE_COLUMNS, HANDLE_INDEX_SQL, IDEMPOTENCY_INDEX_SQL, MAILBOX_ADDITIVE_COLUMNS, MAIL_HISTORY_INDEX_SQL, MAIL_HISTORY_PROJECTION_SQL, RUNTIMES_ADDITIVE_COLUMNS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 import {
   LOGIN_FLOW_PHASES,
   isTerminalLoginPhase,
@@ -676,6 +694,36 @@ function requireNonEmpty(value: unknown, where: string): string {
   return value;
 }
 
+function wellFormedUtf16(value: string): string {
+  let normalized = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        normalized += value[index]! + value[index + 1]!;
+        index += 1;
+      } else {
+        normalized += "�";
+      }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      normalized += "�";
+    } else {
+      normalized += value[index]!;
+    }
+  }
+  return normalized;
+}
+
+function requireBeeId(value: unknown): string {
+  const id = requireNonEmpty(value, "createBee: bee id");
+  if (id !== wellFormedUtf16(id)) throw new CoreError("createBee: bee id must be well-formed UTF-16");
+  if (Buffer.byteLength(id, "utf8") > MAX_BEE_ID_BYTES) {
+    throw new CoreError(`createBee: bee id must be at most ${MAX_BEE_ID_BYTES} UTF-8 bytes`);
+  }
+  return id;
+}
+
 /** v5 `bees.args`: NULL → null; otherwise a json array of strings. */
 function parseArgsColumn(raw: unknown): string[] | null {
   if (raw == null) return null;
@@ -831,6 +879,104 @@ function mapAudit(r: Row): AuditRow {
     kind: r.kind as string,
     beeId: (r.bee_id as string | null) ?? null,
     payload: JSON.parse(r.payload as string) as Record<string, unknown>,
+  };
+}
+
+function auditString(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new CoreError(`mail history: malformed ${label}`);
+  return value;
+}
+
+function auditNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new CoreError(`mail history: malformed ${label}`);
+  }
+  return value;
+}
+
+function auditUrgency(value: unknown, label: string): Urgency {
+  if (typeof value !== "string" || !(MESSAGE_URGENCIES as readonly string[]).includes(value)) {
+    throw new CoreError(`mail history: malformed ${label}`);
+  }
+  return value as Urgency;
+}
+
+function auditCancellationReason(value: unknown, label: string): MailCancellationReason {
+  // Every pre-reason `mail.canceled` row came from cancelMessage, so the
+  // backward-compatible interpretation is an explicit request.
+  if (value === undefined) return "requested";
+  if (typeof value !== "string" || !(MAIL_CANCELLATION_REASONS as readonly string[]).includes(value)) {
+    throw new CoreError(`mail history: malformed ${label}`);
+  }
+  return value as MailCancellationReason;
+}
+
+function auditMailOrigin(value: unknown, label: string): MailOrigin {
+  if (typeof value !== "string" || !(MAIL_ORIGINS as readonly string[]).includes(value)) {
+    throw new CoreError(`mail history: malformed ${label}`);
+  }
+  return value as MailOrigin;
+}
+
+function boundedUtf8Preview(value: string, maxBytes: number): { value: string; truncated: boolean } {
+  let preview = "";
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) return { value: preview, truncated: true };
+    preview += character;
+    bytes += characterBytes;
+  }
+  return { value: preview, truncated: false };
+}
+
+function decodeBoundedUtf8Hex(value: unknown, maxBytes: number, label: string): Buffer {
+  if (typeof value !== "string") throw new CoreError(`mail history: malformed ${label}`);
+  const bytes = Buffer.from(value, "hex");
+  const decoded = new TextDecoder("utf-8").decode(bytes);
+  return Buffer.from(boundedUtf8Preview(decoded, maxBytes).value, "utf8");
+}
+
+function mailHistoryProjectionString(value: unknown, label: string): string {
+  if (!(value instanceof Uint8Array)) throw new CoreError(`mail history: malformed ${label}`);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(value);
+  } catch {
+    throw new CoreError(`mail history: malformed UTF-8 ${label}`);
+  }
+}
+
+function mailHistoryEnqueue(row: Row): MailHistoryMessage {
+  const seq = auditNumber(row.seq, "mail.enqueued seq");
+  return {
+    seq,
+    messageId: auditNumber(row.message_id, `mail.enqueued message.id at seq ${seq}`),
+    beeId: auditString(row.bee_id, `mail.enqueued message.beeId at seq ${seq}`),
+    sender: mailHistoryProjectionString(row.sender, `mail.enqueued message.sender at seq ${seq}`),
+    senderTruncated: Number(row.sender_truncated) === 1,
+    body: mailHistoryProjectionString(row.body, `mail.enqueued message.body at seq ${seq}`),
+    bodyTruncated: Number(row.body_truncated) === 1,
+    priority: auditNumber(row.priority, `mail.enqueued message.priority at seq ${seq}`),
+    urgency: auditUrgency(row.urgency ?? "next", `mail.enqueued message.urgency at seq ${seq}`),
+    enqueuedAt: auditNumber(row.enqueued_at, `mail.enqueued message.enqueuedAt at seq ${seq}`),
+    expeditedAt: null,
+    lifecycle: { state: "queued" },
+  };
+}
+
+function mailPendingMessage(row: Row): MailPendingMessage {
+  const id = auditNumber(row.message_id, "pending message id");
+  return {
+    id,
+    beeId: auditString(row.bee_id, `pending beeId for message ${id}`),
+    origin: auditMailOrigin(row.origin, `pending origin for message ${id}`),
+    sender: mailHistoryProjectionString(row.sender, `pending sender for message ${id}`),
+    senderTruncated: Number(row.sender_truncated) === 1,
+    body: mailHistoryProjectionString(row.body, `pending body for message ${id}`),
+    bodyTruncated: Number(row.body_truncated) === 1,
+    priority: auditNumber(row.priority, `pending priority for message ${id}`),
+    urgency: auditUrgency(row.urgency, `pending urgency for message ${id}`),
+    enqueuedAt: auditNumber(row.enqueued_at, `pending enqueuedAt for message ${id}`),
   };
 }
 
@@ -1030,7 +1176,7 @@ export class CoreStore {
       if (!accountLimitCols.has("display_windows")) {
         this.db.exec("ALTER TABLE account_limits ADD COLUMN display_windows TEXT NOT NULL DEFAULT '[]'");
       }
-      // v17 → v18: the unreadable_reason CHECK gains 'refresh_deferred'.
+      // v18 → v19: the unreadable_reason CHECK gains 'refresh_deferred'.
       // SQLite cannot widen a CHECK in place, so rebuild the table and carry
       // the rows across by name (an ALTER-migrated store appends columns in
       // a different order than a fresh one).
@@ -1044,10 +1190,10 @@ export class CoreStore {
           "weekly_pct", "weekly_resets_at", "weekly_minutes",
           "fable_weekly_pct", "fable_resets_at", "fable_minutes", "display_windows",
         ].join(", ");
-        this.db.exec("ALTER TABLE account_limits RENAME TO account_limits_v17");
+        this.db.exec("ALTER TABLE account_limits RENAME TO account_limits_v18");
         this.db.exec(ACCOUNT_LIMITS_TABLE_SQL);
-        this.db.exec(`INSERT INTO account_limits(${carried}) SELECT ${carried} FROM account_limits_v17`);
-        this.db.exec("DROP TABLE account_limits_v17");
+        this.db.exec(`INSERT INTO account_limits(${carried}) SELECT ${carried} FROM account_limits_v18`);
+        this.db.exec("DROP TABLE account_limits_v18");
       }
       // v9 → v10: mint display handles for existing bees. An imported bee
       // whose old id already IS a pretty handle (CL.7920-style) keeps it —
@@ -1066,6 +1212,15 @@ export class CoreStore {
     // — after the migration — not in SCHEMA_SQL.
     this.db.exec(IDEMPOTENCY_INDEX_SQL);
     this.db.exec(HANDLE_INDEX_SQL);
+    this.db.exec(MAIL_HISTORY_INDEX_SQL);
+    const hadMailHistoryProjection = this.stmt(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mail_history_enqueues'",
+    ).get() !== undefined;
+    this.db.exec(MAIL_HISTORY_PROJECTION_SQL);
+    if (!hadMailHistoryProjection) {
+      this.stmt("DELETE FROM meta WHERE key = 'mail_history_projection_seq'").run();
+    }
+    this.backfillMailHistoryEnqueues();
     this.db
       .prepare(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1073,10 +1228,137 @@ export class CoreStore {
       .run(String(SCHEMA_VERSION));
   }
 
-  private audit(kind: string, beeId: string | null, payload: Record<string, unknown>): void {
-    this.db
+  private audit(kind: string, beeId: string | null, payload: Record<string, unknown>, at = this.now()): number {
+    const inserted = this.db
       .prepare("INSERT INTO audit(ts, kind, bee_id, payload) VALUES(?, ?, ?, ?)")
-      .run(this.now(), kind, beeId, JSON.stringify(payload));
+      .run(at, kind, beeId, JSON.stringify(payload));
+    return Number(inserted.lastInsertRowid);
+  }
+
+  private auditMailCanceled(message: MessageRow, reason: MailCancellationReason, canceledAt: number): void {
+    this.audit(
+      "mail.canceled",
+      message.beeId,
+      { messageId: message.id, urgency: message.urgency, reason, canceledAt },
+      canceledAt,
+    );
+  }
+
+  private insertMailHistoryEnqueue(seq: number, message: MessageRow, origin: MailOrigin): void {
+    const sender = boundedUtf8Preview(message.sender, MAIL_HISTORY_SENDER_PREVIEW_BYTES);
+    const body = boundedUtf8Preview(message.body, MAIL_HISTORY_BODY_PREVIEW_BYTES);
+    this.stmt(
+      `INSERT INTO mail_history_enqueues(
+         seq, message_id, bee_id, origin, sender, sender_truncated, body,
+         body_truncated, priority, urgency, enqueued_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      seq,
+      message.id,
+      message.beeId,
+      origin,
+      Buffer.from(sender.value, "utf8"),
+      sender.truncated ? 1 : 0,
+      Buffer.from(body.value, "utf8"),
+      body.truncated ? 1 : 0,
+      message.priority,
+      message.urgency,
+      message.enqueuedAt,
+    );
+    this.stmt(
+      `INSERT INTO meta(key, value) VALUES('mail_history_projection_seq', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    ).run(String(seq));
+  }
+
+  /** One-time bounded-memory projection fill for stores created by older builds. */
+  private backfillMailHistoryEnqueues(): void {
+    const highWaterRow = this.stmt(
+      "SELECT value FROM meta WHERE key = 'mail_history_projection_seq'",
+    ).get() as Row | undefined;
+    const targetSeq = this.lastAuditSeq();
+    let cursor = highWaterRow === undefined ? 0 : Math.max(0, Math.min(targetSeq, Number(highWaterRow.value)));
+    let legacySpawnMessages: Set<string> | null = null;
+    while (cursor < targetSeq) {
+      const seqRows = this.stmt(
+        `SELECT seq FROM audit
+         WHERE kind = 'mail.enqueued' AND seq > ? AND seq <= ?
+         ORDER BY seq LIMIT 250`,
+      ).all(cursor, targetSeq) as Row[];
+      if (seqRows.length === 0) break;
+      const batchEnd = Number(seqRows[seqRows.length - 1]!.seq);
+      const rows = this.stmt(
+        `SELECT
+           a.seq,
+           a.bee_id,
+           json_extract(a.payload, '$.message.id') AS message_id,
+           json_extract(a.payload, '$.origin') AS origin,
+           hex(substr(CAST(json_extract(a.payload, '$.message.sender') AS BLOB), 1, ?)) AS sender_hex,
+           length(CAST(json_extract(a.payload, '$.message.sender') AS BLOB)) > ? AS sender_truncated,
+           hex(substr(CAST(json_extract(a.payload, '$.message.body') AS BLOB), 1, ?)) AS body_hex,
+           length(CAST(json_extract(a.payload, '$.message.body') AS BLOB)) > ? AS body_truncated,
+           json_extract(a.payload, '$.message.priority') AS priority,
+           COALESCE(json_extract(a.payload, '$.message.urgency'), 'next') AS urgency,
+           json_extract(a.payload, '$.message.enqueuedAt') AS enqueued_at
+         FROM audit a
+         LEFT JOIN mail_history_enqueues h ON h.seq = a.seq
+         WHERE a.kind = 'mail.enqueued' AND a.seq > ? AND a.seq <= ? AND h.seq IS NULL
+         ORDER BY a.seq`,
+      ).all(
+        MAIL_HISTORY_SENDER_PREVIEW_BYTES + 3,
+        MAIL_HISTORY_SENDER_PREVIEW_BYTES,
+        MAIL_HISTORY_BODY_PREVIEW_BYTES + 3,
+        MAIL_HISTORY_BODY_PREVIEW_BYTES,
+        cursor,
+        batchEnd,
+      ) as Row[];
+      const insert = this.stmt(
+        `INSERT INTO mail_history_enqueues(
+           seq, message_id, bee_id, origin, sender, sender_truncated, body,
+           body_truncated, priority, urgency, enqueued_at
+         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const row of rows) {
+        const seq = auditNumber(row.seq, "mail.enqueued seq");
+        const messageId = auditNumber(row.message_id, `mail.enqueued message.id at seq ${seq}`);
+        const beeId = auditString(row.bee_id, `mail.enqueued bee_id at seq ${seq}`);
+        if (row.origin == null && legacySpawnMessages === null) {
+          const facts = this.stmt(
+            `SELECT
+               json_extract(result, '$.beeId') AS bee_id,
+               json_extract(result, '$.messageId') AS message_id
+             FROM rpc_idempotency
+             WHERE verb = 'spawn' AND json_extract(result, '$.messageId') IS NOT NULL`,
+          ).all() as Row[];
+          legacySpawnMessages = new Set(
+            facts.map((fact) => JSON.stringify([String(fact.bee_id), Number(fact.message_id)])),
+          );
+        }
+        const origin = row.origin == null
+          ? legacySpawnMessages!.has(JSON.stringify([beeId, messageId]))
+            ? "spawn.prompt"
+            : "legacy.unknown"
+          : auditMailOrigin(row.origin, `mail.enqueued origin at seq ${seq}`);
+        insert.run(
+          seq,
+          messageId,
+          beeId,
+          origin,
+          decodeBoundedUtf8Hex(row.sender_hex, MAIL_HISTORY_SENDER_PREVIEW_BYTES, `sender at seq ${seq}`),
+          Number(row.sender_truncated) === 1 ? 1 : 0,
+          decodeBoundedUtf8Hex(row.body_hex, MAIL_HISTORY_BODY_PREVIEW_BYTES, `body at seq ${seq}`),
+          Number(row.body_truncated) === 1 ? 1 : 0,
+          auditNumber(row.priority, `mail.enqueued priority at seq ${seq}`),
+          auditUrgency(row.urgency ?? "next", `mail.enqueued urgency at seq ${seq}`),
+          auditNumber(row.enqueued_at, `mail.enqueued enqueuedAt at seq ${seq}`),
+        );
+      }
+      cursor = batchEnd;
+    }
+    this.stmt(
+      `INSERT INTO meta(key, value) VALUES('mail_history_projection_seq', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    ).run(String(targetSeq));
   }
 
   private mustGetBee(beeId: string): BeeRow {
@@ -1128,7 +1410,7 @@ export class CoreStore {
 
   createBee(input: CreateBeeInput): { bee: BeeRow; runtime: RuntimeRow } {
     return this.tx(() => {
-      const id = input.id ?? randomUUID();
+      const id = requireBeeId(input.id ?? randomUUID());
       if (this.getBee(id)) throw new CoreError(`bee already exists: ${id}`);
       let handle: string;
       if (input.handle !== undefined) {
@@ -1328,12 +1610,17 @@ export class CoreStore {
       // ON DELETE CASCADE removes runtimes, flags, mailbox, questions, seals,
       // tasks, and task_supply.
       this.stmt("DELETE FROM bees WHERE id = ?").run(beeId);
-      this.audit("bee.deleted", beeId, {
+      this.audit(
+        "bee.deleted",
         beeId,
-        deletedAt: at,
-        sessionLogPath: bee.sessionLogPath,
-        settledCommandIds,
-      });
+        {
+          beeId,
+          deletedAt: at,
+          sessionLogPath: bee.sessionLogPath,
+          settledCommandIds,
+        },
+        at,
+      );
       return { beeId, sessionLogPath: bee.sessionLogPath, livePid, settledCommandIds, orphanedChildIds };
     });
   }
@@ -1961,9 +2248,20 @@ export class CoreStore {
    * bee has no row → BeeNotFoundError). Archived bees auto-unarchive (Q3). When no
    * live runtime exists, a `send_wake` command is enqueued in the SAME transaction.
    */
-  send(beeId: string, body: string, opts: { sender?: string; priority?: number; urgency?: Urgency } = {}): SendResult {
+  send(
+    beeId: string,
+    body: string,
+    opts: { sender?: string; priority?: number; urgency?: Urgency; origin?: MailOrigin } = {},
+  ): SendResult {
     const urgency = opts.urgency ?? "next";
     if (!(MESSAGE_URGENCIES as readonly string[]).includes(urgency)) throw new UnknownUrgencyError(urgency);
+    const origin = opts.origin ?? "mail.send";
+    if (!(MAIL_ORIGINS as readonly string[]).includes(origin)) throw new CoreError(`unknown mail origin: ${origin}`);
+    if (body.includes("\0")) throw new CoreError("send: body must not contain U+0000");
+    const rawSender = opts.sender ?? "operator";
+    if (rawSender.includes("\0")) throw new CoreError("send: sender must not contain U+0000");
+    const normalizedBody = wellFormedUtf16(body);
+    const sender = wellFormedUtf16(rawSender);
     return this.tx(() => {
       const bee = this.mustGetBee(beeId);
       let unarchived = false;
@@ -1974,22 +2272,23 @@ export class CoreStore {
       const at = this.now();
       const res = this.db
         .prepare("INSERT INTO mailbox(bee_id, sender, body, priority, urgency, enqueued_at) VALUES(?, ?, ?, ?, ?, ?)")
-        .run(beeId, opts.sender ?? "operator", body, opts.priority ?? 0, urgency, at);
+        .run(beeId, sender, normalizedBody, opts.priority ?? 0, urgency, at);
       const message: MessageRow = {
         id: Number(res.lastInsertRowid),
         beeId,
-        sender: opts.sender ?? "operator",
-        body,
+        sender,
+        body: normalizedBody,
         priority: opts.priority ?? 0,
         urgency,
         enqueuedAt: at,
         deliveredAt: null,
         deliveredGeneration: null,
       };
-      this.audit("mail.enqueued", beeId, { message });
+      const enqueueSeq = this.audit("mail.enqueued", beeId, { message, origin });
+      this.insertMailHistoryEnqueue(enqueueSeq, message, origin);
       // Human (and bee) interaction resets the consecutive-feed counter; the
       // supply loop's own sends are excluded by sender name.
-      if ((opts.sender ?? "operator") !== TASK_SUPPLY_SENDER_NAME) {
+      if (sender !== TASK_SUPPLY_SENDER_NAME) {
         this.applyResetTaskSupplyFeeds(beeId);
       }
       const wakeCommand = this.applyWakeIfNeeded(beeId).command;
@@ -2025,9 +2324,195 @@ export class CoreStore {
     return rows.map(mapMessage);
   }
 
+  /** Bounded undelivered-only mailbox snapshot for frequent live indicators. */
+  pendingMail(beeId: string, params: MailPendingParams = {}): MailPendingResult {
+    const requestedLimit = params.limit ?? MAIL_HISTORY_DEFAULT_LIMIT;
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(MAIL_HISTORY_MAX_LIMIT, Math.floor(requestedLimit)))
+      : MAIL_HISTORY_DEFAULT_LIMIT;
+    const rows = this.stmt(
+      `SELECT h.*
+       FROM mailbox m
+       JOIN mail_history_enqueues h ON h.message_id = m.id
+       WHERE m.bee_id = ? AND m.delivered_at IS NULL
+       ORDER BY m.id
+       LIMIT ?`,
+    ).all(beeId, limit + 1) as Row[];
+    const candidates = rows.slice(0, limit).map(mailPendingMessage);
+    const messages: MailPendingMessage[] = [];
+    let bodyBytes = 0;
+    let jsonBytes = 0;
+    for (const message of candidates) {
+      const nextBodyBytes = bodyBytes + Buffer.byteLength(message.body, "utf8");
+      const nextJsonBytes = jsonBytes + Buffer.byteLength(JSON.stringify(message), "utf8");
+      if (nextBodyBytes > MAIL_HISTORY_PAGE_BODY_BUDGET_BYTES || nextJsonBytes > MAIL_HISTORY_PAGE_JSON_BUDGET_BYTES) {
+        if (messages.length === 0) throw new CoreError("mail.pending: one bounded projection row exceeds page budget");
+        break;
+      }
+      messages.push(message);
+      bodyBytes = nextBodyBytes;
+      jsonBytes = nextJsonBytes;
+    }
+    return { messages, hasMore: rows.length > messages.length };
+  }
+
   getMessage(messageId: number): MessageRow | null {
     const row = this.stmt("SELECT * FROM mailbox WHERE id = ?").get(messageId) as Row | undefined;
     return row ? mapMessage(row) : null;
+  }
+
+  /**
+   * Bounded node-wide send history from the append-only audit authority.
+   * Paging selects `mail.enqueued` rows before folding only the selected
+   * messages' lifecycle events, so unrelated audit traffic cannot evict mail.
+   */
+  mailHistory(params: MailHistoryParams = {}): MailHistoryResult {
+    const headSeq = this.lastAuditSeq();
+    const requestedSnapshot = params.snapshotSeq ?? headSeq;
+    const snapshotSeq = Number.isSafeInteger(requestedSnapshot)
+      ? Math.max(0, Math.min(headSeq, requestedSnapshot))
+      : headSeq;
+    const requestedLimit = params.limit ?? MAIL_HISTORY_DEFAULT_LIMIT;
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(MAIL_HISTORY_MAX_LIMIT, Math.floor(requestedLimit)))
+      : MAIL_HISTORY_DEFAULT_LIMIT;
+    const requestedBefore = params.beforeSeq ?? snapshotSeq + 1;
+    const beforeSeq = Number.isSafeInteger(requestedBefore)
+      ? Math.max(0, Math.min(snapshotSeq + 1, requestedBefore))
+      : snapshotSeq + 1;
+
+    const enqueueRows = this.stmt(
+      `SELECT * FROM mail_history_enqueues
+       WHERE seq <= ? AND seq < ?
+       ORDER BY seq DESC LIMIT ?`,
+    ).all(snapshotSeq, beforeSeq, limit + 1) as Row[];
+    const candidates = enqueueRows.slice(0, limit).map(mailHistoryEnqueue);
+
+    // Exactly three indexed point reads per candidate at most. Repeated
+    // expedites or historical duplicate terminal rows cannot enlarge work.
+    const deletedByBee = new Map<string, { seq: number; ts: number } | null>();
+    for (const message of candidates) {
+      const lifecycleRows = this.latestMailLifecycleRows(message.messageId, snapshotSeq);
+      for (const row of lifecycleRows) {
+        switch (row.kind) {
+          case "mail.expedited":
+            message.urgency = auditUrgency(row.payload.to, `mail.expedited to at seq ${row.seq}`);
+            message.expeditedAt =
+              row.payload.expeditedAt === undefined
+                ? row.ts
+                : auditNumber(row.payload.expeditedAt, `mail.expedited expeditedAt at seq ${row.seq}`);
+            break;
+          case "mail.delivered":
+            message.lifecycle = {
+              state: "delivered",
+              deliveredAt: auditNumber(row.payload.deliveredAt, `mail.delivered deliveredAt at seq ${row.seq}`),
+              deliveredGeneration: auditNumber(
+                row.payload.deliveredGeneration,
+                `mail.delivered deliveredGeneration at seq ${row.seq}`,
+              ),
+            };
+            break;
+          case "mail.canceled":
+            message.lifecycle = {
+              state: "canceled",
+              reason: auditCancellationReason(row.payload.reason, `mail.canceled reason at seq ${row.seq}`),
+              canceledAt:
+                row.payload.canceledAt === undefined
+                  ? row.ts
+                  : auditNumber(row.payload.canceledAt, `mail.canceled canceledAt at seq ${row.seq}`),
+            };
+            break;
+        }
+      }
+      // Stores written before bee deletion emitted per-message cancellation
+      // rows still retain the terminal bee.deleted audit. Bee ids are never
+      // reused, so one latest indexed row per selected bee safely closes any
+      // otherwise-queued message accepted before that deletion.
+      if (message.lifecycle.state === "queued") {
+        let deleted = deletedByBee.get(message.beeId);
+        if (deleted === undefined) {
+          deleted = this.latestBeeDeletedRow(message.beeId, snapshotSeq);
+          deletedByBee.set(message.beeId, deleted);
+        }
+        if (deleted !== null && deleted.seq > message.seq) {
+          message.lifecycle = {
+            state: "canceled",
+            reason: "bee_deleted",
+            canceledAt: deleted.ts,
+          };
+        }
+      }
+    }
+
+    const messages: MailHistoryMessage[] = [];
+    let bodyBytes = 0;
+    let jsonBytes = 0;
+    for (const message of candidates) {
+      const nextBodyBytes = bodyBytes + Buffer.byteLength(message.body, "utf8");
+      const nextJsonBytes = jsonBytes + Buffer.byteLength(JSON.stringify(message), "utf8");
+      if (nextBodyBytes > MAIL_HISTORY_PAGE_BODY_BUDGET_BYTES || nextJsonBytes > MAIL_HISTORY_PAGE_JSON_BUDGET_BYTES) {
+        if (messages.length === 0) throw new CoreError("mail history: one bounded projection row exceeds page budget");
+        break;
+      }
+      messages.push(message);
+      bodyBytes = nextBodyBytes;
+      jsonBytes = nextJsonBytes;
+    }
+    const hasMore = enqueueRows.length > messages.length;
+    return {
+      messages,
+      nextBeforeSeq: hasMore ? (messages[messages.length - 1]?.seq ?? null) : null,
+      hasMore,
+      truncated: hasMore,
+      snapshotSeq,
+    };
+  }
+
+  /** Latest event of each lifecycle kind for one message, ordered for folding. */
+  private latestMailLifecycleRows(messageId: number, snapshotSeq: number): AuditRow[] {
+    const delivered = this.stmt(
+      `SELECT * FROM audit
+       WHERE kind = 'mail.delivered'
+         AND CAST(json_extract(payload, '$.messageId') AS INTEGER) = ?
+         AND seq <= ?
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(messageId, snapshotSeq) as Row | undefined;
+    const expedited = this.stmt(
+      `SELECT * FROM audit
+       WHERE kind = 'mail.expedited'
+         AND CAST(json_extract(payload, '$.messageId') AS INTEGER) = ?
+         AND seq <= ?
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(messageId, snapshotSeq) as Row | undefined;
+    const canceled = this.stmt(
+      `SELECT * FROM audit
+       WHERE kind = 'mail.canceled'
+         AND CAST(json_extract(payload, '$.messageId') AS INTEGER) = ?
+         AND seq <= ?
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(messageId, snapshotSeq) as Row | undefined;
+    return [delivered, expedited, canceled]
+      .filter((row): row is Row => row !== undefined)
+      .map(mapAudit)
+      .sort((a, b) => a.seq - b.seq);
+  }
+
+  /** Latest deletion for a bee at this snapshot; bee ids are never reused. */
+  private latestBeeDeletedRow(
+    beeId: string,
+    snapshotSeq: number,
+  ): { seq: number; ts: number } | null {
+    const row = this.stmt(
+      `SELECT seq, ts FROM audit
+       WHERE kind = 'bee.deleted' AND bee_id = ? AND seq <= ?
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(beeId, snapshotSeq) as Row | undefined;
+    return row === undefined
+      ? null
+      : {
+          seq: auditNumber(row.seq, "bee.deleted seq"),
+          ts: auditNumber(row.ts, `bee.deleted timestamp at seq ${String(row.seq)}`),
+        };
   }
 
   /**
@@ -2035,13 +2520,18 @@ export class CoreStore {
    * consumes it (the queued-steering "cancel" affordance). A delivered
    * message is history, never cancelable — typed refusal, not an error.
    */
-  cancelMessage(messageId: number): { canceled: boolean; reason?: "not_found" | "delivered" } {
+  cancelMessage(
+    beeId: string,
+    messageId: number,
+  ): { canceled: boolean; reason?: "not_found" | "bee_mismatch" | "delivered" } {
     return this.tx(() => {
       const message = this.getMessage(messageId);
       if (!message) return { canceled: false, reason: "not_found" };
+      if (message.beeId !== beeId) return { canceled: false, reason: "bee_mismatch" };
       if (message.deliveredAt != null) return { canceled: false, reason: "delivered" };
+      const canceledAt = this.now();
       this.stmt("DELETE FROM mailbox WHERE id = ?").run(messageId);
-      this.audit("mail.canceled", message.beeId, { messageId, urgency: message.urgency });
+      this.auditMailCanceled(message, "requested", canceledAt);
       return { canceled: true };
     });
   }
@@ -2051,11 +2541,16 @@ export class CoreStore {
    * idle → now). The delivery loop honors the new urgency on its next tick —
    * `now` interrupts a running turn exactly like a fresh `--urgency now` send.
    */
-  expediteMessage(messageId: number, urgency: Urgency): { applied: boolean; reason?: "not_found" | "delivered" } {
+  expediteMessage(
+    beeId: string,
+    messageId: number,
+    urgency: Urgency,
+  ): { applied: boolean; reason?: "not_found" | "bee_mismatch" | "delivered" } {
     if (!MESSAGE_URGENCIES.includes(urgency)) throw new UnknownUrgencyError(urgency);
     return this.tx(() => {
       const message = this.getMessage(messageId);
       if (!message) return { applied: false, reason: "not_found" };
+      if (message.beeId !== beeId) return { applied: false, reason: "bee_mismatch" };
       if (message.deliveredAt != null) return { applied: false, reason: "delivered" };
       this.stmt("UPDATE mailbox SET urgency = ? WHERE id = ?").run(urgency, messageId);
       this.audit("mail.expedited", message.beeId, { messageId, from: message.urgency, to: urgency });
@@ -3445,7 +3940,10 @@ export class CoreStore {
       const at = this.now();
       let mailboxMessageId = current.mailboxMessageId;
       if (current.status === "queued" && CLOSING_TASK_ACTIONS.includes(action) && current.mailboxMessageId != null) {
-        const canceled = this.cancelMessage(current.mailboxMessageId);
+        const carryingMessage = this.getMessage(current.mailboxMessageId);
+        const canceled = carryingMessage
+          ? this.cancelMessage(carryingMessage.beeId, current.mailboxMessageId)
+          : { canceled: false };
         if (canceled.canceled) mailboxMessageId = null;
         else mailboxMessageId = null;
       }

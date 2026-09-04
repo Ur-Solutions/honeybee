@@ -163,7 +163,7 @@ test("tasks.supply: gate is six conditions; feed is one idle mailbox message; br
     store.send(bee.id, "human note", { sender: "operator" });
     assert.equal(store.tryFeedTaskSupply(bee.id), null, "mailbox not empty");
     const mail = store.undeliveredMessages(bee.id)[0]!;
-    store.cancelMessage(mail.id);
+    store.cancelMessage(bee.id, mail.id);
 
     const fed = store.tryFeedTaskSupply(bee.id);
     assert.ok(fed);
@@ -262,7 +262,7 @@ test("tasks.stall: idle + empty mail + fed in-flight stamps stalledAt once", () 
     const fed = store.tryFeedTaskSupply(bee.id);
     assert.ok(fed);
     assert.equal(store.maybeStallFedTask(bee.id), null, "mail still queued");
-    store.cancelMessage(fed.fed.mailboxMessageId as number);
+    store.cancelMessage(bee.id, fed.fed.mailboxMessageId as number);
     const stalled = store.maybeStallFedTask(bee.id);
     assert.ok(stalled?.stalledAt);
     assert.equal(store.maybeStallFedTask(bee.id), null, "already stalled");
