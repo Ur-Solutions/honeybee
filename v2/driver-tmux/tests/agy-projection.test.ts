@@ -4,12 +4,18 @@
  * /tmp/agy-fixtures/tooluse-skip-perms.jsonl, and auth-error.jsonl.
  */
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { AgySqliteTail } from "../src/agy-sqlite-tail.ts";
 import { createAgyProjector } from "../src/agy-projection.ts";
 import type { TranscriptProjectedEvent } from "../src/transcript-projection.ts";
 import {
   agyTranscriptRenderer,
   createTranscriptProjector,
+  findTranscript,
   lastAssistantText,
   renderTranscriptLines,
   TRANSCRIPT_RENDERERS,
@@ -17,6 +23,10 @@ import {
 
 const SESSION_ID = "agy-recorded-session";
 const j = (value: unknown): string => JSON.stringify(value);
+const AGY_USER_STEP_TYPE = 14;
+const AGY_ASSISTANT_STEP_TYPE = 15;
+const AGY_ACTIVE_STATUS = 2;
+const AGY_DONE_STATUS = 3;
 
 const USER_LINE = j({
   event: "user",
@@ -112,6 +122,85 @@ const TOOL_TURN_FIXTURE = [
     },
   }),
 ] as const;
+
+function varint(value: number): Buffer {
+  const bytes: number[] = [];
+  let next = value;
+  do {
+    let byte = next & 0x7f;
+    next = Math.floor(next / 128);
+    if (next > 0) byte |= 0x80;
+    bytes.push(byte);
+  } while (next > 0);
+  return Buffer.from(bytes);
+}
+
+function messageField(field: number, payload: Buffer): Buffer {
+  return Buffer.concat([varint((field * 8) + 2), varint(payload.length), payload]);
+}
+
+function stringField(field: number, text: string): Buffer {
+  return messageField(field, Buffer.from(text, "utf8"));
+}
+
+function userPayload(text: string): Buffer {
+  return messageField(19, Buffer.concat([stringField(2, text), messageField(3, stringField(1, text))]));
+}
+
+function assistantPayload(text: string): Buffer {
+  return messageField(20, Buffer.concat([stringField(1, text), stringField(8, text)]));
+}
+
+function makeDb(): { dir: string; path: string; db: DatabaseSync; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "hb-agy-sqlite-tail-"));
+  const path = join(dir, "conversation-1.db");
+  const db = new DatabaseSync(path);
+  db.exec(`
+    create table trajectory_meta (
+      trajectory_id text,
+      cascade_id text,
+      trajectory_type integer,
+      source integer,
+      primary key (trajectory_id)
+    );
+    create table steps (
+      idx integer,
+      step_type integer not null default 0,
+      status integer not null default 0,
+      has_subtrajectory numeric not null default false,
+      metadata blob,
+      error_details blob,
+      permissions blob,
+      task_details blob,
+      render_info blob,
+      step_payload blob,
+      step_format integer not null default 0,
+      primary key (idx)
+    );
+  `);
+  db.prepare("insert into trajectory_meta (trajectory_id, cascade_id, trajectory_type, source) values (?, ?, ?, ?)")
+    .run("trajectory-1", "conversation-1", 4, 17);
+  return {
+    dir,
+    path,
+    db,
+    cleanup: () => {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+function putStep(db: DatabaseSync, idx: number, stepType: number, status: number, payload: Buffer): void {
+  db.prepare(`
+    insert into steps (idx, step_type, status, step_payload)
+    values (?, ?, ?, ?)
+    on conflict(idx) do update set
+      step_type = excluded.step_type,
+      status = excluded.status,
+      step_payload = excluded.step_payload
+  `).run(idx, stepType, status, payload);
+}
 
 function project(lines: readonly string[]): TranscriptProjectedEvent[] {
   const projector = createAgyProjector();
@@ -492,4 +581,83 @@ test("agy CLI rendering shows the user, tools, and reply once; last returns the 
   assert.deepEqual(turns.map((turn) => turn.role), ["user", "tool", "tool", "assistant"]);
   assert.equal(turns.filter((turn) => turn.role === "assistant").length, 1);
   assert.equal(lastAssistantText(turns), "Hi! Ready to build something great today.\n\n`hello-agy`\n");
+});
+
+test("agy sqlite mirror: projects TUI steps into renderable agy stream-json lines", () => {
+  const r = makeDb();
+  try {
+    const tail = new AgySqliteTail(r.path);
+    putStep(r.db, 0, AGY_USER_STEP_TYPE, AGY_DONE_STATUS, userPayload("hello tui"));
+    putStep(r.db, 1, AGY_ASSISTANT_STEP_TYPE, AGY_ACTIVE_STATUS, assistantPayload("hel"));
+
+    const first = tail.poll();
+    assert.equal(JSON.parse(first[0] ?? "{}").event, "init");
+    assert.equal(JSON.parse(first[1] ?? "{}").event, "user");
+    assert.equal(JSON.parse(first[2] ?? "{}").step_update.text_delta, "hel");
+
+    putStep(r.db, 1, AGY_ASSISTANT_STEP_TYPE, AGY_DONE_STATUS, assistantPayload("hello from sqlite"));
+    const second = tail.poll();
+    assert.equal(JSON.parse(second[0] ?? "{}").step_update.state, "DONE");
+    assert.equal(JSON.parse(second[0] ?? "{}").step_update.text_delta, "lo from sqlite");
+    assert.equal(JSON.parse(second[1] ?? "{}").event, "result");
+    assert.equal(JSON.parse(second[1] ?? "{}").result.num_turns, 1);
+
+    const turns = renderTranscriptLines("agy", [...first, ...second]);
+    assert.deepEqual(turns.map((turn) => turn.role), ["user", "assistant"]);
+    assert.equal(lastAssistantText(turns), "hello from sqlite");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("agy sqlite mirror: skipExisting suppresses adopted history but emits new steps", () => {
+  const r = makeDb();
+  try {
+    putStep(r.db, 0, AGY_USER_STEP_TYPE, AGY_DONE_STATUS, userPayload("old prompt"));
+    putStep(r.db, 1, AGY_ASSISTANT_STEP_TYPE, AGY_DONE_STATUS, assistantPayload("old answer"));
+    const tail = new AgySqliteTail(r.path, { skipExisting: true });
+    assert.deepEqual(tail.poll(), []);
+
+    putStep(r.db, 2, AGY_USER_STEP_TYPE, AGY_DONE_STATUS, userPayload("new prompt"));
+    putStep(r.db, 3, AGY_ASSISTANT_STEP_TYPE, AGY_DONE_STATUS, assistantPayload("new answer"));
+    const lines = tail.poll();
+    assert.equal(lines.length, 3);
+    assert.equal(JSON.parse(lines[0] ?? "{}").event, "user");
+    assert.equal(JSON.parse(lines[1] ?? "{}").event, "step_update");
+    assert.equal(JSON.parse(lines[2] ?? "{}").event, "result");
+    assert.equal(lastAssistantText(renderTranscriptLines("agy", lines)), "new answer");
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("agy sqlite mirror locator: cwd filter checks the WAL sibling before checkpoint", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hb-agy-sqlite-locator-"));
+  try {
+    const dbPath = join(dir, "conversation-1.db");
+    writeFileSync(dbPath, "sqlite header without workspace yet");
+    writeFileSync(`${dbPath}-wal`, "file:///workspaces/agy-project");
+    assert.equal(
+      findTranscript({
+        dir,
+        match: /\.db$/,
+        depth: 1,
+        format: "agy-sqlite",
+        containsAny: ["file:///workspaces/agy-project"],
+      }, Date.now() - 1_000),
+      dbPath,
+    );
+    assert.equal(
+      findTranscript({
+        dir,
+        match: /\.db$/,
+        depth: 1,
+        format: "agy-sqlite",
+        containsAny: ["file:///other-project"],
+      }, Date.now() - 1_000),
+      null,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

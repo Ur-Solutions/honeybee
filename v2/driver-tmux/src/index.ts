@@ -36,6 +36,7 @@ export {
   type TranscriptTurn,
   type TranscriptTurnRole,
 } from "./transcripts.ts";
+export { AgySqliteTail } from "./agy-sqlite-tail.ts";
 export { createCodexProjector } from "./codex-projection.ts";
 export {
   type TranscriptFileChange,

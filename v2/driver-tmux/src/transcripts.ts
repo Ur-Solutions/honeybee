@@ -1,10 +1,10 @@
 /**
- * Transcript-file observers (WP5, spec 05 observation source 2 — the
- * MANDATORY baseline for every supported harness under A3).
+ * Transcript-file observers/renderers (WP5, spec 05 observation source 2).
  *
- * Every harness CLI writes session/transcript files; the adapter tails the
- * bee's transcript and derives turn boundaries + output recency from file
- * truth. Formats below are distilled from the v1 tree's transcript layer
+ * When a harness transcript carries structured lifecycle records, the driver
+ * tails it and derives turn boundaries + output recency from file truth.
+ * Render-only sources are kept out of that lifecycle parser registry. Formats
+ * below are distilled from the v1 tree's transcript layer
  * (src/transcripts/{claude,codex,grok}.ts and src/threadCopy.ts, read-only
  * reference — v2 imports nothing from it).
  *
@@ -36,8 +36,15 @@
  *    quiescence-derived, like claude. Shapes come from v1's fixtures
  *    (tests/transcripts.test.ts), NOT from a captured live stream — verify
  *    in a real-grok smoke before relying on it in production.
+ *
+ *  - agy     — lifecycle is hooks-only in tmux (live probe 2026-09-03:
+ *    `.agents/hooks.json` command hooks emit generic HIVE_EVENTS_FILE rows).
+ *    Its TUI SQLite DB under
+ *    `~/.gemini/antigravity-cli/conversations/<conversationId>.db` is
+ *    render-only transcript evidence; protobuf text projection must never be
+ *    folded into runtime state.
  */
-import { readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
 import { join, resolve } from "node:path";
 import { createAgyProjector } from "./agy-projection.ts";
 import { createClaudeProjector } from "./claude-projection.ts";
@@ -619,6 +626,10 @@ export interface TranscriptLocator {
   match?: RegExp;
   /** Recursive search depth (codex nests YYYY/MM/DD). Default 5. */
   depth?: number;
+  /** Tailer implementation for the matched file. SQLite is render-only. */
+  format?: "jsonl" | "agy-sqlite";
+  /** Optional raw-byte filter; checked against the file and WAL sibling. */
+  containsAny?: readonly string[];
 }
 
 /**
@@ -631,6 +642,7 @@ export function findTranscript(locator: TranscriptLocator, notBeforeMs: number):
   const match = locator.match ?? /\.jsonl$/;
   const maxDepth = locator.depth ?? 5;
   const floor = notBeforeMs;
+  const containsAny = locator.containsAny?.filter((needle) => needle.length > 0) ?? [];
   let best: { path: string; mtime: number } | null = null;
   const walk = (dir: string, depth: number): void => {
     let entries: Dirent[];
@@ -653,9 +665,24 @@ export function findTranscript(locator: TranscriptLocator, notBeforeMs: number):
         continue;
       }
       if (mtime < floor) continue;
+      if (containsAny.length > 0 && !fileContainsAny(p, containsAny)) continue;
       if (best == null || mtime > best.mtime) best = { path: p, mtime };
     }
   };
   walk(locator.dir, 0);
   return best == null ? null : (best as { path: string; mtime: number }).path;
+}
+
+function fileContainsAny(path: string, needles: readonly string[]): boolean {
+  const encoded = needles.map((needle) => Buffer.from(needle, "utf8"));
+  for (const candidate of [path, `${path}-wal`]) {
+    let data: Buffer;
+    try {
+      data = readFileSync(candidate);
+    } catch {
+      continue;
+    }
+    if (encoded.some((needle) => data.includes(needle))) return true;
+  }
+  return false;
 }

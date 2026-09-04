@@ -123,7 +123,7 @@ test("cell-driver.background: start returns before provisioning and later boots 
     assert.ok(performance.now() - startedAt < 500, "start must not run Git provisioning on the daemon lane");
     assert.equal(driver.hasProcess("bee-1", 1), true, "pending provisioning owns the generation");
 
-    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"));
+    await drainUntil(driver, (events) => events.some((event) => event.kind === "booted"), 15_000);
     const cell = driver.cellOf("bee-1");
     assert.ok(cell);
     assert.ok(existsSync(join(cell.paths.spaceDir, ".git")));

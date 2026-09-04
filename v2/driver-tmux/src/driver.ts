@@ -11,12 +11,14 @@
  *    and session names are NEVER signal targets — signals go to the recorded
  *    pid only, after verifying its OS start time (the CO.a8d2 lesson).
  *  - Observation (point 2, A3): a per-runtime observer stack, in order of
- *    preference: (a) the driver-owned hook/notify events file, (b) the
- *    MANDATORY transcript-file baseline (transcripts.ts), (c) pane-content
+ *    preference: (a) the driver-owned hook/notify events file, (b) transcript
+ *    files whose records carry structured lifecycle evidence, (c) pane-content
  *    change detection (activity/quiescence only — no string parsing),
- *    expected to be needed by zero harnesses. All sources fold into one
- *    phase machine, so hooks-based, notify-based and transcript-only
- *    harnesses produce IDENTICAL automation outcomes (the spec05.eq matrix).
+ *    expected to be needed by zero harnesses. Render-only mirrors, such as
+ *    agy's SQLite DB projection, feed session logs but never runtime state.
+ *    All lifecycle sources fold into one phase machine, so hooks-based,
+ *    notify-based and transcript-only harnesses produce IDENTICAL automation
+ *    outcomes (the spec05.eq matrix).
  *  - Deliver (point 3): VALIDATED injection, then Enter. Text goes in via
  *    paste-buffer (default) or literal typed chunks (`deliveryMode: "type"`,
  *    for TUIs that ignore the tmux paste buffer entirely — grok, verified
@@ -34,8 +36,8 @@
  *    session by verified pid and re-attaches observers at EOF — the runtime
  *    stays fully deliverable (tmux runtimes are never "degraded").
  */
-import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import type {
   DeliverOutcome,
@@ -47,9 +49,11 @@ import type {
 } from "../../harness/src/driver.ts";
 import { pidAlive, verifyProcessIdentity } from "../../driver-hsr/src/psutil.ts";
 import { exactPaneTarget, exactSession, shQuote, TmuxServer } from "./tmux.ts";
+import { AgySqliteTail } from "./agy-sqlite-tail.ts";
 import { JsonlTail } from "./tail.ts";
 import { parseEventsFileLine } from "./events-file.ts";
 import {
+  canonicalCwd,
   findTranscript,
   TRANSCRIPT_PARSERS,
   type TranscriptEvent,
@@ -60,6 +64,17 @@ import {
 export interface ObservationSpec {
   /** The mandatory transcript baseline: where this harness writes its file. */
   transcript?: { locator: TranscriptLocator; parser: TranscriptParser | string };
+  /**
+   * Optional render-only source. Lines from this source are copied into the
+   * session log but never folded into runtime lifecycle state.
+   */
+  transcriptMirror?: { locator: TranscriptLocator };
+  /** Driver-installed hook roots for harnesses whose lifecycle comes from HIVE_EVENTS_FILE. */
+  hooks?: { kind: "agy" };
+  /** Bounded TUI boot readiness checks for harnesses where prompt readiness is not immediate. */
+  bootReady?: { kind: "agy-tui"; timeoutMs?: number };
+  /** Suppress quiescence end detection when hooks/notify provide explicit end events. */
+  explicitTurnEnd?: boolean;
   /** Source (c): pane-content change detection. Only for file-less harnesses. */
   paneFallback?: boolean;
   /** Quiescence window for formats without an explicit turn-end record. Default 400ms. */
@@ -122,6 +137,11 @@ interface PendingConfirm {
   deadline: number;
 }
 
+interface TranscriptTail {
+  readonly path: string;
+  poll(): string[];
+}
+
 interface TmuxRuntime {
   beeId: string;
   generation: number;
@@ -140,11 +160,15 @@ interface TmuxRuntime {
   eventsTail: JsonlTail;
   transcriptLocator: TranscriptLocator | null;
   transcriptParser: TranscriptParser | null;
-  transcriptTail: JsonlTail | null;
+  transcriptTail: TranscriptTail | null;
+  mirrorLocator: TranscriptLocator | null;
+  mirrorTail: TranscriptTail | null;
   lastBindScanAt: number;
+  lastMirrorBindScanAt: number;
   paneFallback: boolean;
   paneHash: string | null;
   lastPanePollAt: number;
+  explicitTurnEnd: boolean;
   quiesceMs: number;
   deliveryGraceMs: number;
   lastActivityAt: number;
@@ -166,6 +190,13 @@ const TYPE_CHUNK_GAP_MS = 50;
 const ECHO_TAIL_CHARS = 24;
 const ECHO_VERIFY_TIMEOUT_MS = 2_000;
 const ECHO_VERIFY_POLL_MS = 100;
+const AGY_BOOT_READY_TIMEOUT_MS = 45_000;
+const AGY_BOOT_READY_POLL_MS = 100;
+const AGY_BOOT_TRUST_PROMPTS = [
+  "Do you trust the contents of this project?",
+  "Yes, I trust this folder",
+] as const;
+const AGY_BOOT_READY_PROMPTS = ["? for shortcuts"] as const;
 
 /** Synchronous sleep — the driver is fully synchronous (spawnSync tmux). */
 function sleepSync(ms: number): void {
@@ -201,8 +232,74 @@ function countOccurrences(haystack: string, needle: string): number {
 
 /** The driver's session-name convention — exported so `hive v2 attach` can address the recorded session. */
 export function sessionNameFor(beeId: string, generation: number): string {
-  const safe = beeId.replace(/[^a-zA-Z0-9_-]+/g, "-");
-  return `hive-v2-${safe}-g${generation}`;
+  return `hive-v2-${safePathSegment(beeId)}-g${generation}`;
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-");
+}
+
+function agyEventHookCommand(event: "turn_started" | "turn_ended" | "output"): string {
+  const payload = JSON.stringify({ event });
+  return `if [ -n "$HIVE_EVENTS_FILE" ]; then printf '%s\\n' '${payload}' >> "$HIVE_EVENTS_FILE"; fi; printf '{}\\n'`;
+}
+
+function jsonObject(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function agyTrustPaths(path: string): string[] {
+  const out: string[] = [];
+  for (const candidate of [path, canonicalCwd(path)]) {
+    if (candidate.length > 0 && !out.includes(candidate)) out.push(candidate);
+  }
+  return out;
+}
+
+function atomicWriteFileSync(path: string, content: string, mode = 0o600): void {
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync(tmp, content, { mode });
+  renameSync(tmp, path);
+}
+
+function seedAgyTrustedWorkspaces(home: string, workspaces: readonly string[]): void {
+  const settingsPath = join(home, ".gemini", "antigravity-cli", "settings.json");
+  let settings: Record<string, unknown> = {};
+  let existing = "";
+  if (existsSync(settingsPath)) {
+    existing = readFileSync(settingsPath, "utf8");
+    if (existing.trim().length > 0) {
+      const parsed = jsonObject(JSON.parse(existing));
+      if (parsed == null) throw new Error(`tmux driver: agy settings must be a JSON object (${settingsPath})`);
+      settings = parsed;
+    }
+  }
+
+  const rawTrusted = settings.trustedWorkspaces;
+  let trusted: string[];
+  if (rawTrusted === undefined) {
+    trusted = [];
+  } else if (Array.isArray(rawTrusted) && rawTrusted.every((entry) => typeof entry === "string")) {
+    trusted = [...rawTrusted];
+  } else {
+    throw new Error(`tmux driver: agy settings trustedWorkspaces must be a string array (${settingsPath})`);
+  }
+
+  let changed = false;
+  for (const workspace of workspaces) {
+    for (const trustedPath of agyTrustPaths(workspace)) {
+      if (trusted.includes(trustedPath)) continue;
+      trusted.push(trustedPath);
+      changed = true;
+    }
+  }
+  if (!changed && rawTrusted !== undefined) return;
+
+  settings.trustedWorkspaces = trusted;
+  const next = `${JSON.stringify(settings, null, 2)}\n`;
+  if (next === existing) return;
+  mkdirSync(dirname(settingsPath), { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(settingsPath, next);
 }
 
 export class TmuxDriver implements RuntimeDriver {
@@ -228,6 +325,7 @@ export class TmuxDriver implements RuntimeDriver {
     this.graceMs = cfg.stopKillGraceMs ?? 5000;
     this.adoptTolMs = cfg.adoptToleranceMs ?? 5000;
     mkdirSync(cfg.eventsDir, { recursive: true });
+    if (cfg.sessionLogDir) mkdirSync(cfg.sessionLogDir, { recursive: true });
   }
 
   // -------------------------------------------------------------------------
@@ -255,7 +353,14 @@ export class TmuxDriver implements RuntimeDriver {
       HIVE_BEE_ID: beeId,
     };
     for (const [k, v] of Object.entries(env)) envFlags.push("-e", `${k}=${v}`);
-    const shellCommand = [spec.command, ...spec.args].map(shQuote).join(" ");
+    let args: string[];
+    try {
+      args = this.argsForSpawn(beeId, generation, spec);
+    } catch {
+      this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
+    const shellCommand = [spec.command, ...args].map(shQuote).join(" ");
     let paneId: string;
     let pid: number;
     const spawnedAt = this.now();
@@ -298,17 +403,37 @@ export class TmuxDriver implements RuntimeDriver {
       this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
       return;
     }
-    const runtime = this.newRuntime({
-      beeId,
-      generation,
-      sessionName,
-      paneId,
-      pid,
-      pidStartedAt: spawnedAt,
-      spawnedAt,
-      adopted: false,
-      spec,
-    });
+    try {
+      this.waitForBootReady(spec.observation, sessionName, pid);
+    } catch (err) {
+      this.tryKillSession(sessionName);
+      this.events.push({
+        beeId,
+        generation,
+        kind: "exited",
+        exitCause: "crashed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    let runtime: TmuxRuntime;
+    try {
+      runtime = this.newRuntime({
+        beeId,
+        generation,
+        sessionName,
+        paneId,
+        pid,
+        pidStartedAt: spawnedAt,
+        spawnedAt,
+        adopted: false,
+        spec,
+      });
+    } catch {
+      this.tryKillSession(sessionName);
+      this.events.push({ beeId, generation, kind: "exited", exitCause: "crashed" });
+      return;
+    }
     this.procs.set(beeId, runtime);
     // The pane exists and the CLI is launched: booted, straight to idle
     // (the bootedToIdle normalization — a tmux harness boots to its input
@@ -539,17 +664,22 @@ export class TmuxDriver implements RuntimeDriver {
     } catch {
       return false;
     }
-    const runtime = this.newRuntime({
-      beeId,
-      generation,
-      sessionName,
-      paneId,
-      pid,
-      pidStartedAt,
-      spawnedAt: pidStartedAt,
-      adopted: true,
-      spec,
-    });
+    let runtime: TmuxRuntime;
+    try {
+      runtime = this.newRuntime({
+        beeId,
+        generation,
+        sessionName,
+        paneId,
+        pid,
+        pidStartedAt,
+        spawnedAt: pidStartedAt,
+        adopted: true,
+        spec,
+      });
+    } catch {
+      return false;
+    }
     // Safe claim: "running" — the event stream between daemons is gone. The
     // observers re-establish truth: fresh activity confirms running, and
     // quiescence (sawOutputThisTurn starts true for adopted runtimes)
@@ -591,8 +721,92 @@ export class TmuxDriver implements RuntimeDriver {
   }
 
   eventsFilePath(beeId: string): string {
-    const safe = beeId.replace(/[^a-zA-Z0-9_-]+/g, "-");
-    return join(this.cfg.eventsDir, `${safe}.events.jsonl`);
+    return join(this.cfg.eventsDir, `${safePathSegment(beeId)}.events.jsonl`);
+  }
+
+  private argsForSpawn(beeId: string, generation: number, spec: TmuxSpawnSpec): string[] {
+    this.validateObservation(spec.observation);
+    if (spec.observation.hooks?.kind !== "agy") return spec.args;
+    const root = this.installAgyHooks(beeId, generation);
+    const home = spec.env?.HOME ?? process.env.HOME;
+    if (home == null || home.length === 0) throw new Error("tmux driver: agy HOME is required for workspace trust seeding");
+    seedAgyTrustedWorkspaces(home, [spec.cwd, root]);
+    return [...spec.args, "--add-dir", root];
+  }
+
+  private validateObservation(obs: ObservationSpec): void {
+    if (obs.transcript?.locator.format === "agy-sqlite") {
+      throw new Error("tmux driver: agy SQLite locators are render-only transcript mirrors, not lifecycle observers");
+    }
+  }
+
+  private installAgyHooks(beeId: string, generation: number): string {
+    const root = join(this.cfg.eventsDir, "agy-hooks", `${safePathSegment(beeId)}-g${generation}`);
+    // agy only loads added-workspace hooks from `<workspace>/.agents/hooks.json`
+    // (root-level hooks.json did not load in the 2026-09-03 probe). The added
+    // workspace is per runtime and driver-owned; keep it empty except this one
+    // hook config so `--add-dir` exposes no source tree, token, or helper script.
+    rmSync(root, { recursive: true, force: true });
+    const agentsDir = join(root, ".agents");
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(
+      join(agentsDir, "hooks.json"),
+      `${JSON.stringify(
+        {
+          "hive-v2-events": {
+            PreInvocation: [{
+              type: "command",
+              command: agyEventHookCommand("turn_started"),
+              timeout: 5,
+            }],
+            PostInvocation: [{
+              type: "command",
+              command: agyEventHookCommand("output"),
+              timeout: 5,
+            }],
+            Stop: [{
+              type: "command",
+              command: agyEventHookCommand("turn_ended"),
+              timeout: 5,
+            }],
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return root;
+  }
+
+  private waitForBootReady(obs: ObservationSpec, sessionName: string, pid: number): void {
+    if (obs.bootReady?.kind !== "agy-tui") return;
+    const timeoutMs = obs.bootReady.timeoutMs ?? AGY_BOOT_READY_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+    const target = exactPaneTarget(sessionName);
+    let trustSubmitted = false;
+    let sawTrustDialog = false;
+    for (;;) {
+      if (!pidAlive(pid)) throw new Error("tmux driver: agy TUI exited before its input prompt appeared");
+      const captured = this.server.try(["capture-pane", "-p", "-t", target]);
+      if (captured.status !== 0) throw new Error("tmux driver: agy TUI pane disappeared before boot readiness");
+      const text = captured.stdout;
+      const trustDialog = AGY_BOOT_TRUST_PROMPTS.some((prompt) => text.includes(prompt));
+      if (trustDialog) {
+        sawTrustDialog = true;
+        if (!trustSubmitted) {
+          trustSubmitted = true;
+          this.server.try(["send-keys", "-t", target, "Enter"]);
+        }
+      }
+      if (AGY_BOOT_READY_PROMPTS.some((prompt) => text.includes(prompt))) return;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `tmux driver: agy TUI did not reach its input prompt within ${timeoutMs}ms` +
+            (sawTrustDialog ? " after a workspace trust dialog was observed" : ""),
+        );
+      }
+      sleepSync(AGY_BOOT_READY_POLL_MS);
+    }
   }
 
   // --- delivery ground truth (invariant gate) ------------------------------
@@ -652,6 +866,9 @@ export class TmuxDriver implements RuntimeDriver {
     const obs = init.spec.observation;
     let parser: TranscriptParser | null = null;
     if (obs.transcript) {
+      if (obs.transcript.locator.format === "agy-sqlite") {
+        throw new Error("tmux driver: agy SQLite locators are render-only transcript mirrors, not lifecycle observers");
+      }
       parser =
         typeof obs.transcript.parser === "string"
           ? TRANSCRIPT_PARSERS[obs.transcript.parser] ?? null
@@ -678,10 +895,14 @@ export class TmuxDriver implements RuntimeDriver {
       transcriptLocator: obs.transcript?.locator ?? null,
       transcriptParser: parser,
       transcriptTail: null,
+      mirrorLocator: obs.transcriptMirror?.locator ?? null,
+      mirrorTail: null,
       lastBindScanAt: 0,
+      lastMirrorBindScanAt: 0,
       paneFallback: obs.paneFallback ?? false,
       paneHash: null,
       lastPanePollAt: 0,
+      explicitTurnEnd: obs.explicitTurnEnd ?? parser?.explicitTurnEnd ?? false,
       quiesceMs: obs.quiesceMs ?? 400,
       deliveryGraceMs: obs.deliveryGraceMs ?? 5000,
       lastActivityAt: this.now(),
@@ -717,6 +938,20 @@ export class TmuxDriver implements RuntimeDriver {
         }
       }
     }
+    // Render-only transcript mirror: evidence for `hive transcript`, never a
+    // lifecycle input. This is where agy's SQLite projection belongs.
+    if (p.mirrorLocator != null) {
+      if (p.mirrorTail == null && now - p.lastMirrorBindScanAt >= BIND_SCAN_INTERVAL_MS) {
+        p.lastMirrorBindScanAt = now;
+        const found = findTranscript(p.mirrorLocator, p.spawnedAt);
+        if (found != null) {
+          p.mirrorTail = transcriptTailFor(p.mirrorLocator, found, { skipExisting: p.adopted });
+        }
+      }
+      if (p.mirrorTail != null) {
+        for (const line of p.mirrorTail.poll()) this.mirrorSessionLog(p.beeId, line);
+      }
+    }
     // (a) hook/notify events file — lowest latency, explicit semantics.
     for (const line of p.eventsTail.poll()) {
       p.lastActivityAt = now;
@@ -741,10 +976,9 @@ export class TmuxDriver implements RuntimeDriver {
       }
     }
     // Quiescence-derived turn end, for sources without an explicit record.
-    const explicitEnd = p.transcriptParser?.explicitTurnEnd ?? false;
     if (
       p.phase === "running" &&
-      !explicitEnd &&
+      !p.explicitTurnEnd &&
       p.sawOutputThisTurn &&
       now - p.lastActivityAt >= p.quiesceMs
     ) {
@@ -869,4 +1103,12 @@ export class TmuxDriver implements RuntimeDriver {
   private tryKillSession(sessionName: string): void {
     this.server.try(["kill-session", "-t", exactSession(sessionName)]);
   }
+}
+
+function transcriptTailFor(
+  locator: TranscriptLocator,
+  path: string,
+  opts: { skipExisting: boolean },
+): TranscriptTail {
+  return locator.format === "agy-sqlite" ? new AgySqliteTail(path, opts) : new JsonlTail(path, opts);
 }

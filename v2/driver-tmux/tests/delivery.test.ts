@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { drainUntil, kinds, makeRig, settle } from "./helpers.ts";
+import { drainUntil, kinds, makeRig, settle, waitForStubReady } from "./helpers.ts";
 
 test("delivery.unconfirmed: no observed turn start within grace → retryable note, no state change", async () => {
   const rig = makeRig();
@@ -51,6 +51,7 @@ test("delivery.pane-fallback: a file-less harness still yields activity/quiescen
   try {
     rig.configure("bee-1", "silent"); // no transcript, no hooks — pane only
     rig.driver.start("bee-1", 1);
+    await waitForStubReady(rig, "bee-1");
     await drainUntil(rig.driver, (e) => e.some((x) => x.kind === "turn_ended"));
     // Pane mode reports BOOT output as activity too (all it can know); let
     // that phantom activity open+quiesce before delivering.
