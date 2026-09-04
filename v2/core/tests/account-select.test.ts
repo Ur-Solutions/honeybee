@@ -1,25 +1,41 @@
 /**
  * Spec 08 test 4 — the GOLDEN selection suite, ported from the old
- * tests/limits.test.ts against the verbatim port in src/accountSelect.ts.
- * Same inputs, same picks, same reasons. Each test names the old test it
- * came from. Reinterpretations are called out inline (the commitment
+ * tests/limits.test.ts against src/accountSelect.ts. Each test names the old
+ * test it came from. Reinterpretations are called out inline (the commitment
  * weights map old session states onto the v2 four-state model; the cursor
  * rotation is a pure function over a caller-held cursor instead of a json
- * file). Pure — no store, no I/O.
+ * file). Revision 2026-09-02 (the THTO herd): the pace credit is capped, the
+ * 5h window is a gradient, weekly/Fable reserve lines are classes regardless
+ * of time-to-reset, and windows are projected forward by velocity — three
+ * old expectations moved and are annotated where they did. Pure — no store,
+ * no I/O.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  AUTO_BEE_BURN_PER_HOUR,
   AUTO_COMMITMENT_BUSY_PERCENT,
   AUTO_COMMITMENT_PARKED_PERCENT,
+  AUTO_FIVE_HOUR_SATURATION_PERCENT,
+  AUTO_PACE_CREDIT_CAP_PERCENT,
+  AUTO_PICK_DEBIT_PERCENT,
+  AUTO_PICK_DEBIT_TTL_MS,
+  AUTO_WEEKLY_SATURATION_PERCENT,
+  accountActiveBees,
   accountCommitments,
+  decayedPickDebit,
   effectiveWindowLoad,
   limitsFromRow,
+  measureWindowVelocity,
   paceDelta,
+  pendingPickDebit,
+  projectWindow,
+  prunePendingPicks,
   rotateNearTie,
   runtimeCommitmentPercent,
   selectLeastLoadedAccount,
   windowRolledOver,
+  windowVelocityPerHour,
   type AccountLimits,
   type AutoAccountCandidate,
   type SelectableAccount,
@@ -91,8 +107,13 @@ test("golden.4 selectLeastLoadedAccount picks the least weekly usage", () => {
     ],
     now,
   );
-  assert.equal(choice?.account.id, "b");
+  // MOVED 2026-09-02: b has the least weekly usage but its 5h window is 50%
+  // used with the whole window ahead of it (the shared reset is 6h out, so
+  // 0% elapsed) — a hot short window is now a gradient penalty, not a free
+  // ride below the old 90% gate. c (40% weekly, 5% 5h) is the sane landing.
+  assert.equal(choice?.account.id, "c");
   assert.match(choice?.reason ?? "", /behind pace/);
+  assert.match(choice?.reason ?? "", /5h 5 ahead of pace/);
 });
 
 // old: "selectLeastLoadedAccount prefers an imminent reset with expiring surplus over lower raw usage"
@@ -112,8 +133,15 @@ test("golden.5 selectLeastLoadedAccount prefers an imminent reset with expiring 
     ],
     now,
   );
-  assert.equal(choice?.account.id, "a");
-  assert.match(choice?.reason ?? "", /behind pace — surplus expires at reset/);
+  // MOVED 2026-09-02: the pace credit is capped at AUTO_PACE_CREDIT_CAP_PERCENT,
+  // so a's 30 expiring points are worth 25 at most and raw usage decides:
+  // 70 − 25 = 45 vs 40 − 25 = 15. An imminent reset is a preference, not a
+  // magnet (the operator's other threads on a need the headroom more than a
+  // fresh bee needs the surplus). golden.5b below keeps the case where the
+  // surplus DOES decide — usage nearly equal, reset imminent.
+  assert.equal(choice?.account.id, "b");
+  assert.match(choice?.reason ?? "", /ahead of pace/);
+  assert.equal(effectiveWindowLoad(withWeekly(70, "2026-06-11T12:00:00Z").weekly!, now, { paceCreditCap: AUTO_PACE_CREDIT_CAP_PERCENT }), 45);
 
   // Diminishing returns near 100%: c is behind pace too (98% used, resets in
   // 1h) but its remaining 2% is not worth landing a fresh bee on — the
@@ -203,7 +231,8 @@ test("golden.7 selectLeastLoadedAccount protects an almost-empty Fable allowance
     // and is behind pace because it resets soon — exactly the unsafe case a
     // pure pace score would otherwise be tempted to burn.
     { account: pickAccount("a", "2026-01-01"), limits: withFable(10, 95, "2026-06-10T13:00:00Z") },
-    { account: pickAccount("b", "2026-01-02"), limits: withFable(40, 70) },
+    // (60, not the old 70: 70 + one Fable bee's expected 7 crosses the 75 reserve → projected-overrun tier, golden.19)
+    { account: pickAccount("b", "2026-01-02"), limits: withFable(40, 60) },
   ];
 
   assert.equal(selectLeastLoadedAccount(candidates, now)?.account.id, "a", "non-Fable selection remains generic");
@@ -446,6 +475,17 @@ test("golden.15 limitsFromRow maps the store row onto the selector's AccountLimi
     fableWeeklyPct: null, fableResetsAt: null, fableMinutes: null,
   });
   assert.deepEqual(failed, { ok: false, error: "HTTP 401" });
+  // 2026-09-02: the row's fetchedAt and the daemon's measured velocities ride along.
+  const measured = limitsFromRow({
+    readable: true, error: null, plan: null, fetchedAt: 5_000,
+    fiveHourPct: 39, fiveHourResetsAt: 1_000, fiveHourMinutes: 300,
+    weeklyPct: 10, weeklyResetsAt: 2_000, weeklyMinutes: 10_080,
+    fableWeeklyPct: 20, fableResetsAt: 2_000, fableMinutes: 10_080,
+  }, { fiveHour: 40, weekly: null, fableWeekly: 6.5 });
+  assert.equal(measured.fetchedAt, 5_000);
+  assert.equal(measured.fiveHour?.velocityPerHour, 40);
+  assert.equal(measured.weekly?.velocityPerHour, undefined, "null = no measurement (window rolled over between reads)");
+  assert.equal(measured.fableWeekly?.velocityPerHour, 6.5);
   // Epoch-ms boundaries score exactly like the old ISO strings.
   const now = Date.parse("2026-06-10T12:00:00Z");
   const iso: AccountLimits = okLimits(70, 10, "2026-06-11T12:00:00Z");
@@ -456,4 +496,234 @@ test("golden.15 limitsFromRow maps the store row onto the selector's AccountLimi
     fableWeeklyPct: null, fableResetsAt: null, fableMinutes: null,
   });
   assert.equal(effectiveWindowLoad(ms.weekly!, now), effectiveWindowLoad(iso.weekly!, now));
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-02 — the THTO herd. Four Fable picks in one hour all landed on the
+// account whose 5h window went 4% → 93%, each one "correct" under the old
+// model. These pin the terms that stop it.
+// ---------------------------------------------------------------------------
+
+const T = Date.parse("2026-09-02T09:10:00Z");
+const hours = (n: number) => new Date(T + n * 60 * 60 * 1000).toISOString();
+const claudeLimits = (
+  spec: { weekly: number; fable: number; fiveHour: number; weeklyResetsInHours: number; fiveHourResetsInHours: number },
+  extra: Partial<AccountLimits> = {},
+): AccountLimits => ({
+  ok: true,
+  fiveHour: { usedPercent: spec.fiveHour, windowMinutes: 300, resetsAt: hours(spec.fiveHourResetsInHours) },
+  weekly: { usedPercent: spec.weekly, windowMinutes: 10_080, resetsAt: hours(spec.weeklyResetsInHours) },
+  fableWeekly: { usedPercent: spec.fable, windowMinutes: 10_080, resetsAt: hours(spec.weeklyResetsInHours) },
+  ...extra,
+});
+
+test("herd.1 the 09:10 pick: a hot 5h window loses to an idle account even when its week is about to reset", () => {
+  // thto: 94% into its week with 10% used (old score −84 + 16 in-flight),
+  // 5h 39% at 20% elapsed. kontrol: mid-week, 0% everywhere.
+  const thto = claudeLimits({ weekly: 10, fable: 20, fiveHour: 39, weeklyResetsInHours: 9.5, fiveHourResetsInHours: 4 });
+  const kontrol = claudeLimits({ weekly: 0, fable: 0, fiveHour: 0, weeklyResetsInHours: 89, fiveHourResetsInHours: 4.9 });
+  const candidates: AutoAccountCandidate[] = [
+    { account: pickAccount("thto", "2026-01-01"), limits: thto, commitment: 16, activeBees: 2 },
+    { account: pickAccount("kontrol", "2026-01-02"), limits: kontrol },
+  ];
+  const fable = selectLeastLoadedAccount(candidates, T, { model: "fable" });
+  assert.equal(fable?.account.id, "kontrol");
+  assert.deepEqual(fable?.nearTieIds, ["kontrol"], "not a near-tie: thto is projected to cross its 5h line within the hour");
+  // The 5h window alone (39% at 20% elapsed → +19 ahead of pace) already
+  // outweighs the capped weekly credit; the projection makes it a class.
+  assert.ok(effectiveWindowLoad(thto.fiveHour!, T) > 18);
+  const projected = projectWindow(thto.fiveHour!, "fiveHour", T, { activeBees: 2 });
+  assert.ok(projected.projected >= AUTO_FIVE_HOUR_SATURATION_PERCENT, `projected ${projected.projected}`);
+  // Same picture without any in-flight knowledge: still kontrol.
+  const cold = selectLeastLoadedAccount(candidates.map((c) => ({ account: c.account, limits: c.limits })), T, { model: "fable" });
+  assert.equal(cold?.account.id, "kontrol");
+});
+
+test("herd.2 the pace credit is capped: late-week surplus is worth at most 25 points, so commitments can outweigh it", () => {
+  const late = { ok: true, weekly: { usedPercent: 17, windowMinutes: 10_080, resetsAt: hours(9.5) } };
+  const mid = { ok: true, weekly: { usedPercent: 0, windowMinutes: 10_080, resetsAt: hours(89) } };
+  // Old model: late −77 vs mid −47 → late by 30, unbeatable. New: −8 vs −25.
+  assert.equal(Math.round(effectiveWindowLoad(late.weekly, T, { paceCreditCap: AUTO_PACE_CREDIT_CAP_PERCENT })), -8);
+  assert.equal(Math.round(effectiveWindowLoad(mid.weekly, T, { paceCreditCap: AUTO_PACE_CREDIT_CAP_PERCENT })), -25);
+  assert.equal(Math.round(effectiveWindowLoad(late.weekly, T)), -77, "the uncapped pace delta is unchanged");
+  const idle = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("late", "2026-01-01"), limits: late },
+      { account: pickAccount("mid", "2026-01-02"), limits: mid },
+    ],
+    T,
+  );
+  assert.equal(idle?.account.id, "mid");
+  // Three busy bees on mid (+24) now flip it back — the credit is a preference of bee-scale.
+  const loaded = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("late", "2026-01-01"), limits: late },
+      { account: pickAccount("mid", "2026-01-02"), limits: mid, commitment: 3 * AUTO_COMMITMENT_BUSY_PERCENT, activeBees: 3 },
+    ],
+    T,
+  );
+  assert.equal(loaded?.account.id, "late");
+});
+
+test("herd.3 the weekly reserve is a class regardless of time-to-reset: 93% with an hour left loses to 84% mid-week", () => {
+  const nearlyDone = { ok: true, weekly: { usedPercent: 93, windowMinutes: 10_080, resetsAt: hours(1) } };
+  const midWeek = { ok: true, weekly: { usedPercent: 84, windowMinutes: 10_080, resetsAt: hours(84) } };
+  const choice = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("nearly-done", "2026-01-01"), limits: nearlyDone },
+      { account: pickAccount("mid-week", "2026-01-02"), limits: midWeek },
+    ],
+    T,
+  );
+  assert.equal(choice?.account.id, "mid-week");
+  assert.equal(AUTO_WEEKLY_SATURATION_PERCENT, 85);
+  // A general-weekly reserve applies to plain picks too (it used to be a Fable-only tier at 90).
+  const allPast = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: nearlyDone },
+      { account: pickAccount("b", "2026-01-02"), limits: { ok: true, weekly: { usedPercent: 86, windowMinutes: 10_080, resetsAt: hours(84) } } },
+    ],
+    T,
+  );
+  assert.equal(allPast?.account.id, "b");
+  assert.match(allPast?.reason ?? "", /past its weekly reserve/);
+});
+
+test("herd.4 projection: a bee that would push a window over its reserve within the hour is a down-tier class", () => {
+  const fiveHour = (usedPercent: number, velocityPerHour?: number): AccountLimits => ({
+    ok: true,
+    fiveHour: { usedPercent, windowMinutes: 300, resetsAt: hours(2.5), ...(velocityPerHour !== undefined ? { velocityPerHour } : {}) },
+    weekly: { usedPercent: 10, windowMinutes: 10_080, resetsAt: hours(84) },
+  });
+  // Measured velocity: a is emptier (50 vs 55) but burning 35/h → 50 + (35 + 20) = 105.
+  const measured = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: fiveHour(50, 35) },
+      { account: pickAccount("b", "2026-01-02"), limits: fiveHour(55, 0) },
+    ],
+    T,
+  );
+  assert.equal(measured?.account.id, "b");
+  assert.deepEqual(measured?.nearTieIds, ["b"]);
+  // No measurement: busy bees stand in (3 × 20/h) — a 30% window with three
+  // workers on it is projected to 110; a 40% idle window (average 16/h) to 76.
+  const estimated = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: fiveHour(30), activeBees: 3 },
+      { account: pickAccount("b", "2026-01-02"), limits: fiveHour(40) },
+    ],
+    T,
+  );
+  assert.equal(estimated?.account.id, "b");
+  assert.equal(windowVelocityPerHour(fiveHour(30).fiveHour!, "fiveHour", T, 3), 3 * AUTO_BEE_BURN_PER_HOUR.fiveHour);
+  assert.equal(windowVelocityPerHour(fiveHour(40).fiveHour!, "fiveHour", T, 0), 16, "average rate: 40 points over 2.5 elapsed hours");
+  // Everyone projected over → least overshoot, and the reason says so.
+  const allOver = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: fiveHour(50, 35) },
+      { account: pickAccount("b", "2026-01-02"), limits: fiveHour(70, 0) },
+    ],
+    T,
+  );
+  assert.equal(allOver?.account.id, "b", "70 + 20 = 90 overshoots by 10; 105 by 25");
+  assert.match(allOver?.reason ?? "", /projected to cross a limit within the hour; least overshoot \(\+10\)/);
+  // The horizon is clipped to the reset: 30 minutes left → half an hour of burn.
+  const soon = projectWindow({ usedPercent: 60, windowMinutes: 300, resetsAt: hours(0.5), velocityPerHour: 40 }, "fiveHour", T);
+  assert.equal(soon.horizonHours, 0.5);
+  assert.equal(soon.projected, 60 + (40 + 20) * 0.5);
+  // A rolled-over window projects from zero.
+  assert.equal(projectWindow({ usedPercent: 99, windowMinutes: 300, resetsAt: hours(-1) }, "fiveHour", T).projected, AUTO_BEE_BURN_PER_HOUR.fiveHour);
+});
+
+test("herd.5 a stale snapshot is aged forward by its velocity before saturation and scoring", () => {
+  // 39% read 30 minutes ago at 40/h is 59% now; projected 59 + 60 = 119.
+  const aged = projectWindow(
+    { usedPercent: 39, windowMinutes: 300, resetsAt: hours(3), velocityPerHour: 40 },
+    "fiveHour",
+    T,
+    { fetchedAt: T - 30 * 60_000 },
+  );
+  assert.equal(aged.usedNow, 59);
+  assert.equal(aged.projected, 119);
+  // Aging is capped at the horizon and never exceeds 100.
+  assert.equal(projectWindow({ usedPercent: 90, windowMinutes: 300, resetsAt: hours(3), velocityPerHour: 40 }, "fiveHour", T, { fetchedAt: T - 3 * 60 * 60_000 }).usedNow, 100);
+  // Class order: a's 70% read half an hour ago at 30/h is 85% NOW (saturated);
+  // b's fresh 75% is merely projected over (75 + 20 = 95). Saturated is worse.
+  const choice = selectLeastLoadedAccount(
+    [
+      {
+        account: pickAccount("a", "2026-01-01"),
+        limits: { ok: true, fetchedAt: T - 30 * 60_000, fiveHour: { usedPercent: 70, windowMinutes: 300, resetsAt: hours(3), velocityPerHour: 30 } },
+      },
+      {
+        account: pickAccount("b", "2026-01-02"),
+        limits: { ok: true, fetchedAt: T, fiveHour: { usedPercent: 75, windowMinutes: 300, resetsAt: hours(3), velocityPerHour: 0 } },
+      },
+    ],
+    T,
+  );
+  assert.equal(choice?.account.id, "b");
+});
+
+test("herd.6 rate-limit exhaustion evidence is a class below every non-exhausted account", () => {
+  const choice = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits(10, 10), exhausted: true },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits(60, 10) },
+    ],
+    Date.parse("2026-06-10T12:00:00Z"),
+  );
+  assert.equal(choice?.account.id, "b");
+  const all = selectLeastLoadedAccount(
+    [
+      { account: pickAccount("a", "2026-01-01"), limits: okLimits(10, 10), exhausted: true },
+      { account: pickAccount("b", "2026-01-02"), limits: okLimits(60, 10), exhausted: true },
+    ],
+    Date.parse("2026-06-10T12:00:00Z"),
+  );
+  assert.equal(all?.account.id, "a");
+  assert.match(all?.reason ?? "", /exhaustion evidence/);
+});
+
+test("herd.7 pick debits decay linearly over the ttl and prune when spent", () => {
+  const at = T;
+  assert.equal(decayedPickDebit({ at, percent: AUTO_PICK_DEBIT_PERCENT }, at), 10);
+  assert.equal(decayedPickDebit({ at, percent: 10 }, at + AUTO_PICK_DEBIT_TTL_MS / 2), 5);
+  assert.equal(decayedPickDebit({ at, percent: 10 }, at + AUTO_PICK_DEBIT_TTL_MS), 0);
+  assert.equal(decayedPickDebit({ at: at + 60_000, percent: 10 }, at), 10, "a future stamp (skewed clock) counts as fresh");
+  assert.equal(decayedPickDebit({ at, percent: 0 }, at), 0);
+  const picks = [{ at, percent: 10 }, { at: at - AUTO_PICK_DEBIT_TTL_MS / 2, percent: 10 }, { at: at - AUTO_PICK_DEBIT_TTL_MS, percent: 10 }];
+  assert.equal(pendingPickDebit(picks, at), 15);
+  assert.deepEqual(prunePendingPicks(picks, at), picks.slice(0, 2));
+  // Two same-instant picks over equal accounts: the second sees the first's debit and goes elsewhere.
+  const equal = (id: string, i: number, commitment = 0): AutoAccountCandidate => ({ account: pickAccount(id, `2026-01-0${i}`), limits: okLimits(10, 10), commitment });
+  const first = selectLeastLoadedAccount([equal("a", 1), equal("b", 2)], at)!;
+  assert.equal(first.account.id, "a");
+  const second = selectLeastLoadedAccount([equal("a", 1, AUTO_PICK_DEBIT_PERCENT), equal("b", 2)], at)!;
+  assert.equal(second.account.id, "b");
+  assert.deepEqual(second.nearTieIds, ["b"], "a debit of 10 is outside the 3-point tie band");
+});
+
+test("herd.8 velocity is measured only between comparable snapshots of the same window", () => {
+  const prev = { usedPercent: 39, resetsAt: T + 3 * 60 * 60_000, fetchedAt: T };
+  const later = T + 30 * 60_000;
+  assert.equal(measureWindowVelocity(prev, { usedPercent: 59, resetsAt: prev.resetsAt, fetchedAt: later }), 40);
+  assert.equal(measureWindowVelocity(prev, { usedPercent: 59, resetsAt: prev.resetsAt + 400, fetchedAt: later }), 40, "providers jitter the boundary by ms");
+  assert.equal(measureWindowVelocity(prev, { usedPercent: 2, resetsAt: prev.resetsAt + 5 * 60 * 60_000, fetchedAt: later }), null, "a new window");
+  assert.equal(measureWindowVelocity(prev, { usedPercent: 2, resetsAt: prev.resetsAt, fetchedAt: later }), null, "used% fell: rolled over between reads");
+  assert.equal(measureWindowVelocity(prev, { usedPercent: 40, resetsAt: prev.resetsAt, fetchedAt: T + 60_000 }), null, "too close to divide by");
+  assert.equal(measureWindowVelocity({ ...prev, resetsAt: null }, { usedPercent: 59, resetsAt: null, fetchedAt: later }), null, "no boundary, no window identity");
+  assert.equal(measureWindowVelocity(prev, { usedPercent: 39, resetsAt: prev.resetsAt, fetchedAt: later }), 0, "idle is a measurement too");
+});
+
+test("herd.9 accountActiveBees counts busy runtimes only", () => {
+  const counts = accountActiveBees([
+    { account: "a", runtimeState: "running" },
+    { account: "a", runtimeState: "booting" },
+    { account: "a", runtimeState: "idle" },
+    { account: "b", runtimeState: "stopped" },
+    { account: null, runtimeState: "running" },
+  ]);
+  assert.equal(counts.get("a"), 2);
+  assert.equal(counts.get("b"), undefined);
 });

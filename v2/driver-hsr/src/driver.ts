@@ -460,6 +460,9 @@ export class HsrDriver implements RuntimeDriver {
       // semantics the direct child's `spawn` event carried (v9: synthetic,
       // never boot evidence; an agent that fails to spawn reports spawnError
       // and exits while still booting, counting against the spawn budget).
+      // The driver's phase is idle from here; the synthetic booted below is
+      // paired with a synthetic turn_ended so the store lands on the same
+      // idle (see pollHost) instead of a `running` no output will ever close.
       proc.phase = "idle";
     }
   }
@@ -684,6 +687,25 @@ export class HsrDriver implements RuntimeDriver {
               pidStartedAt: p.pidStartedAt,
               synthetic: true,
             });
+            if (p.phase === "idle") {
+              // Nothing has been injected yet: the agent sits at its prompt
+              // (claude emits no line until the first stdin message). booted
+              // alone leaves the store `running` — a turn no output will ever
+              // close, since the driver's own phase is idle and drops the
+              // late init/result edges. Field finding 2026-09-02: a swap of an
+              // idle bee (stop → revive, empty mailbox) showed "working" for
+              // hours (CL.60c9, CL.e72f). Mint the "boots straight to ready"
+              // turn_ended the adapter would have parsed — synthetic: never
+              // boot evidence, never an output fact. A delivery that already
+              // opened the turn (phase running) suppresses it: the real
+              // result closes that turn.
+              this.events.push({
+                beeId: p.beeId,
+                generation: p.generation,
+                kind: "turn_ended",
+                synthetic: true,
+              });
+            }
           }
         }
         if (status.exited) {

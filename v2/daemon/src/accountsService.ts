@@ -19,14 +19,19 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { withFileLock } from "../../../src/lock.ts";
 import {
+  AUTO_PICK_DEBIT_PERCENT,
+  accountActiveBees,
   accountCommitments,
   accountIdFor,
   homeEnvFor,
   isAuthFailureLimitsError,
   limitsFromRow,
+  measureWindowVelocity,
   parseClaudeCredentials,
   parseClaudeUsage,
   parseCodexRateLimits,
+  pendingPickDebit,
+  prunePendingPicks,
   recipeEnvFor,
   recipeFor,
   resolveVendorHome,
@@ -45,8 +50,10 @@ import {
   type CoreStore,
   type CredentialHealth,
   type MirrorAccountRow,
+  type PendingPick,
   type PutAccountLimitsInput,
   type WindowUsage,
+  type WindowVelocities,
 } from "../../core/src/index.ts";
 import {
   activateHomeIfEmpty,
@@ -498,6 +505,19 @@ export class AccountsService {
   private readonly claudeRefreshes = new Map<string, Promise<ClaudeRefreshOutcome>>();
   /** Grok/Kimi refresh tokens also rotate; share the whole provider read. */
   private readonly secondaryProviderFetches = new Map<string, Promise<PutAccountLimitsInput>>();
+  /**
+   * Auto picks not yet visible as runtimes (HIVE-80 reservation): each pick
+   * debits its account for AUTO_PICK_DEBIT_TTL_MS so back-to-back spawns
+   * spread instead of stacking on one snapshot. In-memory: a daemon restart
+   * loses at most 15 minutes of reservations.
+   */
+  private readonly pendingPicks = new Map<string, PendingPick[]>();
+  /**
+   * Measured burn per window (points/hour) from consecutive readable
+   * snapshots of the same window; null = the window rolled over between
+   * reads (fresh, no velocity yet). Feeds the selector's aging + projection.
+   */
+  private readonly velocities = new Map<string, WindowVelocities>();
   /** v19: at most one lease mint per account; concurrent callers join it. */
   private readonly leaseMints = new Map<string, Promise<EphemeralCredential>>();
   private readonly codexLeaseRefresh: (homePath: string) => Promise<void>;
@@ -671,11 +691,12 @@ export class AccountsService {
       this.log(`account auto → ${only.id} — ${reason}`);
       return { ok: true, account: only, reason, limitsAgeMs: null, stale: false, candidates: 1 };
     }
-    // Commitments: live bees on each account (this harness only).
+    // Commitments: live bees on each account (this harness only) + pending
+    // pick debits; busy bees + fresh picks also drive the velocity fallback.
     const bees = this.store.listBees().filter((b) => b.agent === harness && b.account);
-    const commitments = accountCommitments(
-      bees.map((b) => ({ account: b.account, runtimeState: this.store.currentRuntime(b.id)?.state ?? null })),
-    );
+    const runtimes = bees.map((b) => ({ account: b.account, runtimeState: this.store.currentRuntime(b.id)?.state ?? null }));
+    const commitments = accountCommitments(runtimes);
+    const activeBees = accountActiveBees(runtimes);
     const rowsById = new Map<string, AccountLimitsRow>();
     for (const a of eligible) {
       const row = this.store.getAccountLimits(a.id);
@@ -683,10 +704,15 @@ export class AccountsService {
     }
     const scored: AutoAccountCandidate[] = eligible.map((a) => {
       const row = rowsById.get(a.id);
+      const pending = prunePendingPicks(this.pendingPicks.get(a.id) ?? [], now);
+      if (pending.length > 0) this.pendingPicks.set(a.id, pending);
+      else this.pendingPicks.delete(a.id);
       return {
         account: { id: a.id, addedAt: a.addedAt, penalty: a.penalty },
-        ...(row ? { limits: limitsFromRow(row) } : {}),
-        commitment: commitments.get(a.id) ?? 0,
+        ...(row ? { limits: limitsFromRow(row, this.velocities.get(a.id) ?? {}) } : {}),
+        commitment: (commitments.get(a.id) ?? 0) + pendingPickDebit(pending, now),
+        activeBees: (activeBees.get(a.id) ?? 0) + pending.length,
+        exhausted: a.exhaustedAt != null && now - a.exhaustedAt < this.cfg.accounts.exhaustionCoolOffMs,
       };
     });
     const choice = selectLeastLoadedAccount(scored, now, opts.model ? { model: opts.model } : {});
@@ -695,6 +721,8 @@ export class AccountsService {
     const rotated = rotateNearTie(choice, scored, cursor?.lastAccountId ?? null);
     if (rotated.cursor !== null) this.store.setSelectionCursor(harness, rotated.cursor);
     const winner = eligible.find((a) => a.id === rotated.choice.account.id) as AccountRow;
+    // The HIVE-80 reservation: the next concurrent pick sees this one.
+    this.pendingPicks.set(winner.id, [...(this.pendingPicks.get(winner.id) ?? []), { at: now, percent: AUTO_PICK_DEBIT_PERCENT }]);
     const reason = `${rotated.choice.reason}${healthReason}`;
     const row = rowsById.get(winner.id);
     const limitsAgeMs = row ? Math.max(0, now - row.fetchedAt) : null;
@@ -799,6 +827,9 @@ export class AccountsService {
       // readable snapshot became false. Keep its fetchedAt and windows so the
       // mirror and selector honestly expose stale, last-known-good data. Real
       // auth failures still replace the row and drive auth_needed below.
+      if (!keepLastGood && previous?.readable === true && fetched.readable) {
+        this.velocities.set(id, this.measureVelocities(previous, fetched));
+      }
       const row = keepLastGood ? previous! : this.store.putAccountLimits(id, fetched);
       // The probe is the authentication check account health keys on: a REAL
       // auth failure sets auth_needed; a readable answer or agy's successful
@@ -832,6 +863,28 @@ export class AccountsService {
       out.push(row);
     }
     return out;
+  }
+
+  /** Per-window velocity between the stored row and the snapshot about to replace it. */
+  private measureVelocities(previous: AccountLimitsRow, fetched: PutAccountLimitsInput): WindowVelocities {
+    const now = this.now();
+    const measure = (prevPct: number | null, prevReset: number | null, next: PutAccountLimitsInput["weekly"]): number | null => {
+      if (prevPct === null || !next) return null;
+      return measureWindowVelocity(
+        { usedPercent: prevPct, resetsAt: prevReset, fetchedAt: previous.fetchedAt },
+        { usedPercent: next.usedPercent, resetsAt: next.resetsAt ?? null, fetchedAt: now },
+      );
+    };
+    return {
+      fiveHour: measure(previous.fiveHourPct, previous.fiveHourResetsAt, fetched.fiveHour),
+      weekly: measure(previous.weeklyPct, previous.weeklyResetsAt, fetched.weekly),
+      fableWeekly: measure(previous.fableWeeklyPct, previous.fableResetsAt, fetched.fableWeekly),
+    };
+  }
+
+  /** Measured window velocities for an account (tests + the mirror), if any. */
+  velocitiesOf(accountId: string): WindowVelocities | undefined {
+    return this.velocities.get(accountId);
   }
 
   /** One account's limits via its harness's transport; never throws (an unreadable row instead). */
@@ -1786,8 +1839,14 @@ function readIfFile(path: string): string | null {
 /** The old spawn note's usage cell: `Fable 16%, weekly 40%, 5h 3%` (Fable only for a Fable pick). */
 export function autoPickUsage(limits: AccountLimits | undefined, model: string | undefined, now: number): string {
   if (!limits?.ok) return "";
-  const cell = (label: string, window?: WindowUsage) =>
-    window ? `${label} ${Math.round(windowRolledOver(window, now) ? 0 : window.usedPercent)}%` : null;
+  const cell = (label: string, window?: WindowUsage) => {
+    if (!window) return null;
+    const rolled = windowRolledOver(window, now);
+    const velocity = !rolled && typeof window.velocityPerHour === "number" && window.velocityPerHour >= 0.5
+      ? ` +${Math.round(window.velocityPerHour)}/h`
+      : "";
+    return `${label} ${Math.round(rolled ? 0 : window.usedPercent)}%${velocity}`;
+  };
   return [
     ...(isFableModel(model) ? [cell("Fable", limits.fableWeekly)] : []),
     cell("weekly", limits.weekly),

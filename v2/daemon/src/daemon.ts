@@ -2458,6 +2458,9 @@ export class HiveDaemon {
       const env = { ...bee.env };
       if (key) delete env[key];
       store.setBeeEnv(bee.id, { ...env, ...accounts.homeEnvOf(target) });
+      if (target.status === "ok" && store.activeFlags(bee.id).some((f) => f.flag === "auth_needed")) {
+        store.clearFlag(bee.id, "auth_needed", `account swapped to ${target.id}`);
+      }
       // Claude cross-account moves mint a fresh session id (the old
       // copyThread rule): the resume runs as `--resume <seed> --fork-session`.
       if (bee.agent === "claude" && from !== target.id) rekeyed = store.rekeyBeeSession(bee.id).applied;

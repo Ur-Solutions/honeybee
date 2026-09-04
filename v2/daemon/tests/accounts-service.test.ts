@@ -250,9 +250,13 @@ test("select.5: near-ties rotate through the per-harness cursor ROW (a same-inst
       assert.ok(p.ok);
       picks.push(p.account.id);
     }
-    assert.deepEqual(picks, ["claude-a", "claude-b", "claude-c", "claude-a"]);
-    assert.equal(r.store.getSelectionCursor("claude")?.lastAccountId, "claude-a");
-    assert.match(r.log.filter((l) => l.startsWith("account auto"))[1] as string, /near-tie rotation among 3 accounts/);
+    // 2026-09-02: each pick debits its account (+10 for 15 min), so the third
+    // same-instant pick lands on the untouched account by SCORE, not by cursor;
+    // only the fourth — all three debited alike — is a near-tie rotation.
+    assert.deepEqual(picks, ["claude-a", "claude-b", "claude-c", "claude-c"]);
+    assert.equal(r.store.getSelectionCursor("claude")?.lastAccountId, "claude-c");
+    assert.match(r.log.filter((l) => l.startsWith("account auto"))[3] as string, /near-tie rotation among 3 accounts/);
+    assert.match(r.log.filter((l) => l.startsWith("account auto"))[3] as string, /\+10 in-flight/);
     // Fable: a's Fable allowance is almost empty — a Fable spawn avoids it, a plain one does not
     limitsRow(r, "claude-a", 10, 10, r.now() + 6 * HOUR, { fable: 99 });
     limitsRow(r, "claude-b", 40, 10, r.now() + 6 * HOUR, { fable: 60 });
@@ -289,6 +293,106 @@ test("select.6: rr cycles in registration order, skips auth failures, and does n
     r.store.setAccountStatus(bad.id, "ok");
     const restored = [svc.pickRoundRobin("claude"), svc.pickRoundRobin("claude"), svc.pickRoundRobin("claude")];
     assert.deepEqual(restored.map((pick) => pick.ok ? pick.account.id : null), [bad.id, c.id, a.id]);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("select.7: pick debits expire; measured velocity from consecutive refreshes ages and projects the hot account out; exhaustion evidence is a down-tier class until the cool-off", async () => {
+  const r = rig();
+  try {
+    const fiveHourPct = new Map<string, number>();
+    // Fixed boundaries: the provider reports the same window across reads.
+    const fiveHourResetsAt = new Date(r.now() + 3 * HOUR).toISOString();
+    const weeklyResetsAt = new Date(r.now() + 3 * DAY).toISOString();
+    const svc = service(r, {
+      fetchers: {
+        claudeUsage: async (token) => ({
+          five_hour: { utilization: fiveHourPct.get(token) ?? 0, resets_at: fiveHourResetsAt },
+          seven_day: { utilization: 10, resets_at: weeklyResetsAt },
+        }),
+      },
+      keychainReader: async () => null,
+    });
+    const creds = (token: string) => ({ ".credentials.json": JSON.stringify({ claudeAiOauth: { accessToken: token, expiresAt: r.now() + DAY, subscriptionType: "max" } }) });
+    const hot = addAccount(r, "claude", "hot", { addedAt: 1, vault: creds("hot-token") });
+    const cool = addAccount(r, "claude", "cool", { addedAt: 2, vault: creds("cool-token") });
+    // Debit: two equal accounts, two picks in the same instant → both used once;
+    // after the ttl the debit is gone and the cursor rotation resumes.
+    fiveHourPct.set("hot-token", 5);
+    fiveHourPct.set("cool-token", 5);
+    await svc.refreshLimits();
+    const first = svc.pick("claude");
+    const second = svc.pick("claude");
+    assert.ok(first.ok && second.ok);
+    assert.notEqual(first.account.id, second.account.id, "the second pick sees the first's +10 debit");
+    assert.doesNotMatch(second.reason, /near-tie rotation/, "steered by score, not by the cursor");
+    // Both debited alike → the third pick is a near-tie again, and its reason names the debit.
+    const third = svc.pick("claude");
+    assert.ok(third.ok);
+    assert.match(third.reason, /\+10 in-flight/);
+    r.setNow(r.now() + 16 * 60_000);
+    const later = svc.pick("claude");
+    assert.ok(later.ok);
+    assert.doesNotMatch(later.reason, /in-flight/, "debits decayed");
+    // Velocity: hot goes 30 → 45 in 15 minutes (60/h); cool stays put.
+    const t0 = r.now();
+    fiveHourPct.set("hot-token", 30);
+    await svc.refreshLimits();
+    r.setNow(t0 + 15 * 60_000);
+    fiveHourPct.set("hot-token", 45);
+    await svc.refreshLimits();
+    assert.equal(svc.velocitiesOf(hot.id)?.fiveHour, 60);
+    assert.equal(svc.velocitiesOf(cool.id)?.fiveHour, 0);
+    // The picker sees it: 45 + (60 + 20) × 1h = 125 → projected over the 5h line; cool wins outright.
+    r.setNow(r.now() + 16 * 60_000); // debits gone
+    const steered = svc.pick("claude");
+    assert.ok(steered.ok);
+    assert.equal(steered.account.id, cool.id);
+    const line = r.log.filter((l) => l.startsWith("account auto →")).at(-1) as string;
+    assert.match(line, /5h 5%/);
+    assert.ok(!line.includes("+60/h"), "the winner's own cell is printed; hot's velocity is not");
+    // Velocity is re-measured every refresh: hot cools to 4/h (45 → 46 in 15 min)
+    // while cool jumps to 70%. Now cool is the one projected over (70 + 20 = 90)
+    // and hot (46 + 24 = 70) is clear again.
+    fiveHourPct.set("cool-token", 70);
+    fiveHourPct.set("hot-token", 46);
+    r.setNow(r.now() + 15 * 60_000);
+    await svc.refreshLimits();
+    // one point over the 31 minutes since the last read (16 + 15) ≈ 1.9/h
+    const cooled = svc.velocitiesOf(hot.id)?.fiveHour ?? NaN;
+    assert.ok(cooled > 1.9 && cooled < 2, `velocity ${cooled}`);
+    r.setNow(r.now() + 16 * 60_000); // debits gone
+    const flipped = svc.pick("claude");
+    assert.ok(flipped.ok);
+    assert.equal(flipped.account.id, hot.id);
+    assert.match(r.log.filter((l) => l.startsWith("account auto →")).at(-1) as string, /5h 46% \+2\/h/);
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("select.8: exhaustion evidence down-tiers an account for the cool-off, then it competes again", () => {
+  const r = rig();
+  try {
+    const svc = service(r);
+    const a = addAccount(r, "claude", "a", { addedAt: 1 });
+    const b = addAccount(r, "claude", "b", { addedAt: 2 });
+    limitsRow(r, a.id, 10, 10, r.now() + 3 * DAY);
+    limitsRow(r, b.id, 60, 10, r.now() + 3 * DAY);
+    r.store.recordAccountExhaustion(a.id, r.now());
+    const pick = svc.pick("claude");
+    assert.ok(pick.ok);
+    assert.equal(pick.account.id, b.id, "a is emptier but the provider just refused it");
+    // Rotation's explicit exclusion still works on top.
+    assert.equal((svc.pick("claude", { excludeAccountIds: new Set([b.id]), excludeRecentlyExhausted: true }) as { code: string }).code, "no_untried");
+    // After the cool-off the evidence is stale and a competes on load again.
+    r.setNow(r.now() + r.cfg.accounts.exhaustionCoolOffMs + 1);
+    limitsRow(r, a.id, 10, 10, r.now() + 3 * DAY);
+    limitsRow(r, b.id, 60, 10, r.now() + 3 * DAY);
+    const again = svc.pick("claude");
+    assert.ok(again.ok);
+    assert.equal(again.account.id, a.id);
   } finally {
     r.cleanup();
   }

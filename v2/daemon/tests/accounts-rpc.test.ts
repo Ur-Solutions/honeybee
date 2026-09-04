@@ -362,6 +362,79 @@ test("rpc.accounts.2: bee.swapAccount (fake-claude) — same-harness stop → re
   }
 });
 
+test("rpc.accounts.2b: bee.swapAccount clears stale auth_needed before the replacement generation presents as working", async () => {
+  const { dir, cleanup } = makeDaemonDir({
+    agents: {
+      claude: {
+        command: process.execPath,
+        args: [FAKE_CLAUDE, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
+        adapter: "claude",
+      },
+    },
+  });
+  let daemon: DaemonHandle | null = null;
+  try {
+    seedVault(dir, "claude", "claude-a", ".credentials.json", '{"claudeAiOauth":{"accessToken":"a","expiresAt":1}}');
+    seedVault(dir, "claude", "claude-b", ".credentials.json", '{"claudeAiOauth":{"accessToken":"b","expiresAt":1}}');
+    daemon = await startDaemon(dir);
+    const client = await daemon.client();
+    await client.request("account.add", { harness: "claude", label: "a", importExisting: true });
+    await client.request("account.add", { harness: "claude", label: "b", importExisting: true });
+
+    const spawned = await client.request<SpawnResult>("spawn", {
+      name: "auth-rotated",
+      agent: "claude",
+      cwd: dir,
+      account: "claude-a",
+      tags: ["autoswap=false"],
+    });
+    const first = await client.request<SendRpcResult>("send", { beeId: spawned.beeId, body: "establish transcript" });
+    await waitDelivered(client, spawned.beeId, first.messageId, "first delivered");
+    await waitState(client, spawned.beeId, "idle", "idle after first turn");
+
+    const limited = await client.request<SendRpcResult>("send", { beeId: spawned.beeId, body: "@ratelimit preserve this flag" });
+    await waitDelivered(client, spawned.beeId, limited.messageId, "rate-limit turn delivered");
+    await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId: spawned.beeId });
+      return v.view.flags.includes("resource_blocked") ? true : null;
+    }, "resource_blocked set");
+
+    const auth = await client.request<SendRpcResult>("send", { beeId: spawned.beeId, body: "@authfail" });
+    await waitDelivered(client, spawned.beeId, auth.messageId, "authfail turn delivered");
+    await waitFor(async () => {
+      const account = await client.request<AccountGetResult>("account.get", { id: "claude-a" });
+      return account.account.status === "auth_needed" ? true : null;
+    }, "source account auth_needed");
+    const before = await client.request<ViewResult>("view", { beeId: spawned.beeId });
+    assert.deepEqual([...before.view.flags].sort(), ["auth_needed", "resource_blocked"]);
+
+    const swap = await client.request<SwapAccountResult>("bee.swapAccount", {
+      beeId: spawned.beeId,
+      account: "claude-b",
+      idempotencyKey: "swap-clears-auth",
+    });
+    assert.equal(swap.action, "stop_then_revive");
+    assert.equal(swap.to, "claude-b");
+    const replay = await client.request<SwapAccountResult>("bee.swapAccount", {
+      beeId: spawned.beeId,
+      account: "claude-b",
+      idempotencyKey: "swap-clears-auth",
+    });
+    assert.equal(replay.deduped, true);
+
+    const working = await waitFor(async () => {
+      const v = await client.request<ViewResult>("view", { beeId: spawned.beeId });
+      return v.view.generation === 2 && v.view.working ? v : null;
+    }, "replacement generation working", 15_000);
+    assert.equal(working.bee?.account, "claude-b");
+    assert.deepEqual(working.view.flags, ["resource_blocked"]);
+    client.close();
+  } finally {
+    if (daemon) await daemon.stop();
+    cleanup();
+  }
+});
+
 test("rpc.accounts.3: automatic rotation on exhaustion (fake-claude @ratelimit) — swap to the untried account, the next turn continues there; opt-out honored; no candidate = flagged, no loop; auth_needed evidence → account status", async () => {
   const argvLog = join(makeDaemonDir().dir, "argv.jsonl");
   const { dir, cleanup } = makeDaemonDir({

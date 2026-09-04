@@ -375,6 +375,15 @@ export class DaemonCore {
       this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=booted reason=already_${rt.state}`);
       return;
     }
+    if (obs.kind === "turn_ended" && obs.synthetic === true && this.store.undeliveredMessages(obs.beeId).length > 0) {
+      // The readyAtSpawn boot-to-ready edge with mail already waiting: the
+      // delivery loop opens a real turn this same step (synthetic-boot
+      // `running` is provisional — every urgency is eligible there), so
+      // folding idle here would publish a one-step "waiting for you" under
+      // a turn about to start. Keep `running`; the real result idles it.
+      this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=turn_ended reason=mail_pending`);
+      return;
+    }
     if (rt.state === target) {
       this.log(`obs.skip bee=${obs.beeId} gen=${obs.generation} kind=${obs.kind} reason=already_${target}`);
       return;
@@ -431,10 +440,12 @@ export class DaemonCore {
         target,
         // The output/turn-completion fact and running→idle phase are one core
         // transaction. A crash can replay the journal line, but can never
-        // persist idle without its corresponding last-output fact.
-        obs.kind === "turn_ended" ? { recordOutput: true } : {},
+        // persist idle without its corresponding last-output fact. A SYNTHETIC
+        // turn_ended (the readyAtSpawn boot-to-ready edge) is a phase fact
+        // only: the agent produced nothing, so lastOutputAt must not move.
+        obs.kind === "turn_ended" && obs.synthetic !== true ? { recordOutput: true } : {},
       );
-      this.log(`obs.${obs.kind} bee=${obs.beeId} gen=${obs.generation}`);
+      this.log(`obs.${obs.kind} bee=${obs.beeId} gen=${obs.generation}${obs.synthetic ? " synthetic" : ""}`);
     }
   }
 

@@ -113,8 +113,10 @@ export interface HarnessAdapter {
    * stream-json mode emits NOTHING (not even init) until the first user
    * message arrives on stdin — waiting for a booted line deadlocks (found by
    * the WP3 manual smoke). readyAtSpawn adapters get a synthetic booted
-   * observation at spawn and start in the idle phase; stdin buffering makes
-   * early delivery safe.
+   * observation at spawn — followed by a synthetic turn_ended when nothing
+   * has been injected yet, so the store lands on idle like the driver's own
+   * phase — and start in the idle phase; stdin buffering makes early
+   * delivery safe.
    */
   readonly readyAtSpawn: boolean;
   /** Lines to write to the runtime's stdin immediately after spawn. */
